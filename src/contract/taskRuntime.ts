@@ -99,13 +99,35 @@ export const TaskRunSchema = z.object({
   }
 });
 
+const publicEventFields: Record<string, ReadonlySet<string>> = {
+  run_queued: new Set(['status', 'kind', 'route_label', 'summary']),
+  status_changed: new Set(['from', 'status', 'summary', 'blocking_reason', 'failure_type']),
+  agent_phase_changed: new Set(['agent_id', 'role', 'phase', 'operation_summary', 'blocking_reason']),
+  budget_updated: new Set(['usage', 'limits', 'exhausted_dimension', 'status']),
+  budget_exhausted: new Set(['usage', 'limits', 'exhausted_dimension', 'status']),
+  approval_requested: new Set(['status', 'approval']),
+  approval_resolved: new Set(['status', 'approval_id', 'resolution', 'failure_type']),
+  checkpoint_created: new Set(['label']),
+  message_routed: new Set(['route_label', 'summary']),
+  restart_recovery: new Set(['status', 'blocking_reason']),
+  tool_prepared: new Set(['status', 'invocation_id', 'tool_name', 'disposition', 'usage']),
+  verifier_decision: new Set(['status', 'decision_id', 'outcome', 'approved', 'evidence_count']),
+};
+
 const PublicPayloadSchema = z.record(z.unknown()).superRefine((payload, context) => {
   const privateKeys = new Set([
     'chain_of_thought', 'reasoning_content', 'raw_reasoning', 'system_prompt',
     'api_key', 'secret', 'credential', 'private_payload', 'sensitive_payload',
+    'token', 'access_token', 'refresh_token', 'password', 'authorization', 'cookie',
+    'student_id', 'phone', 'email', 'id_card', 'identity_number', 'grade', 'rank',
   ]);
   const walk = (value: unknown): boolean => {
     if (Array.isArray(value)) return value.some(walk);
+    if (typeof value === 'string') {
+      return /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(value)
+        || /(^|\D)1[3-9]\d{9}(\D|$)/.test(value)
+        || /(^|\D)\d{17}[0-9Xx](\D|$)/.test(value);
+    }
     if (!value || typeof value !== 'object') return false;
     return Object.entries(value).some(([key, child]) => privateKeys.has(key.toLowerCase()) || walk(child));
   };
@@ -125,7 +147,17 @@ export const RunEventSchema = z.object({
   sensitivity: z.string().min(1),
   created_at: z.string().min(1),
   schema_version: TaskRuntimeSchemaVersionSchema,
-}).strict();
+}).strict().superRefine((event, context) => {
+  const fields = publicEventFields[event.event_type];
+  if (!fields) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'unsupported public event type' });
+    return;
+  }
+  const extra = Object.keys(event.public_payload).filter((field) => !fields.has(field));
+  if (extra.length) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: `unsupported public fields: ${extra.join(',')}` });
+  }
+});
 
 export const ApprovalRequestSchema = z.object({
   approval_id: z.string().regex(/^apr_[0-9a-f]{32}$/),
@@ -134,6 +166,11 @@ export const ApprovalRequestSchema = z.object({
   kind: z.string().min(1),
   summary: z.string(),
   risk: RiskLevelSchema,
+  requested_capabilities: z.array(z.string()),
+  tool_name: z.string(),
+  operation_scope: z.record(z.string()),
+  purpose: z.string().min(1),
+  expires_at: z.string().nullable(),
   status: z.enum(['pending', 'approved', 'rejected']),
   created_at: z.string().min(1),
   resolved_at: z.string().nullable(),
@@ -147,6 +184,9 @@ export const PermissionGrantSchema = z.object({
   group_id: GroupIdSchema,
   task_id: z.string().regex(/^task_[0-9a-f]{32}$/),
   capabilities: z.array(z.string()),
+  tool_name: z.string(),
+  operation_scope: z.record(z.string()),
+  purpose: z.string().min(1),
   expires_at: z.string().nullable(),
   created_at: z.string().min(1),
   schema_version: TaskRuntimeSchemaVersionSchema,
@@ -162,6 +202,9 @@ export const ToolInvocationSchema = z.object({
   status: z.string().min(1),
   replay_allowed: z.boolean(),
   public_summary: z.string(),
+  operation_scope: z.record(z.string()),
+  purpose: z.string().min(1),
+  disposition: z.enum(['created', 'requires_new_approval', 'recovered_blocked']),
   created_at: z.string().min(1),
   completed_at: z.string().nullable(),
   schema_version: TaskRuntimeSchemaVersionSchema,
@@ -212,6 +255,15 @@ export const GroupRuntimeSnapshotSchema = z.object({
     budget_usage: BudgetUsageSchema,
     indexing_state: z.enum(['idle', 'queued', 'running', 'failed']),
   }).strict(),
+}).strict();
+
+export const GroupRuntimeSnapshotResponseSchema = z.object({
+  ok: z.literal(true),
+  schema_version: TaskRuntimeSchemaVersionSchema,
+  group_id: GroupIdSchema,
+  runs: z.array(TaskRunSchema),
+  pending_approvals: z.array(ApprovalRequestSchema),
+  summary: GroupRuntimeSnapshotSchema.shape.summary,
 }).strict();
 
 export type TaskStatus = z.infer<typeof TaskStatusSchema>;

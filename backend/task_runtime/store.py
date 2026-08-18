@@ -8,6 +8,8 @@ ring and therefore can prove whether a client cursor is contiguous.
 """
 
 import json
+import logging
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -16,16 +18,19 @@ from knowe_storage._sqlite import SQLiteDatabase
 from .contracts import (
     ApprovalRequest,
     Checkpoint,
+    EvidenceRef,
     PermissionGrant,
     RiskLevel,
     RunEvent,
     TaskRun,
     TaskStatus,
     ToolInvocation,
-    assert_public_payload,
+    VerifierDecision,
     opaque_id,
     utc_now,
 )
+
+log = logging.getLogger(__name__)
 
 
 class RuntimeStoreError(RuntimeError):
@@ -44,6 +49,7 @@ def _loads(value: str | None) -> dict[str, Any]:
 class TaskRuntimeStore:
     def __init__(self, path: str | Path) -> None:
         self.db = SQLiteDatabase(path)
+        self._event_listeners: list[Callable[[RunEvent], None]] = []
         self.db.initialize(
             """
             CREATE TABLE IF NOT EXISTS studycrew_task_runs (
@@ -93,6 +99,8 @@ class TaskRuntimeStore:
             );
             CREATE INDEX IF NOT EXISTS idx_studycrew_approvals_group
               ON studycrew_approvals(group_id, status, created_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_studycrew_one_pending_approval
+              ON studycrew_approvals(run_id) WHERE status='pending';
 
             CREATE TABLE IF NOT EXISTS studycrew_permission_grants (
                 grant_id TEXT PRIMARY KEY,
@@ -132,6 +140,30 @@ class TaskRuntimeStore:
                 name TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS studycrew_scheduler_lease (
+                lease_name TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS studycrew_verifier_decisions (
+                decision_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                run_version INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                approved INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(run_id, run_version)
+            );
+            CREATE TABLE IF NOT EXISTS studycrew_group_deletions (
+                group_id TEXT PRIMARY KEY,
+                group_transaction_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         # Development snapshots may have been created by an earlier Task Runtime v1
@@ -150,6 +182,16 @@ class TaskRuntimeStore:
 
     def close(self) -> None:
         self.db.close()
+
+    def add_event_listener(self, listener: Callable[[RunEvent], None]) -> None:
+        self._event_listeners.append(listener)
+
+    def _publish(self, event: RunEvent) -> None:
+        for listener in tuple(self._event_listeners):
+            try:
+                listener(event)
+            except Exception:  # noqa: BLE001 -- a transport subscriber cannot undo durable state
+                log.exception("Task Runtime event listener failed after commit: %s", event.event_id)
 
     @staticmethod
     def _row_run(row: Any) -> TaskRun:
@@ -187,6 +229,7 @@ class TaskRuntimeStore:
                  run.created_at, run.updated_at),
             )
             self._insert_event(conn, event, request_key=f"create:{request_key}")
+        self._publish(event)
         return run, event, True
 
     def get_run(self, run_id: str) -> TaskRun | None:
@@ -223,14 +266,13 @@ class TaskRuntimeStore:
         run_id: str,
         *,
         event_type: str,
-        public_payload: Mapping[str, Any],
+        public_payload: Mapping[str, Any] | Callable[[TaskRun], Mapping[str, Any]],
         idempotency_key: str,
         mutate: Callable[[TaskRun], None] | None = None,
         sensitive_payload: Mapping[str, Any] | None = None,
         sensitivity: str = "public",
         transaction_hook: Callable[[Any, TaskRun, RunEvent], None] | None = None,
     ) -> tuple[TaskRun, RunEvent, bool]:
-        assert_public_payload(public_payload)
         if not idempotency_key.strip():
             raise ValueError("idempotency_key is required")
         with self.db.transaction() as conn:
@@ -251,26 +293,31 @@ class TaskRuntimeStore:
             if row is None:
                 raise RuntimeStoreError(f"run not found: {run_id}")
             run = self._row_run(row)
+            expected_version = run.version
             if mutate is not None:
                 mutate(run)
             run.version += 1
             run.last_seq += 1
             run.updated_at = utc_now()
+            event_payload = dict(public_payload(run) if callable(public_payload) else public_payload)
             event = RunEvent(
                 event_id=opaque_id("evt"), run_id=run.run_id, group_id=run.group_id,
                 seq=run.last_seq, version=run.version, event_type=event_type,
-                public_payload=dict(public_payload), sensitivity=sensitivity,
+                public_payload=event_payload, sensitivity=sensitivity,
                 sensitive_payload=dict(sensitive_payload or {}),
             )
             conn.execute(
                 """UPDATE studycrew_task_runs SET status=?, version=?, last_seq=?,
-                       payload_json=?, updated_at=? WHERE run_id=?""",
+                       payload_json=?, updated_at=? WHERE run_id=? AND version=?""",
                 (run.status.value, run.version, run.last_seq, _dumps(run.to_dict()),
-                 run.updated_at, run.run_id),
+                 run.updated_at, run.run_id, expected_version),
             )
+            if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise RuntimeStoreError("TaskRun compare-and-swap conflict")
             self._insert_event(conn, event, request_key=idempotency_key)
             if transaction_hook is not None:
                 transaction_hook(conn, run, event)
+        self._publish(event)
         return run, event, True
 
     @staticmethod
@@ -333,6 +380,18 @@ class TaskRuntimeStore:
              _dumps(approval.to_dict()), approval.created_at, approval.resolved_at, request_key),
         )
 
+    @staticmethod
+    def resolve_pending_approval_in_transaction(conn: Any, approval: ApprovalRequest) -> None:
+        cursor = conn.execute(
+            """UPDATE studycrew_approvals
+               SET status=?, payload_json=?, resolved_at=?
+               WHERE approval_id=? AND run_id=? AND group_id=? AND status='pending'""",
+            (approval.status, _dumps(approval.to_dict()), approval.resolved_at,
+             approval.approval_id, approval.run_id, approval.group_id),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeStoreError("approval is no longer pending")
+
     def approval_by_request_key(self, request_key: str) -> ApprovalRequest | None:
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
@@ -352,7 +411,12 @@ class TaskRuntimeStore:
             approval_id=str(raw["approval_id"]), run_id=str(raw["run_id"]),
             group_id=str(raw["group_id"]), kind=str(raw["kind"]), summary=str(raw["summary"]),
             risk=RiskLevel(str(raw["risk"])), status=str(raw.get("status") or "pending"),
+            requested_capabilities=tuple(str(item) for item in raw.get("requested_capabilities") or ()),
+            tool_name=str(raw.get("tool_name") or ""),
+            operation_scope={str(key): str(value) for key, value in dict(raw.get("operation_scope") or {}).items()},
+            purpose=str(raw.get("purpose") or ""), expires_at=raw.get("expires_at"),
             created_at=str(raw.get("created_at") or utc_now()), resolved_at=raw.get("resolved_at"),
+            schema_version=int(raw.get("schema_version", 1)),
         )
 
     def pending_approvals(self, group_id: str) -> tuple[ApprovalRequest, ...]:
@@ -380,8 +444,12 @@ class TaskRuntimeStore:
             grant_id=str(raw["grant_id"]), approval_id=str(raw["approval_id"]),
             run_id=str(raw["run_id"]), group_id=str(raw["group_id"]), task_id=str(raw["task_id"]),
             capabilities=tuple(str(item) for item in raw.get("capabilities") or ()),
+            tool_name=str(raw.get("tool_name") or ""),
+            operation_scope={str(key): str(value) for key, value in dict(raw.get("operation_scope") or {}).items()},
+            purpose=str(raw.get("purpose") or ""),
             expires_at=str(raw["expires_at"]) if raw.get("expires_at") else None,
             created_at=str(raw.get("created_at") or utc_now()),
+            schema_version=int(raw.get("schema_version", 1)),
         )
 
     def revoke_group_grants(self, group_id: str) -> int:
@@ -420,6 +488,14 @@ class TaskRuntimeStore:
             )
         return invocation, True
 
+    def tool_by_key(self, run_id: str, idempotency_key: str) -> ToolInvocation | None:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM studycrew_tool_invocations WHERE run_id=? AND idempotency_key=?",
+                (run_id, idempotency_key),
+            ).fetchone()
+        return None if row is None else self._tool_from_raw(_loads(row["payload_json"]))
+
     @staticmethod
     def _tool_from_raw(raw: Mapping[str, Any]) -> ToolInvocation:
         return ToolInvocation(
@@ -428,7 +504,11 @@ class TaskRuntimeStore:
             idempotency_key=str(raw["idempotency_key"]), risk=RiskLevel(str(raw["risk"])),
             status=str(raw.get("status") or "prepared"), replay_allowed=bool(raw.get("replay_allowed")),
             public_summary=str(raw.get("public_summary") or ""),
+            operation_scope={str(key): str(value) for key, value in dict(raw.get("operation_scope") or {}).items()},
+            purpose=str(raw.get("purpose") or ""),
+            disposition=str(raw.get("disposition") or "created"),
             created_at=str(raw.get("created_at") or utc_now()), completed_at=raw.get("completed_at"),
+            schema_version=int(raw.get("schema_version", 1)),
         )
 
     def incomplete_tools(self) -> tuple[ToolInvocation, ...]:
@@ -437,6 +517,124 @@ class TaskRuntimeStore:
                 "SELECT payload_json FROM studycrew_tool_invocations WHERE status IN ('prepared','running')"
             ).fetchall()
         return tuple(self._tool_from_raw(_loads(row["payload_json"])) for row in rows)
+
+    @staticmethod
+    def insert_tool_in_transaction(conn: Any, invocation: ToolInvocation) -> None:
+        conn.execute(
+            """INSERT INTO studycrew_tool_invocations(
+                   invocation_id, run_id, group_id, idempotency_key, risk, status,
+                   replay_allowed, payload_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (invocation.invocation_id, invocation.run_id, invocation.group_id,
+             invocation.idempotency_key, invocation.risk.value, invocation.status,
+             int(invocation.replay_allowed), _dumps(invocation.to_dict())),
+        )
+
+    def mark_tool_recovered_blocked(self, invocation_id: str) -> ToolInvocation:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM studycrew_tool_invocations WHERE invocation_id=?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeStoreError(f"tool invocation not found: {invocation_id}")
+            current = self._tool_from_raw(_loads(row["payload_json"]))
+            blocked = replace(
+                current, status="recovered_blocked", replay_allowed=False,
+                disposition="recovered_blocked",
+            )
+            conn.execute(
+                "UPDATE studycrew_tool_invocations SET status=?, replay_allowed=0, payload_json=? WHERE invocation_id=?",
+                (blocked.status, _dumps(blocked.to_dict()), invocation_id),
+            )
+        return blocked
+
+    def save_verifier_decision_in_transaction(
+        self, conn: Any, decision: VerifierDecision,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO studycrew_verifier_decisions(
+                   decision_id, run_id, task_id, group_id, run_version, outcome,
+                   approved, payload_json, created_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (decision.decision_id, decision.run_id, decision.task_id, decision.group_id,
+             decision.run_version, decision.outcome.value, int(decision.approved),
+             _dumps(decision.to_dict()), decision.created_at),
+        )
+
+    def latest_verifier_decision(self, run_id: str) -> VerifierDecision | None:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM studycrew_verifier_decisions WHERE run_id=? ORDER BY run_version DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        raw = _loads(row["payload_json"])
+        return VerifierDecision(
+            decision_id=str(raw["decision_id"]), run_id=str(raw["run_id"]),
+            task_id=str(raw["task_id"]), group_id=str(raw["group_id"]),
+            verifier_agent_id=str(raw["verifier_agent_id"]), run_version=int(raw["run_version"]),
+            outcome=TaskStatus(str(raw["outcome"])), approved=bool(raw["approved"]),
+            evidence=tuple(EvidenceRef.from_dict(item) for item in raw.get("evidence") or ()),
+            reason=str(raw.get("reason") or ""), created_at=str(raw.get("created_at") or utc_now()),
+            schema_version=int(raw.get("schema_version", 1)),
+        )
+
+    @staticmethod
+    def verifier_decision_for_version_in_transaction(
+        conn: Any, run_id: str, run_version: int,
+    ) -> VerifierDecision | None:
+        row = conn.execute(
+            """SELECT payload_json FROM studycrew_verifier_decisions
+               WHERE run_id=? AND run_version=? ORDER BY created_at DESC LIMIT 1""",
+            (run_id, run_version),
+        ).fetchone()
+        if row is None:
+            return None
+        raw = _loads(row["payload_json"])
+        return VerifierDecision(
+            decision_id=str(raw["decision_id"]), run_id=str(raw["run_id"]),
+            task_id=str(raw["task_id"]), group_id=str(raw["group_id"]),
+            verifier_agent_id=str(raw["verifier_agent_id"]), run_version=int(raw["run_version"]),
+            outcome=TaskStatus(str(raw["outcome"])), approved=bool(raw["approved"]),
+            evidence=tuple(EvidenceRef.from_dict(item) for item in raw.get("evidence") or ()),
+            reason=str(raw.get("reason") or ""), created_at=str(raw.get("created_at") or utc_now()),
+            schema_version=int(raw.get("schema_version") or 1),
+        )
+
+    def prepare_group_deletion(self, group_id: str, group_transaction_id: str) -> dict[str, str]:
+        now = utc_now()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO studycrew_group_deletions(
+                       group_id, group_transaction_id, stage, created_at, updated_at
+                   ) VALUES (?, ?, 'prepared', ?, ?)
+                   ON CONFLICT(group_id) DO NOTHING""",
+                (group_id, group_transaction_id, now, now),
+            )
+            row = conn.execute(
+                "SELECT * FROM studycrew_group_deletions WHERE group_id=?", (group_id,),
+            ).fetchone()
+        if row is None or str(row["group_transaction_id"]) != group_transaction_id:
+            raise RuntimeStoreError("group deletion intent conflicts with existing transaction")
+        return {key: str(row[key]) for key in row.keys()}
+
+    def set_group_deletion_stage(self, group_id: str, stage: str) -> None:
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                "UPDATE studycrew_group_deletions SET stage=?, updated_at=? WHERE group_id=?",
+                (stage, utc_now(), group_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeStoreError(f"group deletion intent not found: {group_id}")
+
+    def pending_group_deletions(self) -> tuple[dict[str, str], ...]:
+        with self.db.transaction(immediate=False) as conn:
+            rows = conn.execute(
+                "SELECT * FROM studycrew_group_deletions WHERE stage != 'complete' ORDER BY created_at"
+            ).fetchall()
+        return tuple({key: str(row[key]) for key in row.keys()} for row in rows)
 
     def save_checkpoint(
         self, checkpoint: Checkpoint, run: TaskRun, *, idempotency_key: str,
@@ -474,6 +672,7 @@ class TaskRuntimeStore:
             group_id=str(raw["group_id"]), seq=int(raw["seq"]), version=int(raw["version"]),
             label=str(raw["label"]), resumable=bool(raw.get("resumable", True)),
             created_at=str(raw.get("created_at") or utc_now()),
+            schema_version=int(raw.get("schema_version", 1)),
         )
 
     def latest_checkpoint(self, run_id: str) -> tuple[Checkpoint, TaskRun] | None:
@@ -490,21 +689,47 @@ class TaskRuntimeStore:
             group_id=str(raw["group_id"]), seq=int(raw["seq"]), version=int(raw["version"]),
             label=str(raw["label"]), resumable=bool(raw.get("resumable", True)),
             created_at=str(raw.get("created_at") or utc_now()),
+            schema_version=int(raw.get("schema_version", 1)),
         )
         return checkpoint, TaskRun.from_dict(_loads(row["snapshot_json"]))
 
-    def scheduler_cursor(self) -> str:
+    def scheduler_cursor(self, lane: str) -> str:
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
-                "SELECT value FROM studycrew_scheduler_state WHERE name='group_cursor'"
+                "SELECT value FROM studycrew_scheduler_state WHERE name=?", (f"group_cursor:{lane}",),
             ).fetchone()
         return "" if row is None else str(row["value"])
 
-    def set_scheduler_cursor(self, group_id: str) -> None:
+    def set_scheduler_cursor(self, lane: str, group_id: str) -> None:
         with self.db.transaction() as conn:
             conn.execute(
-                """INSERT INTO studycrew_scheduler_state(name, value) VALUES ('group_cursor', ?)
-                   ON CONFLICT(name) DO UPDATE SET value=excluded.value""", (group_id,),
+                """INSERT INTO studycrew_scheduler_state(name, value) VALUES (?, ?)
+                   ON CONFLICT(name) DO UPDATE SET value=excluded.value""",
+                (f"group_cursor:{lane}", group_id),
+            )
+
+    def acquire_scheduler_lease(self, owner: str, *, now: str, expires_at: str) -> bool:
+        """CAS a short durable lease so independent service instances cannot overbook."""
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO studycrew_scheduler_lease(lease_name, owner, expires_at)
+                   VALUES ('global', ?, ?)
+                   ON CONFLICT(lease_name) DO UPDATE SET owner=excluded.owner,
+                       expires_at=excluded.expires_at
+                   WHERE studycrew_scheduler_lease.owner=excluded.owner
+                      OR studycrew_scheduler_lease.expires_at<=?""",
+                (owner, expires_at, now),
+            )
+            row = conn.execute(
+                "SELECT owner FROM studycrew_scheduler_lease WHERE lease_name='global'",
+            ).fetchone()
+        return row is not None and str(row["owner"]) == owner
+
+    def release_scheduler_lease(self, owner: str) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                "DELETE FROM studycrew_scheduler_lease WHERE lease_name='global' AND owner=?",
+                (owner,),
             )
 
     def delete_group(self, group_id: str) -> dict[str, int]:
@@ -529,14 +754,33 @@ class TaskRuntimeStore:
                 "checkpoints": int(conn.execute(
                     "SELECT COUNT(*) FROM studycrew_checkpoints WHERE group_id=?", (group_id,),
                 ).fetchone()[0]),
+                "verifier_decisions": int(conn.execute(
+                    "SELECT COUNT(*) FROM studycrew_verifier_decisions WHERE group_id=?", (group_id,),
+                ).fetchone()[0]),
             }
             for table in (
                 "studycrew_checkpoints", "studycrew_tool_invocations",
                 "studycrew_permission_grants", "studycrew_approvals",
+                "studycrew_verifier_decisions",
                 "studycrew_run_events", "studycrew_task_runs",
             ):
                 conn.execute(f"DELETE FROM {table} WHERE group_id=?", (group_id,))
         return counts
+
+    def group_content_counts(self, group_id: str) -> dict[str, int]:
+        tables = {
+            "runs": "studycrew_task_runs", "events": "studycrew_run_events",
+            "approvals": "studycrew_approvals", "grants": "studycrew_permission_grants",
+            "tools": "studycrew_tool_invocations", "checkpoints": "studycrew_checkpoints",
+            "verifier_decisions": "studycrew_verifier_decisions",
+        }
+        with self.db.transaction(immediate=False) as conn:
+            return {
+                name: int(conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE group_id=?", (group_id,),
+                ).fetchone()[0])
+                for name, table in tables.items()
+            }
 
 
 __all__ = ["RuntimeStoreError", "TaskRuntimeStore"]

@@ -5,44 +5,11 @@ import {
   TaskRunSchema,
   ToolInvocationSchema,
 } from './taskRuntime';
+import { taskRunFixture } from './taskRuntime.fixture';
+import { validateInbound } from './envelope';
 
 const groupId = `grp_${'1'.repeat(32)}`;
 const runId = `run_${'2'.repeat(32)}`;
-
-export function taskRunFixture(overrides: Record<string, unknown> = {}): unknown {
-  return {
-    run_id: runId,
-    task_id: `task_${'3'.repeat(32)}`,
-    group_id: groupId,
-    kind: 'primary',
-    title: 'Review calculus',
-    status: 'running',
-    queue_class: 'foreground',
-    route_label: 'queue_new',
-    read_only: false,
-    risk: 'low',
-    parent_run_id: null,
-    version: 1,
-    last_seq: 1,
-    budget_limits: {
-      wall_clock_seconds: 900, model_turns: 20, tool_calls: 30, tokens: 100000, cost_usd: 5,
-    },
-    budget_usage: {
-      wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0,
-    },
-    agent_runs: [],
-    evidence: [],
-    failure_type: null,
-    public_summary: 'Running',
-    blocking_reason: '',
-    created_at: '2026-08-18T00:00:00Z',
-    updated_at: '2026-08-18T00:00:00Z',
-    started_at: '2026-08-18T00:00:00Z',
-    finished_at: null,
-    schema_version: 1,
-    ...overrides,
-  };
-}
 
 describe('Task Runtime public contracts', () => {
   it('accepts exact planned states and rejects unsafe side tasks', () => {
@@ -86,11 +53,43 @@ describe('Task Runtime public contracts', () => {
       status: 'prepared',
       replay_allowed: false,
       public_summary: 'Approved send',
+      operation_scope: { destination: 'example.edu' },
+      purpose: 'send_result',
+      disposition: 'created',
       created_at: '2026-08-18T00:00:01Z',
       completed_at: null,
       schema_version: 1,
     };
     expect(ToolInvocationSchema.parse(tool).replay_allowed).toBe(false);
     expect(() => ToolInvocationSchema.parse({ ...tool, replay_allowed: true })).toThrow();
+  });
+
+  it('rejects unsupported versions, forged ids, nested credentials and PII values', () => {
+    expect(() => TaskRunSchema.parse(taskRunFixture({ schema_version: 2 }))).toThrow();
+    expect(() => TaskRunSchema.parse(taskRunFixture({ run_id: 'run_forged' }))).toThrow();
+    const base = {
+      event_id: `evt_${'6'.repeat(32)}`, run_id: runId, group_id: groupId,
+      seq: 2, version: 2, event_type: 'status_changed', sensitivity: 'public',
+      created_at: '2026-08-18T00:00:01Z', schema_version: 1,
+    };
+    expect(() => RunEventSchema.parse({
+      ...base, public_payload: { status: 'running', summary: { access_token: 'secret' } },
+    })).toThrow(/private data/);
+    expect(() => RunEventSchema.parse({
+      ...base, public_payload: { status: 'running', summary: 'student@example.edu' },
+    })).toThrow(/private data/);
+  });
+
+  it('rejects a forged live envelope whose group differs from its RunEvent', () => {
+    expect(validateInbound({
+      type: 'task_runtime_event', project_id: 'project_live', project_name: 'Live',
+      group_id: groupId, seq: 5, ts: '2026-08-18T00:00:01Z',
+      event: {
+        event_id: `evt_${'7'.repeat(32)}`, run_id: runId,
+        group_id: `grp_${'8'.repeat(32)}`, seq: 2, version: 2,
+        event_type: 'status_changed', public_payload: { status: 'running' },
+        sensitivity: 'public', created_at: '2026-08-18T00:00:01Z', schema_version: 1,
+      },
+    })).toBeNull();
   });
 });

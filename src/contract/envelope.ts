@@ -52,7 +52,7 @@
  */
 
 import { z } from 'zod';
-import { GroupRuntimeSnapshotSchema } from './taskRuntime';
+import { GroupRuntimeSnapshotSchema, RunEventSchema } from './taskRuntime';
 
 // ═══════════════════════════════════════════════════════════════
 // 一、通用基础类型
@@ -928,6 +928,17 @@ export const TaskRuntimeResultSchema = z.object({
 }).passthrough();
 export type TaskRuntimeResult = z.infer<typeof TaskRuntimeResultSchema>;
 
+export const TaskRuntimeEventSchema = z.object({
+  type: z.literal('task_runtime_event'),
+  project_id: z.string(),
+  project_name: z.string(),
+  group_id: z.string().regex(/^grp_[0-9a-f]{32}$/),
+  seq: z.number().int().positive(),
+  ts: z.string(),
+  event: RunEventSchema,
+}).strict();
+export type TaskRuntimeEvent = z.infer<typeof TaskRuntimeEventSchema>;
+
 /** CompletionEvent 的即时、可重放展示状态。 */
 export const CompletionStatusValueSchema = z.enum([
   'SUCCEEDED', 'PARTIAL', 'FAILED', 'BLOCKED', 'WAITING',
@@ -1044,6 +1055,7 @@ export const InboundEventSchema = z.discriminatedUnion('type', [
   ResyncRequiredSchema,
   PongSchema,
   TaskRuntimeResultSchema,
+  TaskRuntimeEventSchema,
 ]);
 export type InboundEvent = z.infer<typeof InboundEventSchema>;
 
@@ -1330,6 +1342,7 @@ export const STRUCTURAL_EVENT_TYPES = new Set([
   'error',
   'recovery_notice',
   'user_echo',
+  'task_runtime_event',
 ]);
 
 // ═══════════════════════════════════════════════════════════════
@@ -1407,6 +1420,11 @@ export function validateInbound(raw: unknown): InboundEvent | null {
     : undefined;
   if (typeof candidate === 'string' && /^grp_[0-9a-f]{32}$/.test(candidate)) {
     data.group_id = candidate;
+  }
+  if (result.data.type === 'task_runtime_event'
+      && result.data.event.group_id !== result.data.group_id) {
+    console.error('[contract] Task Runtime event group mismatch', raw);
+    return null;
   }
   return data;
 }

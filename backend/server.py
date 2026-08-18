@@ -75,6 +75,7 @@ from .task_runtime.contracts import (
     QueueClass,
     RiskLevel,
     RouteLabel,
+    RunEvent,
     RunKind,
     TaskStatus as ControlTaskStatus,
 )
@@ -415,6 +416,8 @@ class KnoweServer:
         )
         self.hub = Hub(store=self.store)
         self.hub.group_id_resolver = self._group_id_for_runtime_project
+        if self.task_runtime is not None:
+            self.task_runtime.add_event_listener(self._on_task_runtime_event)
         self.engines: dict[str, ProjectEngine] = {}
         self.platform: ProjectEngine | None = None   # [v0.4] 知知常驻的平台引擎
         # [v1.0.13 R1] Process-local serialization plus durable history/event-id
@@ -427,6 +430,7 @@ class KnoweServer:
         # settings.  GET /settings exposes the flag so the UI cannot accidentally hide a required
         # restart during ordinary reconciliation.
         self._settings_restart_required = False
+        self._task_runtime_delete_fault: Any = None
 
         # [v0.11 C-1] 三层 Memory 的全局看门人：harness_memory.md 落在 data_dir 下，
         #   每个引擎共用这一个实例（Project Memory 落到各自 internal_workspace）。
@@ -1033,6 +1037,28 @@ class KnoweServer:
         if self.groups is None:
             raise GroupNotFoundError("Group persistence is unavailable")
         return self.groups.runtime_project_id(group_id)
+
+    def _on_task_runtime_event(self, event: RunEvent) -> None:
+        """Bridge the durable public event to the existing sequenced group Hub."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Synchronous maintenance/tests still retain the event for HTTP replay.
+            return
+        loop.create_task(self._broadcast_task_runtime_event(event))
+
+    async def _broadcast_task_runtime_event(self, event: RunEvent) -> None:
+        try:
+            project_id = self._runtime_project_id_for_group(event.group_id)
+            await self.hub.emit(project_id, {
+                "type": "task_runtime_event",
+                "group_id": event.group_id,
+                "event": event.to_public_dict(),
+            })
+        except (GroupNotFoundError, ProjectClosingError):
+            return
+        except Exception:  # noqa: BLE001 -- durable replay remains authoritative
+            log.exception("Task Runtime live event broadcast failed: %s", event.event_id)
 
     def _canonical_group_from_payload(
         self, payload: dict[str, Any], *, require_runtime: bool = True,
@@ -2880,6 +2906,33 @@ class KnoweServer:
             echo_event["attachments"] = [echo_meta(a) for a in att_records]
         await self.hub.emit(project_id, echo_event)
 
+        # Group-chat work enters the authoritative Task Runtime before any legacy
+        # engine/model execution.  Explicit DM channels above remain private Agent
+        # conversations and intentionally do not create or alter a Group TaskRun.
+        group_id = self._group_id_for_runtime_project(project_id)
+        if self.task_runtime is not None and group_id is not None:
+            route_confidence = data.get("route_confidence", 1.0)
+            if isinstance(route_confidence, bool) or not isinstance(route_confidence, (int, float)):
+                route_confidence = 0.0
+            write_hint = bool(data.get("writes")) or bool(re.search(
+                r"(?:删除|覆盖|导出|发送|提交|写入|修改|delete|overwrite|export|send|submit|write)",
+                content, flags=re.IGNORECASE,
+            ))
+            route_result = self.task_runtime.route_message(
+                group_id, content=content,
+                request_key=f"chat-route:{project_id}:{cmid if isinstance(cmid, str) else now_ts()}",
+                confidence=float(route_confidence),
+                read_only=bool(data.get("read_only", not write_hint)),
+                writes=write_hint,
+                sensitive_outbound=bool(data.get("sensitive_outbound")),
+                explicit_new_task=bool(data.get("explicit_new_task")),
+            )
+            # Ambiguous, write-capable, or sensitive requests stop at the durable
+            # approval gate.  The public RunEvent is already broadcast by the same
+            # listener used for HTTP mutations and is replayable after reconnect.
+            if not route_result["auto_routed"]:
+                return
+
         # [v0.13 3b] 目录每次发言都复核。失效时 Harness 接管回复，绝不触发 LLM。
         if not self._project_dir_is_valid(project_id):
             await self._respond_directory_required(project_id)
@@ -4419,9 +4472,14 @@ class KnoweServer:
 
     @staticmethod
     def _decode_json_object(body_bytes: bytes) -> dict[str, Any]:
+        def reject_constant(value: str) -> None:
+            raise ValueError(f"non-finite JSON number is forbidden: {value}")
+
         try:
-            payload = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            payload = json.loads(
+                body_bytes.decode("utf-8"), parse_constant=reject_constant,
+            ) if body_bytes else {}
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
             raise ValueError(msg("server.py.127", exc=exc)) from exc
         if not isinstance(payload, dict):
             raise ValueError(msg("server.py.128"))
@@ -5713,7 +5771,16 @@ class KnoweServer:
         transaction = self.groups.prepare_delete(
             group_id, confirmation_token, runtime_project_id=runtime_project_id,
         )
+        await self._task_runtime_delete_boundary("after_group_prepare", group_id)
         stage = str(transaction.get("stage") or "prepared")
+        runtime_cleanup: dict[str, int] = {}
+        if self.task_runtime is not None and stage != "committed":
+            self.task_runtime.prepare_group_deletion(
+                group_id, str(transaction["transaction_id"]),
+            )
+            await self._task_runtime_delete_boundary("after_runtime_intent", group_id)
+            runtime_cleanup = self.task_runtime.clean_prepared_group_deletion(group_id)
+            await self._task_runtime_delete_boundary("after_runtime_cleanup", group_id)
         legacy_result: dict[str, Any] = {
             "project_id": runtime_project_id,
             "deleted": stage in {"runtime_deleted", "committed"},
@@ -5731,9 +5798,46 @@ class KnoweServer:
             elif runtime_project_id in self._persisted_project_ids:
                 raise ValueError("runtime project is persisted but not loaded; deletion cannot be confirmed")
             transaction = self.groups.mark_runtime_deleted(str(transaction["transaction_id"]))
+            await self._task_runtime_delete_boundary("after_legacy_runtime_deleted", group_id)
         receipt = self.groups.commit_delete(str(transaction["transaction_id"]))
+        await self._task_runtime_delete_boundary("after_group_commit", group_id)
+        if self.task_runtime is not None:
+            self.task_runtime.complete_group_deletion(group_id)
+            await self._task_runtime_delete_boundary("after_runtime_complete", group_id)
         legacy_result["deleted"] = True
+        legacy_result["runtime_cleanup"] = runtime_cleanup
         return legacy_result, receipt
+
+    async def _task_runtime_delete_boundary(self, boundary: str, group_id: str) -> None:
+        injector = self._task_runtime_delete_fault
+        if injector is None:
+            return
+        result = injector(boundary, group_id)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def _reconcile_task_runtime_group_deletions(self) -> None:
+        if self.task_runtime is None or self.groups is None:
+            return
+        runtime_intents = {
+            intent["group_id"]: intent
+            for intent in self.task_runtime.store.pending_group_deletions()
+        }
+        group_transactions = {
+            str(transaction["group_id"]): transaction
+            for transaction in self.groups.pending_delete_transactions()
+        }
+        for group_id in sorted(set(runtime_intents) | set(group_transactions)):
+            transaction = self.groups.delete_transaction(group_id)
+            if transaction is None:
+                # Group commit may have completed before the Task Runtime final marker.
+                self.task_runtime.complete_group_deletion(group_id)
+                continue
+            await self._run_confirmed_group_delete(
+                group_id, str(transaction["runtime_project_id"]),
+                str(transaction["confirmation_token"]),
+                runtime_already_deleted=str(transaction.get("stage")) in {"runtime_deleted", "committed"},
+            )
 
     async def _serve_groups_list(self, writer: asyncio.StreamWriter) -> None:
         if self.groups is None:
@@ -5867,22 +5971,14 @@ class KnoweServer:
                     token = payload.get("confirmation_token")
                     if not isinstance(token, str):
                         raise ValueError("confirmation_token is required")
-                    if self.task_runtime is not None:
-                        self.task_runtime.suspend_group(
-                            group_id, reason="Group deletion requested",
-                        )
                     legacy_result, receipt = await self._run_confirmed_group_delete(
                         group_id, str(runtime_id), token,
                         runtime_already_deleted=str(runtime_id) in self._deleted_project_ids(),
                     )
-                    runtime_cleanup = (
-                        self.task_runtime.delete_group_data(group_id)
-                        if self.task_runtime is not None else {}
-                    )
                     result = {
                         "deleted": True, "receipt": receipt.to_dict(),
                         "legacy_cleanup_pending": bool(legacy_result.get("cleanup_pending")),
-                        "runtime_cleanup": runtime_cleanup,
+                        "runtime_cleanup": legacy_result.get("runtime_cleanup") or {},
                     }
                 elif path == "/groups/course-bind":
                     course_id = payload.get("course_id")
@@ -6059,8 +6155,18 @@ class KnoweServer:
         elif action == "verify":
             if not isinstance(request_key, str) or not request_key:
                 raise ValueError("request_key is required")
-            result = {"run": service.begin_verification(
-                group_id, str(payload.get("run_id") or ""), request_key=request_key,
+            run_id = str(payload.get("run_id") or "")
+            service.begin_verification(group_id, run_id, request_key=request_key)
+            group = self.groups.get(group_id) if self.groups is not None else None
+            verifier = next(
+                (agent for agent in group.roster if agent.role == "verifier"), None,
+            ) if group is not None else None
+            if verifier is None:
+                raise RuntimeConflictError("mandatory Group Verifier is unavailable")
+            result = {"run": service.update_agent(
+                group_id, run_id, agent_id=verifier.agent_id, role="verifier",
+                phase=AgentPhase.VERIFYING, operation_summary="Verifying evidence",
+                idempotency_key=f"{request_key}:verifier-agent",
             ).to_public_dict()}
         elif action == "complete":
             if not isinstance(request_key, str) or not request_key:
@@ -6069,7 +6175,6 @@ class KnoweServer:
                 group_id, str(payload.get("run_id") or ""),
                 outcome=ControlTaskStatus(str(payload.get("outcome") or "")),
                 request_key=request_key, summary=str(payload.get("summary") or ""),
-                verifier_approved=bool(payload.get("verifier_approved")),
             ).to_public_dict()}
         else:
             raise ValueError(f"unknown Task Runtime action: {action}")
@@ -7074,6 +7179,7 @@ class KnoweServer:
 
         await self.welcome_if_needed()
         await self.wake_projects()
+        await self._reconcile_task_runtime_group_deletions()
         await self._update_harness_now()
         self._harness_task = asyncio.create_task(self._harness_memory_loop())
         # [v1.0.31 R2/R3] 存储维护循环：启动先补执行一次（轮转压缩 + 快照裁剪），

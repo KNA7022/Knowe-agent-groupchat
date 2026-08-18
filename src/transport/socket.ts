@@ -108,6 +108,8 @@ export interface SocketCallbacks {
   onProjectDiscovered?: (projectId: string, projectName?: string) => void;
   /** [v1.0.24.4] replay_complete 携带的权威活动账本 → store 以此校准花名册忙碌状态 */
   onActivityLedger?: (projectId: string, activity: ActivityLedgerEntry[]) => void;
+  /** StudyCrew authoritative Task Runtime snapshot carried by reconnect completion. */
+  onTaskRuntimeSnapshot?: (groupId: string, snapshot: unknown) => void;
   /** Get current active project id (for replay_request project context) */
   getActiveProjectId?: () => ProjectId | null;
   /** 系统级项目目录恢复请求；不进入聊天时间线。 */
@@ -260,7 +262,7 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
     onEvent, onStatus, onSent, onEchoOk, onEchoLost, onEpochReset,
     onProjectDiscovered, getActiveProjectId,
     onProjectDirectoryRequired, onProjectDirectoryRestored,
-    onActivityLedger,
+    onActivityLedger, onTaskRuntimeSnapshot,
   } = callbacks;
   // [v0.3-走廊] 没接诊断口时退化为空函数，行为完全不变
   const diag = callbacks.onDiagnostic ?? (() => { /* no-op */ });
@@ -609,6 +611,11 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
         const rcActivity = (rawObj as { activity?: unknown }).activity;
         if (onActivityLedger && Array.isArray(rcActivity)) {
           onActivityLedger(pid, rcActivity as ActivityLedgerEntry[]);
+        }
+        const runtimeSnapshot = (rawObj as { task_runtime?: unknown }).task_runtime;
+        if (onTaskRuntimeSnapshot && runtimeSnapshot && typeof runtimeSnapshot === 'object') {
+          const groupId = (runtimeSnapshot as { group_id?: unknown }).group_id;
+          if (typeof groupId === 'string') onTaskRuntimeSnapshot(groupId, runtimeSnapshot);
         }
         // Auto-register project if store doesn't have it yet
         if (onProjectDiscovered) onProjectDiscovered(pid, undefined);

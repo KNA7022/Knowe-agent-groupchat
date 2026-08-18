@@ -99,6 +99,14 @@ def _engine(extra_required: dict[str, Any], extra_optional: dict[str, Any] | Non
 
 
 EVENT_SPEC: dict[str, Spec] = {
+    "task_runtime_event": Spec(
+        {
+            "project_id": _STR, "project_name": _STR, "group_id": _STR,
+            "event": dict, "ts": _STR, "seq": _INT,
+        },
+        {},
+        has_seq=True,
+    ),
     # ── 聊天 / 流式 ──
     "agent_thinking": _engine(
         {"agent_id": _STR},
@@ -393,6 +401,7 @@ STRUCTURAL_EVENT_TYPES: frozenset[str] = frozenset({
     "error",
     "recovery_notice",
     "user_echo",
+    "task_runtime_event",
 })
 
 # 未读判据：只有「说完了的话」和「待审批卡」算未读，与前端 isUnreadEvent 严格对齐。

@@ -34,6 +34,8 @@ import { createSocket, initWsAuthToken } from '../transport/socket';
 import { warmUpIncremental } from '../store/incrementalSync';   // [v1.0.23.6] 启动预热
 import { record as recordDiagnostic } from '../observe/corridor';
 import { useKnoweStore } from '../store/store';
+import { useTaskRuntimeStore } from '../store/taskRuntime';
+import type { GroupId } from '../contract/group';
 import { selectActiveView, selectActiveProjectId } from '../store/selectors';
 
 /*
@@ -462,6 +464,12 @@ export const App: React.FC = () => {
         onEvent: (ev) => {
           // Token 查询响应是旁路控制帧：先消费，绝不进入聊天时间线或未读状态机。
           if (handleTokenUsageEvent(ev as unknown)) return;
+          if (ev.type === 'task_runtime_event') {
+            const groupId = ev.group_id as GroupId;
+            const accepted = useTaskRuntimeStore.getState().applyEvent(groupId, ev.event);
+            if (!accepted) void useTaskRuntimeStore.getState().refreshGroup(groupId);
+            return;
+          }
           // project_created 先喂给目录 store（它只读 directory_required 字段），再照常入主状态机。
           if (ev.type === 'project_created') syncDirectoryFromProjectCreated(ev);
           // [v1.0.24.6-P2] 事件批量消费：入 16ms rAF 窗口队列，每帧最多渲染一次
@@ -486,6 +494,8 @@ export const App: React.FC = () => {
         // [v1.0.24.4] replay_complete 携带权威活动账本 → store 校准花名册忙碌状态
         onActivityLedger: (pid, activity) =>
           useKnoweStore.getState().calibrateActivity(pid, activity),
+        onTaskRuntimeSnapshot: (groupId, snapshot) =>
+          useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId as GroupId, snapshot),
         getActiveProjectId: () => useKnoweStore.getState().activeProjectId,
         // [v0.13 卡片] 目录失效 → 弹出聊天区内恢复卡片（不再开原生目录对话框）。
         onProjectDirectoryRequired: (event) => openDirectoryRequest(event),

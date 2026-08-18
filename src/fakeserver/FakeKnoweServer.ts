@@ -43,6 +43,7 @@ export const STRUCTURAL_TYPES: ReadonlySet<string> = new Set([
   'error',
   'recovery_notice',
   'user_echo',
+  'task_runtime_event',
 ]);
 
 export interface FakeServerOptions {

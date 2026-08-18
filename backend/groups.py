@@ -942,6 +942,13 @@ class GroupRepository:
                 return dict(row)
         return None
 
+    def pending_delete_transactions(self) -> tuple[dict[str, Any], ...]:
+        """Expose resumable, already-confirmed delete intents for startup recovery."""
+        return tuple(
+            dict(row) for row in self._load_payload()["deletion_transactions"]
+            if row.get("stage") != "committed"
+        )
+
     def mark_runtime_deleted(self, transaction_id: str) -> dict[str, Any]:
         payload = self._load_payload()
         for index, row in enumerate(payload["deletion_transactions"]):

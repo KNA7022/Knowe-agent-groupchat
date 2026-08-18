@@ -11,6 +11,7 @@ from backend.task_runtime.contracts import (
     AgentPhase,
     BudgetLimits,
     BudgetUsage,
+    EvidenceRef,
     FailureType,
     QueueClass,
     RiskLevel,
@@ -38,6 +39,25 @@ def submit_primary(service: TaskRuntimeService, group_id: str, key: str, **kwarg
     return service.submit(group_id, title=f"Task {key}", request_key=key, **kwargs)
 
 
+def verifier_for(group):
+    return next(agent for agent in group.roster if agent.role == "verifier")
+
+
+def approve_completion(service, group, run_id: str, outcome: TaskStatus = TaskStatus.SUCCEEDED):
+    verifier = verifier_for(group)
+    service.update_agent(
+        group.group_id, run_id, agent_id=verifier.agent_id, role="verifier",
+        phase=AgentPhase.VERIFYING, operation_summary="Checking evidence",
+        idempotency_key=f"verifier-agent:{run_id}",
+    )
+    return service.record_verifier_decision(
+        group.group_id, run_id, verifier_agent_id=verifier.agent_id,
+        outcome=outcome, approved=True,
+        evidence=(EvidenceRef("ev-1", "src-1", "ver-1", "page:1"),),
+        reason="Evidence supports the result", request_key=f"verifier-decision:{run_id}",
+    )
+
+
 def test_state_machine_rejects_invalid_transitions_and_requires_verifier(runtime) -> None:
     groups, service = runtime
     group = make_group(groups, "State")
@@ -49,18 +69,19 @@ def test_state_machine_rejects_invalid_transitions_and_requires_verifier(runtime
     with pytest.raises(RuntimeConflictError, match="only verifying"):
         service.complete(
             group.group_id, running.run_id, outcome=TaskStatus.SUCCEEDED,
-            request_key="complete-too-soon", summary="No", verifier_approved=True,
+            request_key="complete-too-soon", summary="No",
         )
     verifying = service.begin_verification(group.group_id, running.run_id, request_key="verify")
     assert verifying.status is TaskStatus.VERIFYING
     with pytest.raises(RuntimeConflictError, match="Verifier"):
         service.complete(
             group.group_id, running.run_id, outcome=TaskStatus.SUCCEEDED,
-            request_key="complete-unverified", summary="No", verifier_approved=False,
+            request_key="complete-unverified", summary="No",
         )
+    approve_completion(service, group, running.run_id)
     done = service.complete(
         group.group_id, running.run_id, outcome=TaskStatus.SUCCEEDED,
-        request_key="complete", summary="Verified answer", verifier_approved=True,
+        request_key="complete", summary="Verified answer",
     )
     assert done.status is TaskStatus.SUCCEEDED
 
@@ -129,7 +150,9 @@ def test_snapshot_and_event_roll_back_together_when_transaction_hook_fails(runti
 
     with pytest.raises(OSError, match="injected"):
         service.store.change_run(
-            run.run_id, event_type="atomic_failure", public_payload={"status": "routing"},
+            run.run_id, event_type="status_changed",
+            public_payload={"from": "queued", "status": "routing", "summary": "",
+                            "blocking_reason": "", "failure_type": None},
             idempotency_key="atomic-failure",
             mutate=lambda item: setattr(item, "status", TaskStatus.ROUTING),
             transaction_hook=fail,
@@ -146,11 +169,13 @@ def test_public_payload_rejects_chain_of_thought_and_keeps_private_separate(runt
     run = submit_primary(service, group.group_id, "privacy")
     with pytest.raises(ValueError, match="private field"):
         service.store.change_run(
-            run.run_id, event_type="bad",
-            public_payload={"chain_of_thought": "hidden"}, idempotency_key="bad-public",
+            run.run_id, event_type="message_routed",
+            public_payload={"route_label": "queue_new", "chain_of_thought": "hidden"},
+            idempotency_key="bad-public",
         )
     _run, event, _created = service.store.change_run(
-        run.run_id, event_type="safe", public_payload={"summary": "public"},
+        run.run_id, event_type="message_routed",
+        public_payload={"route_label": "queue_new", "summary": "public"},
         sensitive_payload={"content": "private document text"}, sensitivity="private",
         idempotency_key="private-event",
     )
@@ -262,22 +287,41 @@ def test_approval_gates_ambiguous_sensitive_routing_and_high_risk_tool(runtime) 
     assert routed["run"]["status"] == "waiting_approval"
     approval_id = routed["approval"]["approval_id"]
     approval, grant, run = service.resolve_approval(
-        group.group_id, approval_id, approved=True, capabilities=("external_send",),
+        group.group_id, approval_id, approved=True,
         request_key="approve-route",
     )
     assert approval.status == "approved"
     assert grant is not None and grant.group_id == group.group_id and grant.task_id == run.task_id
     assert run.status is TaskStatus.RUNNING
+    launder = service.prepare_tool(
+        group.group_id, run.run_id, tool_name="external_send", idempotency_key="launder",
+        risk=RiskLevel.HIGH, public_summary="Must not launder", approval_id=approval_id,
+        operation_scope={"destination": "portal"}, purpose="send_result",
+    )
+    assert launder.disposition == "requires_new_approval"
+    assert launder.status == "requires_new_approval" and launder.replay_allowed is False
+    tool_approval = service.request_approval(
+        group.group_id, run.run_id, kind="tool", summary="Approve exact send",
+        risk=RiskLevel.HIGH, request_key="tool-approval",
+        requested_capabilities=("external_send",), tool_name="external_send",
+        operation_scope={"destination": "portal"}, purpose="send_result",
+    )
+    service.resolve_approval(
+        group.group_id, tool_approval.approval_id, approved=True,
+        capabilities=("external_send",), request_key="tool-approval-resolve",
+    )
     invocation = service.prepare_tool(
         group.group_id, run.run_id, tool_name="external_send",
         idempotency_key="send-1", risk=RiskLevel.HIGH,
-        public_summary="Send approved study result", approval_id=approval_id,
+        public_summary="Send approved study result", approval_id=tool_approval.approval_id,
+        operation_scope={"destination": "portal"}, purpose="send_result",
     )
     assert invocation.replay_allowed is False
     assert service.prepare_tool(
         group.group_id, run.run_id, tool_name="external_send",
         idempotency_key="send-1", risk=RiskLevel.HIGH,
-        public_summary="duplicate", approval_id=approval_id,
+        public_summary="duplicate", approval_id=tool_approval.approval_id,
+        operation_scope={"destination": "portal"}, purpose="send_result",
     ).invocation_id == invocation.invocation_id
 
 
@@ -289,7 +333,8 @@ def test_restart_pauses_interrupted_runs_and_never_replays_high_risk(tmp_path: P
     first.schedule()
     approval = first.request_approval(
         group.group_id, run.run_id, kind="tool", summary="Dangerous operation",
-        risk=RiskLevel.HIGH, request_key="approval",
+        risk=RiskLevel.HIGH, request_key="approval", requested_capabilities=("danger",),
+        tool_name="danger", operation_scope={"target": "workspace"}, purpose="dangerous_test",
     )
     first.resolve_approval(
         group.group_id, approval.approval_id, approved=True, capabilities=("danger",),
@@ -298,6 +343,7 @@ def test_restart_pauses_interrupted_runs_and_never_replays_high_risk(tmp_path: P
     first.prepare_tool(
         group.group_id, run.run_id, tool_name="danger", idempotency_key="danger-1",
         risk=RiskLevel.HIGH, public_summary="Approved once", approval_id=approval.approval_id,
+        operation_scope={"target": "workspace"}, purpose="dangerous_test",
     )
     first.close()
 
@@ -308,6 +354,9 @@ def test_restart_pauses_interrupted_runs_and_never_replays_high_risk(tmp_path: P
         assert len(recovered.recovery_report["high_risk_blocked"]) == 1
         assert recovered.recovery_report["replayable_pending"] == []
         assert snapshot["run"]["blocking_reason"] == "Recovered after backend restart"
+        blocked = recovered.store.tool_by_key(run.run_id, "danger-1")
+        assert blocked is not None and blocked.disposition == "recovered_blocked"
+        assert blocked.status == "recovered_blocked" and blocked.replay_allowed is False
     finally:
         recovered.close()
 
@@ -350,6 +399,8 @@ def test_group_deletion_removes_runtime_events_approvals_tools_and_checkpoints(r
     approval = service.request_approval(
         group.group_id, run.run_id, kind="tool", summary="private approval",
         risk=RiskLevel.HIGH, request_key="delete-approval",
+        requested_capabilities=("private-tool",), tool_name="private-tool",
+        operation_scope={"target": "workspace"}, purpose="delete_test",
     )
     service.resolve_approval(
         group.group_id, approval.approval_id, approved=True, capabilities=("private-tool",),
@@ -358,6 +409,7 @@ def test_group_deletion_removes_runtime_events_approvals_tools_and_checkpoints(r
     service.prepare_tool(
         group.group_id, run.run_id, tool_name="private-tool", idempotency_key="delete-tool",
         risk=RiskLevel.HIGH, public_summary="private operation", approval_id=approval.approval_id,
+        operation_scope={"target": "workspace"}, purpose="delete_test",
     )
     service.suspend_group(group.group_id, reason="Delete")
     preview = groups.delete_preview(group.group_id)
