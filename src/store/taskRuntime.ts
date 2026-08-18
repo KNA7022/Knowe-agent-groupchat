@@ -121,6 +121,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     const current = get().byRun[event.run_id];
     if (!current) return false;
     if (event.seq === current.run.last_seq && event.version === current.run.version) return true;
+    if (event.seq < current.run.last_seq && event.version < current.run.version) return true;
     if (event.seq !== current.run.last_seq + 1 || event.version !== current.run.version + 1) {
       set((state) => ({
         byRun: {

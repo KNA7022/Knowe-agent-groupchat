@@ -71,8 +71,7 @@ async function ensureAuthToken(): Promise<void> {
   authTokenReady = true;
 }
 
-function getAuthWsUrl(): string {
-  const base = runtimeWsUrl();
+function getAuthWsUrl(base = runtimeWsUrl()): string {
   if (!authTokenCache) return base;
   const sep = base.includes('?') ? '&' : '?';
   return `${base}${sep}token=${encodeURIComponent(authTokenCache)}`;
@@ -579,6 +578,19 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
         const rcEv = rawObj as { last_seq: number; project_id?: string; note?: string };
         const pid = rcEv.project_id || DEFAULT_PROJECT;
         const lastSeq = rcEv.last_seq;
+        const runtimeSnapshot = (rawObj as { task_runtime?: unknown }).task_runtime;
+        const runtimeSnapshots = (rawObj as { task_runtime_groups?: unknown }).task_runtime_groups;
+        const installRuntimeSnapshots = (): void => {
+          if (!onTaskRuntimeSnapshot) return;
+          const snapshots = Array.isArray(runtimeSnapshots)
+            ? runtimeSnapshots
+            : runtimeSnapshot && typeof runtimeSnapshot === 'object' ? [runtimeSnapshot] : [];
+          for (const snapshot of snapshots) {
+            if (!snapshot || typeof snapshot !== 'object') continue;
+            const groupId = (snapshot as { group_id?: unknown }).group_id;
+            if (typeof groupId === 'string') onTaskRuntimeSnapshot(groupId, snapshot);
+          }
+        };
 
         // ③ 纪元校准（§2.3-c）
         const curWatermark = getWatermark(pid);
@@ -588,34 +600,31 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
           diag({ type: 'replay_complete', projectId: pid, seq: lastSeq, verdict: 'epoch',  // [v0.3-走廊]
             summary: `检测到服务重启（last_seq=${lastSeq} < 水位=${curWatermark}）→ 清会话重建` });
           if (onEpochReset) onEpochReset(pid);
-          handshakeActive = false;
-          handshakeBuffer = [];
-          handshakeProjectId = null;
-          setWatermark(pid, lastSeq);
-          doRequestSnapshot(pid);
+          installRuntimeSnapshots();
+          _resetGlobalSeen();
+          setWatermark(pid, 0);
+          if (handshakeActive) drainHandshake();
+          setWatermark(pid, Math.max(getWatermark(pid), lastSeq));
           setStatus('live');
           return;
         }
 
-        // Drain handshake buffer BEFORE setting watermark
-        // (so buffered events are compared against the old watermark)
-        if (handshakeActive) {
-          drainHandshake();
-        }
+        // Snapshot is the Task Runtime baseline. It must land before any live events
+        // buffered during replay; older/equal buffered events then deduplicate against
+        // the snapshot while newer events apply contiguously.
+        installRuntimeSnapshots();
 
-        // Normal: update watermark
-        setWatermark(pid, lastSeq);
+        // The server fence guarantees this buffer contains replay frames only; live
+        // frames follow replay_complete on the wire. Apply replay against the previous
+        // cursor, then advance monotonically to the authoritative handoff cursor.
+        if (handshakeActive) drainHandshake();
+        setWatermark(pid, Math.max(getWatermark(pid), curWatermark, lastSeq));
         setStatus('live');
         // [v1.0.24.4] 账本转交：只在正常支转（纪元校准支随后必有快照自带账本）。
         // 旧后端不带 activity 字段 → 不触发 → 完全退回现状行为。
         const rcActivity = (rawObj as { activity?: unknown }).activity;
         if (onActivityLedger && Array.isArray(rcActivity)) {
           onActivityLedger(pid, rcActivity as ActivityLedgerEntry[]);
-        }
-        const runtimeSnapshot = (rawObj as { task_runtime?: unknown }).task_runtime;
-        if (onTaskRuntimeSnapshot && runtimeSnapshot && typeof runtimeSnapshot === 'object') {
-          const groupId = (runtimeSnapshot as { group_id?: unknown }).group_id;
-          if (typeof groupId === 'string') onTaskRuntimeSnapshot(groupId, runtimeSnapshot);
         }
         // Auto-register project if store doesn't have it yet
         if (onProjectDiscovered) onProjectDiscovered(pid, undefined);
@@ -711,7 +720,7 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
     }
 
     // [v1.0.18.4] URL 带 token query 参数，绕过 onBeforeSendHeaders 的 ws:// 不匹配问题
-    const tokenUrl = getAuthWsUrl();
+    const tokenUrl = getAuthWsUrl(url);
     ws = new WebSocket(tokenUrl);
     const thisSocket = ws;
 

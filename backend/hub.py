@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections import deque
 from typing import Any, Callable, Iterable
 
 from websockets.protocol import State
@@ -45,6 +46,7 @@ class Client:
     """一条 WebSocket 连接。每个客户端记住自己收过哪些 project_created。"""
 
     _next_id = 0
+    LIVE_REPLAY_BUFFER_MAX = 4096
 
     def __init__(self, ws: Any) -> None:
         Client._next_id += 1
@@ -53,6 +55,11 @@ class Client:
         # ★ 每客户端独立的「已发过 project_created 的项目集合」——握手时按此补发
         self.sent_projects: set[str] = set()
         self.handshake_done = False
+        # Live Hub broadcasts are fenced until replay_complete has handed over an
+        # authoritative snapshot/cursor. Point-to-point replay frames bypass this queue.
+        self._live_replay_fenced = True
+        self._live_replay_buffer: deque[dict[str, Any]] = deque()
+        self._live_replay_overflow_projects: set[str] = set()
 
     @property
     def alive(self) -> bool:
@@ -67,6 +74,30 @@ class Client:
         except Exception as exc:  # 连接在发的过程中断了
             log.debug("send failed to %s: %s", self.id, exc)
             return False
+
+    async def send_live(self, event: dict[str, Any]) -> bool:
+        """Buffer broadcasts until replay/snapshot handoff completes for this client."""
+        if self._live_replay_fenced:
+            if len(self._live_replay_buffer) >= self.LIVE_REPLAY_BUFFER_MAX:
+                project_id = event.get("project_id")
+                if isinstance(project_id, str):
+                    self._live_replay_overflow_projects.add(project_id)
+                return True
+            self._live_replay_buffer.append(dict(event))
+            return True
+        return await self.send(event)
+
+    async def release_live_replay_fence(self) -> set[str]:
+        """Drain the ordered handoff queue, then atomically switch to direct live sends."""
+        while self._live_replay_buffer:
+            event = self._live_replay_buffer.popleft()
+            if not await self.send(event):
+                self._live_replay_buffer.clear()
+                break
+        self._live_replay_fenced = False
+        overflow = set(self._live_replay_overflow_projects)
+        self._live_replay_overflow_projects.clear()
+        return overflow
 
 
 def _is_alive(ws: Any) -> bool:
@@ -313,6 +344,15 @@ class Hub:
         events = [self._filter_public_text(project_id, ev) for ev in ring_events]
         return events, gap, "ring"
 
+    async def replay_with_cursor(
+        self, project_id: str, since_seq: int,
+    ) -> tuple[list[dict[str, Any]], bool, str, int]:
+        """Take the replay slice and its Hub high-water mark under the emit lock."""
+        async with self._seq_lock:
+            events, gap, source = self.replay(project_id, since_seq)
+            cursor = self.get_or_create(project_id).seq
+        return events, gap, source, cursor
+
     def durable_conversation(self, project_id: str) -> list[dict[str, Any]]:
         """快照的 conversation：磁盘全量结构历史 + ring 中尚未落盘的结构事件。"""
         proj = self.get_or_create(project_id)
@@ -435,7 +475,7 @@ class Hub:
         if not clients:
             return
         results = await asyncio.gather(
-            *(c.send(event) for c in clients), return_exceptions=True
+            *(c.send_live(event) for c in clients), return_exceptions=True
         )
         for client, ok in zip(clients, results):
             if ok is not True:

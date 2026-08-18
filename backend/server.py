@@ -41,7 +41,7 @@ import sys
 import threading
 import time                     # [v0.44.8] 置顶「后来者居上」的单调排序戳
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime            # [v0.38] /history 按日期过滤 & ts 解析
@@ -409,6 +409,12 @@ def _directory_restored_text() -> str:
 
 
 class KnoweServer:
+    TASK_RUNTIME_LIVE_QUEUE_MAX = 2048
+    TASK_RUNTIME_ACTIVE_CURSOR_MAX = 2048
+    TASK_RUNTIME_TERMINAL_CURSOR_MAX = 256
+    TASK_RUNTIME_RECOVERY_MARKER_MAX = 256
+    TASK_RUNTIME_DELIVERY_RETRIES = 3
+
     def __init__(self, data_dir: str | None = None) -> None:
         # [v0.4] 落盘。data_dir 为空串 → 纯内存（测试和「我就试试」模式用）
         raw_dir = CONFIG.data_dir if data_dir is None else data_dir
@@ -428,9 +434,11 @@ class KnoweServer:
         self._task_runtime_event_bridge_active = False
         self._task_runtime_event_bridge_stopped = False
         self._task_runtime_event_bridge_scheduled = False
-        self._task_runtime_event_bridge_pending: deque[RunEvent] = deque()
-        self._task_runtime_event_bridge_published: set[str] = set()
-        self._task_runtime_event_bridge_last_seq: dict[str, int] = {}
+        self._task_runtime_event_bridge_pending: deque[tuple[RunEvent, int]] = deque()
+        self._task_runtime_event_bridge_pending_keys: set[tuple[str, int]] = set()
+        self._task_runtime_event_bridge_last_seq: OrderedDict[str, tuple[int, str]] = OrderedDict()
+        self._task_runtime_event_bridge_terminal_seq: OrderedDict[str, tuple[int, str]] = OrderedDict()
+        self._task_runtime_event_bridge_recovery: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._task_runtime_event_drain_task: asyncio.Task[None] | None = None
         self._task_runtime_listener_service: TaskRuntimeService | None = self.task_runtime
         if self.task_runtime is not None:
@@ -1057,18 +1065,102 @@ class KnoweServer:
             raise GroupNotFoundError("Group persistence is unavailable")
         return self.groups.runtime_project_id(group_id)
 
+    def _task_runtime_cursor_locked(self, run_id: str) -> int:
+        row = self._task_runtime_event_bridge_last_seq.get(run_id)
+        if row is not None:
+            self._task_runtime_event_bridge_last_seq.move_to_end(run_id)
+            return row[0]
+        row = self._task_runtime_event_bridge_terminal_seq.get(run_id)
+        if row is not None:
+            self._task_runtime_event_bridge_terminal_seq.move_to_end(run_id)
+            return row[0]
+        return 0
+
+    def _set_task_runtime_cursor_locked(
+        self, run_id: str, group_id: str, seq: int, *, terminal: bool,
+    ) -> None:
+        target = (
+            self._task_runtime_event_bridge_terminal_seq
+            if terminal else self._task_runtime_event_bridge_last_seq
+        )
+        other = (
+            self._task_runtime_event_bridge_last_seq
+            if terminal else self._task_runtime_event_bridge_terminal_seq
+        )
+        other.pop(run_id, None)
+        target[run_id] = (seq, group_id)
+        target.move_to_end(run_id)
+        limit = (
+            self.TASK_RUNTIME_TERMINAL_CURSOR_MAX
+            if terminal else self.TASK_RUNTIME_ACTIVE_CURSOR_MAX
+        )
+        while len(target) > limit:
+            target.popitem(last=False)
+
+    def _record_task_runtime_recovery_locked(
+        self, event: RunEvent, *, reason: str, attempts: int,
+    ) -> None:
+        marker = {
+            "run_id": event.run_id,
+            "group_id": event.group_id,
+            "through_seq": event.seq,
+            "reason": reason,
+            "attempts": attempts,
+        }
+        self._task_runtime_event_bridge_recovery[event.run_id] = marker
+        self._task_runtime_event_bridge_recovery.move_to_end(event.run_id)
+        while len(self._task_runtime_event_bridge_recovery) > self.TASK_RUNTIME_RECOVERY_MARKER_MAX:
+            self._task_runtime_event_bridge_recovery.popitem(last=False)
+
+    def _enqueue_task_runtime_event_locked(self, event: RunEvent, attempts: int = 0) -> bool:
+        key = (event.run_id, event.seq)
+        if key in self._task_runtime_event_bridge_pending_keys:
+            return True
+        if len(self._task_runtime_event_bridge_pending) >= self.TASK_RUNTIME_LIVE_QUEUE_MAX:
+            self._record_task_runtime_recovery_locked(
+                event, reason="live_queue_overflow", attempts=attempts,
+            )
+            log.error(
+                "Task Runtime live queue reached %d; durable replay required for %s through seq %d",
+                self.TASK_RUNTIME_LIVE_QUEUE_MAX, event.run_id, event.seq,
+            )
+            return False
+        self._task_runtime_event_bridge_pending.append((event, attempts))
+        self._task_runtime_event_bridge_pending_keys.add(key)
+        return True
+
+    def _prune_task_runtime_bridge_group(self, group_id: str) -> None:
+        """Remove bounded live-delivery bookkeeping when Group content is deleted."""
+        with self._task_runtime_event_bridge_lock:
+            for rows in (
+                self._task_runtime_event_bridge_last_seq,
+                self._task_runtime_event_bridge_terminal_seq,
+                self._task_runtime_event_bridge_recovery,
+            ):
+                for run_id, row in tuple(rows.items()):
+                    row_group = row[1] if isinstance(row, tuple) else row.get("group_id")
+                    if row_group == group_id:
+                        rows.pop(run_id, None)
+            self._task_runtime_event_bridge_pending = deque(
+                item for item in self._task_runtime_event_bridge_pending
+                if item[0].group_id != group_id
+            )
+            self._task_runtime_event_bridge_pending_keys = {
+                (item[0].run_id, item[0].seq)
+                for item in self._task_runtime_event_bridge_pending
+            }
+
+    def task_runtime_bridge_recovery_markers(self) -> tuple[dict[str, Any], ...]:
+        """Bounded diagnostics; payloads contain only opaque identity and cursor metadata."""
+        with self._task_runtime_event_bridge_lock:
+            return tuple(dict(item) for item in self._task_runtime_event_bridge_recovery.values())
+
     def _on_task_runtime_event(self, event: RunEvent) -> None:
         """Accept a committed event from any thread without touching async Hub state."""
         with self._task_runtime_event_bridge_lock:
             if not self._task_runtime_event_bridge_active:
-                # Before listen ownership exists, durable replay/snapshot is the delivery
-                # authority.  Retaining the notification lets activation establish an
-                # exact durable baseline without ever borrowing a caller's incidental loop.
-                if (
-                    self._task_runtime_event_bridge_loop is None
-                    and not self._task_runtime_event_bridge_stopped
-                ):
-                    self._task_runtime_event_bridge_pending.append(event)
+                # Before listen ownership exists, the durable replay/snapshot is the
+                # authority. Do not accumulate notifications that activation discards.
                 return
             loop = self._task_runtime_event_bridge_loop
             generation = self._task_runtime_event_bridge_generation
@@ -1081,8 +1173,12 @@ class KnoweServer:
                 self._task_runtime_event_bridge_stopped = True
                 self._task_runtime_event_bridge_loop = None
                 self._task_runtime_event_bridge_pending.clear()
+                self._task_runtime_event_bridge_pending_keys.clear()
                 return
-            self._task_runtime_event_bridge_pending.append(event)
+            if event.seq <= self._task_runtime_cursor_locked(event.run_id):
+                return
+            if not self._enqueue_task_runtime_event_locked(event):
+                return
             if self._task_runtime_event_bridge_scheduled:
                 return
             self._task_runtime_event_bridge_scheduled = True
@@ -1100,6 +1196,7 @@ class KnoweServer:
                 self._task_runtime_event_bridge_stopped = True
                 self._task_runtime_event_bridge_loop = None
                 self._task_runtime_event_bridge_pending.clear()
+                self._task_runtime_event_bridge_pending_keys.clear()
 
     def _start_task_runtime_event_bridge(self) -> None:
         """Bind live publication to the actual server/listen event loop."""
@@ -1128,11 +1225,15 @@ class KnoweServer:
             # reconnect snapshot, not replayed as fresh live notifications.  Holding the
             # ingress lock while reading the durable high-water marks closes the activation
             # race with a commit's synchronous listener callback.
-            self._task_runtime_event_bridge_last_seq = {
-                run.run_id: run.last_seq for run in service.store.list_runs()
-            }
+            self._task_runtime_event_bridge_last_seq.clear()
+            self._task_runtime_event_bridge_terminal_seq.clear()
+            for run in service.store.list_runs():
+                self._set_task_runtime_cursor_locked(
+                    run.run_id, run.group_id, run.last_seq, terminal=run.status.terminal,
+                )
             self._task_runtime_event_bridge_pending.clear()
-            self._task_runtime_event_bridge_published.clear()
+            self._task_runtime_event_bridge_pending_keys.clear()
+            self._task_runtime_event_bridge_recovery.clear()
             self._task_runtime_event_bridge_generation += 1
             self._task_runtime_event_bridge_loop = loop
             self._task_runtime_event_bridge_active = True
@@ -1148,6 +1249,7 @@ class KnoweServer:
             self._task_runtime_event_bridge_loop = None
             self._task_runtime_event_bridge_scheduled = False
             self._task_runtime_event_bridge_pending.clear()
+            self._task_runtime_event_bridge_pending_keys.clear()
             drain = self._task_runtime_event_drain_task
             self._task_runtime_event_drain_task = None
             listener_service = self._task_runtime_listener_service
@@ -1190,13 +1292,17 @@ class KnoweServer:
                     if not self._task_runtime_event_bridge_pending:
                         self._task_runtime_event_bridge_scheduled = False
                         return
-                    notification = self._task_runtime_event_bridge_pending.popleft()
+                    notification, attempts = self._task_runtime_event_bridge_pending.popleft()
+                    self._task_runtime_event_bridge_pending_keys.discard(
+                        (notification.run_id, notification.seq),
+                    )
 
                 service = self.task_runtime
                 if service is None:
                     return
-                last_seq = self._task_runtime_event_bridge_last_seq.get(notification.run_id, 0)
-                if notification.seq <= last_seq or notification.event_id in self._task_runtime_event_bridge_published:
+                with self._task_runtime_event_bridge_lock:
+                    last_seq = self._task_runtime_cursor_locked(notification.run_id)
+                if notification.seq <= last_seq:
                     continue
                 try:
                     # Backfill only through this notification's sequence.  This repairs a
@@ -1206,14 +1312,29 @@ class KnoweServer:
                         event for event in service.store.events_after(notification.run_id, last_seq)
                         if event.seq <= notification.seq
                     )
-                except Exception:  # noqa: BLE001 -- retry while the live lifecycle owns delivery
-                    log.exception("Task Runtime live event journal read failed: %s", notification.event_id)
+                except Exception:  # noqa: BLE001 -- bounded retry; journal stays authoritative
+                    retry = attempts + 1
                     with self._task_runtime_event_bridge_lock:
-                        if self._task_runtime_event_bridge_active:
-                            self._task_runtime_event_bridge_pending.appendleft(notification)
-                    await asyncio.sleep(0.05)
+                        if self._task_runtime_event_bridge_active and retry <= self.TASK_RUNTIME_DELIVERY_RETRIES:
+                            self._enqueue_task_runtime_event_locked(notification, retry)
+                        else:
+                            self._record_task_runtime_recovery_locked(
+                                notification, reason="journal_read_failed", attempts=retry,
+                            )
+                    if retry <= self.TASK_RUNTIME_DELIVERY_RETRIES:
+                        log.warning(
+                            "Task Runtime journal read retry %d/%d for %s",
+                            retry, self.TASK_RUNTIME_DELIVERY_RETRIES, notification.run_id,
+                        )
+                        await asyncio.sleep(0.01 * (2 ** (retry - 1)))
+                    else:
+                        log.exception(
+                            "Task Runtime live journal read exhausted; durable replay required for %s",
+                            notification.run_id,
+                        )
                     continue
 
+                delivery_failed = False
                 for event in committed:
                     with self._task_runtime_event_bridge_lock:
                         if (
@@ -1221,11 +1342,6 @@ class KnoweServer:
                             or generation != self._task_runtime_event_bridge_generation
                         ):
                             return
-                    if event.event_id in self._task_runtime_event_bridge_published:
-                        self._task_runtime_event_bridge_last_seq[event.run_id] = max(
-                            self._task_runtime_event_bridge_last_seq.get(event.run_id, 0), event.seq,
-                        )
-                        continue
                     if event.group_id != notification.group_id:
                         log.error(
                             "Task Runtime live event identity mismatch: %s", event.event_id,
@@ -1233,13 +1349,33 @@ class KnoweServer:
                         continue
                     delivered = await self._broadcast_task_runtime_event(event)
                     if not delivered:
-                        with self._task_runtime_event_bridge_lock:
-                            if self._task_runtime_event_bridge_active:
-                                self._task_runtime_event_bridge_pending.appendleft(notification)
-                        await asyncio.sleep(0.05)
+                        delivery_failed = True
                         break
-                    self._task_runtime_event_bridge_published.add(event.event_id)
-                    self._task_runtime_event_bridge_last_seq[event.run_id] = event.seq
+                    current = service.store.get_run(event.run_id)
+                    if current is None:
+                        self._prune_task_runtime_bridge_group(event.group_id)
+                        continue
+                    with self._task_runtime_event_bridge_lock:
+                        self._set_task_runtime_cursor_locked(
+                            event.run_id, event.group_id, event.seq,
+                            terminal=current.status.terminal,
+                        )
+                if delivery_failed:
+                    retry = attempts + 1
+                    with self._task_runtime_event_bridge_lock:
+                        if self._task_runtime_event_bridge_active and retry <= self.TASK_RUNTIME_DELIVERY_RETRIES:
+                            self._enqueue_task_runtime_event_locked(notification, retry)
+                        else:
+                            self._record_task_runtime_recovery_locked(
+                                notification, reason="hub_broadcast_failed", attempts=retry,
+                            )
+                    if retry <= self.TASK_RUNTIME_DELIVERY_RETRIES:
+                        await asyncio.sleep(0.01 * (2 ** (retry - 1)))
+                    else:
+                        log.error(
+                            "Task Runtime live broadcast exhausted; durable replay required for %s",
+                            notification.run_id,
+                        )
         finally:
             current = asyncio.current_task()
             with self._task_runtime_event_bridge_lock:
@@ -2914,6 +3050,15 @@ class KnoweServer:
 
         try:
             await self._handshake(client)
+            overflow_projects = await client.release_live_replay_fence()
+            for project_id in sorted(overflow_projects):
+                project = self.hub.projects.get(project_id)
+                await self.hub.send_to(client, {
+                    "type": "resync_required",
+                    "project_id": project_id,
+                    "last_seq": project.seq if project is not None else 0,
+                    "message": "Live replay buffer exceeded its bounded policy",
+                })
             async for raw in ws:
                 await self._on_frame(client, raw)
         except websockets.ConnectionClosed:
@@ -3027,13 +3172,15 @@ class KnoweServer:
                 client.sent_projects.add(pid)
 
         # ── 增量回放 ──
-        events, gap, source = self.hub.replay(project_id, since_seq)
+        events, gap, source, replay_cursor = await self.hub.replay_with_cursor(
+            project_id, since_seq,
+        )
 
         if gap:
             # ★ B-5：要的那一段被淘汰了 → 绝不给残缺历史，直接让前端走快照重建
             await self.hub.send_to(client, {
                 "type": "resync_required",
-                "last_seq": proj.seq,
+                "last_seq": replay_cursor,
                 "project_id": project_id,
                 "message": msg("event.server.01"),
             })
@@ -3048,7 +3195,7 @@ class KnoweServer:
         complete: dict[str, Any] = {
             "type": "replay_complete",
             "project_id": project_id,
-            "last_seq": proj.seq,
+            "last_seq": replay_cursor,
             "unread_count": (
                 0 if (
                     self._conversation_state(project_id)["muted"]
@@ -3064,9 +3211,22 @@ class KnoweServer:
         # existing reconnect response but is never reconstructed from chat text.
         if self.task_runtime is not None and dm_group_id is None:
             group_id = self._group_id_for_runtime_project(project_id)
+            runtime_snapshots: list[dict[str, Any]] = []
+            if self.groups is not None:
+                for group in self.groups.list_groups(include_archived=True):
+                    with contextlib.suppress(RuntimeConflictError, RuntimeNotFoundError):
+                        runtime_snapshots.append(
+                            self.task_runtime.group_snapshot(group.group_id),
+                        )
+            if runtime_snapshots:
+                complete["task_runtime_groups"] = runtime_snapshots
             if group_id is not None:
-                with contextlib.suppress(RuntimeConflictError, RuntimeNotFoundError):
-                    complete["task_runtime"] = self.task_runtime.group_snapshot(group_id)
+                current = next(
+                    (item for item in runtime_snapshots if item.get("group_id") == group_id),
+                    None,
+                )
+                if current is not None:
+                    complete["task_runtime"] = current
         # [v1.0.24.4] 磁盘写失败可见性：写失败不再阻断主循环，这里在握手时
         # 把累计计数暴露到日志，运维不再靠翻异常堆栈才发现磁盘异常。
         if self.store is not None:
@@ -3078,7 +3238,7 @@ class KnoweServer:
         await self.hub.send_to(client, complete)
 
         log.info("[%s] client %s replayed %d events since %d via %s (last_seq=%d)",
-                 project_id, client.id, len(events), since_seq, source, proj.seq)
+                 project_id, client.id, len(events), since_seq, source, replay_cursor)
 
     # ═══════════════════════════════════════════════════════════
     # 入站帧路由
@@ -6337,6 +6497,7 @@ class KnoweServer:
         if self.task_runtime is not None:
             self.task_runtime.complete_group_deletion(group_id)
             await self._task_runtime_delete_boundary("after_runtime_complete", group_id)
+        self._prune_task_runtime_bridge_group(group_id)
         legacy_result["deleted"] = True
         legacy_result["runtime_cleanup"] = runtime_cleanup
         return legacy_result, receipt
@@ -6365,6 +6526,7 @@ class KnoweServer:
             if transaction is None:
                 # Group commit may have completed before the Task Runtime final marker.
                 self.task_runtime.complete_group_deletion(group_id)
+                self._prune_task_runtime_bridge_group(group_id)
                 continue
             await self._run_confirmed_group_delete(
                 group_id, str(transaction["runtime_project_id"]),

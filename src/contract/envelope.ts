@@ -890,6 +890,8 @@ export const ReplayCompleteSchema = z.object({
   activity: z.array(ActivityLedgerEntrySchema).optional(),
   /** StudyCrew authoritative control-plane snapshot; never inferred from chat. */
   task_runtime: GroupRuntimeSnapshotSchema.optional(),
+  /** All local Group projections captured before the per-client live handoff. */
+  task_runtime_groups: z.array(GroupRuntimeSnapshotSchema).optional(),
 });
 export type ReplayComplete = z.infer<typeof ReplayCompleteSchema>;
 
@@ -1237,6 +1239,14 @@ export const TaskRuntimeCmdSchema = z.object({
 }).passthrough();
 export type TaskRuntimeCmd = z.infer<typeof TaskRuntimeCmdSchema>;
 
+/** Stop one Worker without shutting down its Group engine. */
+export const StopWorkerCmdSchema = z.object({
+  type: z.literal('stop_worker'),
+  project_id: z.string(),
+  agent_id: z.string(),
+});
+export type StopWorkerCmd = z.infer<typeof StopWorkerCmdSchema>;
+
 /**
  * 关闭项目引擎
  *
@@ -1265,6 +1275,7 @@ export const OutboundCommandSchema = z.discriminatedUnion('type', [
   CancelProjectDirectoryCmdSchema,
   PingCmdSchema,
   TaskRuntimeCmdSchema,
+  StopWorkerCmdSchema,
   ShutdownCmdSchema,       // [v2#10] 保留但前端禁用
 ]);
 export type OutboundCommand = z.infer<typeof OutboundCommandSchema>;

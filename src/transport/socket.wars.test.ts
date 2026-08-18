@@ -120,13 +120,12 @@ describe('W1 · 纪元锁死（server 重启）', () => {
     await until(() => h.statuses.at(-1) !== 'live', '断线');
     await until(() => h.epochResets.includes('demo'), '★ 纪元重置被识别', 6000);
 
-    // 水位被拉回新纪元（远低于旧水位），并且请求了快照重建
-    await until(
-      () => server.inbound.some((m) => m.type === 'request_snapshot' && m.project_id === 'demo'),
-      '★ 发出了 request_snapshot',
-    );
-    // 注：快照本身消耗一个 seq，所以水位最终落在 snapshot.seq（=1），
-    //    关键是它**远低于旧水位**——旧纪元的水位没有被带进新纪元。
+    // replay_complete 本身就是权威快照/水位交接；不再依赖额外 HTTP/WS 快照。
+    await until(() => h.statuses.at(-1) === 'live', '新纪元权威交接完成');
+    expect(server.inbound.some(
+      (m) => m.type === 'request_snapshot' && m.project_id === 'demo',
+    )).toBe(false);
+    // 关键是水位远低于旧水位——旧纪元的水位没有被带进新纪元。
     expect(h.socket.watermarks.demo!).toBeLessThan(oldWatermark);
     expect(getCorridorState().epochResets).toBeGreaterThan(0);   // 走廊留痕
   });
@@ -351,8 +350,9 @@ describe('W13 · 权威活动账本转交', () => {
     // 断开重连：这次注入账本（FakeServer 配置在 beforeEach 里创建，需换实例）
     h.socket.disconnect();
     await sleep(50);
+    const port = Number(new URL(server.url).port);
     await server.stop();
-    server = new FakeKnoweServer({ ringMax: 5, replayActivity: activity });
+    server = new FakeKnoweServer({ port, ringMax: 5, replayActivity: activity });
     await server.start();
     h.socket.connect();
     await until(() => h.ledger.length > 0, '账本转交');

@@ -113,6 +113,21 @@ describe('authoritative Task Runtime projection', () => {
     expect(useTaskRuntimeStore.getState().byRun[runId]?.needsResync).toBe(true);
   });
 
+  it('installs reconnect snapshot before buffered events and converges without refresh', () => {
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot([
+      taskRunFixture({ version: 3, last_seq: 3 }),
+    ]));
+    // Events already represented by the snapshot are harmless replay duplicates.
+    expect(useTaskRuntimeStore.getState().applyEvent(groupId, event(2, 2))).toBe(true);
+    expect(useTaskRuntimeStore.getState().byRun[runId]?.needsResync).toBe(false);
+    // The first post-snapshot event and the next live event remain contiguous.
+    expect(useTaskRuntimeStore.getState().applyEvent(groupId, event(4, 4))).toBe(true);
+    expect(useTaskRuntimeStore.getState().applyEvent(groupId, event(5, 5))).toBe(true);
+    expect(useTaskRuntimeStore.getState().byRun[runId]?.run.last_seq).toBe(5);
+    expect(useTaskRuntimeStore.getState().byRun[runId]?.events).toHaveLength(2);
+    expect(useTaskRuntimeStore.getState().error).toBeNull();
+  });
+
   it.each([
     {
       name: 'gap snapshot',
