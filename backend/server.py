@@ -457,7 +457,10 @@ class KnoweServer:
         self._closing_projects: set[str] = set()
         # Runtime adapters prepared by Group duplication exist only as recovery state.
         # They are excluded from routing, lists and replay until canonical commit succeeds.
-        self._provisional_project_ids: set[str] = set()
+        self._provisional_project_ids: set[str] = (
+            self.groups.uncommitted_duplicate_runtime_ids()
+            if self.groups is not None else set()
+        )
         # Project-internal reads dispatched through ``asyncio.to_thread`` outlive a
         # cancelled HTTP request unless the underlying thread is tracked separately.
         # Permanent deletion drains this registry before renaming the project root.
@@ -1715,6 +1718,7 @@ class KnoweServer:
             recovered_duplicates = self.groups.recover_duplicate_transactions(
                 self._persisted_project_ids,
             )
+            self._provisional_project_ids = self.groups.uncommitted_duplicate_runtime_ids()
             if recovered_duplicates:
                 log.warning("recovered %d interrupted Group duplicate transaction(s)", len(recovered_duplicates))
 

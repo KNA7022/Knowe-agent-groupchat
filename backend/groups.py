@@ -730,6 +730,16 @@ class GroupRepository:
             if row.get("source_group_id") == group_id and row.get("request_id") == request_id
         ), None)
 
+    def uncommitted_duplicate_runtime_ids(self) -> set[str]:
+        """Durable routing fence for every duplicate not yet canonically committed."""
+        return {
+            str(row["runtime_project_id"])
+            for row in self._load_payload()["duplicate_transactions"]
+            if row.get("stage") not in {"committed", "deleted"}
+            and isinstance(row.get("runtime_project_id"), str)
+            and str(row["runtime_project_id"]).strip()
+        }
+
     def recover_duplicate_transactions(self, runtime_project_ids: Iterable[str]) -> list[str]:
         available = set(runtime_project_ids)
         recovered: list[str] = []

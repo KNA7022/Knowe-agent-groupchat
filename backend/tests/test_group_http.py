@@ -316,33 +316,72 @@ async def test_duplicate_retries_after_store_failure_following_hub_insertion(
     with pytest.raises(ProjectIdResolutionError, match="not canonically published"):
         group_server._canonical_project_id_from_request(runtime_id)  # noqa: SLF001
 
-    retry_writer = CaptureWriter()
-    await group_server._serve_group_operation(  # noqa: SLF001
-        retry_writer, "/groups/duplicate", json.dumps(body).encode(),
-    )
-    retry_status, retried = retry_writer.payload()
-    assert retry_status == 200
-    assert defer_calls == 2
-    assert retried["group_id"] == duplicate_id
-    assert retried["project_id"] == runtime_id
-    assert group_server._duplicate_runtime_provisioning_complete(runtime_id)  # noqa: SLF001
-    assert runtime_id in group_server._persisted_project_ids  # noqa: SLF001
-    assert any(
-        row.get("project_id") == runtime_id for row in group_server.store.load_projects()
-    )
-    assert group_server.groups.get(duplicate_id).legacy_project_id == runtime_id
-    assert runtime_id not in group_server._provisional_project_ids  # noqa: SLF001
-    assert [event["type"] for event in emitted] == ["project_created"]
-    assert emitted[0]["group_id"] == duplicate_id
-
+    # Restart before retry: the directory ledger alone must not make the prepared
+    # adapter routable or allow user_message/Hub.emit to recreate a conversation.
     restarted = KnoweServer(data_dir=str(group_server.data_root))
     try:
+        assert runtime_id in restarted._provisional_project_ids  # noqa: SLF001
         restarted.load_from_disk()
-        assert runtime_id in restarted._persisted_project_ids  # noqa: SLF001
-        assert runtime_id in restarted.hub.projects
-        assert restarted.groups.runtime_project_id(duplicate_id) == runtime_id
+        assert runtime_id in restarted.project_dirs
+        assert runtime_id in restarted._provisional_project_ids  # noqa: SLF001
+        assert runtime_id not in restarted._persisted_project_ids  # noqa: SLF001
+        assert runtime_id not in restarted.hub.projects
+        with pytest.raises(ProjectIdResolutionError, match="not canonically published"):
+            restarted._canonical_project_id_from_request(runtime_id)  # noqa: SLF001
+        with pytest.raises(ProjectIdResolutionError, match="not canonically published"):
+            await restarted._cmd_user_message(None, {  # noqa: SLF001
+                "type": "user_message",
+                "project_id": runtime_id,
+                "content": "must not recreate the provisional runtime",
+                "client_msg_id": "msg_provisional_restart",
+            })
+        assert runtime_id not in restarted.hub.projects
+        assert runtime_id not in {
+            row["project_id"] for row in restarted._conversation_state_rows()  # noqa: SLF001
+        }
+
+        restart_emitted: list[dict] = []
+        original_restart_defer = restarted.store.defer
+        restart_defer_calls = 0
+
+        def count_retry_upsert(callback):
+            nonlocal restart_defer_calls
+            restart_defer_calls += 1
+            return original_restart_defer(callback)
+
+        async def capture_restart_event(event):
+            restart_emitted.append(dict(event))
+
+        monkeypatch.setattr(restarted.store, "defer", count_retry_upsert)
+        monkeypatch.setattr(restarted.hub, "emit_no_seq", capture_restart_event)
+        retry_writer = CaptureWriter()
+        await restarted._serve_group_operation(  # noqa: SLF001
+            retry_writer, "/groups/duplicate", json.dumps(body).encode(),
+        )
+        retry_status, retried = retry_writer.payload()
+        assert retry_status == 200
+        assert defer_calls == 1
+        assert restart_defer_calls == 1
+        assert retried["group_id"] == duplicate_id
+        assert retried["project_id"] == runtime_id
+        assert restarted._duplicate_runtime_provisioning_complete(runtime_id)  # noqa: SLF001
+        assert restarted.groups.get(duplicate_id).legacy_project_id == runtime_id
+        assert runtime_id not in restarted._provisional_project_ids  # noqa: SLF001
+        assert [event["type"] for event in restart_emitted] == ["project_created"]
+        assert restart_emitted[0]["group_id"] == duplicate_id
+        assert restarted._canonical_project_id_from_request(runtime_id) == runtime_id  # noqa: SLF001
     finally:
         restarted.store.close()
+
+    successful_restart = KnoweServer(data_dir=str(group_server.data_root))
+    try:
+        successful_restart.load_from_disk()
+        assert runtime_id not in successful_restart._provisional_project_ids  # noqa: SLF001
+        assert runtime_id in successful_restart._persisted_project_ids  # noqa: SLF001
+        assert runtime_id in successful_restart.hub.projects
+        assert successful_restart.groups.runtime_project_id(duplicate_id) == runtime_id
+    finally:
+        successful_restart.store.close()
 
 
 async def test_real_runtime_provisioning_emits_nothing_while_provisional(
@@ -371,6 +410,41 @@ async def test_real_runtime_provisioning_emits_nothing_while_provisional(
     }
     with pytest.raises(ValueError, match="not canonically published"):
         group_server._project_created_payload(runtime_id)  # noqa: SLF001
+
+
+def test_restart_keeps_orphaned_runtime_provisioned_transaction_fenced(
+    group_server, tmp_path: Path,
+) -> None:
+    source = group_server.groups.create_group(
+        "Provisioned journal source", legacy_project_id="project_provisioned_source",
+    )
+    runtime_id = group_server._allocate_canonical_project_id()  # noqa: SLF001
+    transaction = group_server.groups.prepare_duplicate(
+        source.group_id,
+        name="Orphaned provisioned copy",
+        legacy_project_id=runtime_id,
+        request_id="gdup_orphaned_provisioned_001",
+    )
+    group_server.groups.mark_duplicate_runtime_provisioned(str(transaction["transaction_id"]))
+    workspace = tmp_path / "orphaned-provisioned"
+    workspace.mkdir()
+    group_server.project_dirs[runtime_id] = str(workspace)
+    group_server._save_project_dirs()  # noqa: SLF001
+
+    restarted = KnoweServer(data_dir=str(group_server.data_root))
+    try:
+        assert runtime_id in restarted._provisional_project_ids  # noqa: SLF001
+        restarted.load_from_disk()
+        assert runtime_id in restarted._provisional_project_ids  # noqa: SLF001
+        assert runtime_id not in restarted._persisted_project_ids  # noqa: SLF001
+        assert runtime_id not in restarted.hub.projects
+        assert restarted.groups.duplicate_transaction(
+            source.group_id, "gdup_orphaned_provisioned_001",
+        )["stage"] == "runtime_provisioned"
+        with pytest.raises(ProjectIdResolutionError, match="not canonically published"):
+            restarted._canonical_project_id_from_request(runtime_id)  # noqa: SLF001
+    finally:
+        restarted.store.close()
 
 
 async def test_delete_state_machine_resumes_runtime_and_registry_interruptions(
