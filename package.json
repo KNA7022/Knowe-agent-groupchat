@@ -10,6 +10,7 @@
   "scripts": {
     "verify": "npm run typecheck && npm run lint && npm run test",
     "verify:runtime": "node scripts/verify-runtime.mjs",
+    "test:foundation": "node --test scripts/python-command.test.mjs && npm run verify:runtime",
     "test:backend": "py -3.12 -m pytest backend/tests",
     "verify:all": "npm run preflight && npm run verify:runtime && npm run verify && npm run test:backend && npm run electron:build",
     "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json",

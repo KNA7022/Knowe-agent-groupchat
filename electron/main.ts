@@ -234,6 +234,7 @@ function migrateLegacyDataRoots(legacyElectronRoots: readonly string[]): void {
   // stops migration, so the original remains recoverable even after a successful move.
   if (unique.length) {
     const backupRoot = join(DATA_ROOT, 'migration-backups', `knowe-${Date.now()}`);
+    mkdirSync(backupRoot, { recursive: true });
     unique.forEach(({ source }, index) => {
       const backup = join(backupRoot, `${String(index + 1).padStart(2, '0')}-${basename(source)}`);
       cpSync(source, backup, {

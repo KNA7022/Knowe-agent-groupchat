@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { delimiter, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parsePythonCommand } from './python-command.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const requiredNodeMajor = 24;
@@ -37,7 +38,7 @@ const candidates = [
   .filter((value, index, all) => value && all.indexOf(value) === index);
 let smoke = null;
 for (const executable of candidates) {
-  const [command, ...commandArgs] = executable.split(' ');
+  const { command, args: commandArgs } = parsePythonCommand(executable);
   const version = spawnSync(command, [...commandArgs, '-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'], {
     cwd: projectRoot,
     encoding: 'utf8',

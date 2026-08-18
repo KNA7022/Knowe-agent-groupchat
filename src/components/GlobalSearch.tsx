@@ -249,7 +249,7 @@ export function useGlobalSearchGroups(query: string): GlobalSearchGroup[] {
         appearance === 'dark' ? t('global.search.37') : t('global.search.35'),
         fontScale === 'large' ? t('global.search.23') : t('global.search.26'),
       ],
-      '关于': [t('global.search.02'), t('global.search.11'), t('global.search.34'), 'Knowe', t('global.search.41')],
+      '关于': [t('global.search.02'), t('global.search.11'), t('global.search.34'), 'StudyCrew', t('global.search.41')],
     };
     const settingsResults = SETTINGS_SECTIONS
       .filter((section) => matches(section, t('common.12'), ...settingsSearch[section]))
