@@ -268,11 +268,13 @@ def test_expired_approval_is_reconciled_on_restart_without_user_resolution(tmp_p
         risk=RiskLevel.MEDIUM, request_key="restart-expiry-approval",
         requested_capabilities=("route_message",), operation_scope={"route": "queue_new"},
         purpose="confirm_route",
-        expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat().replace(
+        expires_at=(datetime.now(timezone.utc) + timedelta(milliseconds=40)).isoformat().replace(
             "+00:00", "Z",
         ),
     )
     service.close()
+    import time
+    time.sleep(0.07)
 
     recovered = TaskRuntimeService(tmp_path, groups)
     try:
@@ -324,12 +326,12 @@ async def test_recovered_high_risk_requires_fresh_linked_attempt_and_executes_on
 
     second_approval, waiting = first_restart.reapprove_recovered_continuation(
         group.group_id, str(first_blocked["continuation_id"]),
-        purpose="confirm_recovered_route", operation_scope={"route": "queue_new"},
+        operation_scope={"route": "queue_new"},
         request_key="reapprove-first-blocked",
     )
     duplicate, _ = first_restart.reapprove_recovered_continuation(
         group.group_id, str(first_blocked["continuation_id"]),
-        purpose="confirm_recovered_route", operation_scope={"route": "queue_new"},
+        operation_scope={"route": "queue_new"},
         request_key="reapprove-first-blocked",
     )
     assert duplicate.approval_id == second_approval.approval_id
@@ -369,8 +371,6 @@ async def test_recovered_high_risk_requires_fresh_linked_attempt_and_executes_on
     response = server._task_runtime_dispatch("reapprove-recovered", {  # noqa: SLF001
         "group_id": group.group_id,
         "continuation_id": blocked_again["continuation_id"],
-        "purpose": "confirm_recovered_route",
-        "operation_scope": {"route": "queue_new"},
         "request_key": "reapprove-second-blocked",
     })
     third_approval_id = response["approval"]["approval_id"]

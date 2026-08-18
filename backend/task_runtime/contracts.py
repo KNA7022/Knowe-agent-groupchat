@@ -69,6 +69,15 @@ _ID_PATTERNS = {
     "invocation_id": re.compile(r"^tool_[0-9a-f]{32}$"), "checkpoint_id": re.compile(r"^ckp_[0-9a-f]{32}$"),
     "decision_id": re.compile(r"^vfd_[0-9a-f]{32}$"), "group_id": re.compile(r"^grp_[0-9a-f]{32}$"),
 }
+
+
+def _is_public_opaque_control_value(value: str) -> bool:
+    return (
+        any(pattern.fullmatch(value) for pattern in _ID_PATTERNS.values())
+        or re.fullmatch(r"[0-9a-f]{64}", value) is not None
+    )
+
+
 _PUBLIC_VALUE_CLASSIFIERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("credential", re.compile(
         r"(?i)(?:authorization\s*:\s*bearer\s+\S+|\bbearer\s+(?:sk-|pk-|tok_)?[A-Za-z0-9._-]{6,}|"
@@ -144,7 +153,10 @@ def assert_public_payload(event_type: str, value: Mapping[str, Any]) -> None:
         elif isinstance(item, (list, tuple)):
             for child in item:
                 walk(child)
-        elif isinstance(item, str) and classify_public_text(item):
+        elif (
+            isinstance(item, str) and not _is_public_opaque_control_value(item)
+            and classify_public_text(item)
+        ):
             raise ValueError("PII or credential value is forbidden in public payload")
 
     walk(value)
@@ -219,6 +231,8 @@ def normalize_legacy_public_payload(
         if isinstance(item, (list, tuple)):
             return [protected(child, fallback=fallback) for child in item]
         if isinstance(item, str):
+            if _is_public_opaque_control_value(item):
+                return item
             found = classify_public_text(item)
             if found:
                 return fallback

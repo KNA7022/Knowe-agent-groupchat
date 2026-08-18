@@ -135,9 +135,38 @@ describe('Task Runtime public contracts', () => {
       type: 'task_runtime', action: 'reapprove-recovered', group_id: groupId,
       continuation_id: `cont_${'a'.repeat(32)}`,
     }).action).toBe('reapprove-recovered');
+    expect(() => TaskRuntimeCmdSchema.parse({
+      type: 'task_runtime', action: 'reapprove-recovered', group_id: groupId,
+      expires_at: 'not-a-date',
+    })).toThrow();
+    expect(() => TaskRuntimeCmdSchema.parse({
+      type: 'task_runtime', action: 'reapprove-recovered', group_id: groupId,
+      ttl_seconds: Number.POSITIVE_INFINITY,
+    })).toThrow();
     expect(TaskRuntimeResultSchema.parse({
       type: 'task_runtime_result', action: 'reapprove-recovered',
       schema_version: 1, group_id: groupId,
     }).action).toBe('reapprove-recovered');
+  });
+
+  it('treats validated control ids and request digests as opaque, not PII text', () => {
+    const opaqueGroup = 'grp_03a132975893445697135f16b50a5694';
+    expect(RunEventSchema.parse({
+      event_id: `evt_${'a'.repeat(32)}`, run_id: runId, group_id: opaqueGroup,
+      seq: 1, version: 1, event_type: 'approval_requested', sensitivity: 'public',
+      created_at: '2026-08-19T00:00:00Z', schema_version: 1,
+      public_payload: {
+        status: 'waiting_approval',
+        approval: {
+          approval_id: `apr_${'b'.repeat(32)}`, run_id: runId, group_id: opaqueGroup,
+          kind: 'recovered_message_route', summary: 'Confirm recovered request', risk: 'high',
+          requested_capabilities: ['route_message'], tool_name: '',
+          operation_scope: { route: 'queue_new', request_digest: 'c'.repeat(64) },
+          purpose: 'confirm_route', expires_at: '2026-08-19T00:10:00Z',
+          status: 'pending', created_at: '2026-08-19T00:00:00Z', resolved_at: null,
+          schema_version: 1,
+        },
+      },
+    }).group_id).toBe(opaqueGroup);
   });
 });

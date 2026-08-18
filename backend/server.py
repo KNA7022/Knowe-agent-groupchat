@@ -6468,15 +6468,21 @@ class KnoweServer:
         elif action == "reapprove-recovered":
             if not isinstance(request_key, str) or not request_key:
                 raise ValueError("request_key is required")
+            if "expires_at" in payload:
+                raise ValueError("transport accepts bounded ttl_seconds, not expires_at")
             raw_scope = payload.get("operation_scope")
-            if not isinstance(raw_scope, dict):
-                raise ValueError("operation_scope is required")
+            if raw_scope is not None and not isinstance(raw_scope, dict):
+                raise ValueError("operation_scope must be an object")
+            raw_ttl = payload.get("ttl_seconds")
             approval, run = service.reapprove_recovered_continuation(
                 group_id, str(payload.get("continuation_id") or ""),
-                purpose=str(payload.get("purpose") or ""),
-                operation_scope={str(key): str(value) for key, value in raw_scope.items()},
                 request_key=request_key,
-                expires_at=str(payload["expires_at"]) if payload.get("expires_at") else None,
+                purpose=str(payload["purpose"]) if payload.get("purpose") is not None else None,
+                operation_scope=(
+                    {str(key): str(value) for key, value in raw_scope.items()}
+                    if isinstance(raw_scope, dict) else None
+                ),
+                ttl_seconds=raw_ttl,
             )
             result = {"approval": approval.to_dict(), "run": run.to_public_dict()}
         elif action == "agent":

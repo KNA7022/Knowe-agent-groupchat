@@ -1232,6 +1232,8 @@ export const TaskRuntimeCmdSchema = z.object({
   group_id: z.string().regex(/^grp_[0-9a-f]{32}$/).optional(),
   project_id: z.string().min(1).optional(),
   request_id: z.union([z.string(), z.number()]).optional(),
+  expires_at: z.never().optional(),
+  ttl_seconds: z.number().finite().positive().max(86_400).optional(),
 }).passthrough();
 export type TaskRuntimeCmd = z.infer<typeof TaskRuntimeCmdSchema>;
 

@@ -27,6 +27,9 @@ const PublicClassificationSchema = z.enum([
 const publicValueIsSensitive = (value: unknown): boolean => {
   if (Array.isArray(value)) return value.some(publicValueIsSensitive);
   if (typeof value === 'string') {
+    if (/^(?:(?:run|task|evt|arun|apr|grant|tool|ckp|vfd|grp)_[0-9a-f]{32}|[0-9a-f]{64})$/.test(value)) {
+      return false;
+    }
     return /(?:authorization\s*:\s*bearer\s+\S+|\bbearer\s+(?:sk-|pk-|tok_)?[A-Za-z0-9._-]{6,}|\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|cookie)\s*[:=]\s*\S+|\bsk-[A-Za-z0-9._-]{6,})/i.test(value)
       || /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(value)
       || /(^|\D)1[3-9]\d{9}(\D|$)/.test(value)

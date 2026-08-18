@@ -454,3 +454,87 @@ explicit recovery path for uncertain high-risk executor requests.
 - Python Ruff is not installed in the selected Python environment, so no Ruff result is
   claimed. Python compilation and all focused/combined regressions above are clean.
 - Task 4 visual UI and Task 5 full Tool Gateway/DLP/MCP remain outside this patch.
+
+## Independent re-review fix round 5/5
+
+The fourth re-review left exactly two Important subfindings in the governed
+approval lifecycle. This final Task 3 fix round closes autonomous durable expiry
+and immutable recovered-request purpose binding without expanding into Task 4 UI
+or Task 5 gateway implementation.
+
+### N2.A — durable autonomous approval expiry and timestamp safety
+
+- Approval creation now validates every explicit expiry before any TaskRun,
+  ApprovalRequest, continuation, or RunEvent mutation. Timestamps must be strict
+  timezone-aware ISO-8601 values, parse to a real finite date, be in the future,
+  and fall within the 24-hour policy maximum. Values are normalized to canonical
+  UTC with a `Z` suffix. The default server TTL remains ten minutes.
+- The recovered-reapproval HTTP/WS boundary no longer accepts raw `expires_at`.
+  It accepts only a finite positive `ttl_seconds` bounded to 86,400 seconds; the
+  backend computes the authoritative expiry. Malformed, timezone-naive, past,
+  overflow/distant, Boolean, and non-finite values fail before mutation.
+- Each service instance owns a nearest-deadline timer reconstructed from durable
+  pending approvals at startup and re-armed after approval creation, resolution,
+  cancellation/sweep, or recovery. At the deadline, the existing transactional
+  CAS rejects the approval and continuation, moves the waiting run to the
+  truthful `failed/permission_denied` state, emits one public
+  `approval_resolved` event, releases scheduler capacity, and dispatches eligible
+  queued work without requiring a snapshot, read, or user action. `close()`
+  cancels the timer.
+- Concurrent service timers race through the same durable run/version and event
+  idempotency boundary; exactly one expiry event wins. A transient timer-side
+  SQLite race re-arms a bounded retry rather than silently disabling expiry.
+- Startup quarantines legacy missing, malformed, or out-of-policy pending
+  expiries deterministically. It first replaces the unsafe value with a canonical
+  due timestamp and then terminalizes it. A crash between those transactions is
+  restart-safe, and a second open leaves the normalized row and event history
+  unchanged.
+
+### N2.B — immutable recovered-request purpose and digest binding
+
+- Reapproval derives purpose, risk, capabilities, tool identity, group/task/run,
+  private request, and operation scope from the original crash-blocked approval
+  and continuation. A compatibility `purpose` input is accepted only when it is
+  byte-for-byte equal to the inherited value; a substituted purpose is rejected
+  before any durable mutation. Optional supplied scope must likewise be exactly
+  equal to the original scope.
+- A SHA-256 digest of the immutable private request is persisted in the fresh
+  approval operation scope and continuation. Recovery validates any prior digest
+  before creating a new attempt. Claim validates the fresh approval, grant,
+  inherited purpose, exact scope/digest, expiry, and the old
+  `recovered_blocked` tombstone before crossing into Engine execution.
+- The generated digest and typed Task Runtime opaque identifiers are recognized
+  as control metadata by the backend/frontend public-data validators. This
+  narrowly avoids treating random identifier digit sequences as phone PII while
+  retaining value-level DLP for arbitrary public text and credentials.
+- The reviewer reproduction (`confirm_route` changed to `export_grades`) now
+  produces a zero-mutation conflict and no grant. The proper path retains
+  `confirm_route` through ApprovalRequest, PermissionGrant, continuation claim,
+  completion, public audit event, and restart. Duplicate reapproval, resolution,
+  and claim cannot execute twice.
+
+### Round-5 exact regression evidence
+
+- `python -m pytest -q backend/tests/test_task_runtime_rereview_round5.py` ->
+  `10 passed in 2.72s`.
+- `python -m pytest -q backend/tests/test_groups.py backend/tests/test_group_http.py backend/tests/test_task_runtime.py backend/tests/test_task_runtime_review_fixes.py backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_rereview_round3.py backend/tests/test_task_runtime_rereview_round4.py backend/tests/test_task_runtime_rereview_round5.py`
+  -> `108 passed in 12.83s`.
+- `python -m pytest -q backend/tests/test_worker_completion_v1.py backend/tests/test_runtime_impl_v10184.py backend/tests/test_coordinator_no_reply.py`
+  -> `26 passed, 10 subtests passed in 1.88s`.
+- `npm exec vitest run -- src/contract/taskRuntime.test.ts src/store/taskRuntime.test.ts src/contract/group.test.ts src/store/groups.test.ts --pool=forks --poolOptions.forks.singleFork=true`
+  -> `4 files / 26 tests passed`.
+- Targeted strict TypeScript compilation for the Task Runtime contract/envelope/store
+  passed. Targeted ESLint and Python compilation passed without diagnostics.
+  `git diff --check` passed with only repository Windows LF-to-CRLF notices.
+
+### Baseline note and residual assessment
+
+- Broad `npm run typecheck` still reports the same unrelated repository baseline
+  failures already recorded in prior rounds (legacy `Conv.unread` fixtures,
+  `calibrateActivity`, old SocketAPI/Bridge fakes, PDF worker typing, Store
+  strictness, and `stop_worker`). None references the changed Task Runtime
+  contract, envelope, service, store, server dispatcher, or round-5 tests; the
+  targeted strict compilation is clean.
+- No Task 3 round-5 acceptance issue remains known. Visual Agent status UI and the
+  full Tool Gateway/DLP/MCP implementation remain intentionally assigned to later
+  plan tasks.

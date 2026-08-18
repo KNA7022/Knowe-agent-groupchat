@@ -627,6 +627,28 @@ class TaskRuntimeStore:
                 )
         return self.get_approval(approval_id)
 
+    def normalize_pending_approval_expiry(
+        self, approval_id: str, *, expires_at: str,
+    ) -> ApprovalRequest | None:
+        """Canonicalize a legacy pending expiry without changing approval authority."""
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT group_id, payload_json FROM studycrew_approvals "
+                "WHERE approval_id=? AND status='pending'",
+                (approval_id,),
+            ).fetchone()
+            if row is not None:
+                self._assert_group_mutable_in_transaction(conn, str(row["group_id"]))
+                raw = _loads(row["payload_json"])
+                raw["expires_at"] = expires_at
+                raw["expiry_normalized"] = True
+                conn.execute(
+                    "UPDATE studycrew_approvals SET payload_json=? "
+                    "WHERE approval_id=? AND status='pending'",
+                    (_dumps(raw), approval_id),
+                )
+        return self.get_approval(approval_id)
+
     @staticmethod
     def reject_pending_approvals_in_transaction(
         conn: Any, *, run_id: str, resolution: str, resolved_at: str,
@@ -800,6 +822,7 @@ class TaskRuntimeStore:
         status: str, private_request: Mapping[str, Any],
         recovery_of_continuation_id: str | None = None,
         private_request_digest: str | None = None,
+        inherited_purpose: str | None = None,
     ) -> None:
         now = utc_now()
         payload = {
@@ -811,6 +834,7 @@ class TaskRuntimeStore:
             "private_request": dict(private_request), "created_at": now, "updated_at": now,
             "recovery_of_continuation_id": recovery_of_continuation_id,
             "private_request_digest": private_request_digest,
+            "inherited_purpose": inherited_purpose,
         }
         conn.execute(
             """INSERT OR IGNORE INTO studycrew_executor_continuations(

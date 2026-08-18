@@ -2,11 +2,13 @@ from __future__ import annotations
 
 """Authoritative state machine, recovery policy, and fair local scheduler."""
 
+import contextlib
 import hashlib
 import json
-import threading
-import sqlite3
 import math
+import re
+import sqlite3
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -116,6 +118,11 @@ class TaskRuntimeService:
     GROUP_SIDE_LIMIT = 2
     ROUTE_AUTO_CONFIDENCE = 0.85
     SCHEDULER_LEASE_SECONDS = 30.0
+    APPROVAL_DEFAULT_TTL_SECONDS = 600.0
+    APPROVAL_MAX_TTL_SECONDS = 86_400.0
+    _AWARE_ISO8601 = re.compile(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+    )
 
     def __init__(self, data_root: str | Path, groups: GroupRepository) -> None:
         self.groups = groups
@@ -123,6 +130,7 @@ class TaskRuntimeService:
         self._lock = threading.RLock()
         self._scheduler_owner = opaque_id("lease")
         self._scheduler_retry: threading.Timer | None = None
+        self._approval_expiry_timer: threading.Timer | None = None
         self._closed = False
         self.recovery_report = {"deletions": self.reconcile_group_deletions()}
         self.recovery_report.update(self.recover_after_restart())
@@ -130,6 +138,7 @@ class TaskRuntimeService:
             self.expire_pending_approvals(reschedule=False)
         )
         self.recovery_report["scheduled_runs"] = [run.run_id for run in self.schedule()]
+        self._arm_approval_expiry_watcher()
 
     def add_event_listener(self, listener: Any) -> None:
         self.store.add_event_listener(listener)
@@ -143,6 +152,10 @@ class TaskRuntimeService:
             self._scheduler_retry = None
             if timer is not None:
                 timer.cancel()
+            approval_timer = self._approval_expiry_timer
+            self._approval_expiry_timer = None
+            if approval_timer is not None:
+                approval_timer.cancel()
             self.store.release_scheduler_lease(self._scheduler_owner)
             self.store.close()
 
@@ -533,6 +546,7 @@ class TaskRuntimeService:
         executor_execution_key: str | None = None,
         route_request_key: str | None = None,
     ) -> ApprovalRequest:
+        normalized_expiry = self._normalize_approval_expiry(expires_at)
         current = self._owned_run(run_id, group_id)
         existing = self.store.approval_by_request_key(request_key)
         if existing is not None:
@@ -547,7 +561,7 @@ class TaskRuntimeService:
             requested_capabilities=tuple(dict.fromkeys(requested_capabilities)),
             tool_name=tool_name, operation_scope=self._normalize_operation_scope(operation_scope),
             purpose=purpose,
-            expires_at=expires_at or (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+            expires_at=normalized_expiry,
         )
         continuation_id = opaque_id("cont") if executor_private_request is not None else None
 
@@ -586,6 +600,7 @@ class TaskRuntimeService:
         winner = self.store.approval_by_request_key(request_key)
         if winner is None:
             raise RuntimeConflictError("approval idempotency winner is unavailable")
+        self._arm_approval_expiry_watcher()
         return winner
 
     def resolve_approval(
@@ -677,23 +692,56 @@ class TaskRuntimeService:
         if durable_approval is None:
             raise RuntimeConflictError("resolved approval is unavailable")
         durable_grant = self.store.grant_for_approval(approval_id) if approved else None
+        self._arm_approval_expiry_watcher()
         return durable_approval, durable_grant, self.store.get_run(run.run_id) or run
 
     def expire_pending_approvals(self, *, reschedule: bool = True) -> tuple[str, ...]:
         """Durably remove expired approval actions without waiting for a user click."""
         expired_ids: list[str] = []
-        now = utc_now()
+        now_dt = datetime.now(timezone.utc)
+        now = self._canonical_utc(now_dt)
         with self._lock:
             for approval in self.store.all_pending_approvals():
-                if not approval.expires_at or not self._is_expired(approval.expires_at):
+                invalid_expiry = False
+                try:
+                    if not approval.expires_at:
+                        raise ValueError("missing expiry")
+                    parsed_expiry = self._parse_approval_expiry(approval.expires_at)
+                    remaining = (parsed_expiry - now_dt).total_seconds()
+                    if not math.isfinite(remaining) or remaining > self.APPROVAL_MAX_TTL_SECONDS:
+                        raise ValueError("legacy expiry exceeds policy")
+                    canonical_expiry = self._canonical_utc(parsed_expiry)
+                except ValueError:
+                    # Legacy malformed/missing/out-of-policy rows are quarantined as
+                    # immediately expired rather than bricking startup or snapshots.
+                    invalid_expiry = True
+                    parsed_expiry = now_dt
+                    canonical_expiry = now
+                if approval.expires_at != canonical_expiry:
+                    try:
+                        normalized = self.store.normalize_pending_approval_expiry(
+                            approval.approval_id, expires_at=canonical_expiry,
+                        )
+                    except RuntimeStoreError:
+                        continue
+                    if normalized is not None:
+                        approval = normalized
+                if not invalid_expiry and parsed_expiry > now_dt:
                     continue
                 run = self.store.get_run(approval.run_id)
                 if run is None:
+                    with contextlib.suppress(RuntimeStoreError):
+                        self.store.reject_pending_approval(
+                            approval.approval_id,
+                            resolution="invalid_expiry" if invalid_expiry else "expired",
+                            resolved_at=now,
+                        )
                     continue
+                resolution = "invalid_expiry" if invalid_expiry else "expired"
                 if run.status is not TaskStatus.WAITING_APPROVAL:
                     try:
                         durable = self.store.reject_pending_approval(
-                            approval.approval_id, resolution="expired", resolved_at=now,
+                            approval.approval_id, resolution=resolution, resolved_at=now,
                         )
                     except RuntimeStoreError:
                         # Deletion reconciliation owns fenced Group content.
@@ -703,7 +751,7 @@ class TaskRuntimeService:
                     continue
                 resolved = replace(
                     approval, status="rejected", resolved_at=now,
-                    summary="Approval is no longer actionable",
+                    summary="Approval is no longer actionable", expires_at=canonical_expiry,
                 )
 
                 def mutate(item: TaskRun, *, expected_group: str = approval.group_id) -> None:
@@ -731,7 +779,7 @@ class TaskRuntimeService:
                         public_payload={
                             "status": TaskStatus.FAILED.value,
                             "approval_id": approval.approval_id,
-                            "resolution": "expired",
+                            "resolution": resolution,
                             "failure_type": FailureType.PERMISSION_DENIED.value,
                         },
                         idempotency_key=f"approval-expired:{approval.approval_id}",
@@ -746,12 +794,14 @@ class TaskRuntimeService:
                     expired_ids.append(approval.approval_id)
         if expired_ids and reschedule:
             self.schedule(sweep_expired=False)
+        self._arm_approval_expiry_watcher()
         return tuple(expired_ids)
 
     def reapprove_recovered_continuation(
-        self, group_id: str, continuation_id: str, *, purpose: str,
-        operation_scope: Mapping[str, str], request_key: str,
-        expires_at: str | None = None,
+        self, group_id: str, continuation_id: str, *, request_key: str,
+        purpose: str | None = None,
+        operation_scope: Mapping[str, str] | None = None,
+        expires_at: str | None = None, ttl_seconds: float | int | None = None,
     ) -> tuple[ApprovalRequest, TaskRun]:
         """Create a fresh governed attempt for an uncertain high-risk request.
 
@@ -762,15 +812,13 @@ class TaskRuntimeService:
         self._assert_group_mutable(canonical)
         if not request_key.strip():
             raise ValueError("request_key is required")
-        normalized_purpose = str(purpose).strip()
-        if (
-            not normalized_purpose or len(normalized_purpose) > 120
-            or not all(char.isalnum() or char in "_.:/-" for char in normalized_purpose)
-        ):
-            raise ValueError("reapproval purpose must be a normalized identifier")
-        normalized_scope = self._normalize_operation_scope(operation_scope)
-        if not normalized_scope:
-            raise ValueError("reapproval operation_scope is required")
+        if expires_at is not None and ttl_seconds is not None:
+            raise ValueError("specify approval expiry or ttl_seconds, not both")
+        normalized_expiry = (
+            self._normalize_approval_expiry(expires_at)
+            if expires_at is not None
+            else self.approval_expiry_from_ttl(ttl_seconds)
+        )
 
         with self._lock:
             blocked = self.store.executor_continuation(continuation_id=continuation_id)
@@ -799,10 +847,14 @@ class TaskRuntimeService:
             old_approval = self.store.get_approval(old_approval_id) if old_approval_id else None
             if old_approval is None:
                 raise RuntimeConflictError("recovered continuation has no auditable approval")
-            if normalized_scope != old_approval.operation_scope:
-                # The private message is immutable.  Changing its operation binding
-                # would approve a different action while replaying the old content.
-                raise RuntimeConflictError("reapproval scope must match the blocked operation")
+            inherited_purpose = old_approval.purpose
+            if purpose is not None and str(purpose) != inherited_purpose:
+                raise RuntimeConflictError("reapproval purpose must match the blocked operation")
+            inherited_scope = dict(old_approval.operation_scope)
+            if operation_scope is not None:
+                supplied_scope = self._normalize_operation_scope(operation_scope)
+                if supplied_scope != inherited_scope:
+                    raise RuntimeConflictError("reapproval scope must match the blocked operation")
 
             private_request = blocked.get("private_request")
             if not isinstance(private_request, dict):
@@ -813,6 +865,13 @@ class TaskRuntimeService:
                     separators=(",", ":"), default=str,
                 ).encode("utf-8")
             ).hexdigest()
+            stored_digest = str(blocked.get("private_request_digest") or "")
+            if stored_digest and stored_digest != private_digest:
+                raise RuntimeConflictError("recovered continuation request digest mismatch")
+            bound_digest = inherited_scope.get("request_digest")
+            if bound_digest and bound_digest != private_digest:
+                raise RuntimeConflictError("recovered approval request digest mismatch")
+            bound_scope = {**inherited_scope, "request_digest": private_digest}
             request_digest = hashlib.sha256(request_key.encode("utf-8")).hexdigest()
             approval = ApprovalRequest(
                 approval_id=opaque_id("apr"), run_id=run.run_id, group_id=canonical,
@@ -820,11 +879,9 @@ class TaskRuntimeService:
                 risk=RiskLevel.HIGH,
                 requested_capabilities=old_approval.requested_capabilities,
                 tool_name=old_approval.tool_name,
-                operation_scope=normalized_scope,
-                purpose=normalized_purpose,
-                expires_at=expires_at or (
-                    datetime.now(timezone.utc) + timedelta(minutes=10)
-                ).isoformat().replace("+00:00", "Z"),
+                operation_scope=bound_scope,
+                purpose=inherited_purpose,
+                expires_at=normalized_expiry,
             )
             new_continuation_id = opaque_id("cont")
             new_execution_key = (
@@ -851,6 +908,7 @@ class TaskRuntimeService:
                     private_request=private_request,
                     recovery_of_continuation_id=continuation_id,
                     private_request_digest=private_digest,
+                    inherited_purpose=inherited_purpose,
                 )
 
             try:
@@ -869,6 +927,7 @@ class TaskRuntimeService:
             durable_run = self.store.get_run(run.run_id)
             if winner is None or durable_run is None:
                 raise RuntimeConflictError("reapproval durability winner is unavailable")
+            self._arm_approval_expiry_watcher()
             return winner, durable_run
 
     def prepare_tool(
@@ -1150,6 +1209,56 @@ class TaskRuntimeService:
         except GroupNotFoundError:
             return False
 
+    def _arm_approval_expiry_watcher(self) -> None:
+        """Own one nearest-deadline timer reconstructed from durable approvals."""
+        with self._lock:
+            current = self._approval_expiry_timer
+            self._approval_expiry_timer = None
+            if current is not None:
+                current.cancel()
+            if self._closed:
+                return
+            now = datetime.now(timezone.utc)
+            nearest: datetime | None = None
+            for approval in self.store.all_pending_approvals():
+                if not approval.expires_at:
+                    candidate = now
+                else:
+                    try:
+                        candidate = self._parse_approval_expiry(approval.expires_at)
+                        ttl = (candidate - now).total_seconds()
+                        if not math.isfinite(ttl) or ttl > self.APPROVAL_MAX_TTL_SECONDS:
+                            candidate = now
+                    except ValueError:
+                        candidate = now
+                if nearest is None or candidate < nearest:
+                    nearest = candidate
+            if nearest is None:
+                return
+            delay = max(0.005, (nearest - now).total_seconds() + 0.002)
+            timer = threading.Timer(delay, self._approval_expiry_deadline)
+            timer.daemon = True
+            self._approval_expiry_timer = timer
+            timer.start()
+
+    def _approval_expiry_deadline(self) -> None:
+        with self._lock:
+            self._approval_expiry_timer = None
+            if self._closed:
+                return
+        try:
+            self.expire_pending_approvals()
+        except Exception:  # noqa: BLE001 -- durable next startup/read retries safely
+            # Re-arm shortly instead of letting one transient SQLite race permanently
+            # disable autonomous expiry.
+            with self._lock:
+                if self._closed:
+                    return
+                timer = threading.Timer(0.05, self._approval_expiry_deadline)
+                timer.daemon = True
+                self._approval_expiry_timer = timer
+                timer.start()
+
     def schedule(self, *, sweep_expired: bool = True) -> tuple[TaskRun, ...]:
         if self._closed:
             return ()
@@ -1402,9 +1511,68 @@ class TaskRuntimeService:
             result[key_text] = item_text
         return result
 
+    @classmethod
+    def _parse_approval_expiry(cls, value: str) -> datetime:
+        text = str(value)
+        if not cls._AWARE_ISO8601.fullmatch(text):
+            raise ValueError("approval expiry must be a timezone-aware ISO-8601 timestamp")
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            offset = parsed.utcoffset()
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise ValueError("approval expiry is invalid") from exc
+        if parsed.tzinfo is None or offset is None:
+            raise ValueError("approval expiry must include a timezone")
+        return parsed.astimezone(timezone.utc)
+
     @staticmethod
-    def _is_expired(value: str) -> bool:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")) <= datetime.now(timezone.utc)
+    def _canonical_utc(value: datetime) -> str:
+        return value.astimezone(timezone.utc).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+
+    @classmethod
+    def _normalize_approval_expiry(
+        cls, value: str | None, *, now: datetime | None = None,
+    ) -> str:
+        reference = now or datetime.now(timezone.utc)
+        if value is None:
+            parsed = reference + timedelta(seconds=cls.APPROVAL_DEFAULT_TTL_SECONDS)
+        else:
+            parsed = cls._parse_approval_expiry(value)
+        delta = (parsed - reference).total_seconds()
+        if not math.isfinite(delta) or delta <= 0:
+            raise ValueError("approval expiry must be in the future")
+        if delta > cls.APPROVAL_MAX_TTL_SECONDS:
+            raise ValueError("approval expiry exceeds the policy maximum")
+        return cls._canonical_utc(parsed)
+
+    @classmethod
+    def approval_expiry_from_ttl(
+        cls, ttl_seconds: float | int | None,
+    ) -> str:
+        ttl = cls.APPROVAL_DEFAULT_TTL_SECONDS if ttl_seconds is None else ttl_seconds
+        if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+            raise ValueError("approval ttl_seconds must be a finite number")
+        numeric = float(ttl)
+        if (
+            not math.isfinite(numeric) or numeric <= 0
+            or numeric > cls.APPROVAL_MAX_TTL_SECONDS
+        ):
+            raise ValueError("approval ttl_seconds is outside the policy range")
+        try:
+            expiry = datetime.now(timezone.utc) + timedelta(seconds=numeric)
+        except OverflowError as exc:
+            raise ValueError("approval ttl_seconds is invalid") from exc
+        return cls._normalize_approval_expiry(cls._canonical_utc(expiry))
+
+    @classmethod
+    def _is_expired(cls, value: str) -> bool:
+        try:
+            return cls._parse_approval_expiry(value) <= datetime.now(timezone.utc)
+        except ValueError:
+            # Legacy malformed permission records are never treated as authority.
+            return True
 
     @staticmethod
     def recovery_action(
@@ -1482,6 +1650,41 @@ class TaskRuntimeService:
             raise RuntimeConflictError("executor continuation task binding mismatch")
         if run.status is not TaskStatus.RUNNING:
             return continuation, False
+        recovery_of = str(continuation.get("recovery_of_continuation_id") or "")
+        if recovery_of:
+            private_request = continuation.get("private_request")
+            if not isinstance(private_request, dict):
+                raise RuntimeConflictError("recovered continuation private request is unavailable")
+            digest = hashlib.sha256(
+                json.dumps(
+                    private_request, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            approval_id = str(continuation.get("approval_id") or "")
+            approval = self.store.get_approval(approval_id)
+            grant = self.store.grant_for_approval(approval_id)
+            blocked = self.store.executor_continuation(continuation_id=recovery_of)
+            inherited_purpose = str(continuation.get("inherited_purpose") or "")
+            if (
+                continuation.get("risk") != RiskLevel.HIGH.value
+                or continuation.get("private_request_digest") != digest
+                or approval is None or approval.status != "approved"
+                or approval.risk is not RiskLevel.HIGH
+                or approval.run_id != run.run_id or approval.group_id != run.group_id
+                or approval.purpose != inherited_purpose
+                or approval.operation_scope.get("request_digest") != digest
+                or grant is None or grant.approval_id != approval_id
+                or grant.run_id != run.run_id or grant.group_id != run.group_id
+                or grant.task_id != run.task_id or grant.purpose != inherited_purpose
+                or grant.operation_scope != approval.operation_scope
+                or "route_message" not in grant.capabilities
+                or (grant.expires_at is not None and self._is_expired(grant.expires_at))
+                or blocked is None or blocked.get("status") != "recovered_blocked"
+                or blocked.get("group_id") != run.group_id
+                or blocked.get("task_id") != run.task_id
+            ):
+                raise RuntimeConflictError("recovered continuation approval binding mismatch")
         return self.store.claim_executor_continuation(str(continuation["continuation_id"]))
 
     def claim_approved_executor_continuation(
