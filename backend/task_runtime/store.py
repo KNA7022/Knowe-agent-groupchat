@@ -186,13 +186,17 @@ class TaskRuntimeStore:
             );
             CREATE TABLE IF NOT EXISTS studycrew_live_recovery (
                 group_id TEXT PRIMARY KEY,
+                affected_run_id TEXT NOT NULL DEFAULT '',
                 through_seq INTEGER NOT NULL,
+                through_version INTEGER NOT NULL DEFAULT 0,
                 reason TEXT NOT NULL,
                 attempts INTEGER NOT NULL,
                 recovery_token TEXT NOT NULL UNIQUE,
                 generation INTEGER NOT NULL,
                 failure_count INTEGER NOT NULL,
                 cause_digest TEXT NOT NULL,
+                disconnect_retry INTEGER NOT NULL DEFAULT 0,
+                disconnected_at_ns INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -224,6 +228,12 @@ class TaskRuntimeStore:
         self.db.ensure_columns("studycrew_checkpoints", {"idempotency_key": "TEXT"})
         self.db.ensure_columns("studycrew_migration_tombstones", {"winner_id": "TEXT NOT NULL DEFAULT ''"})
         self._migrate_group_live_recovery()
+        self.db.ensure_columns("studycrew_live_recovery", {
+            "affected_run_id": "TEXT NOT NULL DEFAULT ''",
+            "through_version": "INTEGER NOT NULL DEFAULT 0",
+            "disconnect_retry": "INTEGER NOT NULL DEFAULT 0",
+            "disconnected_at_ns": "INTEGER NOT NULL DEFAULT 0",
+        })
         self._migrate_v1_side_records()
         self.db.initialize(
             """
@@ -256,15 +266,19 @@ class TaskRuntimeStore:
             )
             conn.execute(
                 """CREATE TABLE studycrew_live_recovery (
-                       group_id TEXT PRIMARY KEY,
-                       through_seq INTEGER NOT NULL,
-                       reason TEXT NOT NULL,
+                   group_id TEXT PRIMARY KEY,
+                   affected_run_id TEXT NOT NULL DEFAULT '',
+                   through_seq INTEGER NOT NULL,
+                   through_version INTEGER NOT NULL DEFAULT 0,
+                   reason TEXT NOT NULL,
                        attempts INTEGER NOT NULL,
                        recovery_token TEXT NOT NULL UNIQUE,
                        generation INTEGER NOT NULL,
                        failure_count INTEGER NOT NULL,
-                       cause_digest TEXT NOT NULL,
-                       created_at TEXT NOT NULL,
+                   cause_digest TEXT NOT NULL,
+                   disconnect_retry INTEGER NOT NULL DEFAULT 0,
+                   disconnected_at_ns INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL,
                        updated_at TEXT NOT NULL
                    )""",
             )
@@ -280,11 +294,13 @@ class TaskRuntimeStore:
                 newest = rows[-1]
                 conn.execute(
                     """INSERT INTO studycrew_live_recovery(
-                           group_id, through_seq, reason, attempts, recovery_token,
+                           group_id, affected_run_id, through_seq, through_version,
+                           reason, attempts, recovery_token,
                            generation, failure_count, cause_digest, created_at, updated_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        group_id, max(int(row["through_seq"]) for row in rows),
+                        group_id, str(newest["run_id"]), int(newest["through_seq"]),
+                        int(newest["through_seq"]),
                         str(newest["reason"]), max(int(row["attempts"]) for row in rows),
                         str(rows[0]["recovery_token"]), len(rows), len(rows), digest,
                         str(rows[0]["created_at"]), str(newest["updated_at"]),
@@ -1219,7 +1235,7 @@ class TaskRuntimeStore:
 
     def record_live_recovery(
         self, *, run_id: str, group_id: str, through_seq: int, reason: str,
-        attempts: int, recovery_token: str,
+        attempts: int, recovery_token: str, run_version: int | None = None,
     ) -> dict[str, Any]:
         """Upsert one monotonic, lossless recovery generation for the affected Group."""
         now = utc_now()
@@ -1232,16 +1248,19 @@ class TaskRuntimeStore:
             failure_count = (int(previous["failure_count"]) if previous is not None else 0) + 1
             old_digest = str(previous["cause_digest"]) if previous is not None else ""
             cause_digest = hashlib.sha256(
-                f"{old_digest}|{run_id}|{through_seq}|{reason}|{attempts}".encode(),
+                f"{old_digest}|{run_id}|{through_seq}|{run_version or through_seq}|{reason}|{attempts}".encode(),
             ).hexdigest()
             created_at = str(previous["created_at"]) if previous is not None else now
             conn.execute(
                 """INSERT INTO studycrew_live_recovery(
-                       group_id, through_seq, reason, attempts, recovery_token,
+                       group_id, affected_run_id, through_seq, through_version,
+                       reason, attempts, recovery_token,
                        generation, failure_count, cause_digest, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(group_id) DO UPDATE SET
-                     through_seq=MAX(studycrew_live_recovery.through_seq, excluded.through_seq),
+                     affected_run_id=excluded.affected_run_id,
+                     through_seq=excluded.through_seq,
+                     through_version=excluded.through_version,
                      reason=excluded.reason,
                      attempts=MAX(studycrew_live_recovery.attempts, excluded.attempts),
                      generation=excluded.generation,
@@ -1249,7 +1268,8 @@ class TaskRuntimeStore:
                      cause_digest=excluded.cause_digest,
                      updated_at=excluded.updated_at""",
                 (
-                    group_id, through_seq, reason, attempts, token, generation,
+                    group_id, run_id, through_seq, int(run_version or through_seq),
+                    reason, attempts, token, generation,
                     failure_count, cause_digest, created_at, now,
                 ),
             )
@@ -1289,6 +1309,37 @@ class TaskRuntimeStore:
                 """DELETE FROM studycrew_live_recovery
                    WHERE group_id=? AND recovery_token=? AND generation=?""",
                 (group_id, recovery_token, generation),
+            )
+        return cursor.rowcount == 1
+
+    def mark_live_recovery_disconnect(
+        self, group_id: str, recovery_token: str, generation: int,
+        *, disconnected_at_ns: int,
+    ) -> bool:
+        """Retain one durable fresh-connection retry after an unacknowledged socket closes."""
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE studycrew_live_recovery
+                   SET disconnect_retry=1,
+                       disconnected_at_ns=MAX(disconnected_at_ns, ?),
+                       updated_at=?
+                   WHERE group_id=? AND recovery_token=? AND generation=?""",
+                (int(disconnected_at_ns), utc_now(), group_id, recovery_token, generation),
+            )
+        return cursor.rowcount == 1
+
+    def consume_live_recovery_disconnect(
+        self, group_id: str, recovery_token: str, generation: int,
+        *, connected_at_ns: int,
+    ) -> bool:
+        """Consume retry debt only from a connection established after the loss."""
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE studycrew_live_recovery
+                   SET disconnect_retry=0, updated_at=?
+                   WHERE group_id=? AND recovery_token=? AND generation=?
+                     AND disconnect_retry=1 AND disconnected_at_ns < ?""",
+                (utc_now(), group_id, recovery_token, generation, int(connected_at_ns)),
             )
         return cursor.rowcount == 1
 

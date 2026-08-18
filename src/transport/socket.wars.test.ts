@@ -390,6 +390,56 @@ describe('W5 · seq 空洞', () => {
     expect(h.statuses.at(-1)).toBe('live');
   });
 
+  it('多个项目并行恢复时，最后一个完成前全局状态保持 resync', async () => {
+    const h = connect({ projectRuntime: true });
+    await until(() => h.statuses.includes('live'), 'live');
+    const groups = [`grp_${'6'.repeat(32)}`, `grp_${'7'.repeat(32)}`] as const;
+    const projects = ['project_recovery_a', 'project_recovery_b'] as const;
+    const tokens = ['recovery_multi_a', 'recovery_multi_b'] as const;
+    for (let index = 0; index < projects.length; index += 1) {
+      server.emitNoSeq({
+        type: 'resync_required', project_id: projects[index], last_seq: index + 1,
+        group_id: groups[index], recovery_token: tokens[index], recovery_generation: 1,
+      });
+    }
+    await until(() => tokens.every((token) => server.inbound.some(
+      (item) => item.type === 'request_snapshot' && item.recovery_token === token,
+    )), 'both recovery requests');
+
+    const respond = (index: number): void => {
+      server.emitNoSeq({
+        type: 'task_runtime_result', action: 'snapshot', request_id: tokens[index],
+        schema_version: 1, project_id: projects[index], group_id: groups[index],
+        recovery_token: tokens[index], recovery_generation: 1,
+        snapshot_cursor: String(index + 1).repeat(64),
+        task_runtime: {
+          schema_version: 1, group_id: groups[index], runs: [], pending_approvals: [],
+          summary: {
+            active_primary_run_id: null, primary_task_status: null, queued_task_count: 0,
+            active_side_task_count: 0, pending_approval_count: 0,
+            budget_usage: {
+              wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0,
+            },
+            indexing_state: 'idle',
+          },
+        },
+      });
+    };
+
+    respond(0);
+    await until(() => server.inbound.some(
+      (item) => item.type === 'task_runtime_recovery_ack'
+        && item.recovery_token === tokens[0],
+    ), 'first recovery ack');
+    expect(h.statuses.at(-1)).toBe('resync');
+    respond(1);
+    await until(() => server.inbound.some(
+      (item) => item.type === 'task_runtime_recovery_ack'
+        && item.recovery_token === tokens[1],
+    ), 'second recovery ack');
+    expect(h.statuses.at(-1)).toBe('live');
+  });
+
   it('同一 durable token 断线重连后可重试；畸形快照不 ACK 且保持 resync', async () => {
     const h = connect();
     await until(() => h.statuses.includes('live'), 'live');

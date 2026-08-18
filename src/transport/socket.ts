@@ -804,7 +804,11 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
           return;
         }
         delete _recoveryAttemptByProject[response.project_id];
-        setStatus('live');
+        // Recovery is application-wide transport state: completing one background
+        // Group must not hide another Group that is still rebuilding.
+        if (Object.keys(_recoveryAttemptByProject).length === 0) {
+          setStatus('live');
+        }
         sendRaw({
           type: 'task_runtime_recovery_ack',
           project_id: response.project_id,

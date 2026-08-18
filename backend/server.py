@@ -414,6 +414,7 @@ class KnoweServer:
     TASK_RUNTIME_ACTIVE_CURSOR_MAX = 2048
     TASK_RUNTIME_TERMINAL_CURSOR_MAX = 256
     TASK_RUNTIME_RECOVERY_MARKER_MAX = 256
+    TASK_RUNTIME_RECOVERY_SNAPSHOT_RETRIES = 8
     TASK_RUNTIME_DELIVERY_RETRIES = 3
 
     def __init__(self, data_dir: str | None = None) -> None:
@@ -440,6 +441,8 @@ class KnoweServer:
         self._task_runtime_event_bridge_last_seq: OrderedDict[str, tuple[int, str]] = OrderedDict()
         self._task_runtime_event_bridge_terminal_seq: OrderedDict[str, tuple[int, str]] = OrderedDict()
         self._task_runtime_event_bridge_recovery: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        self._task_runtime_recovery_revision = 0
+        self._task_runtime_recovery_latest_group_id: str | None = None
         self._task_runtime_event_drain_task: asyncio.Task[None] | None = None
         self._task_runtime_listener_service: TaskRuntimeService | None = self.task_runtime
         if self.task_runtime is not None:
@@ -1119,6 +1122,7 @@ class KnoweServer:
                     run_id=event.run_id, group_id=event.group_id,
                     through_seq=event.seq, reason=reason, attempts=attempts,
                     recovery_token=marker["recovery_token"],
+                    run_version=event.version,
                 )
                 if stored:
                     marker = dict(stored)
@@ -1129,6 +1133,8 @@ class KnoweServer:
         self._task_runtime_event_bridge_recovery.move_to_end(event.group_id)
         while len(self._task_runtime_event_bridge_recovery) > self.TASK_RUNTIME_RECOVERY_MARKER_MAX:
             self._task_runtime_event_bridge_recovery.popitem(last=False)
+        self._task_runtime_recovery_revision += 1
+        self._task_runtime_recovery_latest_group_id = event.group_id
 
     def _enqueue_task_runtime_event_locked(self, event: RunEvent, attempts: int = 0) -> bool:
         key = (event.run_id, event.seq)
@@ -1167,6 +1173,16 @@ class KnoweServer:
                 (item[0].run_id, item[0].seq)
                 for item in self._task_runtime_event_bridge_pending
             }
+            for client in tuple(self.hub.clients):
+                client.task_runtime_recovery_notified = {
+                    item for item in client.task_runtime_recovery_notified
+                    if item[0] != group_id
+                }
+                client.task_runtime_recovery_snapshots = {
+                    item: cursor
+                    for item, cursor in client.task_runtime_recovery_snapshots.items()
+                    if item[0] != group_id
+                }
         if self.task_runtime is not None:
             self.task_runtime.store.clear_group_live_recovery(group_id)
             self.task_runtime.store.clear_group_live_publication(group_id)
@@ -1179,14 +1195,13 @@ class KnoweServer:
             } for item in self._task_runtime_event_bridge_recovery.values())
 
     async def _notify_task_runtime_recoveries(self, client: Client | None = None) -> None:
-        """Fair-page every durable affected Group without retaining an unbounded dispatcher."""
+        """Fill each connection's bounded, independent durable recovery window."""
         targets = (client,) if client is not None else tuple(self.hub.clients)
         service = self.task_runtime
         if service is None:
             return
-        notified_groups: set[str] = set()
 
-        async def send_marker(marker: dict[str, Any]) -> None:
+        async def send_marker(target: Client, marker: dict[str, Any]) -> bool:
             group_id = str(marker["group_id"])
             token = str(marker["recovery_token"])
             generation = int(marker["generation"])
@@ -1194,60 +1209,197 @@ class KnoweServer:
             try:
                 project_id = self._runtime_project_id_for_group(group_id)
             except (GroupNotFoundError, ProjectClosingError):
-                return
-            for target in targets:
-                if not target.alive or any(
-                    item[0] == group_id and item[1] == token
-                    for item in target.task_runtime_recovery_notified
-                ):
-                    continue
-                sent = await self.hub.send_to(target, {
-                    "type": "resync_required",
-                    "project_id": project_id,
-                    "group_id": group_id,
-                    "last_seq": self.hub.get_or_create(project_id).seq,
-                    "recovery_token": token,
-                    "recovery_generation": generation,
-                    "message": "Task Runtime live delivery requires an authoritative snapshot",
-                })
-                if sent:
-                    target.task_runtime_recovery_notified = {
-                        item for item in target.task_runtime_recovery_notified
-                        if item[0] != group_id
-                    }
-                    target.task_runtime_recovery_snapshots = {
-                        item: cursor
-                        for item, cursor in target.task_runtime_recovery_snapshots.items()
-                        if item[0] != group_id
-                    }
-                    target.task_runtime_recovery_notified.add(notice_key)
+                return False
+            if not target.alive or any(
+                item[0] == group_id and item[1] == token
+                for item in target.task_runtime_recovery_notified
+            ):
+                return False
+            # Reserve before the await.  An ACK on another connection must observe
+            # this client's obligation even while its notice frame is in flight.
+            with self._task_runtime_event_bridge_lock:
+                target.task_runtime_recovery_notified.add(notice_key)
+            sent = await self.hub.send_to(target, {
+                "type": "resync_required",
+                "project_id": project_id,
+                "group_id": group_id,
+                "last_seq": self.hub.get_or_create(project_id).seq,
+                "recovery_token": token,
+                "recovery_generation": generation,
+                "message": "Task Runtime live delivery requires an authoritative snapshot",
+            })
+            if not sent:
+                with self._task_runtime_event_bridge_lock:
+                    target.task_runtime_recovery_notified.discard(notice_key)
+                return False
+            return True
 
-        after_group_id = ""
-        while True:
-            pending = service.store.live_recoveries(
-                limit=self.TASK_RUNTIME_RECOVERY_MARKER_MAX,
-                after_group_id=after_group_id,
-            )
-            if not pending:
-                break
-            for marker in pending:
-                notified_groups.add(str(marker["group_id"]))
-                await send_marker(marker)
-            after_group_id = str(pending[-1]["group_id"])
-            if len(pending) < self.TASK_RUNTIME_RECOVERY_MARKER_MAX:
-                break
-            await asyncio.sleep(0)
-        # If the recovery table itself was temporarily unwritable, retain live
-        # observability from the bounded hot markers. Durable RunEvents remain the
-        # restart authority, while this path avoids leaving a connected client stale.
+        async def fill_target(target: Client) -> None:
+            if not target.alive:
+                return
+            occupied = {
+                item[0] for item in target.task_runtime_recovery_notified
+            } | {
+                item[0] for item in target.task_runtime_recovery_snapshots
+            }
+            available = max(0, target.TASK_RUNTIME_RECOVERY_WINDOW_MAX - len(occupied))
+            if available == 0:
+                return
+            with self._task_runtime_event_bridge_lock:
+                latest_revision = self._task_runtime_recovery_revision
+                hinted_group = (
+                    self._task_runtime_recovery_latest_group_id
+                    if target.task_runtime_recovery_seen_revision < latest_revision
+                    else None
+                )
+                target.task_runtime_recovery_seen_revision = latest_revision
+            if hinted_group is not None:
+                hinted = service.store.live_recovery(hinted_group)
+                if hinted is not None and hinted_group not in occupied:
+                    if await send_marker(target, hinted):
+                        occupied.add(hinted_group)
+                        available -= 1
+            if available == 0 or target.task_runtime_recovery_page_exhausted:
+                return
+            while available > 0:
+                page = service.store.live_recoveries(
+                    limit=target.TASK_RUNTIME_RECOVERY_WINDOW_MAX,
+                    after_group_id=target.task_runtime_recovery_after_group_id,
+                )
+                if not page:
+                    target.task_runtime_recovery_page_exhausted = True
+                    break
+                page_complete = True
+                for marker in page:
+                    group_id = str(marker["group_id"])
+                    target.task_runtime_recovery_after_group_id = group_id
+                    if group_id in occupied:
+                        continue
+                    if await send_marker(target, marker):
+                        occupied.add(group_id)
+                        available -= 1
+                        if available == 0:
+                            page_complete = False
+                            break
+                if page_complete and len(page) < target.TASK_RUNTIME_RECOVERY_WINDOW_MAX:
+                    target.task_runtime_recovery_page_exhausted = True
+                    break
+                await asyncio.sleep(0)
+
+        for target in targets:
+            await fill_target(target)
+
+        # A recovery-table write failure is represented by the bounded hot cache.
+        # It may occupy remaining slots, but is never copied into an unbounded set.
         with self._task_runtime_event_bridge_lock:
-            hot_markers = tuple(self._task_runtime_event_bridge_recovery.values())
-        for marker in hot_markers:
-            if str(marker.get("group_id")) not in notified_groups:
-                await send_marker(marker)
+            hot_markers = tuple(
+                marker for marker in self._task_runtime_event_bridge_recovery.values()
+                if marker.get("persisted") is False
+            )
+        for target in targets:
+            occupied = {item[0] for item in target.task_runtime_recovery_notified}
+            for marker in hot_markers:
+                if len(occupied) >= target.TASK_RUNTIME_RECOVERY_WINDOW_MAX:
+                    break
+                group_id = str(marker.get("group_id"))
+                if group_id not in occupied and await send_marker(target, marker):
+                    occupied.add(group_id)
 
     @staticmethod
-    def _task_runtime_snapshot_cursor(snapshot: dict[str, Any]) -> str:
+    def _task_runtime_snapshot_covers_marker(
+        snapshot: dict[str, Any], marker: dict[str, Any],
+    ) -> bool:
+        covered = {
+            str(run["run_id"]): (int(run.get("last_seq", 0)), int(run.get("version", 0)))
+            for run in snapshot.get("runs", [])
+            if isinstance(run, dict) and isinstance(run.get("run_id"), str)
+        }
+        affected_run_id = marker.get("affected_run_id")
+        if isinstance(affected_run_id, str) and affected_run_id:
+            cursor = covered.get(affected_run_id)
+            return bool(
+                cursor is not None
+                and cursor[0] >= int(marker.get("through_seq", 0))
+                and cursor[1] >= int(marker.get("through_version", 0))
+            )
+        # Only a migrated or bounded volatile fallback lacks the latest Run ID.
+        # Reading the marker before the snapshot and rechecking its generation after
+        # materialization provides the Group-wide temporal fence for earlier causes.
+        return any(seq >= int(marker.get("through_seq", 0)) for seq, _version in covered.values())
+
+    @staticmethod
+    def _task_runtime_marker_identity(marker: dict[str, Any]) -> tuple[str, int, str]:
+        return (
+            str(marker.get("recovery_token") or ""),
+            int(marker.get("generation") or 0),
+            str(marker.get("cause_digest") or ""),
+        )
+
+    def _capture_task_runtime_recovery_snapshot(
+        self, client: Client, *, group_id: str, recovery_token: str,
+        requested_generation: int,
+    ) -> tuple[dict[str, Any], dict[str, Any], str] | None:
+        """Optimistically capture marker+snapshot, then CAS the issued obligation."""
+        service = self.task_runtime
+        if service is None:
+            return None
+        for _attempt in range(self.TASK_RUNTIME_RECOVERY_SNAPSHOT_RETRIES):
+            before = service.store.live_recovery(group_id)
+            if before is None:
+                with self._task_runtime_event_bridge_lock:
+                    hot = self._task_runtime_event_bridge_recovery.get(group_id)
+                    before = dict(hot) if hot is not None else None
+            if (
+                before is None
+                or str(before.get("recovery_token")) != recovery_token
+                or requested_generation > int(before.get("generation", 0))
+            ):
+                return None
+            snapshot = service.group_snapshot(group_id)
+            after = service.store.live_recovery(group_id)
+            if after is None and before.get("persisted") is False:
+                with self._task_runtime_event_bridge_lock:
+                    hot = self._task_runtime_event_bridge_recovery.get(group_id)
+                    after = dict(hot) if hot is not None else None
+            if (
+                after is None
+                or self._task_runtime_marker_identity(before)
+                != self._task_runtime_marker_identity(after)
+                or not self._task_runtime_snapshot_covers_marker(snapshot, after)
+            ):
+                continue
+            cursor = self._task_runtime_snapshot_cursor(snapshot, marker=after)
+            key = (group_id, recovery_token, int(after["generation"]))
+            # The synchronous listener also holds this lock while advancing the
+            # durable generation, closing the final validation/issuance race.
+            with self._task_runtime_event_bridge_lock:
+                final = service.store.live_recovery(group_id)
+                if final is None and after.get("persisted") is False:
+                    hot = self._task_runtime_event_bridge_recovery.get(group_id)
+                    final = dict(hot) if hot is not None else None
+                if (
+                    final is None
+                    or self._task_runtime_marker_identity(final)
+                    != self._task_runtime_marker_identity(after)
+                ):
+                    continue
+                client.task_runtime_recovery_notified = {
+                    item for item in client.task_runtime_recovery_notified
+                    if item[0] != group_id
+                }
+                client.task_runtime_recovery_snapshots = {
+                    item: issued for item, issued in client.task_runtime_recovery_snapshots.items()
+                    if item[0] != group_id
+                }
+                client.task_runtime_recovery_notified.add(key)
+                client.task_runtime_recovery_snapshots[key] = cursor
+            return snapshot, dict(after), cursor
+        return None
+
+    @staticmethod
+    def _task_runtime_snapshot_cursor(
+        snapshot: dict[str, Any], *, marker: dict[str, Any] | None = None,
+    ) -> str:
         runs = snapshot.get("runs") if isinstance(snapshot, dict) else None
         rows = sorted(
             (
@@ -1258,7 +1410,17 @@ class KnoweServer:
             if isinstance(run, dict) and isinstance(run.get("run_id"), str)
         )
         raw = json.dumps(
-            {"group_id": snapshot.get("group_id"), "runs": rows},
+            {
+                "group_id": snapshot.get("group_id"), "runs": rows,
+                "recovery": None if marker is None else {
+                    "token": marker.get("recovery_token"),
+                    "generation": marker.get("generation"),
+                    "cause_digest": marker.get("cause_digest"),
+                    "affected_run_id": marker.get("affected_run_id"),
+                    "through_seq": marker.get("through_seq"),
+                    "through_version": marker.get("through_version"),
+                },
+            },
             ensure_ascii=True, sort_keys=True, separators=(",", ":"),
         )
         return hashlib.sha256(raw.encode()).hexdigest()
@@ -1273,21 +1435,41 @@ class KnoweServer:
         key = (group_id, recovery_token, generation)
         if client.task_runtime_recovery_snapshots.get(key) != snapshot_cursor:
             return False
-        if not self.task_runtime.store.clear_live_recovery(
-            group_id, recovery_token, generation,
-        ):
-            with self._task_runtime_event_bridge_lock:
-                fallback = self._task_runtime_event_bridge_recovery.get(group_id)
-                if self.task_runtime.store.live_recovery(group_id) is not None or not (
-                    fallback is not None
-                    and fallback.get("persisted") is False
-                    and fallback.get("recovery_token") == recovery_token
-                    and int(fallback.get("generation", 0)) == generation
-                ):
-                    return False
-        client.task_runtime_recovery_snapshots.pop(key, None)
-        client.task_runtime_recovery_notified.discard(key)
         with self._task_runtime_event_bridge_lock:
+            marker = self.task_runtime.store.live_recovery(group_id)
+            fallback = self._task_runtime_event_bridge_recovery.get(group_id)
+            if marker is None and fallback is not None and fallback.get("persisted") is False:
+                marker = fallback
+            if marker is None or self._task_runtime_marker_identity(marker)[:2] != (
+                recovery_token, generation,
+            ):
+                return False
+            if marker.get("persisted") is not False:
+                try:
+                    self.task_runtime.store.consume_live_recovery_disconnect(
+                        group_id, recovery_token, generation,
+                        connected_at_ns=client.connected_at_ns,
+                    )
+                except Exception:  # noqa: BLE001 -- durable intent must remain retryable
+                    log.exception("Could not consume Task Runtime disconnect retry for %s", group_id)
+                    return False
+            client.task_runtime_recovery_snapshots.pop(key, None)
+            client.task_runtime_recovery_notified.discard(key)
+            marker = self.task_runtime.store.live_recovery(group_id) or marker
+            other_obligation = any(
+                other is not client and other.alive and (
+                    key in other.task_runtime_recovery_notified
+                    or key in other.task_runtime_recovery_snapshots
+                )
+                for other in self.hub.clients
+            )
+            retry_required = bool(int(marker.get("disconnect_retry", 0)))
+            if other_obligation or retry_required:
+                return True
+            if marker.get("persisted") is not False and not self.task_runtime.store.clear_live_recovery(
+                group_id, recovery_token, generation,
+            ):
+                return False
             current = self._task_runtime_event_bridge_recovery.get(group_id)
             if current is not None and (
                 current.get("recovery_token") == recovery_token
@@ -1295,6 +1477,27 @@ class KnoweServer:
             ):
                 self._task_runtime_event_bridge_recovery.pop(group_id, None)
         return True
+
+    def _retain_client_recovery_on_disconnect(self, client: Client) -> None:
+        """Persist a retry fence for recovery obligations lost with this socket."""
+        service = self.task_runtime
+        if service is None:
+            return
+        obligations = set(client.task_runtime_recovery_notified) | set(
+            client.task_runtime_recovery_snapshots,
+        )
+        disconnected_at_ns = time.time_ns()
+        with self._task_runtime_event_bridge_lock:
+            for group_id, token, generation in obligations:
+                try:
+                    service.store.mark_live_recovery_disconnect(
+                        group_id, token, generation,
+                        disconnected_at_ns=disconnected_at_ns,
+                    )
+                except Exception:  # noqa: BLE001 -- Hub cleanup must still complete
+                    log.exception("Could not retain Task Runtime disconnect retry for %s", group_id)
+            client.task_runtime_recovery_notified.clear()
+            client.task_runtime_recovery_snapshots.clear()
 
     def _record_task_runtime_snapshot_publication(self, snapshot: dict[str, Any]) -> None:
         if self.task_runtime is None:
@@ -3252,6 +3455,7 @@ class KnoweServer:
         except Exception:
             log.exception("client %s crashed", client.id)
         finally:
+            self._retain_client_recovery_on_disconnect(client)
             self.hub.remove_client(client)
             log.info("client %s gone (total=%d)", client.id, self.hub.client_count)
 
@@ -4798,33 +5002,34 @@ class KnoweServer:
             return
         project_id = self._canonical_project_id_from_request(project_id)
         group_id = self._group_id_for_runtime_project(project_id)
-        runtime_snapshot = None
-        if self.task_runtime is not None and group_id is not None:
-            with contextlib.suppress(RuntimeConflictError, RuntimeNotFoundError):
-                runtime_snapshot = self.task_runtime.group_snapshot(group_id)
         recovery_token = data.get("recovery_token")
         recovery_generation = data.get("recovery_generation")
         if (
-            runtime_snapshot is not None
-            and group_id is not None
+            group_id is not None
             and isinstance(recovery_token, str)
             and recovery_token
             and isinstance(recovery_generation, int)
             and not isinstance(recovery_generation, bool)
             and recovery_generation > 0
         ):
-            marker = self.task_runtime.store.live_recovery(group_id) if self.task_runtime else None
-            if marker is None:
-                with self._task_runtime_event_bridge_lock:
-                    marker = self._task_runtime_event_bridge_recovery.get(group_id)
-            if marker is None or str(marker["recovery_token"]) != recovery_token:
+            if not any(
+                item[0] == group_id and item[1] == recovery_token
+                for item in client.task_runtime_recovery_notified
+            ):
                 await self._server_error(client, "Task Runtime recovery request is stale or invalid")
                 return
+            try:
+                captured = self._capture_task_runtime_recovery_snapshot(
+                    client, group_id=group_id, recovery_token=recovery_token,
+                    requested_generation=recovery_generation,
+                )
+            except (RuntimeConflictError, RuntimeNotFoundError):
+                captured = None
+            if captured is None:
+                await self._server_error(client, "Task Runtime recovery request is stale or invalid")
+                return
+            runtime_snapshot, marker, snapshot_cursor = captured
             current_generation = int(marker["generation"])
-            if recovery_generation > current_generation:
-                await self._server_error(client, "Task Runtime recovery request is stale or invalid")
-                return
-            snapshot_cursor = self._task_runtime_snapshot_cursor(runtime_snapshot)
             handed_off = await self.hub.send_to(client, {
                 "type": "task_runtime_result", "action": "snapshot",
                 "request_id": recovery_token, "schema_version": 1,
@@ -4836,15 +5041,16 @@ class KnoweServer:
             })
             if handed_off:
                 self._record_task_runtime_snapshot_publication(runtime_snapshot)
-                client.task_runtime_recovery_snapshots = {
-                    item: cursor
-                    for item, cursor in client.task_runtime_recovery_snapshots.items()
-                    if item[0] != group_id
-                }
-                client.task_runtime_recovery_snapshots[
-                    (group_id, recovery_token, current_generation)
-                ] = snapshot_cursor
+            else:
+                key = (group_id, recovery_token, current_generation)
+                with self._task_runtime_event_bridge_lock:
+                    client.task_runtime_recovery_snapshots.pop(key, None)
+                    client.task_runtime_recovery_notified.discard(key)
             return
+        runtime_snapshot = None
+        if self.task_runtime is not None and group_id is not None:
+            with contextlib.suppress(RuntimeConflictError, RuntimeNotFoundError):
+                runtime_snapshot = self.task_runtime.group_snapshot(group_id)
         # [v1.0.24.4] 快照附带权威活动账本（全量）：前端重建现场时忙碌状态一次对齐。
         await self.hub.snapshot(
             project_id, activity=self._open_activity_all(), task_runtime=runtime_snapshot,
@@ -4891,7 +5097,9 @@ class KnoweServer:
                 item for item in client.task_runtime_recovery_notified
                 if item[0] != group_id
             }
-            await self._notify_task_runtime_recoveries(client)
+            client.task_runtime_recovery_after_group_id = ""
+            client.task_runtime_recovery_page_exhausted = False
+        await self._notify_task_runtime_recoveries(client)
 
     # ── replay_request（非首帧 → 拒绝，前端应改用 request_snapshot） ──
     async def _cmd_replay_request(self, client: Client, data: dict[str, Any]) -> None:

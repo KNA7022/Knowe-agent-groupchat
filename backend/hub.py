@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections import OrderedDict, deque
 from typing import Any, Callable, Iterable
 
@@ -47,10 +48,12 @@ class Client:
 
     _next_id = 0
     LIVE_REPLAY_BUFFER_MAX = 4096
+    TASK_RUNTIME_RECOVERY_WINDOW_MAX = 4
 
     def __init__(self, ws: Any) -> None:
         Client._next_id += 1
         self.id = f"c{Client._next_id}"
+        self.connected_at_ns = time.time_ns()
         self.ws = ws
         # ★ 每客户端独立的「已发过 project_created 的项目集合」——握手时按此补发
         self.sent_projects: set[str] = set()
@@ -64,6 +67,12 @@ class Client:
         # authenticated live connection.  Reconnect intentionally starts empty.
         self.task_runtime_recovery_notified: set[tuple[str, str, int]] = set()
         self.task_runtime_recovery_snapshots: dict[tuple[str, str, int], str] = {}
+        # Recovery intents stay durable in SQLite.  A connection holds only a small
+        # fair-scanning window and one opaque paging cursor, never a mirror of the
+        # complete recovery table.
+        self.task_runtime_recovery_after_group_id = ""
+        self.task_runtime_recovery_page_exhausted = False
+        self.task_runtime_recovery_seen_revision = 0
 
     @property
     def alive(self) -> bool:

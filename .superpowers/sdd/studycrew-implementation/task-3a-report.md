@@ -253,3 +253,72 @@ Group-coalesced durable protocol.
 - Targeted Python compilation, ESLint, strict TypeScript compilation and
   `git diff --check` all passed; Git emitted only the repository's existing Windows
   LF-to-CRLF notices.
+
+## Independent re-review fix round 4/5
+
+The third re-review exposed a generation/snapshot TOCTOU, first-ACK global
+retirement, unbounded per-client recovery fan-out, and a renderer status that could
+hide a second recovering Group. This round closes those production boundaries.
+
+### Stable generation-bound snapshot capture
+
+- The durable Group recovery marker now retains bounded latest-cause coverage:
+  affected Run ID, sequence, version, stable token, monotonic generation, failure
+  count and chained cause digest. Metadata remains constant-size regardless of the
+  number of failed Runs in a Group.
+- Recovery capture reads the marker before materializing the Group snapshot, verifies
+  the same token/generation/digest afterwards, proves the snapshot covers the marker's
+  Run sequence/version, then performs a final marker comparison while holding the
+  same bridge ingress lock used by production failure recording. The issued cursor
+  hashes both the complete snapshot Run cursors and exact marker identity/coverage.
+- A generation advance at any boundary rebuilds the snapshot. A bounded retry
+  exhaustion leaves the durable generation outstanding. The regression injects a
+  checkpoint and recovery generation during the first `group_snapshot()` call and
+  proves the response contains generation 2 with the Run's authoritative sequence 2;
+  only that exact cursor can clear generation 2.
+
+### Multi-client ACK obligations and durable disconnect retry
+
+- A recovery notice reserves its per-client obligation before the socket send await,
+  so an ACK racing another client's in-flight notice cannot retire the Group intent.
+  Global retirement occurs only after the ACKing connection applied its issued cursor
+  and no other live connection retains the same notified/issued generation.
+- A socket that closes with an unacknowledged obligation records one durable
+  fresh-connection retry fence on the Group row. An older still-connected window
+  cannot consume it; a connection established after the loss must apply and ACK the
+  authoritative snapshot. Forged, stale or cross-Group ACKs still mutate nothing.
+- Both direct Client tests and two genuinely connected WebSocket clients prove A's ACK
+  leaves B valid, B can request/apply/ACK without reconnect, and only the final valid
+  obligation retires. A disconnect/B-ACK/replacement-connection sequence proves the
+  durable retry fence survives the lost window.
+
+### Bounded fair recovery paging and global renderer status
+
+- Each Client owns a four-Group recovery window, one opaque SQLite paging cursor and
+  fixed revision metadata. Notification fills only free slots and never constructs a
+  full-table Group set. ACK completion advances the next page; all correctness rows
+  remain losslessly in SQLite. The existing bridge hot cache remains capped at 256 and
+  temporary recovery-table write failures can use only free window slots.
+- A 513-Group regression proves the initial send and both independent clients' maps
+  stop at four, every subsequent completion advances fairly, all 513 Groups including
+  the oldest arrive exactly once, and per-client memory never exceeds the configured
+  window. Restart reconstructs delivery from the still-durable rows rather than hot
+  client state.
+- The renderer now returns the global connection to `live` only when its complete
+  per-project recovery-attempt map is empty. A real socket/store test starts two
+  background Group recoveries, proves the first applied+ACKed snapshot remains
+  `resync`, and proves only the second completion returns to `live`.
+
+### Round-4 acceptance evidence
+
+- Task 1–3 Group/Task Runtime regressions, including recovery and real bridge suites:
+  `125 passed in 28.73s`.
+- Focused bridge/recovery suites after final bounded-marker refinement:
+  `17 passed in 17.81s` (`8` recovery protocol tests plus `9` bridge tests).
+- Legacy Engine regressions: `26 passed, 10 subtests passed in 1.33s`.
+- Frontend real transport/store plus Task Runtime/Group suites:
+  `5 files / 45 tests passed in 12.66s`.
+- Targeted Python compilation, changed-file ESLint, strict compilation of
+  `src/transport/socket.ts`, and `git diff --check` passed. The broad repository
+  `npm run typecheck` continues to report its documented unrelated legacy fixture,
+  component and store errors; it reported no new error in `src/transport/socket.ts`.
