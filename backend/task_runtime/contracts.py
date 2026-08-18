@@ -90,6 +90,15 @@ _PUBLIC_VALUE_CLASSIFIERS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 _PUBLIC_CLASSIFICATION_LABELS = frozenset(label for label, _pattern in _PUBLIC_VALUE_CLASSIFIERS)
 
+_BUDGET_PUBLIC_FIELDS = frozenset({
+    "wall_clock_seconds", "model_turns", "tool_calls", "tokens", "cost_usd",
+})
+_APPROVAL_PUBLIC_FIELDS = frozenset({
+    "approval_id", "run_id", "group_id", "kind", "summary", "risk",
+    "requested_capabilities", "tool_name", "operation_scope", "purpose",
+    "expires_at", "status", "created_at", "resolved_at", "schema_version",
+})
+
 
 def classify_public_text(value: str) -> tuple[str, ...]:
     """Return content classifications without retaining or echoing the value."""
@@ -152,6 +161,116 @@ def assert_public_payload(event_type: str, value: Mapping[str, Any]) -> None:
             raise ValueError("invalid public data classification metadata")
 
 
+def normalize_legacy_public_payload(
+    event_type: str, value: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Project a previously accepted event onto today's public contract.
+
+    Task Runtime v1 originally allowed arbitrary public dictionaries.  Upgrade must
+    therefore *rebuild* the payload from the event-specific allowlist rather than
+    merely replacing secret values while retaining their field names.  The result is
+    deterministic and safe to run on every startup; durable event identity/ordering
+    columns are deliberately outside this function and remain untouched.
+    """
+    allowed = _PUBLIC_EVENT_FIELDS.get(str(event_type))
+    if allowed is None:
+        # No unsupported event type was emitted by the Task 3 service.  Keeping this
+        # as a hard error prevents silently changing an event's audit meaning.
+        raise ValueError(f"unsupported legacy public event type: {event_type}")
+    raw = dict(value or {})
+    labels: list[str] = []
+
+    def classify_dropped(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for child_key, child in item.items():
+                folded = str(child_key).casefold()
+                if folded in _PRIVATE_PUBLIC_KEYS:
+                    labels.append(
+                        "credential" if "token" in folded
+                        or folded in {"password", "authorization", "cookie", "api_key"}
+                        else "identity_pii"
+                    )
+                classify_dropped(child)
+        elif isinstance(item, (list, tuple)):
+            for child in item:
+                classify_dropped(child)
+        elif isinstance(item, str):
+            labels.extend(classify_public_text(item))
+
+    # Unknown fields are dropped, but their contents still inform opaque
+    # classification metadata for event types that support it.
+    classify_dropped(raw)
+
+    def protected(item: Any, *, fallback: str = "Protected status") -> Any:
+        if isinstance(item, Mapping):
+            result: dict[str, Any] = {}
+            for child_key, child in item.items():
+                name = str(child_key)
+                folded = name.casefold()
+                if folded in _PRIVATE_PUBLIC_KEYS:
+                    labels.append(
+                        "credential" if "token" in folded
+                        or folded in {"password", "authorization", "cookie", "api_key"}
+                        else "identity_pii"
+                    )
+                    continue
+                result[name] = protected(child, fallback=fallback)
+            return result
+        if isinstance(item, (list, tuple)):
+            return [protected(child, fallback=fallback) for child in item]
+        if isinstance(item, str):
+            found = classify_public_text(item)
+            if found:
+                return fallback
+        return item
+
+    projected: dict[str, Any] = {}
+    for key in sorted(allowed):
+        if key not in raw:
+            continue
+        item = raw[key]
+        if key in {"usage", "limits"}:
+            budget = dict(item) if isinstance(item, Mapping) else {}
+            projected[key] = {
+                name: budget[name] for name in sorted(_BUDGET_PUBLIC_FIELDS)
+                if name in budget and isinstance(budget[name], (int, float))
+                and not isinstance(budget[name], bool) and math.isfinite(float(budget[name]))
+            }
+        elif key == "approval":
+            approval = dict(item) if isinstance(item, Mapping) else {}
+            safe_approval = {
+                name: protected(approval[name], fallback="Protected approval request")
+                for name in sorted(_APPROVAL_PUBLIC_FIELDS) if name in approval
+                and name.casefold() not in _PRIVATE_PUBLIC_KEYS
+            }
+            scope = safe_approval.get("operation_scope")
+            if isinstance(scope, Mapping):
+                safe_approval["operation_scope"] = {
+                    str(name): protected(child, fallback="protected")
+                    for name, child in scope.items()
+                    if str(name).casefold() not in _PRIVATE_PUBLIC_KEYS
+                }
+            projected[key] = safe_approval
+        elif key == "classification":
+            # Recomputed below: old clients could have supplied arbitrary labels.
+            continue
+        else:
+            projected[key] = protected(item)
+
+    if event_type in {"run_queued", "message_routed"}:
+        existing = raw.get("classification")
+        if isinstance(existing, (list, tuple)):
+            labels.extend(
+                str(item) for item in existing
+                if str(item) in _PUBLIC_CLASSIFICATION_LABELS
+            )
+        projected["classification"] = list(dict.fromkeys(
+            label for label in labels if label in _PUBLIC_CLASSIFICATION_LABELS
+        ))
+    assert_public_payload(event_type, projected)
+    return projected
+
+
 class TaskStatus(str, Enum):
     QUEUED = "queued"
     ROUTING = "routing"
@@ -208,6 +327,7 @@ class FailureType(str, Enum):
     PERMISSION_DENIED = "permission_denied"
     BUDGET_EXHAUSTED = "budget_exhausted"
     VERIFICATION_FAILED = "verification_failed"
+    EXECUTOR_FAILURE = "executor_failure"
     IRREVERSIBLE_SIDE_EFFECT = "irreversible_side_effect"
 
     @property
@@ -601,5 +721,5 @@ __all__ = [
     "PermissionGrant", "QueueClass", "RiskLevel", "RouteLabel", "RunEvent",
     "RunKind", "TaskRun", "TaskStatus", "ToolInvocation", "assert_public_payload",
     "VerifierDecision", "assert_public_text", "classify_public_text", "safe_public_text",
-    "opaque_id", "utc_now",
+    "normalize_legacy_public_payload", "opaque_id", "utc_now",
 ]

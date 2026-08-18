@@ -242,8 +242,9 @@ async def test_group_deletion_recovers_after_every_durable_boundary(
             restarted.groups.get(group.group_id)  # type: ignore[union-attr]
         assert restarted.task_runtime.store.group_content_counts(group.group_id) == {  # type: ignore[union-attr]
             "runs": 0, "events": 0, "approvals": 0, "grants": 0,
-            "tools": 0, "checkpoints": 0, "verifier_decisions": 0,
-        }
+                "tools": 0, "checkpoints": 0, "verifier_decisions": 0,
+                "executor_continuations": 0,
+            }
         with pytest.raises(RuntimeNotFoundError):
             restarted.task_runtime.snapshot(group.group_id, run.run_id)  # type: ignore[union-attr]
     finally:

@@ -27,6 +27,7 @@ from .contracts import (
     ToolInvocation,
     VerifierDecision,
     classify_public_text,
+    normalize_legacy_public_payload,
     opaque_id,
     utc_now,
 )
@@ -156,6 +157,23 @@ class TaskRuntimeStore:
                 created_at TEXT NOT NULL,
                 UNIQUE(run_id, run_version)
             );
+            CREATE TABLE IF NOT EXISTS studycrew_executor_continuations (
+                continuation_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                approval_id TEXT,
+                execution_key TEXT NOT NULL,
+                route_request_key TEXT NOT NULL,
+                route_version INTEGER NOT NULL,
+                risk TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(run_id, execution_key),
+                UNIQUE(approval_id)
+            );
             CREATE TABLE IF NOT EXISTS studycrew_group_deletions (
                 group_id TEXT PRIMARY KEY,
                 group_transaction_id TEXT NOT NULL,
@@ -204,23 +222,7 @@ class TaskRuntimeStore:
         with self.db.transaction() as conn:
             for row in conn.execute("SELECT * FROM studycrew_run_events").fetchall():
                 raw = _loads(row["public_payload_json"])
-                labels: list[str] = []
-
-                def scrub(value: Any) -> Any:
-                    if isinstance(value, dict):
-                        return {str(key): scrub(item) for key, item in value.items()}
-                    if isinstance(value, list):
-                        return [scrub(item) for item in value]
-                    if isinstance(value, str):
-                        found = classify_public_text(value)
-                        if found:
-                            labels.extend(found)
-                            return "Protected status"
-                    return value
-
-                scrubbed = scrub(raw)
-                if labels and str(row["event_type"]) in {"run_queued", "message_routed"}:
-                    scrubbed["classification"] = list(dict.fromkeys(labels))
+                scrubbed = normalize_legacy_public_payload(str(row["event_type"]), raw)
                 conn.execute(
                     "UPDATE studycrew_run_events SET public_payload_json=? WHERE event_id=?",
                     (_dumps(scrubbed), str(row["event_id"])),
@@ -730,6 +732,185 @@ class TaskRuntimeStore:
              _dumps(decision.to_dict()), decision.created_at),
         )
 
+    @staticmethod
+    def insert_executor_continuation_in_transaction(
+        conn: Any, *, continuation_id: str, run: TaskRun, approval_id: str | None,
+        execution_key: str, route_request_key: str, risk: RiskLevel,
+        status: str, private_request: Mapping[str, Any],
+    ) -> None:
+        now = utc_now()
+        payload = {
+            "continuation_id": continuation_id, "run_id": run.run_id,
+            "task_id": run.task_id, "group_id": run.group_id,
+            "approval_id": approval_id, "execution_key": execution_key,
+            "route_request_key": route_request_key, "route_version": run.version,
+            "risk": risk.value, "status": status,
+            "private_request": dict(private_request), "created_at": now, "updated_at": now,
+        }
+        conn.execute(
+            """INSERT OR IGNORE INTO studycrew_executor_continuations(
+                   continuation_id, run_id, task_id, group_id, approval_id,
+                   execution_key, route_request_key, route_version, risk, status,
+                   payload_json, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (continuation_id, run.run_id, run.task_id, run.group_id, approval_id,
+             execution_key, route_request_key, run.version, risk.value, status,
+             _dumps(payload), now, now),
+        )
+
+    @staticmethod
+    def update_executor_continuation_in_transaction(
+        conn: Any, *, approval_id: str, status: str, run: TaskRun,
+    ) -> None:
+        row = conn.execute(
+            "SELECT payload_json FROM studycrew_executor_continuations WHERE approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        if row is None:
+            return
+        raw = _loads(row["payload_json"])
+        raw["status"] = status
+        raw["route_version"] = run.version
+        raw["updated_at"] = utc_now()
+        conn.execute(
+            """UPDATE studycrew_executor_continuations
+               SET status=?, route_version=?, payload_json=?, updated_at=?
+               WHERE approval_id=?""",
+            (status, run.version, _dumps(raw), raw["updated_at"], approval_id),
+        )
+
+    def executor_continuation(
+        self, *, continuation_id: str | None = None, approval_id: str | None = None,
+        run_id: str | None = None, execution_key: str | None = None,
+    ) -> dict[str, Any] | None:
+        clauses: list[str] = []
+        args: list[str] = []
+        for column, value in (
+            ("continuation_id", continuation_id), ("approval_id", approval_id),
+            ("run_id", run_id), ("execution_key", execution_key),
+        ):
+            if value:
+                clauses.append(f"{column}=?")
+                args.append(value)
+        if not clauses:
+            raise ValueError("continuation identity is required")
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM studycrew_executor_continuations WHERE "
+                + " AND ".join(clauses), tuple(args),
+            ).fetchone()
+        return None if row is None else _loads(row["payload_json"])
+
+    def claim_executor_continuation(self, continuation_id: str) -> tuple[dict[str, Any], bool]:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM studycrew_executor_continuations WHERE continuation_id=?",
+                (continuation_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeStoreError(f"executor continuation not found: {continuation_id}")
+            self._assert_group_mutable_in_transaction(conn, str(row["group_id"]))
+            claimed = str(row["status"]) == "ready"
+            raw = _loads(row["payload_json"])
+            if claimed:
+                now = utc_now()
+                raw["status"] = "claimed"
+                raw["updated_at"] = now
+                conn.execute(
+                    """UPDATE studycrew_executor_continuations
+                       SET status='claimed', payload_json=?, updated_at=?
+                       WHERE continuation_id=? AND status='ready'""",
+                    (_dumps(raw), now, continuation_id),
+                )
+                claimed = conn.execute("SELECT changes()").fetchone()[0] == 1
+            winner = conn.execute(
+                "SELECT payload_json FROM studycrew_executor_continuations WHERE continuation_id=?",
+                (continuation_id,),
+            ).fetchone()
+        if winner is None:
+            raise RuntimeStoreError(f"executor continuation not found: {continuation_id}")
+        return _loads(winner["payload_json"]), claimed
+
+    def finish_executor_continuation(
+        self, continuation_id: str, *, status: str, failure_type: str | None = None,
+    ) -> dict[str, Any]:
+        if status not in {"completed", "failed", "cancelled", "rejected", "recovered_blocked"}:
+            raise ValueError("invalid executor continuation terminal status")
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM studycrew_executor_continuations WHERE continuation_id=?",
+                (continuation_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeStoreError(f"executor continuation not found: {continuation_id}")
+            raw = _loads(row["payload_json"])
+            if str(row["status"]) in {"completed", "failed", "cancelled", "rejected", "recovered_blocked"}:
+                return raw
+            now = utc_now()
+            raw.update({"status": status, "failure_type": failure_type, "updated_at": now})
+            conn.execute(
+                """UPDATE studycrew_executor_continuations
+                   SET status=?, payload_json=?, updated_at=? WHERE continuation_id=?""",
+                (status, _dumps(raw), now, continuation_id),
+            )
+        return raw
+
+    def terminalize_executor_continuations(self, run_id: str, *, status: str) -> int:
+        if status not in {"cancelled", "rejected", "recovered_blocked"}:
+            raise ValueError("invalid executor continuation terminal status")
+        with self.db.transaction() as conn:
+            return self.terminalize_executor_continuations_in_transaction(
+                conn, run_id=run_id, status=status,
+            )
+
+    @staticmethod
+    def terminalize_executor_continuations_in_transaction(
+        conn: Any, *, run_id: str, status: str,
+    ) -> int:
+        changed = 0
+        rows = conn.execute(
+            """SELECT continuation_id, payload_json
+               FROM studycrew_executor_continuations
+               WHERE run_id=? AND status IN ('waiting_approval','ready','claimed')""",
+            (run_id,),
+        ).fetchall()
+        for row in rows:
+            raw = _loads(row["payload_json"])
+            raw["status"] = status
+            raw["updated_at"] = utc_now()
+            conn.execute(
+                """UPDATE studycrew_executor_continuations
+                   SET status=?, payload_json=?, updated_at=? WHERE continuation_id=?""",
+                (status, _dumps(raw), raw["updated_at"], str(row["continuation_id"])),
+            )
+            changed += 1
+        return changed
+
+    def reconcile_executor_continuations(self) -> dict[str, list[str]]:
+        """Never replay a request that may have crossed the executor boundary."""
+        report: dict[str, list[str]] = {"ready": [], "recovered_blocked": []}
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """SELECT * FROM studycrew_executor_continuations
+                   WHERE status IN ('ready','claimed') ORDER BY created_at"""
+            ).fetchall()
+            for row in rows:
+                raw = _loads(row["payload_json"])
+                continuation_id = str(row["continuation_id"])
+                if str(row["status"]) == "claimed" or str(row["risk"]) == RiskLevel.HIGH.value:
+                    raw["status"] = "recovered_blocked"
+                    raw["updated_at"] = utc_now()
+                    conn.execute(
+                        """UPDATE studycrew_executor_continuations
+                           SET status='recovered_blocked', payload_json=?, updated_at=?
+                           WHERE continuation_id=?""",
+                        (_dumps(raw), raw["updated_at"], continuation_id),
+                    )
+                    report["recovered_blocked"].append(continuation_id)
+                else:
+                    report["ready"].append(continuation_id)
+        return report
+
     def latest_verifier_decision(self, run_id: str) -> VerifierDecision | None:
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
@@ -966,11 +1147,14 @@ class TaskRuntimeStore:
                 "verifier_decisions": int(conn.execute(
                     "SELECT COUNT(*) FROM studycrew_verifier_decisions WHERE group_id=?", (group_id,),
                 ).fetchone()[0]),
+                "executor_continuations": int(conn.execute(
+                    "SELECT COUNT(*) FROM studycrew_executor_continuations WHERE group_id=?", (group_id,),
+                ).fetchone()[0]),
             }
             for table in (
                 "studycrew_checkpoints", "studycrew_tool_invocations",
                 "studycrew_permission_grants", "studycrew_approvals",
-                "studycrew_verifier_decisions",
+                "studycrew_verifier_decisions", "studycrew_executor_continuations",
                 "studycrew_run_events", "studycrew_task_runs",
             ):
                 conn.execute(f"DELETE FROM {table} WHERE group_id=?", (group_id,))
@@ -982,6 +1166,7 @@ class TaskRuntimeStore:
             "approvals": "studycrew_approvals", "grants": "studycrew_permission_grants",
             "tools": "studycrew_tool_invocations", "checkpoints": "studycrew_checkpoints",
             "verifier_decisions": "studycrew_verifier_decisions",
+            "executor_continuations": "studycrew_executor_continuations",
         }
         with self.db.transaction(immediate=False) as conn:
             return {

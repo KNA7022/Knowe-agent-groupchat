@@ -17,7 +17,7 @@ export const RouteLabelSchema = z.enum(['supplement_current', 'side_answer', 'qu
 export const RiskLevelSchema = z.enum(['low', 'medium', 'high']);
 export const FailureTypeSchema = z.enum([
   'parameter_error', 'transient_provider_failure', 'permission_denied',
-  'budget_exhausted', 'verification_failed', 'irreversible_side_effect',
+  'budget_exhausted', 'verification_failed', 'executor_failure', 'irreversible_side_effect',
 ]);
 const PublicClassificationSchema = z.enum([
   'credential', 'contact_pii', 'identity_pii', 'student_identifier',

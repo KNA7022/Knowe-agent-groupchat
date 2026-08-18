@@ -73,6 +73,7 @@ from .task_runtime.contracts import (
     BudgetLimits as ControlBudgetLimits,
     BudgetUsage as ControlBudgetUsage,
     EvidenceRef,
+    FailureType as ControlFailureType,
     QueueClass,
     RiskLevel,
     RouteLabel,
@@ -487,6 +488,7 @@ class KnoweServer:
         self._restart_tasks: dict[str, asyncio.Task[None]] = {}
         self._purge_tasks: set[asyncio.Task[Any]] = set()
         self._task_runtime_bridge_tasks: set[asyncio.Task[Any]] = set()
+        self._task_runtime_bridges_by_run: dict[str, set[asyncio.Task[Any]]] = {}
         self._shutdown_event = asyncio.Event()
         self._last_pinned_at = 0
 
@@ -1065,27 +1067,58 @@ class KnoweServer:
     def _track_task_runtime_bridge(self, coroutine: Any, *, run_id: str) -> None:
         task = asyncio.create_task(coroutine, name=f"task-runtime-bridge:{run_id}")
         self._task_runtime_bridge_tasks.add(task)
+        self._task_runtime_bridges_by_run.setdefault(run_id, set()).add(task)
 
         def settled(done: asyncio.Task[Any]) -> None:
             self._task_runtime_bridge_tasks.discard(done)
+            owned = self._task_runtime_bridges_by_run.get(run_id)
+            if owned is not None:
+                owned.discard(done)
+                if not owned:
+                    self._task_runtime_bridges_by_run.pop(run_id, None)
             if not done.cancelled():
                 with contextlib.suppress(Exception):
                     done.result()
 
         task.add_done_callback(settled)
 
+    def _cancel_task_runtime_bridges(self, run_id: str) -> None:
+        for task in tuple(self._task_runtime_bridges_by_run.get(run_id) or ()):
+            if not task.done():
+                task.cancel()
+
     async def _bridge_task_runtime_execution(
         self, *, group_id: str, run_id: str, project_id: str,
-        execution_key: str, completion: Any,
+        execution_key: str, completion: Any, continuation_id: str | None = None,
     ) -> None:
         try:
             result = await completion if isinstance(completion, asyncio.Future) else completion
             result_map = result if isinstance(result, dict) else {}
-            raw_outcome = str(result_map.get("outcome") or "succeeded")
+            raw_outcome = str(result_map.get("outcome") or "succeeded").casefold()
             outcome = {
                 "succeeded": ControlTaskStatus.SUCCEEDED,
                 "partial": ControlTaskStatus.PARTIAL,
+                "cancelled": ControlTaskStatus.CANCELLED,
             }.get(raw_outcome, ControlTaskStatus.FAILED)
+            raw_error = str(result_map.get("error_type") or "")
+            folded_error = raw_error.casefold()
+            if any(word in folded_error for word in ("cancel", "abort")):
+                outcome = ControlTaskStatus.CANCELLED
+            failure_type: ControlFailureType | None = None
+            if outcome is ControlTaskStatus.FAILED:
+                if any(word in folded_error for word in ("parameter", "valueerror", "typeerror", "invalid_argument")):
+                    failure_type = ControlFailureType.PARAMETER_ERROR
+                elif any(word in folded_error for word in ("permission", "forbidden", "unauthorized", "auth")):
+                    failure_type = ControlFailureType.PERMISSION_DENIED
+                elif any(word in folded_error for word in ("budget", "quota", "token_limit")):
+                    failure_type = ControlFailureType.BUDGET_EXHAUSTED
+                elif any(word in folded_error for word in (
+                    "provider", "timeout", "ratelimit", "rate_limit", "connection",
+                    "missing_model", "model_unavailable",
+                )):
+                    failure_type = ControlFailureType.TRANSIENT_PROVIDER_FAILURE
+                else:
+                    failure_type = ControlFailureType.EXECUTOR_FAILURE
             digest = hashlib.sha256(
                 f"{group_id}\0{run_id}\0{execution_key}".encode("utf-8")
             ).hexdigest()
@@ -1101,27 +1134,191 @@ class KnoweServer:
                 self.task_runtime.finalize_trusted_execution(
                     group_id, run_id, execution_key=execution_key,
                     outcome=outcome, evidence=evidence,
-                    summary="Task completed" if outcome is not ControlTaskStatus.FAILED else "Task failed",
+                    summary=("Task cancelled" if outcome is ControlTaskStatus.CANCELLED
+                             else "Task completed" if outcome is not ControlTaskStatus.FAILED
+                             else "Task failed"),
+                    failure_type=failure_type,
                 )
+                if continuation_id:
+                    terminal_status = {
+                        ControlTaskStatus.SUCCEEDED: "completed",
+                        ControlTaskStatus.PARTIAL: "completed",
+                        ControlTaskStatus.CANCELLED: "cancelled",
+                    }.get(outcome, "failed")
+                    self.task_runtime.finish_executor_continuation(
+                        continuation_id, status=terminal_status, failure_type=failure_type,
+                    )
         except (RuntimeConflictError, RuntimeNotFoundError):
             # Deletion/cancellation fences always win over a late legacy callback.
             return
         except Exception:  # noqa: BLE001 -- reflect bridge failures without orphaning the loop
             log.exception("Task Runtime execution bridge failed for %s", run_id)
+            if continuation_id and self.task_runtime is not None:
+                with contextlib.suppress(Exception):
+                    self.task_runtime.finish_executor_continuation(
+                        continuation_id, status="failed",
+                        failure_type=ControlFailureType.EXECUTOR_FAILURE,
+                    )
 
     def _finish_routed_runtime_immediately(
         self, *, group_id: str | None, run_id: str | None,
         project_id: str, execution_key: str | None, outcome: str,
+        continuation_id: str | None = None, error_type: str = "",
     ) -> None:
         if not group_id or not run_id or not execution_key:
             return
         self._track_task_runtime_bridge(
             self._bridge_task_runtime_execution(
                 group_id=group_id, run_id=run_id, project_id=project_id,
-                execution_key=execution_key, completion={"outcome": outcome},
+                execution_key=execution_key,
+                completion={"outcome": outcome, "error_type": error_type},
+                continuation_id=continuation_id,
             ),
             run_id=run_id,
         )
+
+    async def _execute_executor_continuation(self, continuation: dict[str, Any]) -> None:
+        """Execute one already-claimed private request and bind its terminal callback."""
+        if self.task_runtime is None:
+            return
+        continuation_id = str(continuation.get("continuation_id") or "")
+        group_id = str(continuation.get("group_id") or "")
+        run_id = str(continuation.get("run_id") or "")
+        execution_key = str(continuation.get("execution_key") or "")
+        private = continuation.get("private_request")
+        if not isinstance(private, dict):
+            await self._bridge_task_runtime_execution(
+                group_id=group_id, run_id=run_id, project_id="",
+                execution_key=execution_key,
+                completion={"outcome": "failed", "error_type": "executor_precondition_failed"},
+                continuation_id=continuation_id,
+            )
+            return
+        project_id = str(private.get("project_id") or "")
+        content = str(private.get("content") or "")
+        if not project_id or not content:
+            await self._bridge_task_runtime_execution(
+                group_id=group_id, run_id=run_id, project_id=project_id,
+                execution_key=execution_key,
+                completion={"outcome": "failed", "error_type": "executor_precondition_failed"},
+                continuation_id=continuation_id,
+            )
+            return
+        try:
+            canonical_project = self._runtime_project_id_for_group(group_id)
+            if canonical_project != project_id:
+                raise RuntimeConflictError("executor continuation project binding mismatch")
+            if not self._project_dir_is_valid(project_id):
+                await self._respond_directory_required(project_id)
+                raise WorkspaceUnavailable("project directory is unavailable")
+            eng = self.engine_for(project_id)
+            raw_attachments = private.get("attachments")
+            attachment_records = (
+                [dict(item) for item in raw_attachments if isinstance(item, dict)]
+                if isinstance(raw_attachments, list) else []
+            )
+            ok, attachment_parts = await self._prepare_attachments(
+                project_id, COORDINATOR, attachment_records,
+            )
+            if not ok:
+                raise ValueError("attachment_precondition_failed")
+            forwarded = private.get("forwarded")
+            llm_content = content
+            if isinstance(forwarded, dict):
+                llm_content = build_forward_template(
+                    username=runtime_settings.user_name(default="用户"),
+                    project_name=forwarded.get("sourceProjectName"),
+                    source_name=forwarded.get("sourceName") or "",
+                    original=forwarded.get("originalText") or "",
+                    comment=content,
+                )
+            mentions = eng.resolve_group_mentions(content)
+            if mentions.worker_ids:
+                calls = [
+                    eng.submit_dm(
+                        agent_id, eng.rewrap_group_mention(llm_content, agent_id),
+                        project_id, group_mention=True, attachments=attachment_parts,
+                    )
+                    for agent_id in mentions.worker_ids
+                ]
+                results = await asyncio.gather(*calls, return_exceptions=True)
+                failure = next((item for item in results if isinstance(item, Exception)), None)
+                completion: dict[str, Any] = (
+                    {"outcome": "failed", "error_type": type(failure).__name__}
+                    if failure is not None else {"outcome": "succeeded"}
+                )
+            elif hasattr(eng, "submit_tracked"):
+                completion = await eng.submit_tracked(llm_content, attachments=attachment_parts)
+            else:
+                await eng.submit(llm_content, attachments=attachment_parts)
+                completion = {"outcome": "succeeded"}
+            await self._bridge_task_runtime_execution(
+                group_id=group_id, run_id=run_id, project_id=project_id,
+                execution_key=execution_key, completion=completion,
+                continuation_id=continuation_id,
+            )
+        except asyncio.CancelledError:
+            await self._bridge_task_runtime_execution(
+                group_id=group_id, run_id=run_id, project_id=project_id,
+                execution_key=execution_key,
+                completion={"outcome": "cancelled", "error_type": "engine_cancelled"},
+                continuation_id=continuation_id,
+            )
+            raise
+        except (RuntimeConflictError, RuntimeNotFoundError):
+            return
+        except Exception as exc:  # noqa: BLE001 -- terminal provenance is persisted below
+            await self._bridge_task_runtime_execution(
+                group_id=group_id, run_id=run_id, project_id=project_id,
+                execution_key=execution_key,
+                completion={"outcome": "failed", "error_type": type(exc).__name__},
+                continuation_id=continuation_id,
+            )
+
+    def _start_approved_executor_continuation(
+        self, *, group_id: str, approval_id: str,
+    ) -> None:
+        if self.task_runtime is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # A synchronous maintenance caller may resolve policy state, but cannot
+            # cross the executor boundary.  Leave the durable request ``ready`` for
+            # the normal async server/startup reconciliation path.
+            return
+        continuation, claimed = self.task_runtime.claim_approved_executor_continuation(
+            group_id, approval_id,
+        )
+        if continuation is None or not claimed:
+            return
+        self._track_task_runtime_bridge(
+            self._execute_executor_continuation(continuation),
+            run_id=str(continuation.get("run_id") or ""),
+        )
+
+    def _resume_safe_executor_continuations_after_startup(self) -> None:
+        """Resume only never-claimed, non-high-risk requests after Engines are awake."""
+        if self.task_runtime is None:
+            return
+        recovery = self.task_runtime.recovery_report.get("executor_continuations") or {}
+        for continuation_id in tuple(recovery.get("ready") or ()):
+            continuation = self.task_runtime.store.executor_continuation(
+                continuation_id=str(continuation_id),
+            )
+            if continuation is None:
+                continue
+            claimed_continuation, claimed = self.task_runtime.claim_executor_continuation(
+                str(continuation.get("group_id") or ""),
+                str(continuation.get("run_id") or ""),
+                execution_key=str(continuation.get("execution_key") or ""),
+            )
+            if not claimed or claimed_continuation is None:
+                continue
+            self._track_task_runtime_bridge(
+                self._execute_executor_continuation(claimed_continuation),
+                run_id=str(claimed_continuation.get("run_id") or ""),
+            )
 
     def _canonical_group_from_payload(
         self, payload: dict[str, Any], *, require_runtime: bool = True,
@@ -2975,6 +3172,7 @@ class KnoweServer:
         group_id = self._group_id_for_runtime_project(project_id)
         runtime_run_id: str | None = None
         runtime_execution_key: str | None = None
+        runtime_continuation_id: str | None = None
         if self.task_runtime is not None and group_id is not None:
             route_confidence = data.get("route_confidence", 1.0)
             if isinstance(route_confidence, bool) or not isinstance(route_confidence, (int, float)):
@@ -2983,24 +3181,38 @@ class KnoweServer:
                 r"(?:删除|覆盖|导出|发送|提交|写入|修改|delete|overwrite|export|send|submit|write)",
                 content, flags=re.IGNORECASE,
             ))
+            runtime_message_key = cmid if isinstance(cmid, str) else str(now_ts())
+            runtime_execution_key = f"chat:{project_id}:{runtime_message_key}"
             route_result = self.task_runtime.route_message(
                 group_id, content=content,
-                request_key=f"chat-route:{project_id}:{cmid if isinstance(cmid, str) else now_ts()}",
+                request_key=f"chat-route:{project_id}:{runtime_message_key}",
                 confidence=float(route_confidence),
                 read_only=bool(data.get("read_only", not write_hint)),
                 writes=write_hint,
                 sensitive_outbound=bool(data.get("sensitive_outbound")),
                 explicit_new_task=bool(data.get("explicit_new_task")),
+                executor_private_request={
+                    "project_id": project_id, "content": content,
+                    "client_msg_id": cmid if isinstance(cmid, str) else None,
+                    "attachments": att_records, "forwarded": fwd,
+                },
+                executor_execution_key=runtime_execution_key,
             )
             run_payload = route_result.get("run")
             if isinstance(run_payload, dict) and isinstance(run_payload.get("run_id"), str):
                 runtime_run_id = str(run_payload["run_id"])
-                runtime_execution_key = f"chat:{project_id}:{cmid if isinstance(cmid, str) else runtime_run_id}"
             # Ambiguous, write-capable, or sensitive requests stop at the durable
             # approval gate.  The public RunEvent is already broadcast by the same
             # listener used for HTTP mutations and is replayable after reconnect.
             if not route_result["auto_routed"]:
                 return
+            if runtime_run_id and runtime_execution_key:
+                continuation, claimed = self.task_runtime.claim_executor_continuation(
+                    group_id, runtime_run_id, execution_key=runtime_execution_key,
+                )
+                if continuation is None or not claimed:
+                    return
+                runtime_continuation_id = str(continuation.get("continuation_id") or "")
 
         # [v0.13 3b] 目录每次发言都复核。失效时 Harness 接管回复，绝不触发 LLM。
         if not self._project_dir_is_valid(project_id):
@@ -3008,6 +3220,8 @@ class KnoweServer:
             self._finish_routed_runtime_immediately(
                 group_id=group_id, run_id=runtime_run_id, project_id=project_id,
                 execution_key=runtime_execution_key, outcome="failed",
+                continuation_id=runtime_continuation_id,
+                error_type="executor_precondition_failed",
             )
             return
 
@@ -3018,6 +3232,8 @@ class KnoweServer:
             self._finish_routed_runtime_immediately(
                 group_id=group_id, run_id=runtime_run_id, project_id=project_id,
                 execution_key=runtime_execution_key, outcome="failed",
+                continuation_id=runtime_continuation_id,
+                error_type="executor_precondition_failed",
             )
             return
 
@@ -3033,6 +3249,8 @@ class KnoweServer:
             self._finish_routed_runtime_immediately(
                 group_id=group_id, run_id=runtime_run_id, project_id=project_id,
                 execution_key=runtime_execution_key, outcome="failed",
+                continuation_id=runtime_continuation_id,
+                error_type="attachment_precondition_failed",
             )
             return
 
@@ -3081,6 +3299,7 @@ class KnoweServer:
                         group_id=group_id, run_id=runtime_run_id, project_id=project_id,
                         execution_key=runtime_execution_key,
                         completion={"outcome": outcome},
+                        continuation_id=runtime_continuation_id,
                     ),
                     run_id=runtime_run_id,
                 )
@@ -3092,6 +3311,7 @@ class KnoweServer:
                     self._bridge_task_runtime_execution(
                         group_id=group_id, run_id=runtime_run_id, project_id=project_id,
                         execution_key=runtime_execution_key, completion=completion,
+                        continuation_id=runtime_continuation_id,
                     ),
                     run_id=runtime_run_id,
                 )
@@ -3100,11 +3320,14 @@ class KnoweServer:
                 self._finish_routed_runtime_immediately(
                     group_id=group_id, run_id=runtime_run_id, project_id=project_id,
                     execution_key=runtime_execution_key, outcome="succeeded",
+                    continuation_id=runtime_continuation_id,
                 )
         except Exception:
             self._finish_routed_runtime_immediately(
                 group_id=group_id, run_id=runtime_run_id, project_id=project_id,
                 execution_key=runtime_execution_key, outcome="failed",
+                continuation_id=runtime_continuation_id,
+                error_type="executor_exception",
             )
             raise
 
@@ -6201,6 +6424,8 @@ class KnoweServer:
             if command not in commands:
                 raise ValueError("command must be pause, cancel, or resume")
             result = {"run": commands[command](group_id, run_id, request_key=request_key).to_public_dict()}
+            if command == "cancel":
+                self._cancel_task_runtime_bridges(run_id)
         elif action == "snapshot":
             run_id = payload.get("run_id")
             result = (
@@ -6235,6 +6460,10 @@ class KnoweServer:
             )
             result = {"approval": approval.to_dict(), "grant": grant.to_dict() if grant else None,
                       "run": run.to_public_dict()}
+            if approval.status == "approved":
+                self._start_approved_executor_continuation(
+                    group_id=group_id, approval_id=approval.approval_id,
+                )
         elif action == "agent":
             if not isinstance(request_key, str) or not request_key:
                 raise ValueError("request_key is required")
@@ -7291,6 +7520,7 @@ class KnoweServer:
 
         await self.welcome_if_needed()
         await self.wake_projects()
+        self._resume_safe_executor_continuations_after_startup()
         await self._reconcile_task_runtime_group_deletions()
         await self._update_harness_now()
         self._harness_task = asyncio.create_task(self._harness_memory_loop())

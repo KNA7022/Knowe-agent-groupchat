@@ -932,6 +932,12 @@ _TURN_ATTACHMENTS_VAR: contextvars.ContextVar["list[dict[str, Any]] | None"] = c
 _ACTIVITY_SCOPE_VAR: contextvars.ContextVar["dict[str, str] | None"] = contextvars.ContextVar(
     "knowe_activity_scope", default=None,
 )
+# A submit_tracked turn owns every Worker it delegates and every Coordinator
+# aggregation notification those Workers produce.  The explicit scope id prevents a
+# concurrent user turn from borrowing or prematurely completing another TaskRun.
+_GOVERNED_TASK_SCOPE_VAR: contextvars.ContextVar["str | None"] = contextvars.ContextVar(
+    "studycrew_governed_task_scope", default=None,
+)
 
 _CORRELATED_EVENT_TYPES: frozenset[str] = frozenset({
     "agent_active", "agent_idle", "agent_thinking", "tool_gen", "tool_start",
@@ -1624,6 +1630,7 @@ class ProjectEngine:
         # Worker scheduling reads directly from ``_task_envelopes``.
         self._worker_turns: dict[str, asyncio.Task[None]] = {}
         self._worker_runtime_runs: dict[str, TaskRun] = {}
+        self._governed_task_scopes: dict[str, dict[str, Any]] = {}
         # Runtime completion → Project Memory is an Engine boundary side effect.  Keep
         # one in-process idempotency ledger so retries/replayed DeliveryRecords do not
         # increment Project Memory twice for the same authoritative outcome.
@@ -2361,6 +2368,14 @@ class ProjectEngine:
                 await task
             except BaseException:      # 停机不挑食
                 pass
+        for scope_id, state in tuple(self._governed_task_scopes.items()):
+            future = state.get("future")
+            if isinstance(future, asyncio.Future) and not future.done():
+                future.set_result({
+                    "outcome": "cancelled", "error_type": "engine_stopped",
+                    "project_id": self.project_id,
+                })
+            self._governed_task_scopes.pop(scope_id, None)
 
         # [v0.20 Batch 4] ★ Worker 的浏览器会话和后台进程也得跟着收摊。
         #
@@ -2499,6 +2514,7 @@ class ProjectEngine:
         attachments: list[dict[str, Any]] | None = None,
         *,
         _completion_future: asyncio.Future[dict[str, Any]] | None = None,
+        _governed_scope_id: str | None = None,
     ) -> None:
         if getattr(self, "_stopping", False) or getattr(self, "_stopped", False):
             raise RuntimeError(msg("engine.095"))
@@ -2523,6 +2539,8 @@ class ProjectEngine:
         }
         if _completion_future is not None:
             envelope["_turn_completion_future"] = _completion_future
+        if _governed_scope_id:
+            envelope["_governed_scope_id"] = _governed_scope_id
         await self.inbox.put(envelope)
 
     async def submit_tracked(
@@ -2530,8 +2548,63 @@ class ProjectEngine:
     ) -> asyncio.Future[dict[str, Any]]:
         """Queue a normal turn and return its trusted Engine lifecycle future."""
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        await self.submit(content, attachments=attachments, _completion_future=future)
+        scope_id = "governed_" + uuid.uuid4().hex
+        self._governed_task_scopes[scope_id] = {
+            "future": future, "pending_turns": 1, "worker_tasks": set(),
+            "outcome": "succeeded", "error_type": "",
+        }
+        await self.submit(
+            content, attachments=attachments, _governed_scope_id=scope_id,
+        )
+
+        def cancelled(done: asyncio.Future[dict[str, Any]]) -> None:
+            if not done.cancelled():
+                return
+            state = self._governed_task_scopes.get(scope_id)
+            for task in tuple((state or {}).get("worker_tasks") or ()):
+                if not task.done():
+                    task.cancel()
+
+        future.add_done_callback(cancelled)
         return future
+
+    @staticmethod
+    def _governed_outcome_rank(outcome: str) -> int:
+        return {"succeeded": 0, "partial": 1, "failed": 2, "cancelled": 3}.get(outcome, 2)
+
+    def _governed_scope_add_turn(self, scope_id: str) -> None:
+        state = self._governed_task_scopes.get(scope_id)
+        if state is not None:
+            state["pending_turns"] = int(state.get("pending_turns") or 0) + 1
+
+    def _governed_scope_settle_turn(
+        self, scope_id: str, *, outcome: str, error_type: str,
+    ) -> None:
+        state = self._governed_task_scopes.get(scope_id)
+        if state is None:
+            return
+        state["pending_turns"] = max(0, int(state.get("pending_turns") or 0) - 1)
+        if self._governed_outcome_rank(outcome) > self._governed_outcome_rank(str(state["outcome"])):
+            state["outcome"] = outcome
+            state["error_type"] = error_type
+        self._maybe_finish_governed_scope(scope_id)
+
+    def _maybe_finish_governed_scope(self, scope_id: str) -> None:
+        state = self._governed_task_scopes.get(scope_id)
+        if state is None or int(state.get("pending_turns") or 0) != 0:
+            return
+        workers = {task for task in state.get("worker_tasks") or set() if not task.done()}
+        state["worker_tasks"] = workers
+        if workers:
+            return
+        future = state.get("future")
+        if isinstance(future, asyncio.Future) and not future.done():
+            future.set_result({
+                "outcome": str(state.get("outcome") or "failed"),
+                "error_type": str(state.get("error_type") or ""),
+                "project_id": self.project_id,
+            })
+        self._governed_task_scopes.pop(scope_id, None)
 
     def dispatch_frozen(self) -> bool:
         """
@@ -3566,6 +3639,10 @@ class ProjectEngine:
             )
             item["_completion_notification_id"] = notification_id
             item["_idempotency_key"] = idempotency_key or f"completion-notification:{notification_id}"
+        governed_scope_id = _GOVERNED_TASK_SCOPE_VAR.get()
+        if governed_scope_id and governed_scope_id in self._governed_task_scopes:
+            item["_governed_scope_id"] = governed_scope_id
+            self._governed_scope_add_turn(governed_scope_id)
         await self.inbox.put(item)
 
     # ═══════════════════════════════════════════════════════════
@@ -4781,6 +4858,10 @@ class ProjectEngine:
                 turn_completion = None
             if not isinstance(turn_attachments, list) or not turn_attachments:
                 turn_attachments = None
+            governed_scope_id = str(envelope.get("_governed_scope_id") or "").strip()
+            governed_scope_token: contextvars.Token[str | None] | None = None
+            if governed_scope_id:
+                governed_scope_token = _GOVERNED_TASK_SCOPE_VAR.set(governed_scope_id)
             notification_token: contextvars.Token[str | None] | None = None
             structured_token: contextvars.Token[dict[str, Any] | None] | None = None
             idempotency_token: contextvars.Token[str | None] | None = None
@@ -4926,6 +5007,12 @@ class ProjectEngine:
                         "error_type": turn_error,
                         "project_id": self.project_id,
                     })
+                if governed_scope_id:
+                    self._governed_scope_settle_turn(
+                        governed_scope_id, outcome=turn_outcome, error_type=turn_error,
+                    )
+                if governed_scope_token is not None:
+                    _GOVERNED_TASK_SCOPE_VAR.reset(governed_scope_token)
 
     # ═══════════════════════════════════════════════════════════
     # Harness：一个回合 + 链式调度
@@ -5064,14 +5151,23 @@ class ProjectEngine:
         envelope = envelope or self._task_envelopes.get(agent_id)
         if envelope is None:
             return
+        governed_scope_id = _GOVERNED_TASK_SCOPE_VAR.get()
         async def run() -> None:
             try:
                 await self._process_turn(envelope.goal, agent_id, internal=True)
             except ApprovalCancelled:
+                if governed_scope_id and governed_scope_id in self._governed_task_scopes:
+                    self._governed_task_scopes[governed_scope_id].update({
+                        "outcome": "cancelled", "error_type": "worker_approval_cancelled",
+                    })
                 log.info("[%s] %s 的 Runtime 回合被审批取消", self.project_id, agent_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
+                if governed_scope_id and governed_scope_id in self._governed_task_scopes:
+                    self._governed_task_scopes[governed_scope_id].update({
+                        "outcome": "failed", "error_type": "worker_runtime_exception",
+                    })
                 log.exception("[%s] %s 的 Runtime 回合异常", self.project_id, agent_id)
                 # [v1.0.21.1 REQ-3] 回合异常=终局：落盘失败+关信封，杜绝异常静默死循环
                 try:
@@ -5091,15 +5187,35 @@ class ProjectEngine:
             self._turns_active -= 1
             raise
         self._worker_turns[agent_id] = task
-        task.add_done_callback(lambda done, aid=agent_id: self._worker_turn_finished(aid, done))
+        if governed_scope_id:
+            state = self._governed_task_scopes.get(governed_scope_id)
+            if state is not None:
+                state.setdefault("worker_tasks", set()).add(task)
+        task.add_done_callback(
+            lambda done, aid=agent_id, scope_id=governed_scope_id:
+            self._worker_turn_finished(aid, done, governed_scope_id=scope_id)
+        )
 
-    def _worker_turn_finished(self, agent_id: str, task: asyncio.Task[None]) -> None:
+    def _worker_turn_finished(
+        self, agent_id: str, task: asyncio.Task[None], *, governed_scope_id: str | None = None,
+    ) -> None:
         if self._worker_turns.get(agent_id) is task:
             self._worker_turns.pop(agent_id, None)
         try:
             task.exception()
         except (asyncio.CancelledError, asyncio.InvalidStateError):
             pass
+        if governed_scope_id:
+            state = self._governed_task_scopes.get(governed_scope_id)
+            if state is not None:
+                state.setdefault("worker_tasks", set()).discard(task)
+                if task.cancelled():
+                    state["outcome"] = "cancelled"
+                    state["error_type"] = "worker_cancelled"
+                elif task.exception() is not None:
+                    state["outcome"] = "failed"
+                    state["error_type"] = type(task.exception()).__name__
+                self._maybe_finish_governed_scope(governed_scope_id)
         if not self._stopping:
             self._flush_pending_dm(agent_id)
             self._spawn_pending_workers()

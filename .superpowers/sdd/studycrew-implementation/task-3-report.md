@@ -246,3 +246,122 @@ The round-2 backend probes include deterministic late-submit/side-record/dispatc
 - `backend/tests/test_worker_completion_v1.py` remains green. In the adjacent `test_engine_display_name.py` run, three existing locale expectations still fail because production returns `Leader` while the tests expect `Coordinator`; this is unrelated to the tracked-turn bridge and was not changed.
 - The previous report's statement that legacy execution had no terminal bridge is superseded by this round. The Engine is now connected at its real turn-completion boundary, while deeper per-step Agent/Tool execution projection remains a later Harness integration.
 - Task 4 visual status bar/event drawer and Task 5 full Tool Gateway/DLP/MCP internals remain intentionally outside this patch.
+
+## Independent re-review fix round 3/5
+
+The second re-review left exactly two Important findings: unsafe legacy public-event
+upgrade and an incomplete governed production lifecycle. This round fixes both without
+changing the Task 4 UI or implementing the Task 5 Tool Gateway.
+
+### N1 — allowlisted legacy RunEvent migration
+
+- The v1 migration no longer recursively redacts an arbitrary public dictionary while
+  retaining its keys. It now rebuilds every reachable event type from the current
+  event-specific allowlist, drops forbidden and unknown outer keys, filters nested
+  budget and approval shapes, rejects non-finite legacy budget values, and replaces
+  sensitive allowed values with opaque status text.
+- Dropped credential/PII fields contribute only fixed classification labels for the
+  event types that support classification. Neither the field name nor its value is
+  retained in public JSON.
+- Event identity, run/group binding, sequence, version, timestamp, sensitivity,
+  idempotency key, and audit ordering are untouched. Migration remains one SQLite
+  transaction and is deterministic/idempotent on consecutive opens.
+- The exact prior-v1 `run_queued` payload containing
+  `access_token: legacy-secret`, an unknown `extra` object, and
+  `Authorization: Bearer sk-secret` now hydrates/replays after the first and second
+  open. The public SQLite JSON contains none of those keys/values and the normalized
+  row metadata/bytes are stable on the second open. Parameterized probes cover all 12
+  reachable public event types and malformed extra keys.
+
+### N2A/D — durable private approval continuation
+
+- Group-chat routing can atomically persist a private executor continuation beside the
+  route approval before returning `waiting_approval`. It is bound to group, task, run,
+  approval, route request/idempotency key, route version, risk, execution key, and the
+  exact private request envelope (message, attachments, and forwarding metadata).
+- Approval resolution and continuation readiness/rejection commit in the same run CAS
+  transaction. The server claims `ready -> claimed` with a SQLite compare-and-swap
+  before invoking the Engine. Duplicate/replayed resolutions observe the durable
+  winner and cannot invoke the Engine twice.
+- Cancellation terminalizes continuations in the same transaction as the cancelled
+  TaskRun. Rejection/expiry terminalize with approval resolution. Group deletion now
+  counts and deletes continuations before completion, so private request content is
+  unreadable after deletion.
+- Restart reconciliation never replays a claimed request. High-risk ready work
+  (including sensitive outbound and write-capable routes) becomes
+  `recovered_blocked` and its queued run is paused for explicit approval. Only a
+  never-claimed, non-high-risk ready request can be resumed after the project Engine is
+  awake.
+- A real `_cmd_user_message` regression proves: ambiguous message -> waiting with zero
+  Engine calls; approval -> exactly one call containing the original private text;
+  governed Verifier completion -> terminal; duplicate approval -> still one call. The
+  original text is absent from public RunEvents/snapshots.
+
+### N2B — whole-task ProjectEngine completion scope
+
+- `submit_tracked()` now creates a unique governed scope rather than resolving a
+  per-inbox-turn future directly. Coordinator turns, every Worker task spawned from the
+  governed context, and Worker-produced Coordinator aggregation notifications retain
+  that scope explicitly.
+- The trusted Future resolves only when the scope has no pending Coordinator turns and
+  no attached Worker task. A concurrent turn cannot attach to or complete another
+  scope. Coordinator aggregation can delegate further scoped Workers without
+  cross-turn contamination.
+- Future cancellation propagates to all scoped Worker tasks; Engine shutdown joins
+  Workers and returns a trusted cancelled outcome for any remaining scope. Server run
+  cancellation cancels its bridge, which cancels the tracked Future and therefore its
+  Worker subtree.
+- The real-Engine probe holds a Worker pending after the root Coordinator turn returns:
+  the trusted Future and Task Runtime capacity remain nonterminal. Releasing the Worker
+  queues a scoped aggregation turn; only after that Coordinator turn finishes does the
+  Future resolve. A separate probe verifies cancellation drains the scoped Worker and
+  scope ledger.
+
+### N2C/D — truthful executor and Verifier provenance
+
+- Trusted Engine results now preserve `succeeded`, `partial`, `failed`, and `cancelled`
+  outcomes plus error provenance. Parameter, provider/model/timeout, permission,
+  budget, generic executor, and cancellation categories map to distinct public
+  Task Runtime truth; `executor_failure` was added to the versioned backend/frontend
+  failure enum.
+- Failed executor work records an approved, task/version/evidence-bound mandatory Group
+  Verifier decision meaning “the failure classification is verified,” then completes
+  with the actual executor failure type. A rejected Verifier decision instead produces
+  `verification_failed`; those states can no longer be conflated.
+- Successful/partial execution still requires bound evidence, partial remains a
+  truthful terminal outcome, and cancellation uses the cancellation transition rather
+  than fabricating Verifier failure. No transport endpoint accepts a client-supplied
+  Verifier decision.
+- Stable execution keys make duplicate completion callbacks no-ops. Continuation state
+  and Task Runtime terminal state survive restart, while any uncertain crossed
+  executor boundary remains blocked rather than replayed.
+
+### Round-3 exact regression evidence
+
+- `python -m pytest -q backend/tests/test_task_runtime_rereview_round3.py` ->
+  `20 passed in 1.33s`.
+- `python -m pytest -q backend/tests/test_task_runtime.py backend/tests/test_task_runtime_review_fixes.py backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_rereview_round3.py`
+  -> `67 passed in 7.69s`.
+- `python -m pytest -q backend/tests/test_groups.py backend/tests/test_group_http.py backend/tests/test_task_runtime.py backend/tests/test_task_runtime_review_fixes.py backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_rereview_round3.py`
+  -> `91 passed in 11.42s`.
+- `python -m pytest -q backend/tests/test_worker_completion_v1.py backend/tests/test_runtime_impl_v10184.py backend/tests/test_coordinator_no_reply.py`
+  -> `26 passed, 10 subtests passed in 2.42s`.
+- `npx vitest run src/contract/taskRuntime.test.ts src/store/taskRuntime.test.ts src/contract/group.test.ts src/store/groups.test.ts --pool=forks --poolOptions.forks.singleFork=true`
+  -> `4 files / 24 tests passed`.
+- Targeted strict TypeScript compilation and ESLint for
+  `src/contract/taskRuntime.ts` and `src/store/taskRuntime.ts` passed without diagnostics.
+- Python compilation of Engine, Server, Task Runtime contracts/store/service, and the
+  round-3 probe module passed. `git diff --check` passed with only the repository's
+  existing Windows LF-to-CRLF notices.
+
+### Broad baseline note and remaining planned boundary
+
+- Broad `npm run typecheck` still reports the already documented unrelated repository
+  baseline errors (`Conv.unread` fixtures, `calibrateActivity`, old SocketAPI/Bridge
+  fakes, PDF worker typing, legacy Store strictness, and similar files). The changed
+  Task Runtime contract/store pass the targeted strict compile and lint.
+- The continuation record intentionally remains a private Task Runtime side record;
+  it is not a new public/frontend contract. Task 5 still owns encrypted vault storage,
+  the unified Tool Gateway, MCP transports, DLP gateway, and shell/network policy.
+- Task 4 remains responsible for rendering the authoritative run/Agent state in the
+  visual status bar and event drawer. No visual UI was added in this round.

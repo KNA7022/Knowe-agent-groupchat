@@ -203,6 +203,7 @@ class TaskRuntimeService:
         self, group_id: str, run_id: str, target: TaskStatus, *,
         idempotency_key: str, summary: str = "", blocking_reason: str = "",
         failure_type: FailureType | None = None,
+        _transaction_hook: Any | None = None,
     ) -> TaskRun:
         with self._lock:
             current = self._owned_run(run_id, group_id)
@@ -234,6 +235,7 @@ class TaskRuntimeService:
                     "failure_type": failure_type.value if failure_type else None,
                 },
                 idempotency_key=idempotency_key, mutate=mutate,
+                transaction_hook=_transaction_hook,
             )
             return run
 
@@ -291,7 +293,11 @@ class TaskRuntimeService:
         if current.status.terminal:
             raise RuntimeConflictError("terminal runs cannot be cancelled")
         cancelled = self.transition(group_id, run_id, TaskStatus.CANCELLED,
-                                    idempotency_key=request_key, summary="Task cancelled")
+                                    idempotency_key=request_key, summary="Task cancelled",
+                                    _transaction_hook=lambda conn, _run, _event:
+                                    self.store.terminalize_executor_continuations_in_transaction(
+                                        conn, run_id=run_id, status="cancelled",
+                                    ))
         self.schedule()
         return cancelled
 
@@ -356,11 +362,15 @@ class TaskRuntimeService:
     def complete(
         self, group_id: str, run_id: str, *, outcome: TaskStatus,
         request_key: str, summary: str,
+        _trusted_failure_type: FailureType | None = None,
     ) -> TaskRun:
         if outcome not in {TaskStatus.SUCCEEDED, TaskStatus.PARTIAL, TaskStatus.FAILED}:
             raise ValueError("completion outcome must be succeeded, partial, or failed")
         current = self._owned_run(run_id, group_id)
-        failure = FailureType.VERIFICATION_FAILED if outcome is TaskStatus.FAILED else None
+        failure = (
+            _trusted_failure_type or FailureType.VERIFICATION_FAILED
+            if outcome is TaskStatus.FAILED else None
+        )
 
         def mutate(run: TaskRun) -> None:
             if run.group_id != current.group_id or run.status is not TaskStatus.VERIFYING:
@@ -375,8 +385,10 @@ class TaskRuntimeService:
             decision = self.store.verifier_decision_for_version_in_transaction(
                 conn, run_id, updated.version - 1,
             )
-            if (decision is None or not decision.approved or decision.outcome is not outcome
-                    or decision.task_id != updated.task_id or decision.group_id != updated.group_id):
+            expected_approval = failure is not FailureType.VERIFICATION_FAILED
+            if (decision is None or decision.approved is not expected_approval
+                    or decision.outcome is not outcome or decision.task_id != updated.task_id
+                    or decision.group_id != updated.group_id):
                 raise RuntimeConflictError("a current task-bound Verifier decision is required")
 
         completed, _event, _created = self.store.change_run(
@@ -393,6 +405,8 @@ class TaskRuntimeService:
         self, group_id: str, run_id: str, *, execution_key: str,
         outcome: TaskStatus, evidence: tuple[EvidenceRef, ...] = (),
         summary: str = "Task execution completed",
+        failure_type: FailureType | None = None,
+        verifier_approved: bool = True,
     ) -> TaskRun:
         """Bridge a trusted executor lifecycle into mandatory Verifier completion.
 
@@ -400,8 +414,21 @@ class TaskRuntimeService:
         executor-derived idempotency key, and the persisted Group Verifier remains the
         sole producer of the version/evidence-bound completion decision.
         """
+        if outcome is TaskStatus.CANCELLED:
+            current = self._owned_run(run_id, group_id)
+            if current.status.terminal:
+                return current
+            return self.cancel(
+                group_id, run_id, request_key=f"executor:{execution_key}:cancelled",
+            )
         if outcome not in {TaskStatus.SUCCEEDED, TaskStatus.PARTIAL, TaskStatus.FAILED}:
             raise ValueError("trusted execution outcome must be terminal and verifiable")
+        if outcome is TaskStatus.FAILED and failure_type is None:
+            failure_type = FailureType.EXECUTOR_FAILURE
+        if outcome is not TaskStatus.FAILED and failure_type is not None:
+            raise ValueError("failure_type is only valid for failed executor outcomes")
+        if not verifier_approved and outcome is not TaskStatus.FAILED:
+            raise ValueError("Verifier rejection must produce a failed outcome")
         current = self._owned_run(run_id, group_id)
         if current.status.terminal:
             return current
@@ -424,13 +451,17 @@ class TaskRuntimeService:
         )
         self.record_verifier_decision(
             group_id, run_id, verifier_agent_id=verifier.agent_id,
-            outcome=outcome, approved=True, evidence=evidence,
-            reason="Trusted executor lifecycle verified",
+            outcome=outcome, approved=verifier_approved, evidence=evidence,
+            reason=("Trusted executor lifecycle verified" if verifier_approved
+                    else "Verifier rejected executor evidence"),
             request_key=f"executor:{execution_key}:verifier-decision",
         )
         return self.complete(
             group_id, run_id, outcome=outcome,
             request_key=f"executor:{execution_key}:complete", summary=summary,
+            _trusted_failure_type=(
+                FailureType.VERIFICATION_FAILED if not verifier_approved else failure_type
+            ),
         )
 
     def consume_budget(
@@ -477,6 +508,9 @@ class TaskRuntimeService:
         risk: RiskLevel, request_key: str, requested_capabilities: tuple[str, ...] = (),
         tool_name: str = "", operation_scope: Mapping[str, str] | None = None,
         purpose: str = "confirm_route", expires_at: str | None = None,
+        executor_private_request: Mapping[str, Any] | None = None,
+        executor_execution_key: str | None = None,
+        route_request_key: str | None = None,
     ) -> ApprovalRequest:
         current = self._owned_run(run_id, group_id)
         existing = self.store.approval_by_request_key(request_key)
@@ -494,6 +528,7 @@ class TaskRuntimeService:
             purpose=purpose,
             expires_at=expires_at or (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
         )
+        continuation_id = opaque_id("cont") if executor_private_request is not None else None
 
         def mutate(run: TaskRun) -> None:
             if run.status not in {TaskStatus.ROUTING, TaskStatus.RUNNING}:
@@ -502,10 +537,21 @@ class TaskRuntimeService:
             run.public_summary = summary or run.public_summary
             run.blocking_reason = "User approval required"
 
-        def persist_approval(conn: Any, _run: TaskRun, _event: Any) -> None:
+        def persist_approval(conn: Any, updated: TaskRun, _event: Any) -> None:
             self.store.upsert_approval_in_transaction(
                 conn, approval, request_key=request_key,
             )
+            if continuation_id is not None:
+                if not executor_execution_key or not route_request_key:
+                    raise RuntimeConflictError("executor continuation identity is required")
+                self.store.insert_executor_continuation_in_transaction(
+                    conn, continuation_id=continuation_id, run=updated,
+                    approval_id=approval.approval_id,
+                    execution_key=executor_execution_key,
+                    route_request_key=route_request_key,
+                    risk=approval.risk, status="waiting_approval",
+                    private_request=executor_private_request or {},
+                )
 
         try:
             self.store.change_run(
@@ -564,6 +610,9 @@ class TaskRuntimeService:
             def persist_approval_and_grant(conn: Any, _run: TaskRun, _event: Any) -> None:
                 self.store.resolve_pending_approval_in_transaction(conn, resolved)
                 self.store.insert_grant_in_transaction(conn, grant)
+                self.store.update_executor_continuation_in_transaction(
+                    conn, approval_id=approval_id, status="ready", run=_run,
+                )
 
             run, _event, _created = self.store.change_run(
                 current.run_id, event_type="approval_resolved",
@@ -588,6 +637,9 @@ class TaskRuntimeService:
 
             def persist_rejection(conn: Any, _run: TaskRun, _event: Any) -> None:
                 self.store.resolve_pending_approval_in_transaction(conn, resolved)
+                self.store.update_executor_continuation_in_transaction(
+                    conn, approval_id=approval_id, status="rejected", run=_run,
+                )
 
             run, _event, _created = self.store.change_run(
                 current.run_id, event_type="approval_resolved",
@@ -1014,6 +1066,8 @@ class TaskRuntimeService:
         self, group_id: str, *, content: str, request_key: str,
         confidence: float, read_only: bool, writes: bool = False,
         sensitive_outbound: bool = False, explicit_new_task: bool = False,
+        executor_private_request: Mapping[str, Any] | None = None,
+        executor_execution_key: str | None = None,
     ) -> dict[str, Any]:
         if not math.isfinite(confidence) or not 0 <= confidence <= 1:
             raise ValueError("route confidence must be finite and between 0 and 1")
@@ -1031,14 +1085,30 @@ class TaskRuntimeService:
         else:
             label = RouteLabel.SUPPLEMENT_CURRENT
         requires_approval = confidence < self.ROUTE_AUTO_CONFIDENCE or writes or sensitive_outbound
+        private_request = dict(executor_private_request or {})
+        if executor_private_request is not None:
+            private_request.setdefault("content", content)
+            if not executor_execution_key:
+                raise ValueError("executor_execution_key is required with a private executor request")
 
         if label is RouteLabel.SUPPLEMENT_CURRENT and primary is not None and not requires_approval:
+            continuation_id = opaque_id("cont") if executor_private_request is not None else None
+
+            def persist_supplement(conn: Any, updated: TaskRun, _event: Any) -> None:
+                if continuation_id is not None and executor_execution_key is not None:
+                    self.store.insert_executor_continuation_in_transaction(
+                        conn, continuation_id=continuation_id, run=updated, approval_id=None,
+                        execution_key=executor_execution_key, route_request_key=request_key,
+                        risk=updated.risk, status="ready", private_request=private_request,
+                    )
+
             updated, event, _created = self.store.change_run(
                 primary.run_id, event_type="message_routed",
                 public_payload={"route_label": label.value, "summary": "Message supplements current task",
                                 "classification": list(classifications)},
                 idempotency_key=request_key,
                 sensitive_payload={"content": content}, sensitivity="private",
+                transaction_hook=persist_supplement,
             )
             return {"route_label": label.value, "auto_routed": True,
                     "run": updated.to_public_dict(), "event": event.to_public_dict()}
@@ -1055,12 +1125,24 @@ class TaskRuntimeService:
             public_summary=public_summary,
             data_classification=classifications,
         )
+        continuation_id = opaque_id("cont") if executor_private_request is not None else None
+
+        def persist_auto_continuation(conn: Any, updated: TaskRun, _event: Any) -> None:
+            if (not requires_approval and continuation_id is not None
+                    and executor_execution_key is not None):
+                self.store.insert_executor_continuation_in_transaction(
+                    conn, continuation_id=continuation_id, run=updated, approval_id=None,
+                    execution_key=executor_execution_key, route_request_key=request_key,
+                    risk=updated.risk, status="ready", private_request=private_request,
+                )
+
         self.store.change_run(
             run.run_id, event_type="message_routed",
             public_payload={"route_label": label.value, "summary": public_summary,
                             "classification": list(classifications)},
             sensitive_payload={"content": content}, sensitivity="private",
             idempotency_key=f"route-content:{request_key}",
+            transaction_hook=persist_auto_continuation,
         )
         approval: ApprovalRequest | None = None
         if requires_approval:
@@ -1070,10 +1152,13 @@ class TaskRuntimeService:
             approval = self.request_approval(
                 canonical, routed.run_id, kind="message_route",
                 summary="Confirm task routing or sensitive/write operation",
-                risk=RiskLevel.HIGH if sensitive_outbound else RiskLevel.MEDIUM,
+                risk=RiskLevel.HIGH if sensitive_outbound or writes else RiskLevel.MEDIUM,
                 request_key=f"approval:{request_key}",
                 requested_capabilities=("route_message",), purpose="confirm_route",
                 operation_scope={"route": label.value},
+                executor_private_request=private_request if executor_private_request is not None else None,
+                executor_execution_key=executor_execution_key,
+                route_request_key=request_key,
             )
             run = self.store.get_run(run.run_id) or run
         else:
@@ -1142,7 +1227,63 @@ class TaskRuntimeService:
                     # A later Tool Gateway may offer an explicit user retry.  Recovery
                     # only reports it; it does not call the tool.
                     report["replayable_pending"].append(invocation.invocation_id)
+            continuation_report = self.store.reconcile_executor_continuations()
+            report["executor_continuations"] = continuation_report
+            for continuation_id in continuation_report["recovered_blocked"]:
+                continuation = self.store.executor_continuation(
+                    continuation_id=continuation_id,
+                )
+                if continuation is None:
+                    continue
+                run = self.store.get_run(str(continuation.get("run_id") or ""))
+                if run is not None and run.status is TaskStatus.QUEUED:
+                    routed = self.transition(
+                        run.group_id, run.run_id, TaskStatus.ROUTING,
+                        idempotency_key=f"continuation-recovery-route:{continuation_id}",
+                        summary="Recovered request requires explicit approval",
+                    )
+                    self.transition(
+                        routed.group_id, routed.run_id, TaskStatus.PAUSED,
+                        idempotency_key=f"continuation-recovery-pause:{continuation_id}",
+                        summary="Recovered request requires explicit approval",
+                        blocking_reason="Executor request was not replayed after restart",
+                    )
         return report
+
+    def claim_executor_continuation(
+        self, group_id: str, run_id: str, *, execution_key: str,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        run = self._owned_run(run_id, group_id)
+        continuation = self.store.executor_continuation(
+            run_id=run_id, execution_key=execution_key,
+        )
+        if continuation is None:
+            return None, False
+        if (continuation.get("group_id") != run.group_id
+                or continuation.get("task_id") != run.task_id):
+            raise RuntimeConflictError("executor continuation task binding mismatch")
+        if run.status is not TaskStatus.RUNNING:
+            return continuation, False
+        return self.store.claim_executor_continuation(str(continuation["continuation_id"]))
+
+    def claim_approved_executor_continuation(
+        self, group_id: str, approval_id: str,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        continuation = self.store.executor_continuation(approval_id=approval_id)
+        if continuation is None:
+            return None, False
+        run_id = str(continuation.get("run_id") or "")
+        return self.claim_executor_continuation(
+            group_id, run_id, execution_key=str(continuation.get("execution_key") or ""),
+        )
+
+    def finish_executor_continuation(
+        self, continuation_id: str, *, status: str, failure_type: FailureType | None = None,
+    ) -> dict[str, Any]:
+        return self.store.finish_executor_continuation(
+            continuation_id, status=status,
+            failure_type=failure_type.value if failure_type else None,
+        )
 
 
 __all__ = ["RuntimeConflictError", "RuntimeNotFoundError", "TaskRuntimeService"]
