@@ -55,6 +55,7 @@ class Client:
         self.id = f"c{Client._next_id}"
         self.connected_at_ns = time.time_ns()
         self.ws = ws
+        self.task_runtime_recovery_fenced = False
         # ★ 每客户端独立的「已发过 project_created 的项目集合」——握手时按此补发
         self.sent_projects: set[str] = set()
         self.handshake_done = False
@@ -78,6 +79,9 @@ class Client:
         self.task_runtime_recovery_send_tasks: dict[
             tuple[str, str, int], asyncio.Task[bool]
         ] = {}
+        self.task_runtime_recovery_send_deadlines: dict[
+            tuple[str, str, int], float
+        ] = {}
         # Recovery intents stay durable in SQLite.  A connection holds only a small
         # fair-scanning window and one opaque paging cursor, never a mirror of the
         # complete recovery table.
@@ -89,7 +93,7 @@ class Client:
 
     @property
     def alive(self) -> bool:
-        return _is_alive(self.ws)
+        return not self.task_runtime_recovery_fenced and _is_alive(self.ws)
 
     @property
     def task_runtime_recovery_slot_count(self) -> int:

@@ -22,6 +22,7 @@ def _assert_window(client: Client) -> None:
     assert len(client.task_runtime_recovery_revisions) <= phase_total
     assert len(client.task_runtime_recovery_order) <= phase_total
     assert len(client.task_runtime_recovery_send_tasks) <= phase_total
+    assert len(client.task_runtime_recovery_send_deadlines) <= phase_total
 
 
 def _seed(server: KnoweServer, count: int) -> list[str]:
@@ -46,6 +47,7 @@ async def test_cancelled_notice_send_keeps_one_bounded_owner_then_refills_four(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server = KnoweServer(str(tmp_path))
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_SEND_TIMEOUT_SECONDS", 0.05)
     groups = _seed(server, 8)
     monkeypatch.setattr(
         server, "_runtime_project_id_for_group", lambda group_id: f"project_{group_id[4:]}",
@@ -55,11 +57,10 @@ async def test_cancelled_notice_send_keeps_one_bounded_owner_then_refills_four(
     await client.release_live_replay_fence()
     original_send = server.hub.send_to
     entered = asyncio.Event()
-    release = asyncio.Event()
 
     async def suspended_send(target: Client, payload: dict[str, object]) -> bool:
         entered.set()
-        await release.wait()
+        await asyncio.Future()
         return await original_send(target, payload)
 
     monkeypatch.setattr(server.hub, "send_to", suspended_send)
@@ -73,19 +74,33 @@ async def test_cancelled_notice_send_keeps_one_bounded_owner_then_refills_four(
     with pytest.raises(asyncio.CancelledError):
         await fill
     assert not client.task_runtime_recovery_fill_lock.locked()
-    # The shielded socket write is an explicit ambiguous owner, not a ghost: it is
-    # bounded, visible, and will settle to notified or roll back.
+    # The transferred ambiguous owner remains bounded only until its original deadline.
     assert len(client.task_runtime_recovery_reserved) == 1
     _assert_window(client)
     assert client.ws.messages == []
 
-    release.set()
-    await _wait_for(lambda: len(client.task_runtime_recovery_notified) == 1)
+    await _wait_for(lambda: client.task_runtime_recovery_fenced, timeout=1)
+    await _wait_for(
+        lambda: not server._task_runtime_recovery_reconcile_tasks, timeout=1,  # noqa: SLF001
+    )
+    await _wait_for(
+        lambda: not server._task_runtime_recovery_write_tasks, timeout=1,  # noqa: SLF001
+    )
+    assert client.task_runtime_recovery_slot_count == 0
+    assert client not in server.hub.clients
+    assert server.task_runtime is not None
+    assert len(server.task_runtime.store.live_recoveries()) == 8
     monkeypatch.setattr(server.hub, "send_to", original_send)
-    await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
-    _assert_window(client)
-    assert client.task_runtime_recovery_slot_count == 4
-    notices = [row for row in client.ws.messages if row.get("type") == "resync_required"]
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_SEND_TIMEOUT_SECONDS", 1.0)
+    replacement = Client(_OpenSocket())
+    server.hub.add_client(replacement)
+    await replacement.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(replacement)  # noqa: SLF001
+    _assert_window(replacement)
+    assert replacement.task_runtime_recovery_slot_count == 4
+    notices = [
+        row for row in replacement.ws.messages if row.get("type") == "resync_required"
+    ]
     assert len(notices) == 4
     assert notices[0]["group_id"] == groups[0]
     await _close(server)
@@ -144,10 +159,49 @@ async def test_notice_timeout_rolls_back_exact_slot_and_next_fill_recovers(
     assert not client.task_runtime_recovery_fill_lock.locked()
     assert server.task_runtime is not None
     assert server.task_runtime.store.live_recovery(groups[0]) is not None
+    assert client.task_runtime_recovery_fenced
+    assert client not in server.hub.clients
+    monkeypatch.setattr(server.hub, "send_to", original_send)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_SEND_TIMEOUT_SECONDS", 1.0)
+    replacement = Client(_OpenSocket())
+    server.hub.add_client(replacement)
+    await replacement.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(replacement)  # noqa: SLF001
+    assert replacement.task_runtime_recovery_slot_count == 1
+    assert len(replacement.ws.messages) == 1
+    await _close(server)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["false", "exception"])
+async def test_notice_failure_rolls_back_without_fencing_healthy_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_mode: str,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    _seed(server, 4)
+    monkeypatch.setattr(
+        server, "_runtime_project_id_for_group", lambda group_id: f"project_{group_id[4:]}",
+    )
+    client = Client(_OpenSocket())
+    server.hub.add_client(client)
+    await client.release_live_replay_fence()
+    original_send = server.hub.send_to
+
+    async def fail(_target: Client, _payload: dict[str, object]) -> bool:
+        if failure_mode == "exception":
+            raise OSError("socket failed before handoff")
+        return False
+
+    monkeypatch.setattr(server.hub, "send_to", fail)
+    await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+    assert client.alive
+    assert client.task_runtime_recovery_slot_count == 0
+    assert not client.task_runtime_recovery_fill_lock.locked()
+    assert server.task_runtime is not None
+    assert len(server.task_runtime.store.live_recoveries()) == 4
     monkeypatch.setattr(server.hub, "send_to", original_send)
     await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
-    assert client.task_runtime_recovery_slot_count == 1
-    assert len(client.ws.messages) == 1
+    assert client.task_runtime_recovery_slot_count == 4
     await _close(server)
 
 
@@ -156,6 +210,7 @@ async def test_cancelled_snapshot_write_retains_bounded_issued_owner_until_ack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server = KnoweServer(str(tmp_path))
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_SEND_TIMEOUT_SECONDS", 0.05)
     assert server.groups is not None and server.task_runtime is not None
     project_id = "project_snapshot_cancel"
     group = server.groups.create_group("Snapshot cancel", legacy_project_id=project_id)
@@ -170,12 +225,11 @@ async def test_cancelled_snapshot_write_retains_bounded_issued_owner_until_ack(
     notice = next(row for row in client.ws.messages if row.get("type") == "resync_required")
     original_send = server.hub.send_to
     entered = asyncio.Event()
-    release = asyncio.Event()
 
     async def suspend_snapshot(target: Client, payload: dict[str, object]) -> bool:
         if payload.get("type") == "task_runtime_result":
             entered.set()
-            await release.wait()
+            await asyncio.Future()
         return await original_send(target, payload)
 
     monkeypatch.setattr(server.hub, "send_to", suspend_snapshot)
@@ -192,23 +246,24 @@ async def test_cancelled_snapshot_write_retains_bounded_issued_owner_until_ack(
         await request
     assert len(client.task_runtime_recovery_snapshots) == 1
     _assert_window(client)
-    release.set()
-    await _wait_for(lambda: any(
-        row.get("type") == "task_runtime_result" for row in client.ws.messages
-    ))
-    response = next(
-        row for row in reversed(client.ws.messages)
-        if row.get("type") == "task_runtime_result"
+    await _wait_for(lambda: client.task_runtime_recovery_fenced, timeout=1)
+    await _wait_for(
+        lambda: not server._task_runtime_recovery_reconcile_tasks, timeout=1,  # noqa: SLF001
     )
-    await server._cmd_task_runtime_recovery_ack(client, {  # noqa: SLF001
-        "project_id": project_id,
-        "group_id": group.group_id,
-        "recovery_token": response["recovery_token"],
-        "recovery_generation": response["recovery_generation"],
-        "snapshot_cursor": response["snapshot_cursor"],
-    })
-    assert server.task_runtime.store.live_recovery(group.group_id) is None
+    await _wait_for(
+        lambda: not server._task_runtime_recovery_write_tasks, timeout=1,  # noqa: SLF001
+    )
     assert client.task_runtime_recovery_slot_count == 0
+    assert client not in server.hub.clients
+    assert server.task_runtime.store.live_recovery(group.group_id) is not None
+    monkeypatch.setattr(server.hub, "send_to", original_send)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_SEND_TIMEOUT_SECONDS", 1.0)
+    replacement = Client(_OpenSocket())
+    server.hub.add_client(replacement)
+    await replacement.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(replacement)  # noqa: SLF001
+    assert replacement.task_runtime_recovery_slot_count == 1
+    assert any(row.get("type") == "resync_required" for row in replacement.ws.messages)
     await _close(server)
 
 
@@ -254,15 +309,18 @@ async def test_three_staggered_clients_remain_four_slots_and_retire_every_group(
             await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
             _assert_window(client)
 
-    # Fast client traverses the complete SQLite pager while two slow cohorts retain
-    # only their original four explicit obligations. No fast applied set mirrors them.
+    # The fast client cannot retire the suffix before both slow live pagers traverse it.
     await drain(0)
     assert applied_by_client[0] == expected
     assert clients[0].task_runtime_recovery_applied == set()
     assert clients[1].task_runtime_recovery_slot_count == min(4, group_count)
     assert clients[2].task_runtime_recovery_slot_count == min(4, group_count)
+    assert len(server.task_runtime.store.live_recoveries()) == group_count
     await drain(1)
+    assert applied_by_client[1] == expected
+    assert len(server.task_runtime.store.live_recoveries()) == group_count
     await drain(2)
+    assert applied_by_client[2] == expected
     assert server.task_runtime is not None
     assert server.task_runtime.store.live_recoveries() == ()
     for client in clients:

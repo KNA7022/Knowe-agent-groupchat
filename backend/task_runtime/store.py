@@ -1335,7 +1335,14 @@ class TaskRuntimeStore:
         after_revision: int | None = None,
     ) -> tuple[dict[str, Any], ...]:
         with self.db.transaction(immediate=False) as conn:
-            if limit is None:
+            if limit is None and after_revision is not None:
+                rows = conn.execute(
+                    """SELECT * FROM studycrew_live_recovery
+                       WHERE recovery_revision > ?
+                       ORDER BY recovery_revision, group_id""",
+                    (max(0, int(after_revision)),),
+                ).fetchall()
+            elif limit is None:
                 rows = conn.execute(
                     "SELECT * FROM studycrew_live_recovery ORDER BY recovery_revision, group_id",
                 ).fetchall()
@@ -1371,6 +1378,28 @@ class TaskRuntimeStore:
                 (group_id, recovery_token, generation),
             )
         return cursor.rowcount == 1
+
+    def retire_live_recoveries_through(
+        self, recovery_revision: int,
+    ) -> tuple[dict[str, Any], ...]:
+        """Atomically retire rows covered by every live pager and no retry debt."""
+        frontier = max(0, int(recovery_revision))
+        if frontier <= 0:
+            return ()
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """SELECT * FROM studycrew_live_recovery
+                   WHERE recovery_revision <= ? AND disconnect_retry=0
+                   ORDER BY recovery_revision, group_id""",
+                (frontier,),
+            ).fetchall()
+            if rows:
+                conn.execute(
+                    """DELETE FROM studycrew_live_recovery
+                       WHERE recovery_revision <= ? AND disconnect_retry=0""",
+                    (frontier,),
+                )
+        return tuple({key: row[key] for key in row.keys()} for row in rows)
 
     def mark_live_recovery_disconnect(
         self, group_id: str, recovery_token: str, generation: int,

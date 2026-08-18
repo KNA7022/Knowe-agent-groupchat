@@ -122,7 +122,32 @@ async def test_two_failed_runs_share_one_group_recovery_and_scoped_ack(tmp_path:
         assert len(server.task_runtime.store.live_recoveries()) == 2
     await server._cmd_task_runtime_recovery_ack(client, valid_ack)  # noqa: SLF001
     remaining = server.task_runtime.store.live_recoveries()
-    assert [row["group_id"] for row in remaining] == [second_group.group_id]
+    assert {row["group_id"] for row in remaining} == {
+        first_group.group_id, second_group.group_id,
+    }
+    second_notice = next(
+        item for item in socket.messages
+        if item.get("type") == "resync_required"
+        and item.get("group_id") == second_group.group_id
+    )
+    await server._cmd_request_snapshot(client, {  # noqa: SLF001
+        "project_id": second_notice["project_id"],
+        "recovery_token": second_notice["recovery_token"],
+        "recovery_generation": second_notice["recovery_generation"],
+    })
+    second_response = next(
+        item for item in reversed(socket.messages)
+        if item.get("type") == "task_runtime_result"
+        and item.get("recovery_token") == second_notice["recovery_token"]
+    )
+    await server._cmd_task_runtime_recovery_ack(client, {  # noqa: SLF001
+        "project_id": second_notice["project_id"],
+        "group_id": second_group.group_id,
+        "recovery_token": second_response["recovery_token"],
+        "recovery_generation": second_response["recovery_generation"],
+        "snapshot_cursor": second_response["snapshot_cursor"],
+    })
+    assert server.task_runtime.store.live_recoveries() == ()
     await _close(server)
 
 
@@ -756,11 +781,16 @@ async def test_slow_client_does_not_starve_fast_clients_bounded_window(
     assert processed == set(project_by_group)
     assert len(slow.task_runtime_recovery_notified) == slow.TASK_RUNTIME_RECOVERY_WINDOW_MAX
 
-    slow_notices = [
-        item for item in slow.ws.messages if item.get("type") == "resync_required"
-    ]
-    for notice in slow_notices:
+    slow_processed: set[str] = set()
+    while len(slow_processed) < len(project_by_group):
+        notice = next(
+            item for item in slow.ws.messages
+            if item.get("type") == "resync_required"
+            and item["group_id"] not in slow_processed
+        )
         await apply_notice(slow, notice)
+        slow_processed.add(notice["group_id"])
+    assert slow_processed == set(project_by_group)
     assert server.task_runtime.store.live_recoveries() == ()
     await _close(server)
 

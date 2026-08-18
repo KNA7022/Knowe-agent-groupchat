@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import hmac
 import json
 import logging
@@ -443,6 +444,8 @@ class KnoweServer:
         self._task_runtime_event_bridge_terminal_seq: OrderedDict[str, tuple[int, str]] = OrderedDict()
         self._task_runtime_event_bridge_recovery: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._task_runtime_recovery_revision = 0
+        self._task_runtime_recovery_reconcile_tasks: set[asyncio.Task[Any]] = set()
+        self._task_runtime_recovery_write_tasks: set[asyncio.Task[Any]] = set()
         self._task_runtime_event_drain_task: asyncio.Task[None] | None = None
         self._task_runtime_listener_service: TaskRuntimeService | None = self.task_runtime
         if self.task_runtime is not None:
@@ -1210,6 +1213,49 @@ class KnoweServer:
             | set(client.task_runtime_recovery_applied)
         )
 
+    def _track_task_runtime_recovery_task(
+        self, task: asyncio.Task[Any], *, reconciler: bool,
+    ) -> asyncio.Task[Any]:
+        owners = (
+            self._task_runtime_recovery_reconcile_tasks
+            if reconciler else self._task_runtime_recovery_write_tasks
+        )
+        owners.add(task)
+
+        def settled(done: asyncio.Task[Any]) -> None:
+            owners.discard(done)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                log.error("Task Runtime recovery owner failed: %s", error)
+
+        task.add_done_callback(settled)
+        return task
+
+    def _spawn_task_runtime_reconciler(
+        self, coroutine: Any, *, name: str,
+    ) -> asyncio.Task[Any]:
+        return self._track_task_runtime_recovery_task(
+            asyncio.create_task(coroutine, name=name), reconciler=True,
+        )
+
+    async def _fence_task_runtime_recovery_client(self, client: Client) -> None:
+        """Discharge an ambiguous socket by fencing it before freeing owned slots."""
+        if client.task_runtime_recovery_fenced:
+            return
+        client.task_runtime_recovery_fenced = True
+        self._retain_client_recovery_on_disconnect(client)
+        self.hub.remove_client(client)
+        close = getattr(client.ws, "close", None)
+        if callable(close):
+            try:
+                result = close(code=1011, reason="Task Runtime recovery handoff timed out")
+                if inspect.isawaitable(result):
+                    await asyncio.wait_for(result, timeout=1.0)
+            except BaseException:  # the connection is already fenced from authority
+                pass
+
     def _normalize_client_recovery_slots_locked(self, client: Client) -> None:
         """Prune auxiliary ownership metadata after a phase transition or test hook."""
         keys = self._client_recovery_keys(client)
@@ -1217,9 +1263,15 @@ class KnoweServer:
             key: revision for key, revision in client.task_runtime_recovery_revisions.items()
             if key in keys
         }
-        client.task_runtime_recovery_order = deque(
-            key for key in client.task_runtime_recovery_order if key in keys
-        )
+        client.task_runtime_recovery_send_deadlines = {
+            key: deadline
+            for key, deadline in client.task_runtime_recovery_send_deadlines.items()
+            if key in keys
+        }
+        client.task_runtime_recovery_order = deque(sorted(
+            keys,
+            key=lambda key: (client.task_runtime_recovery_revisions.get(key, 0), key),
+        ))
         for key, task in tuple(client.task_runtime_recovery_send_tasks.items()):
             if key not in keys and task.done():
                 client.task_runtime_recovery_send_tasks.pop(key, None)
@@ -1230,6 +1282,7 @@ class KnoweServer:
         self, client: Client, key: tuple[str, str, int],
     ) -> None:
         send_task = client.task_runtime_recovery_send_tasks.pop(key, None)
+        client.task_runtime_recovery_send_deadlines.pop(key, None)
         if send_task is not None and not send_task.done():
             send_task.cancel()
         client.task_runtime_recovery_reserved.discard(key)
@@ -1241,36 +1294,34 @@ class KnoweServer:
             item for item in client.task_runtime_recovery_order if item != key
         )
 
-    def _retire_task_runtime_recoveries_locked(
-        self, candidates: set[tuple[str, str, int]],
-    ) -> None:
-        """Retire rows with no explicitly handed-off socket obligation or retry debt."""
+    def _compact_client_recovery_acks_locked(self, client: Client) -> None:
+        """Advance the scalar watermark only across the bounded applied prefix."""
+        self._normalize_client_recovery_slots_locked(client)
+        while client.task_runtime_recovery_order:
+            key = client.task_runtime_recovery_order[0]
+            if key not in client.task_runtime_recovery_applied:
+                break
+            client.task_runtime_recovery_order.popleft()
+            revision = client.task_runtime_recovery_revisions.pop(key, 0)
+            client.task_runtime_recovery_applied.discard(key)
+            client.task_runtime_recovery_ack_revision = max(
+                client.task_runtime_recovery_ack_revision, revision,
+            )
+        self._normalize_client_recovery_slots_locked(client)
+
+    def _retire_task_runtime_recoveries_locked(self) -> None:
+        """Retire only through the minimum contiguous live-client ACK watermark."""
         service = self.task_runtime
         if service is None:
             return
-        for candidate_group, candidate_token, candidate_generation in candidates:
-            marker = service.store.live_recovery(candidate_group)
-            if marker is None:
-                continue
-            if int(marker.get("disconnect_retry") or 0):
-                continue
+        alive = tuple(client for client in self.hub.clients if client.alive)
+        if not alive:
+            return
+        frontier = min(client.task_runtime_recovery_ack_revision for client in alive)
+        for marker in service.store.retire_live_recoveries_through(frontier):
             group_id = str(marker["group_id"])
             token = str(marker["recovery_token"])
             generation = int(marker["generation"])
-            if (group_id, token, generation) != (
-                candidate_group, candidate_token, candidate_generation,
-            ):
-                continue
-            if any(
-                other.alive and any(
-                    key[0] == group_id and key[1] == token
-                    for key in self._client_recovery_keys(other)
-                )
-                for other in self.hub.clients
-            ):
-                continue
-            if not service.store.clear_live_recovery(group_id, token, generation):
-                continue
             for other in tuple(self.hub.clients):
                 for key in tuple(self._client_recovery_keys(other)):
                     if key[0] == group_id and key[1] == token:
@@ -1298,10 +1349,14 @@ class KnoweServer:
 
         async def reconcile_send(
             target: Client, key: tuple[str, str, int], send_task: asyncio.Task[bool],
-            *, refill_on_failure: bool = False,
+            *, deadline: float, refill_on_failure: bool = False,
         ) -> bool:
             try:
-                sent = bool(await send_task)
+                remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+                sent = bool(await asyncio.wait_for(asyncio.shield(send_task), remaining))
+            except TimeoutError:
+                await self._fence_task_runtime_recovery_client(target)
+                sent = False
             except BaseException:  # cancellation/connection teardown owns rollback too
                 sent = False
             refill = False
@@ -1359,35 +1414,47 @@ class KnoweServer:
                 "recovery_generation": generation,
                 "message": "Task Runtime live delivery requires an authoritative snapshot",
             }
-            send_task = asyncio.create_task(
-                self.hub.send_to(target, payload),
-                name=f"task-runtime-recovery-notice-{target.id}",
+            deadline = (
+                asyncio.get_running_loop().time()
+                + self.TASK_RUNTIME_RECOVERY_SEND_TIMEOUT_SECONDS
+            )
+            send_task = self._track_task_runtime_recovery_task(
+                asyncio.create_task(
+                    self.hub.send_to(target, payload),
+                    name=f"task-runtime-recovery-notice-{target.id}",
+                ),
+                reconciler=False,
             )
             with self._task_runtime_event_bridge_lock:
                 target.task_runtime_recovery_send_tasks[notice_key] = send_task
+                target.task_runtime_recovery_send_deadlines[notice_key] = deadline
             try:
                 sent = await asyncio.wait_for(
                     asyncio.shield(send_task),
-                    timeout=self.TASK_RUNTIME_RECOVERY_SEND_TIMEOUT_SECONDS,
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
                 )
             except TimeoutError:
-                send_task.cancel()
-                await reconcile_send(target, notice_key, send_task)
+                await self._fence_task_runtime_recovery_client(target)
                 return "failed"
             except asyncio.CancelledError:
                 # The socket write now owns the bounded reserved slot.  It will either
                 # verifiably hand off or roll back and refill after this caller exits.
-                asyncio.create_task(
+                self._spawn_task_runtime_reconciler(
                     reconcile_send(
-                        target, notice_key, send_task, refill_on_failure=True,
+                        target, notice_key, send_task, deadline=deadline,
+                        refill_on_failure=True,
                     ),
                     name=f"task-runtime-recovery-reconcile-{target.id}",
                 )
                 raise
             except BaseException:
-                await reconcile_send(target, notice_key, send_task)
+                await reconcile_send(
+                    target, notice_key, send_task, deadline=deadline,
+                )
                 raise
-            await reconcile_send(target, notice_key, send_task)
+            await reconcile_send(
+                target, notice_key, send_task, deadline=deadline,
+            )
             return "sent" if sent else "failed"
 
         async def fill_target(target: Client) -> None:
@@ -1608,11 +1675,17 @@ class KnoweServer:
     async def _reconcile_task_runtime_snapshot_send(
         self, client: Client, key: tuple[str, str, int],
         send_task: asyncio.Task[bool], snapshot: dict[str, Any],
-        *, refill_on_failure: bool,
+        *, deadline: float, refill_on_failure: bool,
     ) -> bool:
         """Settle an issued snapshot whose socket write may outlive its request task."""
         try:
-            handed_off = bool(await send_task)
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            handed_off = bool(
+                await asyncio.wait_for(asyncio.shield(send_task), remaining)
+            )
+        except TimeoutError:
+            await self._fence_task_runtime_recovery_client(client)
+            handed_off = False
         except BaseException:
             handed_off = False
         refill = False
@@ -1660,12 +1733,13 @@ class KnoweServer:
                 except Exception:  # noqa: BLE001 -- durable intent must remain retryable
                     log.exception("Could not consume Task Runtime disconnect retry for %s", group_id)
                     return False
-            client.task_runtime_recovery_ack_revision = max(
-                client.task_runtime_recovery_ack_revision,
-                int(marker.get("recovery_revision") or 0),
+            client.task_runtime_recovery_snapshots.pop(key, None)
+            client.task_runtime_recovery_applied.add(key)
+            client.task_runtime_recovery_revisions[key] = int(
+                marker.get("recovery_revision") or 0,
             )
-            self._drop_client_recovery_key_locked(client, key)
-            self._retire_task_runtime_recoveries_locked({key})
+            self._compact_client_recovery_acks_locked(client)
+            self._retire_task_runtime_recoveries_locked()
         return True
 
     def _retain_client_recovery_on_disconnect(self, client: Client) -> None:
@@ -1675,22 +1749,13 @@ class KnoweServer:
             return
         disconnected_at_ns = time.time_ns()
         with self._task_runtime_event_bridge_lock:
-            unresolved = (
-                set(client.task_runtime_recovery_reserved)
-                | set(client.task_runtime_recovery_notified)
-                | set(client.task_runtime_recovery_snapshots)
-            )
-            identities = {(item[0], item[1]) for item in unresolved}
-            for group_id, token in identities:
-                marker = service.store.live_recovery(group_id)
-                if marker is None or str(marker.get("recovery_token")) != token:
-                    continue
-                needs_retry = any(
-                    item[0] == group_id and item[1] == token
-                    for item in unresolved
-                )
-                if not needs_retry:
-                    continue
+            # A live pager owns the entire durable suffix, not merely its current
+            # four slots. Transfer that suffix to one durable reconnect debt.
+            for marker in service.store.live_recoveries(
+                after_revision=client.task_runtime_recovery_ack_revision,
+            ):
+                group_id = str(marker["group_id"])
+                token = str(marker["recovery_token"])
                 try:
                     service.store.mark_live_recovery_disconnect(
                         group_id, token, int(marker.get("generation", 0)),
@@ -1702,6 +1767,7 @@ class KnoweServer:
                 if not task.done():
                     task.cancel()
             client.task_runtime_recovery_send_tasks.clear()
+            client.task_runtime_recovery_send_deadlines.clear()
             client.task_runtime_recovery_reserved.clear()
             client.task_runtime_recovery_notified.clear()
             client.task_runtime_recovery_snapshots.clear()
@@ -1826,7 +1892,10 @@ class KnoweServer:
 
     async def _stop_task_runtime_event_bridge(self) -> None:
         """Atomically fence callbacks and cancel queued live publication."""
+        for client in tuple(self.hub.clients):
+            self._retain_client_recovery_on_disconnect(client)
         recovery_sends: list[asyncio.Task[bool]] = []
+        owned_tasks: set[asyncio.Task[Any]] = set()
         with self._task_runtime_event_bridge_lock:
             self._task_runtime_event_bridge_active = False
             self._task_runtime_event_bridge_stopped = True
@@ -1846,11 +1915,25 @@ class KnoweServer:
                 for key in tuple(client.task_runtime_recovery_send_tasks):
                     self._drop_client_recovery_key_locked(client, key)
                 self._normalize_client_recovery_slots_locked(client)
+            owned_tasks = (
+                set(self._task_runtime_recovery_write_tasks)
+                | set(self._task_runtime_recovery_reconcile_tasks)
+            )
+            for task in owned_tasks:
+                if not task.done():
+                    task.cancel()
         if drain is not None and drain is not asyncio.current_task() and not drain.done():
             drain.cancel()
             await asyncio.gather(drain, return_exceptions=True)
         if recovery_sends:
             await asyncio.gather(*recovery_sends, return_exceptions=True)
+        if owned_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*owned_tasks, return_exceptions=True), timeout=1.0,
+                )
+            except TimeoutError:
+                log.error("Task Runtime recovery owners ignored shutdown cancellation")
 
     def _schedule_task_runtime_event_drain(self, generation: int) -> None:
         """Loop-thread callback scheduled by the thread-safe ingress path."""
@@ -3680,6 +3763,8 @@ class KnoweServer:
         finally:
             self._retain_client_recovery_on_disconnect(client)
             self.hub.remove_client(client)
+            with self._task_runtime_event_bridge_lock:
+                self._retire_task_runtime_recoveries_locked()
             log.info("client %s gone (total=%d)", client.id, self.hub.client_count)
 
     async def _authenticate_ws(self, connection: Any, request: Any) -> Any:
@@ -5243,8 +5328,17 @@ class KnoweServer:
                 send_task = client.task_runtime_recovery_send_tasks.get(reserved_key)
                 handed_off = False
                 if send_task is not None:
+                    deadline = client.task_runtime_recovery_send_deadlines.get(
+                        reserved_key, asyncio.get_running_loop().time(),
+                    )
                     try:
-                        handed_off = bool(await asyncio.shield(send_task))
+                        handed_off = bool(await asyncio.wait_for(
+                            asyncio.shield(send_task),
+                            max(0.0, deadline - asyncio.get_running_loop().time()),
+                        ))
+                    except TimeoutError:
+                        await self._fence_task_runtime_recovery_client(client)
+                        return
                     except asyncio.CancelledError:
                         raise
                     except BaseException:
@@ -5286,29 +5380,33 @@ class KnoweServer:
                 "snapshot_cursor": snapshot_cursor,
                 "task_runtime": runtime_snapshot,
             }
-            send_task = asyncio.create_task(
-                self.hub.send_to(client, payload),
-                name=f"task-runtime-recovery-snapshot-{client.id}",
+            deadline = (
+                asyncio.get_running_loop().time()
+                + self.TASK_RUNTIME_RECOVERY_SEND_TIMEOUT_SECONDS
+            )
+            send_task = self._track_task_runtime_recovery_task(
+                asyncio.create_task(
+                    self.hub.send_to(client, payload),
+                    name=f"task-runtime-recovery-snapshot-{client.id}",
+                ),
+                reconciler=False,
             )
             with self._task_runtime_event_bridge_lock:
                 client.task_runtime_recovery_send_tasks[key] = send_task
+                client.task_runtime_recovery_send_deadlines[key] = deadline
             try:
                 await asyncio.wait_for(
                     asyncio.shield(send_task),
-                    timeout=self.TASK_RUNTIME_RECOVERY_SEND_TIMEOUT_SECONDS,
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
                 )
             except TimeoutError:
-                send_task.cancel()
-                await self._reconcile_task_runtime_snapshot_send(
-                    client, key, send_task, runtime_snapshot,
-                    refill_on_failure=False,
-                )
+                await self._fence_task_runtime_recovery_client(client)
                 return
             except asyncio.CancelledError:
-                asyncio.create_task(
+                self._spawn_task_runtime_reconciler(
                     self._reconcile_task_runtime_snapshot_send(
                         client, key, send_task, runtime_snapshot,
-                        refill_on_failure=True,
+                        deadline=deadline, refill_on_failure=True,
                     ),
                     name=f"task-runtime-recovery-snapshot-reconcile-{client.id}",
                 )
@@ -5316,12 +5414,12 @@ class KnoweServer:
             except BaseException:
                 await self._reconcile_task_runtime_snapshot_send(
                     client, key, send_task, runtime_snapshot,
-                    refill_on_failure=False,
+                    deadline=deadline, refill_on_failure=False,
                 )
                 raise
             await self._reconcile_task_runtime_snapshot_send(
                 client, key, send_task, runtime_snapshot,
-                refill_on_failure=False,
+                deadline=deadline, refill_on_failure=False,
             )
             return
         runtime_snapshot = None
