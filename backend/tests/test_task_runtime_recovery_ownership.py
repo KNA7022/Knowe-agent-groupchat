@@ -329,6 +329,182 @@ async def test_three_staggered_clients_remain_four_slots_and_retire_every_group(
     await _close(server)
 
 
+@pytest.mark.asyncio
+async def test_generation_update_keeps_queue_position_and_cannot_skip_fifth_group(
+    tmp_path: Path,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    client = Client(_OpenSocket())
+    server.hub.add_client(client)
+    await client.release_live_replay_fence()
+    groups = []
+    events = []
+    for index in range(5):
+        project_id = f"project_queue_{index}"
+        group = server.groups.create_group(
+            f"Queue {index}", legacy_project_id=project_id,
+        )
+        run = server.task_runtime.submit(
+            group.group_id, title=f"Queue {index}", request_key=f"queue-{index}",
+        )
+        event = server.task_runtime.store.events_after(run.run_id, 0)[0]
+        groups.append(group)
+        events.append(event)
+        with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+            server._record_task_runtime_recovery_locked(  # noqa: SLF001
+                event, reason="queue", attempts=4,
+            )
+
+    initial_rows = server.task_runtime.store.live_recoveries()
+    initial_positions = {
+        str(row["group_id"]): int(row["recovery_revision"]) for row in initial_rows
+    }
+    await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+    notices = [
+        row for row in client.ws.messages if row.get("type") == "resync_required"
+    ]
+    assert [row["group_id"] for row in notices] == [
+        group.group_id for group in groups[:4]
+    ]
+
+    # Advance the oldest in-window Group several generations. Its queue position is
+    # immutable, so the unrelated fifth Group cannot fall behind a moving cursor.
+    for generation in range(2, 5):
+        with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+            server._record_task_runtime_recovery_locked(  # noqa: SLF001
+                events[0], reason=f"queue-gen-{generation}", attempts=4,
+            )
+    updated = server.task_runtime.store.live_recovery(groups[0].group_id)
+    assert updated is not None
+    assert int(updated["generation"]) == 4
+    assert int(updated["recovery_revision"]) == initial_positions[groups[0].group_id]
+
+    for notice in notices:
+        await server._cmd_request_snapshot(client, {  # noqa: SLF001
+            "project_id": notice["project_id"],
+            "recovery_token": notice["recovery_token"],
+            "recovery_generation": notice["recovery_generation"],
+        })
+        response = next(
+            row for row in reversed(client.ws.messages)
+            if row.get("type") == "task_runtime_result"
+            and row.get("project_id") == notice["project_id"]
+        )
+        await server._cmd_task_runtime_recovery_ack(client, {  # noqa: SLF001
+            "project_id": notice["project_id"],
+            "group_id": notice["group_id"],
+            "recovery_token": response["recovery_token"],
+            "recovery_generation": response["recovery_generation"],
+            "snapshot_cursor": response["snapshot_cursor"],
+        })
+        _assert_window(client)
+
+    fifth_id = groups[4].group_id
+    assert client.task_runtime_recovery_ack_revision == initial_positions[groups[3].group_id]
+    remaining = server.task_runtime.store.live_recoveries()
+    assert [row["group_id"] for row in remaining] == [fifth_id]
+    fifth_notice = next(
+        row for row in client.ws.messages
+        if row.get("type") == "resync_required" and row.get("group_id") == fifth_id
+    )
+    await server._cmd_request_snapshot(client, {  # noqa: SLF001
+        "project_id": fifth_notice["project_id"],
+        "recovery_token": fifth_notice["recovery_token"],
+        "recovery_generation": fifth_notice["recovery_generation"],
+    })
+    fifth_response = next(
+        row for row in reversed(client.ws.messages)
+        if row.get("type") == "task_runtime_result"
+        and row.get("project_id") == fifth_notice["project_id"]
+    )
+    await server._cmd_task_runtime_recovery_ack(client, {  # noqa: SLF001
+        "project_id": fifth_notice["project_id"], "group_id": fifth_id,
+        "recovery_token": fifth_response["recovery_token"],
+        "recovery_generation": fifth_response["recovery_generation"],
+        "snapshot_cursor": fifth_response["snapshot_cursor"],
+    })
+    assert server.task_runtime.store.live_recoveries() == ()
+    await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_disconnect_transfer_is_one_shot_and_replacement_claims_exact_debt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    expected = set(_seed(server, 8))
+    assert server.task_runtime is not None
+    monkeypatch.setattr(
+        server, "_runtime_project_id_for_group", lambda group_id: f"project_{group_id[4:]}",
+    )
+    old = Client(_OpenSocket())
+    server.hub.add_client(old)
+    await old.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(old)  # noqa: SLF001
+    assert old.task_runtime_recovery_disconnect_epoch_baseline == 0
+
+    server._retain_client_recovery_on_disconnect(old)  # noqa: SLF001
+    server.hub.remove_client(old)
+    first_transfer = {
+        str(row["group_id"]): (
+            int(row["disconnect_debt_generation"]), str(row["disconnect_fence_id"]),
+        )
+        for row in server.task_runtime.store.live_recoveries()
+    }
+    assert set(first_transfer) == expected
+    assert {value[1] for value in first_transfer.values()} == {
+        old.task_runtime_recovery_session_id,
+    }
+
+    replacements = [Client(_OpenSocket()), Client(_OpenSocket())]
+    for replacement in replacements:
+        server.hub.add_client(replacement)
+        await replacement.release_live_replay_fence()
+        await server._notify_task_runtime_recoveries(replacement)  # noqa: SLF001
+        assert replacement.task_runtime_recovery_disconnect_epoch_baseline == 1
+
+    # This is the old handler's delayed ``finally`` after the replacement joined.
+    server._retain_client_recovery_on_disconnect(old)  # noqa: SLF001
+    second_transfer = {
+        str(row["group_id"]): (
+            int(row["disconnect_debt_generation"]), str(row["disconnect_fence_id"]),
+        )
+        for row in server.task_runtime.store.live_recoveries()
+    }
+    assert second_transfer == first_transfer
+    first = server.task_runtime.store.live_recoveries()[0]
+    assert not server.task_runtime.store.consume_live_recovery_disconnect(
+        str(first["group_id"]), str(first["recovery_token"]), int(first["generation"]),
+        claim_id="forged-pre-debt-session", claim_after_epoch=0,
+    )
+
+    async def drain(replacement: Client, cursor: str) -> set[str]:
+        applied: set[str] = set()
+        while replacement.task_runtime_recovery_notified:
+            key = min(
+                replacement.task_runtime_recovery_notified,
+                key=lambda item: replacement.task_runtime_recovery_revisions[item],
+            )
+            replacement.task_runtime_recovery_notified.remove(key)
+            replacement.task_runtime_recovery_snapshots[key] = cursor
+            assert server._ack_task_runtime_recovery(  # noqa: SLF001
+                replacement, group_id=key[0], recovery_token=key[1],
+                generation=key[2], snapshot_cursor=cursor,
+            )
+            applied.add(key[0])
+            _assert_window(replacement)
+            await server._notify_task_runtime_recoveries(replacement)  # noqa: SLF001
+        return applied
+
+    assert await drain(replacements[0], "a" * 64) == expected
+    assert len(server.task_runtime.store.live_recoveries()) == len(expected)
+    assert await drain(replacements[1], "b" * 64) == expected
+    assert server.task_runtime.store.live_recoveries() == ()
+    assert old.task_runtime_recovery_slot_count == 0
+    await _close(server)
+
+
 def test_recovery_revision_never_reuses_after_full_table_retirement(tmp_path: Path) -> None:
     server = KnoweServer(str(tmp_path))
     first = _seed(server, 8)

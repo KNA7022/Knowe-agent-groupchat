@@ -1116,6 +1116,7 @@ class KnoweServer:
             "recovery_token": str(previous.get("recovery_token") or opaque_id("recovery")),
             "generation": int(previous.get("generation", 0)) + 1,
             "failure_count": int(previous.get("failure_count", 0)) + 1,
+            "recovery_revision": int(previous.get("recovery_revision") or 0),
             "persisted": False,
         }
         service = self.task_runtime
@@ -1133,12 +1134,30 @@ class KnoweServer:
             except Exception:  # noqa: BLE001 -- in-memory marker still makes failure visible
                 log.exception("Could not persist Task Runtime recovery marker for %s", event.run_id)
         durable_revision = int(marker.get("recovery_revision") or 0)
-        self._task_runtime_recovery_revision = max(
-            self._task_runtime_recovery_revision + 1, durable_revision,
-        )
-        marker["recovery_revision"] = (
-            durable_revision or self._task_runtime_recovery_revision
-        )
+        if durable_revision:
+            self._task_runtime_recovery_revision = max(
+                self._task_runtime_recovery_revision, durable_revision,
+            )
+        else:
+            self._task_runtime_recovery_revision += 1
+            marker["recovery_revision"] = self._task_runtime_recovery_revision
+        queue_revision = int(marker["recovery_revision"])
+        # A newer mutable generation at an existing queue position invalidates
+        # coverage of that position for every live pager that already passed it.
+        # Rewind only scalar cursors; no per-Group history is retained.
+        for client in tuple(self.hub.clients):
+            owns_group = any(
+                key[0] == event.group_id and key[1] == marker["recovery_token"]
+                for key in self._client_recovery_keys(client)
+            )
+            if owns_group:
+                continue
+            rewind = max(0, queue_revision - 1)
+            if client.task_runtime_recovery_ack_revision >= queue_revision:
+                client.task_runtime_recovery_ack_revision = rewind
+            if client.task_runtime_recovery_after_revision >= queue_revision:
+                client.task_runtime_recovery_after_revision = rewind
+                client.task_runtime_recovery_page_exhausted = False
         self._task_runtime_event_bridge_recovery[event.group_id] = marker
         self._task_runtime_event_bridge_recovery.move_to_end(event.group_id)
         while len(self._task_runtime_event_bridge_recovery) > self.TASK_RUNTIME_RECOVERY_MARKER_MAX:
@@ -1463,6 +1482,10 @@ class KnoweServer:
                     self._normalize_client_recovery_slots_locked(target)
                     if not target.alive:
                         return
+                    if target.task_runtime_recovery_disconnect_epoch_baseline is None:
+                        target.task_runtime_recovery_disconnect_epoch_baseline = (
+                            service.store.live_recovery_disconnect_epoch()
+                        )
                     available = max(
                         0, target.TASK_RUNTIME_RECOVERY_WINDOW_MAX
                         - len(self._client_recovery_keys(target)),
@@ -1725,14 +1748,24 @@ class KnoweServer:
             ):
                 return False
             if marker.get("persisted") is not False:
-                try:
-                    self.task_runtime.store.consume_live_recovery_disconnect(
-                        group_id, recovery_token, generation,
-                        connected_at_ns=client.connected_at_ns,
-                    )
-                except Exception:  # noqa: BLE001 -- durable intent must remain retryable
-                    log.exception("Could not consume Task Runtime disconnect retry for %s", group_id)
-                    return False
+                if int(marker.get("disconnect_retry") or 0):
+                    try:
+                        consumed = self.task_runtime.store.consume_live_recovery_disconnect(
+                            group_id, recovery_token, generation,
+                            claim_id=client.task_runtime_recovery_session_id,
+                            claim_after_epoch=(
+                                client.task_runtime_recovery_disconnect_epoch_baseline
+                                if client.task_runtime_recovery_disconnect_epoch_baseline is not None
+                                else -1
+                            ),
+                        )
+                    except Exception:  # noqa: BLE001 -- durable intent must remain retryable
+                        log.exception(
+                            "Could not consume Task Runtime disconnect retry for %s", group_id,
+                        )
+                        return False
+                    if not consumed:
+                        return False
             client.task_runtime_recovery_snapshots.pop(key, None)
             client.task_runtime_recovery_applied.add(key)
             client.task_runtime_recovery_revisions[key] = int(
@@ -1749,20 +1782,21 @@ class KnoweServer:
             return
         disconnected_at_ns = time.time_ns()
         with self._task_runtime_event_bridge_lock:
+            if client.task_runtime_recovery_disconnect_debt_transferred:
+                return
             # A live pager owns the entire durable suffix, not merely its current
-            # four slots. Transfer that suffix to one durable reconnect debt.
-            for marker in service.store.live_recoveries(
-                after_revision=client.task_runtime_recovery_ack_revision,
-            ):
-                group_id = str(marker["group_id"])
-                token = str(marker["recovery_token"])
-                try:
-                    service.store.mark_live_recovery_disconnect(
-                        group_id, token, int(marker.get("generation", 0)),
-                        disconnected_at_ns=disconnected_at_ns,
-                    )
-                except Exception:  # noqa: BLE001 -- Hub cleanup must still complete
-                    log.exception("Could not retain Task Runtime disconnect retry for %s", group_id)
+            # four slots. One SQLite statement freezes that exact queue suffix; the
+            # handler's later ``finally`` invocation is an in-memory one-shot no-op.
+            try:
+                service.store.mark_live_recoveries_disconnect_after(
+                    client.task_runtime_recovery_ack_revision,
+                    fence_id=client.task_runtime_recovery_session_id,
+                    disconnected_at_ns=disconnected_at_ns,
+                )
+            except Exception:  # noqa: BLE001 -- Hub cleanup must still complete
+                log.exception("Could not retain Task Runtime disconnect retry suffix")
+            else:
+                client.task_runtime_recovery_disconnect_debt_transferred = True
             for task in tuple(client.task_runtime_recovery_send_tasks.values()):
                 if not task.done():
                     task.cancel()
@@ -5472,6 +5506,12 @@ class KnoweServer:
                     for item in tuple(self._client_recovery_keys(client)):
                         if item[0] == group_id and item[1] == token:
                             self._drop_client_recovery_key_locked(client, item)
+                    # A stale debt claim or generation CAS must not leave the pager
+                    # beyond the still-durable row it failed to apply.
+                    client.task_runtime_recovery_after_revision = (
+                        client.task_runtime_recovery_ack_revision
+                    )
+                    client.task_runtime_recovery_page_exhausted = False
         # A newer durable revision may now be visible to another independent pager;
         # filling only the ACKing client can strand that generation.
         await self._notify_task_runtime_recoveries()

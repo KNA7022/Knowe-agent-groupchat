@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import secrets
 import time
 from collections import OrderedDict, deque
 from typing import Any, Callable, Iterable
@@ -56,6 +57,9 @@ class Client:
         self.connected_at_ns = time.time_ns()
         self.ws = ws
         self.task_runtime_recovery_fenced = False
+        self.task_runtime_recovery_session_id = secrets.token_urlsafe(24)
+        self.task_runtime_recovery_disconnect_debt_transferred = False
+        self.task_runtime_recovery_disconnect_epoch_baseline: int | None = None
         # ★ 每客户端独立的「已发过 project_created 的项目集合」——握手时按此补发
         self.sent_projects: set[str] = set()
         self.handshake_done = False

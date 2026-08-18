@@ -198,6 +198,9 @@ class TaskRuntimeStore:
                 recovery_revision INTEGER NOT NULL DEFAULT 0,
                 disconnect_retry INTEGER NOT NULL DEFAULT 0,
                 disconnected_at_ns INTEGER NOT NULL DEFAULT 0,
+                disconnect_debt_generation INTEGER NOT NULL DEFAULT 0,
+                disconnect_fence_id TEXT NOT NULL DEFAULT '',
+                disconnect_claim_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -239,6 +242,9 @@ class TaskRuntimeStore:
             "recovery_revision": "INTEGER NOT NULL DEFAULT 0",
             "disconnect_retry": "INTEGER NOT NULL DEFAULT 0",
             "disconnected_at_ns": "INTEGER NOT NULL DEFAULT 0",
+            "disconnect_debt_generation": "INTEGER NOT NULL DEFAULT 0",
+            "disconnect_fence_id": "TEXT NOT NULL DEFAULT ''",
+            "disconnect_claim_id": "TEXT NOT NULL DEFAULT ''",
         })
         self._backfill_live_recovery_revisions()
         self._migrate_v1_side_records()
@@ -286,6 +292,9 @@ class TaskRuntimeStore:
                     recovery_revision INTEGER NOT NULL DEFAULT 0,
                     disconnect_retry INTEGER NOT NULL DEFAULT 0,
                    disconnected_at_ns INTEGER NOT NULL DEFAULT 0,
+                   disconnect_debt_generation INTEGER NOT NULL DEFAULT 0,
+                   disconnect_fence_id TEXT NOT NULL DEFAULT '',
+                   disconnect_claim_id TEXT NOT NULL DEFAULT '',
                    created_at TEXT NOT NULL,
                        updated_at TEXT NOT NULL
                    )""",
@@ -1274,7 +1283,7 @@ class TaskRuntimeStore:
         self, *, run_id: str, group_id: str, through_seq: int, reason: str,
         attempts: int, recovery_token: str, run_version: int | None = None,
     ) -> dict[str, Any]:
-        """Upsert one monotonic, lossless recovery generation for the affected Group."""
+        """Upsert a mutable generation without moving its immutable queue position."""
         now = utc_now()
         with self.db.transaction() as conn:
             previous = conn.execute(
@@ -1293,14 +1302,17 @@ class TaskRuntimeStore:
                    VALUES ('live_recovery_revision', 0)
                    ON CONFLICT(name) DO NOTHING""",
             )
-            conn.execute(
-                """UPDATE studycrew_runtime_counters SET value=value+1
-                   WHERE name='live_recovery_revision'""",
-            )
-            recovery_revision = int(conn.execute(
-                """SELECT value FROM studycrew_runtime_counters
-                   WHERE name='live_recovery_revision'""",
-            ).fetchone()[0])
+            if previous is None:
+                conn.execute(
+                    """UPDATE studycrew_runtime_counters SET value=value+1
+                       WHERE name='live_recovery_revision'""",
+                )
+                recovery_revision = int(conn.execute(
+                    """SELECT value FROM studycrew_runtime_counters
+                       WHERE name='live_recovery_revision'""",
+                ).fetchone()[0])
+            else:
+                recovery_revision = int(previous["recovery_revision"])
             conn.execute(
                 """INSERT INTO studycrew_live_recovery(
                        group_id, affected_run_id, through_seq, through_version,
@@ -1317,7 +1329,6 @@ class TaskRuntimeStore:
                      generation=excluded.generation,
                      failure_count=excluded.failure_count,
                      cause_digest=excluded.cause_digest,
-                     recovery_revision=excluded.recovery_revision,
                      updated_at=excluded.updated_at""",
                 (
                     group_id, run_id, through_seq, int(run_version or through_seq),
@@ -1403,34 +1414,126 @@ class TaskRuntimeStore:
 
     def mark_live_recovery_disconnect(
         self, group_id: str, recovery_token: str, generation: int,
-        *, disconnected_at_ns: int,
+        *, disconnected_at_ns: int, fence_id: str = "legacy",
     ) -> bool:
-        """Retain one durable fresh-connection retry after an unacknowledged socket closes."""
+        """Retain one explicitly fenced retry for a single recovery row."""
         with self.db.transaction() as conn:
+            exists = conn.execute(
+                """SELECT 1 FROM studycrew_live_recovery
+                   WHERE group_id=? AND recovery_token=? AND generation=?""",
+                (group_id, recovery_token, generation),
+            ).fetchone()
+            if exists is None:
+                return False
+            conn.execute(
+                """INSERT INTO studycrew_runtime_counters(name, value)
+                   VALUES ('live_recovery_disconnect_epoch', 0)
+                   ON CONFLICT(name) DO NOTHING""",
+            )
+            conn.execute(
+                """UPDATE studycrew_runtime_counters SET value=value+1
+                   WHERE name='live_recovery_disconnect_epoch'""",
+            )
+            debt_generation = int(conn.execute(
+                """SELECT value FROM studycrew_runtime_counters
+                   WHERE name='live_recovery_disconnect_epoch'""",
+            ).fetchone()[0])
             cursor = conn.execute(
                 """UPDATE studycrew_live_recovery
                    SET disconnect_retry=1,
-                       disconnected_at_ns=MAX(disconnected_at_ns, ?),
+                       disconnected_at_ns=?,
+                       disconnect_debt_generation=?,
+                       disconnect_fence_id=?, disconnect_claim_id='',
                        updated_at=?
                    WHERE group_id=? AND recovery_token=? AND generation=?""",
-                (int(disconnected_at_ns), utc_now(), group_id, recovery_token, generation),
+                (
+                    int(disconnected_at_ns), debt_generation, fence_id, utc_now(), group_id,
+                    recovery_token, generation,
+                ),
             )
         return cursor.rowcount == 1
 
-    def consume_live_recovery_disconnect(
-        self, group_id: str, recovery_token: str, generation: int,
-        *, connected_at_ns: int,
-    ) -> bool:
-        """Consume retry debt only from a connection established after the loss."""
+    def mark_live_recoveries_disconnect_after(
+        self, recovery_revision: int, *, fence_id: str, disconnected_at_ns: int,
+    ) -> int:
+        """Atomically transfer one connection's immutable queue suffix to debt."""
+        if not fence_id:
+            raise ValueError("fence_id is required")
         with self.db.transaction() as conn:
+            exists = conn.execute(
+                """SELECT 1 FROM studycrew_live_recovery
+                   WHERE recovery_revision > ? LIMIT 1""",
+                (max(0, int(recovery_revision)),),
+            ).fetchone()
+            if exists is None:
+                return 0
+            conn.execute(
+                """INSERT INTO studycrew_runtime_counters(name, value)
+                   VALUES ('live_recovery_disconnect_epoch', 0)
+                   ON CONFLICT(name) DO NOTHING""",
+            )
+            conn.execute(
+                """UPDATE studycrew_runtime_counters SET value=value+1
+                   WHERE name='live_recovery_disconnect_epoch'""",
+            )
+            debt_generation = int(conn.execute(
+                """SELECT value FROM studycrew_runtime_counters
+                   WHERE name='live_recovery_disconnect_epoch'""",
+            ).fetchone()[0])
             cursor = conn.execute(
                 """UPDATE studycrew_live_recovery
-                   SET disconnect_retry=0, updated_at=?
-                   WHERE group_id=? AND recovery_token=? AND generation=?
-                     AND disconnect_retry=1 AND disconnected_at_ns < ?""",
-                (utc_now(), group_id, recovery_token, generation, int(connected_at_ns)),
+                   SET disconnect_retry=1,
+                       disconnected_at_ns=?,
+                       disconnect_debt_generation=?,
+                       disconnect_fence_id=?, disconnect_claim_id='',
+                       updated_at=?
+                   WHERE recovery_revision > ?""",
+                (
+                    int(disconnected_at_ns), debt_generation, fence_id, utc_now(),
+                    max(0, int(recovery_revision)),
+                ),
             )
-        return cursor.rowcount == 1
+        return max(0, int(cursor.rowcount))
+
+    def live_recovery_disconnect_epoch(self) -> int:
+        """Return the durable debt epoch visible when a recovery session joins."""
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                """SELECT value FROM studycrew_runtime_counters
+                   WHERE name='live_recovery_disconnect_epoch'""",
+            ).fetchone()
+        return 0 if row is None else max(0, int(row[0]))
+
+    def consume_live_recovery_disconnect(
+        self, group_id: str, recovery_token: str, generation: int,
+        *, claim_id: str, claim_after_epoch: int,
+    ) -> bool:
+        """Atomically claim and consume the exact current disconnect debt."""
+        if not claim_id:
+            return False
+        with self.db.transaction() as conn:
+            claimed = conn.execute(
+                """UPDATE studycrew_live_recovery
+                   SET disconnect_claim_id=?, updated_at=?
+                   WHERE group_id=? AND recovery_token=? AND generation=?
+                     AND disconnect_retry=1
+                     AND disconnect_debt_generation <= ?
+                     AND (disconnect_claim_id='' OR disconnect_claim_id=?)""",
+                (
+                    claim_id, utc_now(), group_id, recovery_token, generation,
+                    max(0, int(claim_after_epoch)), claim_id,
+                ),
+            )
+            if claimed.rowcount != 1:
+                return False
+            consumed = conn.execute(
+                """UPDATE studycrew_live_recovery
+                   SET disconnect_retry=0, disconnect_claim_id='', updated_at=?
+                   WHERE group_id=? AND recovery_token=? AND generation=?
+                     AND disconnect_retry=1 AND disconnect_claim_id=?""",
+                (utc_now(), group_id, recovery_token, generation, claim_id),
+            )
+        return consumed.rowcount == 1
 
     def clear_group_live_recovery(self, group_id: str) -> int:
         with self.db.transaction() as conn:

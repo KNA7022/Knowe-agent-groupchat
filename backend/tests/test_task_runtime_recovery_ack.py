@@ -122,9 +122,7 @@ async def test_two_failed_runs_share_one_group_recovery_and_scoped_ack(tmp_path:
         assert len(server.task_runtime.store.live_recoveries()) == 2
     await server._cmd_task_runtime_recovery_ack(client, valid_ack)  # noqa: SLF001
     remaining = server.task_runtime.store.live_recoveries()
-    assert {row["group_id"] for row in remaining} == {
-        first_group.group_id, second_group.group_id,
-    }
+    assert [row["group_id"] for row in remaining] == [second_group.group_id]
     second_notice = next(
         item for item in socket.messages
         if item.get("type") == "resync_required"
@@ -341,6 +339,11 @@ async def test_two_clients_must_ack_and_disconnect_retries_on_fresh_connection(
     await replacement.release_live_replay_fence()
     replacement_response = await issue(replacement)
     await acknowledge(replacement, replacement_response)
+    # The pre-existing client could not claim a debt created after its session
+    # baseline, so it must retry only after the replacement consumes that debt.
+    assert server.task_runtime.store.live_recovery(group.group_id) is not None
+    retried_response = await issue(clients[1])
+    await acknowledge(clients[1], retried_response)
     assert server.task_runtime.store.live_recovery(group.group_id) is None
     await _close(server)
 
