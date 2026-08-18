@@ -497,6 +497,57 @@ def test_run_scoped_recovery_schema_migrates_to_one_group_generation(tmp_path: P
     store.close()
 
 
+def test_single_row_dirty_schema_migrates_as_frozen_immutable_entry(tmp_path: Path) -> None:
+    database = tmp_path / "legacy-dirty.sqlite3"
+    group_id = f"grp_{7:032x}"
+    token = f"recovery_{7:032x}"
+    store = TaskRuntimeStore(database)
+    store.record_live_recovery(
+        run_id=f"run_{7:032x}", group_id=group_id, through_seq=1,
+        reason="legacy-dirty", attempts=4, recovery_token=token,
+    )
+    store.record_live_recovery(
+        run_id=f"run_{7:032x}", group_id=group_id, through_seq=2,
+        reason="legacy-dirty", attempts=4, recovery_token=token,
+    )
+    store.close()
+    with sqlite3.connect(database) as conn:
+        conn.executescript(
+            """ALTER TABLE studycrew_live_recovery_dirty
+                 RENAME TO studycrew_live_recovery_dirty_new;
+               CREATE TABLE studycrew_live_recovery_dirty (
+                 group_id TEXT PRIMARY KEY,
+                 recovery_token TEXT NOT NULL,
+                 generation INTEGER NOT NULL,
+                 queue_revision INTEGER NOT NULL UNIQUE,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+               );
+               INSERT INTO studycrew_live_recovery_dirty(
+                 group_id, recovery_token, generation, queue_revision,
+                 created_at, updated_at
+               )
+               SELECT group_id, recovery_token, generation, queue_revision,
+                      created_at, updated_at
+               FROM studycrew_live_recovery_dirty_new;
+               DROP TABLE studycrew_live_recovery_dirty_new;""",
+        )
+
+    migrated = TaskRuntimeStore(database)
+    dirty = migrated.live_recovery_dirty()
+    assert len(dirty) == 1
+    assert int(dirty[0]["dirty_queue_revision"]) == 1
+    assert int(dirty[0]["dirty_frozen"]) == 1
+    migrated.record_live_recovery(
+        run_id=f"run_{7:032x}", group_id=group_id, through_seq=3,
+        reason="post-migration", attempts=4, recovery_token=token,
+    )
+    assert [int(row["dirty_queue_revision"]) for row in migrated.live_recovery_dirty()] == [
+        1, 2,
+    ]
+    migrated.close()
+
+
 @pytest.mark.asyncio
 async def test_real_websocket_retries_same_token_until_renderer_ack(tmp_path: Path) -> None:
     server = KnoweServer(str(tmp_path))

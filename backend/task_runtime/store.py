@@ -207,15 +207,18 @@ class TaskRuntimeStore:
             CREATE INDEX IF NOT EXISTS idx_studycrew_live_recovery_group
               ON studycrew_live_recovery(group_id, updated_at);
             CREATE TABLE IF NOT EXISTS studycrew_live_recovery_dirty (
-                group_id TEXT PRIMARY KEY,
+                queue_revision INTEGER PRIMARY KEY,
+                group_id TEXT NOT NULL,
                 recovery_token TEXT NOT NULL,
                 generation INTEGER NOT NULL,
-                queue_revision INTEGER NOT NULL UNIQUE,
+                frozen INTEGER NOT NULL DEFAULT 0 CHECK(frozen IN (0, 1)),
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_studycrew_live_recovery_dirty_queue
               ON studycrew_live_recovery_dirty(queue_revision, group_id);
+            CREATE INDEX IF NOT EXISTS idx_studycrew_live_recovery_dirty_group
+              ON studycrew_live_recovery_dirty(group_id, queue_revision);
             CREATE TABLE IF NOT EXISTS studycrew_runtime_counters (
                 name TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
@@ -256,6 +259,7 @@ class TaskRuntimeStore:
             "disconnect_fence_id": "TEXT NOT NULL DEFAULT ''",
             "disconnect_claim_id": "TEXT NOT NULL DEFAULT ''",
         })
+        self._migrate_live_recovery_dirty_queue()
         self._backfill_live_recovery_revisions()
         self._migrate_v1_side_records()
         self.db.initialize(
@@ -377,6 +381,65 @@ class TaskRuntimeStore:
             conn.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS idx_studycrew_live_recovery_revision
                    ON studycrew_live_recovery(recovery_revision)""",
+            )
+
+    def _migrate_live_recovery_dirty_queue(self) -> None:
+        """Make already-issued dirty positions immutable across the schema upgrade."""
+        with self.db.transaction() as conn:
+            columns = {
+                str(row["name"]): row for row in conn.execute(
+                    "PRAGMA table_info(studycrew_live_recovery_dirty)",
+                ).fetchall()
+            }
+            if (
+                "frozen" in columns
+                and int(columns["queue_revision"]["pk"]) == 1
+                and int(columns["group_id"]["pk"]) == 0
+            ):
+                return
+            rows = conn.execute(
+                """SELECT group_id, recovery_token, generation, queue_revision,
+                          created_at, updated_at
+                   FROM studycrew_live_recovery_dirty
+                   ORDER BY queue_revision, group_id""",
+            ).fetchall()
+            conn.execute("DROP INDEX IF EXISTS idx_studycrew_live_recovery_dirty_queue")
+            conn.execute("DROP INDEX IF EXISTS idx_studycrew_live_recovery_dirty_group")
+            conn.execute(
+                "ALTER TABLE studycrew_live_recovery_dirty "
+                "RENAME TO studycrew_live_recovery_dirty_moving",
+            )
+            conn.execute(
+                """CREATE TABLE studycrew_live_recovery_dirty (
+                       queue_revision INTEGER PRIMARY KEY,
+                       group_id TEXT NOT NULL,
+                       recovery_token TEXT NOT NULL,
+                       generation INTEGER NOT NULL,
+                       frozen INTEGER NOT NULL DEFAULT 0 CHECK(frozen IN (0, 1)),
+                       created_at TEXT NOT NULL,
+                       updated_at TEXT NOT NULL
+                   )""",
+            )
+            for row in rows:
+                conn.execute(
+                    """INSERT INTO studycrew_live_recovery_dirty(
+                           queue_revision, group_id, recovery_token, generation,
+                           frozen, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, 1, ?, ?)""",
+                    (
+                        int(row["queue_revision"]), str(row["group_id"]),
+                        str(row["recovery_token"]), int(row["generation"]),
+                        str(row["created_at"]), str(row["updated_at"]),
+                    ),
+                )
+            conn.execute("DROP TABLE studycrew_live_recovery_dirty_moving")
+            conn.execute(
+                """CREATE INDEX idx_studycrew_live_recovery_dirty_queue
+                   ON studycrew_live_recovery_dirty(queue_revision, group_id)""",
+            )
+            conn.execute(
+                """CREATE INDEX idx_studycrew_live_recovery_dirty_group
+                   ON studycrew_live_recovery_dirty(group_id, queue_revision)""",
             )
 
     def _migrate_v1_side_records(self) -> None:
@@ -1362,35 +1425,45 @@ class TaskRuntimeStore:
                 "SELECT * FROM studycrew_live_recovery WHERE group_id=?", (group_id,),
             ).fetchone()
             if previous is not None and row is not None:
-                conn.execute(
-                    """UPDATE studycrew_runtime_counters SET value=MAX(value, ?)
-                       WHERE name='live_recovery_dirty_revision'""",
-                    (max(0, int(dirty_revision_floor)),),
-                )
-                conn.execute(
-                    """UPDATE studycrew_runtime_counters SET value=value+1
-                       WHERE name='live_recovery_dirty_revision'""",
-                )
-                dirty_revision = int(conn.execute(
-                    """SELECT value FROM studycrew_runtime_counters
-                       WHERE name='live_recovery_dirty_revision'""",
-                ).fetchone()[0])
-                conn.execute(
-                    """INSERT INTO studycrew_live_recovery_dirty(
-                           group_id, recovery_token, generation, queue_revision,
-                           created_at, updated_at
-                       ) VALUES (?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(group_id) DO UPDATE SET
-                          recovery_token=excluded.recovery_token,
-                          generation=excluded.generation,
-                          queue_revision=excluded.queue_revision,
-                          updated_at=excluded.updated_at""",
-                    (
-                        group_id, str(row["recovery_token"]), int(row["generation"]),
-                        dirty_revision,
-                        str(previous["created_at"]), now,
-                    ),
-                )
+                latest_dirty = conn.execute(
+                    """SELECT * FROM studycrew_live_recovery_dirty
+                       WHERE group_id=? ORDER BY queue_revision DESC LIMIT 1""",
+                    (group_id,),
+                ).fetchone()
+                if latest_dirty is not None and int(latest_dirty["frozen"]) == 0:
+                    conn.execute(
+                        """UPDATE studycrew_live_recovery_dirty
+                           SET recovery_token=?, generation=?, updated_at=?
+                           WHERE queue_revision=? AND frozen=0""",
+                        (
+                            str(row["recovery_token"]), int(row["generation"]), now,
+                            int(latest_dirty["queue_revision"]),
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE studycrew_runtime_counters SET value=MAX(value, ?)
+                           WHERE name='live_recovery_dirty_revision'""",
+                        (max(0, int(dirty_revision_floor)),),
+                    )
+                    conn.execute(
+                        """UPDATE studycrew_runtime_counters SET value=value+1
+                           WHERE name='live_recovery_dirty_revision'""",
+                    )
+                    dirty_revision = int(conn.execute(
+                        """SELECT value FROM studycrew_runtime_counters
+                           WHERE name='live_recovery_dirty_revision'""",
+                    ).fetchone()[0])
+                    conn.execute(
+                        """INSERT INTO studycrew_live_recovery_dirty(
+                               queue_revision, group_id, recovery_token, generation,
+                               frozen, created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, 0, ?, ?)""",
+                        (
+                            dirty_revision, group_id, str(row["recovery_token"]),
+                            int(row["generation"]), now, now,
+                        ),
+                    )
         return {} if row is None else {key: row[key] for key in row.keys()}
 
     def live_recoveries(
@@ -1450,8 +1523,12 @@ class TaskRuntimeStore:
     def live_recovery_dirty(
         self, *, limit: int | None = None, after_queue_revision: int = 0,
     ) -> tuple[dict[str, Any], ...]:
-        """Page the coalesced latest generation for changed recovery Groups."""
-        sql = """SELECT r.*, d.queue_revision AS dirty_queue_revision
+        """Page immutable issued entries plus each Group's coalesced unissued tail."""
+        sql = """SELECT r.*,
+                        d.recovery_token AS dirty_recovery_token,
+                        d.generation AS dirty_generation,
+                        d.queue_revision AS dirty_queue_revision,
+                        d.frozen AS dirty_frozen
                  FROM studycrew_live_recovery_dirty AS d
                  JOIN studycrew_live_recovery AS r ON r.group_id=d.group_id
                  WHERE d.queue_revision > ?
@@ -1466,18 +1543,89 @@ class TaskRuntimeStore:
             )
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(sql, params).fetchall()
-        return tuple({key: row[key] for key in row.keys()} for row in rows)
+        return tuple(self._dirty_recovery_row(row) for row in rows)
+
+    @staticmethod
+    def _dirty_recovery_row(row: Any) -> dict[str, Any]:
+        result = {key: row[key] for key in row.keys()}
+        result["recovery_token"] = str(row["dirty_recovery_token"])
+        result["generation"] = int(row["dirty_generation"])
+        result["dirty_queue_revision"] = int(row["dirty_queue_revision"])
+        result["dirty_frozen"] = int(row["dirty_frozen"])
+        return result
 
     def live_recovery_dirty_marker(self, group_id: str) -> dict[str, Any] | None:
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
-                """SELECT r.*, d.queue_revision AS dirty_queue_revision
+                """SELECT r.*,
+                          d.recovery_token AS dirty_recovery_token,
+                          d.generation AS dirty_generation,
+                          d.queue_revision AS dirty_queue_revision,
+                          d.frozen AS dirty_frozen
                    FROM studycrew_live_recovery_dirty AS d
                    JOIN studycrew_live_recovery AS r ON r.group_id=d.group_id
-                   WHERE d.group_id=?""",
+                   WHERE d.group_id=?
+                   ORDER BY d.queue_revision DESC LIMIT 1""",
                 (group_id,),
             ).fetchone()
-        return None if row is None else {key: row[key] for key in row.keys()}
+        return None if row is None else self._dirty_recovery_row(row)
+
+    def live_recovery_dirty_entry(self, queue_revision: int) -> dict[str, Any] | None:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                """SELECT r.*,
+                          d.recovery_token AS dirty_recovery_token,
+                          d.generation AS dirty_generation,
+                          d.queue_revision AS dirty_queue_revision,
+                          d.frozen AS dirty_frozen
+                   FROM studycrew_live_recovery_dirty AS d
+                   JOIN studycrew_live_recovery AS r ON r.group_id=d.group_id
+                   WHERE d.queue_revision=?""",
+                (max(0, int(queue_revision)),),
+            ).fetchone()
+        return None if row is None else self._dirty_recovery_row(row)
+
+    def live_recovery_dirty_next(
+        self, after_queue_revision: int,
+    ) -> dict[str, Any] | None:
+        rows = self.live_recovery_dirty(
+            limit=1, after_queue_revision=after_queue_revision,
+        )
+        return None if not rows else rows[0]
+
+    def freeze_live_recovery_dirty(
+        self, queue_revision: int, *, group_id: str,
+        recovery_token: str, generation: int,
+    ) -> dict[str, Any] | None:
+        """Freeze one exact update position before any client-visible reservation."""
+        revision = max(0, int(queue_revision))
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                """SELECT recovery_token, generation FROM studycrew_live_recovery_dirty
+                   WHERE queue_revision=? AND group_id=?""",
+                (revision, group_id),
+            ).fetchone()
+            if row is None or (
+                str(row["recovery_token"]), int(row["generation"])
+            ) != (recovery_token, int(generation)):
+                return None
+            conn.execute(
+                """UPDATE studycrew_live_recovery_dirty SET frozen=1, updated_at=?
+                   WHERE queue_revision=? AND group_id=?""",
+                (utc_now(), revision, group_id),
+            )
+            frozen = conn.execute(
+                """SELECT r.*,
+                          d.recovery_token AS dirty_recovery_token,
+                          d.generation AS dirty_generation,
+                          d.queue_revision AS dirty_queue_revision,
+                          d.frozen AS dirty_frozen
+                   FROM studycrew_live_recovery_dirty AS d
+                   JOIN studycrew_live_recovery AS r ON r.group_id=d.group_id
+                   WHERE d.queue_revision=? AND d.group_id=?""",
+                (revision, group_id),
+            ).fetchone()
+        return None if frozen is None else self._dirty_recovery_row(frozen)
 
     def live_recovery_dirty_revision_high_water(self) -> int:
         with self.db.transaction(immediate=False) as conn:

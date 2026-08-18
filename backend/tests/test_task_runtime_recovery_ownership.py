@@ -365,12 +365,6 @@ async def test_dirty_generation_stream_coalesces_changed_group_without_suffix_re
                 replacement = (key[0], key[1], int(marker["generation"]))
                 with server._task_runtime_event_bridge_lock:  # noqa: SLF001
                     revision = client.task_runtime_recovery_revisions[key]
-                    if kind == "update":
-                        dirty_marker = server.task_runtime.store.live_recovery_dirty_marker(
-                            key[0],
-                        )
-                        assert dirty_marker is not None
-                        revision = int(dirty_marker["dirty_queue_revision"])
                     server._drop_client_recovery_key_locked(client, key)  # noqa: SLF001
                     client.task_runtime_recovery_notified.add(replacement)
                     client.task_runtime_recovery_revisions[replacement] = revision
@@ -427,6 +421,11 @@ async def test_dirty_generation_stream_coalesces_changed_group_without_suffix_re
         )
     second_base, second_updates = await drain(clients[0])
     assert second_base == set() and second_updates == {groups[0]}
+    changed_notices = [
+        row for row in clients[0].ws.messages
+        if row.get("type") == "resync_required" and row.get("group_id") == groups[0]
+    ]
+    assert [row["recovery_generation"] for row in changed_notices[-2:]] == [7, 9]
     assert len(server.task_runtime.store.live_recoveries()) == group_count
 
     slow_a_base, _slow_a_updates = await drain(clients[1])
@@ -439,6 +438,120 @@ async def test_dirty_generation_stream_coalesces_changed_group_without_suffix_re
     for client in clients:
         _assert_window(client)
         assert client.task_runtime_recovery_slot_count == 0
+    await _close(server)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("group_count", [8, 513])
+async def test_frozen_dirty_entry_appends_without_skipping_intervening_revisions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group_count: int,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    groups = _seed(server, group_count)
+    assert server.task_runtime is not None
+    monkeypatch.setattr(
+        server, "_runtime_project_id_for_group", lambda group_id: f"project_{group_id[4:]}",
+    )
+    fast, slow = Client(_OpenSocket()), Client(_OpenSocket())
+    for client in (fast, slow):
+        server._admit_task_runtime_client(client)  # noqa: SLF001
+        await client.release_live_replay_fence()
+        await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+
+    async def ack_one(client: Client) -> tuple[str, int, str]:
+        key = min(
+            client.task_runtime_recovery_notified,
+            key=lambda item: client.task_runtime_recovery_revisions[item],
+        )
+        kind = client.task_runtime_recovery_kinds.get(key, "base")
+        revision = client.task_runtime_recovery_revisions[key]
+        marker = server.task_runtime.store.live_recovery(key[0])
+        assert marker is not None
+        if int(marker["generation"]) != key[2]:
+            replacement = (key[0], key[1], int(marker["generation"]))
+            with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+                server._drop_client_recovery_key_locked(client, key)  # noqa: SLF001
+                client.task_runtime_recovery_notified.add(replacement)
+                client.task_runtime_recovery_revisions[replacement] = revision
+                client.task_runtime_recovery_kinds[replacement] = kind
+                server._normalize_client_recovery_slots_locked(client)  # noqa: SLF001
+            key = replacement
+        cursor = f"{client.id}:{kind}:{revision}".encode().hex().ljust(64, "0")[:64]
+        client.task_runtime_recovery_notified.remove(key)
+        client.task_runtime_recovery_snapshots[key] = cursor
+        assert server._ack_task_runtime_recovery(  # noqa: SLF001
+            client, group_id=key[0], recovery_token=key[1],
+            generation=key[2], snapshot_cursor=cursor,
+        )
+        _assert_window(client)
+        return kind, revision, key[0]
+
+    fast_base: set[str] = set()
+    while fast.task_runtime_recovery_notified:
+        kind, _revision, group_id = await ack_one(fast)
+        assert kind == "base"
+        fast_base.add(group_id)
+        await server._notify_task_runtime_recoveries(fast)  # noqa: SLF001
+    assert fast_base == set(groups)
+    assert len(server.task_runtime.store.live_recoveries()) == group_count
+
+    for group_id in groups[:5]:
+        current = server.task_runtime.store.live_recovery(group_id)
+        assert current is not None
+        server.task_runtime.store.record_live_recovery(
+            run_id=str(current["affected_run_id"]), group_id=group_id,
+            through_seq=2, reason="five-dirty", attempts=4,
+            recovery_token=str(current["recovery_token"]), run_version=2,
+        )
+    await server._notify_task_runtime_recoveries(fast)  # noqa: SLF001
+    assert sorted(fast.task_runtime_recovery_revisions.values()) == [1, 2, 3, 4]
+    assert [int(row["dirty_frozen"]) for row in server.task_runtime.store.live_recovery_dirty()] == [
+        1, 1, 1, 1, 0,
+    ]
+
+    first = server.task_runtime.store.live_recovery(groups[0])
+    assert first is not None
+    server.task_runtime.store.record_live_recovery(
+        run_id=str(first["affected_run_id"]), group_id=groups[0],
+        through_seq=3, reason="append-after-issue", attempts=4,
+        recovery_token=str(first["recovery_token"]), run_version=3,
+    )
+    dirty_rows = server.task_runtime.store.live_recovery_dirty()
+    assert [int(row["dirty_queue_revision"]) for row in dirty_rows] == [1, 2, 3, 4, 5, 6]
+    assert [int(row["generation"]) for row in dirty_rows] == [2, 2, 2, 2, 2, 3]
+
+    fast_dirty: list[int] = []
+    for expected_revision in (1, 2, 3, 4):
+        kind, revision, _group_id = await ack_one(fast)
+        assert kind == "update" and revision == expected_revision
+        fast_dirty.append(revision)
+    assert fast.task_runtime_recovery_update_ack_revision == 4
+    await server._notify_task_runtime_recoveries(fast)  # noqa: SLF001
+    assert sorted(fast.task_runtime_recovery_revisions.values()) == [5, 6]
+    for expected_revision in (5, 6):
+        kind, revision, _group_id = await ack_one(fast)
+        assert kind == "update" and revision == expected_revision
+        fast_dirty.append(revision)
+    assert fast_dirty == [1, 2, 3, 4, 5, 6]
+    assert fast.task_runtime_recovery_update_ack_revision == 6
+    assert len(server.task_runtime.store.live_recoveries()) == group_count
+
+    slow_base: set[str] = set()
+    slow_updates: list[int] = []
+    while slow.task_runtime_recovery_notified:
+        kind, revision, group_id = await ack_one(slow)
+        if kind == "base":
+            slow_base.add(group_id)
+        else:
+            slow_updates.append(revision)
+        await server._notify_task_runtime_recoveries(slow)  # noqa: SLF001
+    assert slow_base == set(groups)
+    assert slow.task_runtime_recovery_update_ack_revision == 6
+    assert slow_updates in ([], [6])
+    assert server.task_runtime.store.live_recovery_dirty() == ()
+    assert server.task_runtime.store.live_recoveries() == ()
+    _assert_window(fast)
+    _assert_window(slow)
     await _close(server)
 
 
@@ -743,6 +856,15 @@ async def test_volatile_store_failure_uses_changed_group_stream_without_base_rew
     assert notices[-1]["recovery_generation"] == 2
     assert client.task_runtime_recovery_ack_revision == base_frontier
     assert next(iter(client.task_runtime_recovery_kinds.values())) == "update"
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(  # noqa: SLF001
+            event, reason="volatile-three", attempts=4,
+        )
+        hot = server._task_runtime_event_bridge_recovery[group.group_id]  # noqa: SLF001
+        assert [
+            (int(item["queue_revision"]), int(item["generation"]), bool(item["frozen"]))
+            for item in hot["volatile_dirty_entries"]
+        ] == [(1, 2, True), (2, 3, False)]
     _assert_window(client)
     await _close(server)
 
@@ -799,5 +921,20 @@ def test_dirty_revision_survives_restart_and_remains_monotonic(tmp_path: Path) -
     assert int(advanced["generation"]) == 4
     assert after is not None
     assert int(after["recovery_revision"]) == base_revision
-    assert int(after["dirty_queue_revision"]) > dirty_revision
+    assert int(after["dirty_queue_revision"]) == dirty_revision
+    assert int(after["generation"]) == 4
+    frozen = restarted.task_runtime.store.freeze_live_recovery_dirty(
+        dirty_revision, group_id=group_id,
+        recovery_token=str(after["recovery_token"]), generation=4,
+    )
+    assert frozen is not None and int(frozen["dirty_frozen"]) == 1
+    restarted.task_runtime.store.record_live_recovery(
+        run_id=str(first["affected_run_id"]), group_id=group_id,
+        through_seq=5, reason="restart-dirty", attempts=4,
+        recovery_token=str(first["recovery_token"]), run_version=5,
+    )
+    appended = restarted.task_runtime.store.live_recovery_dirty_marker(group_id)
+    assert appended is not None
+    assert int(appended["generation"]) == 5
+    assert int(appended["dirty_queue_revision"]) > dirty_revision
     restarted.task_runtime.close()
