@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from backend.groups import GroupNotFoundError
-from backend.server import KnoweServer
+from backend.server import KnoweServer, ProjectIdResolutionError
 
 
 class CaptureWriter:
@@ -91,6 +91,40 @@ async def test_roster_endpoint_rejects_expert_tool_override_bypass(group_server)
     assert len(group_server.groups.get(group.group_id).roster) == 2
 
 
+async def test_unbind_endpoints_return_addressed_group_identity_and_safe_count(group_server) -> None:
+    group = group_server.groups.create_group("Bindings", legacy_project_id="project_bindings")
+    group_server.groups.bind_course(group.group_id, "course_1")
+    source_id = group_server.groups.link_source(group.group_id).source_id
+
+    course_writer = CaptureWriter()
+    await group_server._serve_group_operation(  # noqa: SLF001
+        course_writer, "/groups/course-unbind", json.dumps({
+            "group_id": group.group_id,
+            "project_id": group.legacy_project_id,
+            "course_id": "course_1",
+        }).encode(),
+    )
+    course_status, course_payload = course_writer.payload()
+    assert course_status == 200
+    assert course_payload["group_id"] == group.group_id
+    assert course_payload["project_id"] == group.legacy_project_id
+    assert course_payload["removed"] is True
+
+    source_writer = CaptureWriter()
+    await group_server._serve_group_operation(  # noqa: SLF001
+        source_writer, "/groups/source-unlink", json.dumps({
+            "group_id": group.group_id,
+            "project_id": group.legacy_project_id,
+            "source_id": source_id,
+        }).encode(),
+    )
+    source_status, source_payload = source_writer.payload()
+    assert source_status == 200
+    assert source_payload["group_id"] == group.group_id
+    assert source_payload["reference_count"] == 0
+    assert isinstance(source_payload["reference_count"], int)
+
+
 async def test_duplicate_http_provisions_distinct_runtime_and_returns_duplicate_ids(
     group_server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -139,6 +173,113 @@ async def test_duplicate_http_provisions_distinct_runtime_and_returns_duplicate_
     _, retried = retry.payload()
     assert retried["group_id"] == payload["group_id"]
     assert len(provisioned) == 1
+
+
+async def test_duplicate_runtime_stays_fenced_until_retry_commits_canonical_group(
+    group_server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = group_server.groups.create_group("Private source", legacy_project_id="project_private")
+    workspace = tmp_path / "private-copy"
+    workspace.mkdir()
+    emitted: list[dict] = []
+
+    async def provision(project_id, project_name, project_dir=None, **kwargs):
+        assert kwargs["register_group_metadata"] is False
+        assert kwargs["publish_events"] is False
+        group_server.hub.get_or_create(project_id, project_name)
+        return project_id
+
+    async def capture_event(event):
+        emitted.append(dict(event))
+
+    monkeypatch.setattr(group_server, "create_project", provision)
+    monkeypatch.setattr(group_server.hub, "emit_no_seq", capture_event)
+    original_commit = group_server.groups.commit_duplicate
+    commit_calls = 0
+
+    def fail_once(transaction_id):
+        nonlocal commit_calls
+        commit_calls += 1
+        if commit_calls == 1:
+            raise OSError("canonical duplicate commit interrupted")
+        return original_commit(transaction_id)
+
+    monkeypatch.setattr(group_server.groups, "commit_duplicate", fail_once)
+    body = {
+        "group_id": source.group_id,
+        "project_id": source.legacy_project_id,
+        "name": "Private copy",
+        "project_dir": str(workspace),
+        "request_id": "gdup_publication_fence_001",
+    }
+    failed_writer = CaptureWriter()
+    await group_server._serve_group_operation(  # noqa: SLF001
+        failed_writer, "/groups/duplicate", json.dumps(body).encode(),
+    )
+    failed_status, _ = failed_writer.payload()
+    assert failed_status == 500
+    transaction = group_server.groups.duplicate_transaction(
+        source.group_id, body["request_id"],
+    )
+    assert transaction is not None
+    runtime_id = str(transaction["runtime_project_id"])
+    duplicate_id = str(transaction["group_id"])
+    assert runtime_id in group_server.hub.projects
+    assert runtime_id in group_server._provisional_project_ids  # noqa: SLF001
+    assert runtime_id not in {
+        row["project_id"] for row in group_server._conversation_state_rows()  # noqa: SLF001
+    }
+    assert emitted == []
+    with pytest.raises(GroupNotFoundError):
+        group_server.groups.get(duplicate_id)
+    with pytest.raises(ValueError, match="not canonically published"):
+        group_server._project_created_payload(runtime_id)  # noqa: SLF001
+    with pytest.raises(ProjectIdResolutionError, match="not canonically published"):
+        group_server._canonical_project_id_from_request(runtime_id)  # noqa: SLF001
+
+    retry_writer = CaptureWriter()
+    await group_server._serve_group_operation(  # noqa: SLF001
+        retry_writer, "/groups/duplicate", json.dumps(body).encode(),
+    )
+    retry_status, retried = retry_writer.payload()
+    assert retry_status == 200
+    assert retried["group_id"] == duplicate_id
+    assert retried["project_id"] == runtime_id
+    assert runtime_id not in group_server._provisional_project_ids  # noqa: SLF001
+    assert runtime_id in {
+        row["project_id"] for row in group_server._conversation_state_rows()  # noqa: SLF001
+    }
+    assert group_server.groups.get(duplicate_id).legacy_project_id == runtime_id
+    assert [event["type"] for event in emitted] == ["project_created"]
+    assert emitted[0]["group_id"] == duplicate_id
+
+
+async def test_real_runtime_provisioning_emits_nothing_while_provisional(
+    group_server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_id = group_server._allocate_canonical_project_id()  # noqa: SLF001
+    workspace = tmp_path / "provisional-runtime"
+    workspace.mkdir()
+    emitted: list[dict] = []
+
+    async def capture_event(event):
+        emitted.append(dict(event))
+
+    monkeypatch.setattr(group_server.hub, "emit_no_seq", capture_event)
+    group_server._provisional_project_ids.add(runtime_id)  # noqa: SLF001
+    await group_server.create_project(
+        runtime_id, "Hidden runtime", str(workspace),
+        register_group_metadata=False, publish_events=False,
+    )
+
+    assert runtime_id in group_server.hub.projects
+    assert runtime_id in group_server._persisted_project_ids  # noqa: SLF001
+    assert emitted == []
+    assert runtime_id not in {
+        row["project_id"] for row in group_server._conversation_state_rows()  # noqa: SLF001
+    }
+    with pytest.raises(ValueError, match="not canonically published"):
+        group_server._project_created_payload(runtime_id)  # noqa: SLF001
 
 
 async def test_delete_state_machine_resumes_runtime_and_registry_interruptions(

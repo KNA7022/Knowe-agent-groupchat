@@ -109,10 +109,15 @@ describe('canonical Group store', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const path = new URL(String(input)).pathname;
       const payload = path.endsWith('/course-bind') ? { binding }
-        : path.endsWith('/course-unbind') ? { removed: true }
+        : path.endsWith('/course-unbind') ? {
+          ok: true, group_id: firstId, project_id: firstId, removed: true,
+        }
           : path.endsWith('/roster-update') ? { group: updated }
             : path.endsWith('/source-link') ? { link, reference_count: 2 }
-              : path.endsWith('/source-unlink') ? { removed: true, reference_count: 1 }
+              : path.endsWith('/source-unlink') ? {
+                ok: true, group_id: firstId, project_id: firstId,
+                removed: true, reference_count: 1,
+              }
                 : path.endsWith('/runtime-summary') ? { summary }
                   : { error: `unexpected path: ${path}` };
       return new Response(JSON.stringify(payload), {
@@ -154,5 +159,49 @@ describe('canonical Group store', () => {
     await expect(useGroupStore.getState().linkSource(firstId)).rejects.toThrow('addressed group_id');
     expect(useGroupStore.getState().groups).toEqual(before);
     expect(useGroupStore.getState().sourceReferenceCounts).toEqual({});
+  });
+
+  it('rejects malformed or cross-group unbind responses before state mutation', async () => {
+    const seeded = group(firstId);
+    seeded.course_bindings = [{
+      binding_id: `gcb_${'8'.repeat(32)}`,
+      group_id: firstId,
+      course_id: 'course-a',
+      created_at: '2026-08-18T00:00:00Z',
+    }];
+    seeded.source_links = [{
+      link_id: `gsl_${'9'.repeat(32)}`,
+      group_id: firstId,
+      source_id: `src_${'a'.repeat(32)}`,
+      created_at: '2026-08-18T00:00:00Z',
+    }];
+    useGroupStore.getState().ingest([seeded, group(secondId)]);
+    useGroupStore.setState({
+      sourceReferenceCounts: { [firstId]: { [seeded.source_links[0]!.source_id]: 2 } },
+    });
+    const beforeGroups = structuredClone(useGroupStore.getState().groups);
+    const beforeCounts = structuredClone(useGroupStore.getState().sourceReferenceCounts);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ok: true, group_id: secondId, project_id: secondId, removed: true,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ok: true, group_id: secondId, project_id: secondId,
+        removed: true, reference_count: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ok: true, group_id: firstId, project_id: firstId,
+        removed: true, reference_count: 1.5,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(useGroupStore.getState().unbindCourse(firstId, 'course-a'))
+      .rejects.toThrow('addressed group_id');
+    await expect(useGroupStore.getState().unlinkSource(firstId, seeded.source_links[0]!.source_id))
+      .rejects.toThrow('addressed group_id');
+    await expect(useGroupStore.getState().unlinkSource(firstId, seeded.source_links[0]!.source_id))
+      .rejects.toThrow();
+    expect(useGroupStore.getState().groups).toEqual(beforeGroups);
+    expect(useGroupStore.getState().sourceReferenceCounts).toEqual(beforeCounts);
   });
 });

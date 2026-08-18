@@ -455,6 +455,9 @@ class KnoweServer:
         # Process-local activation fence.  Durable deletion remains the Harness tombstone;
         # this set only closes the race between "delete requested" and "tombstone committed".
         self._closing_projects: set[str] = set()
+        # Runtime adapters prepared by Group duplication exist only as recovery state.
+        # They are excluded from routing, lists and replay until canonical commit succeeds.
+        self._provisional_project_ids: set[str] = set()
         # Project-internal reads dispatched through ``asyncio.to_thread`` outlive a
         # cancelled HTTP request unless the underlying thread is tracked separately.
         # Permanent deletion drains this registry before renaming the project root.
@@ -1052,6 +1055,8 @@ class KnoweServer:
 
     def _project_created_payload(self, project_id: str) -> dict[str, Any]:
         """兼容刷新帧：旧前端不认识新事件，也能借它触发 HTTP 对账。"""
+        if project_id in getattr(self, "_provisional_project_ids", set()):
+            raise ValueError("runtime project is not canonically published")
         proj = self.hub.projects[project_id]
         state = self._conversation_state(project_id)
         payload: dict[str, Any] = {
@@ -1127,7 +1132,11 @@ class KnoweServer:
     def _conversation_state_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for project_id, proj in self.hub.projects.items():
-            if project_id == PLATFORM_PROJECT_ID or _parse_dm(project_id) is not None:
+            if (
+                project_id == PLATFORM_PROJECT_ID
+                or _parse_dm(project_id) is not None
+                or project_id in getattr(self, "_provisional_project_ids", set())
+            ):
                 continue
             rows.append({
                 "project_id": project_id,
@@ -2504,7 +2513,11 @@ class KnoweServer:
         for pid, p in self.hub.projects.items():
             # [v0.4] __platform__ 不是项目——它是左栏顶上那个固定的「知知」入口，
             #        不能混进项目列表里（否则会多出来一个叫「知知」的假项目）
-            if pid == PLATFORM_PROJECT_ID or _parse_dm(pid) is not None:
+            if (
+                pid == PLATFORM_PROJECT_ID
+                or _parse_dm(pid) is not None
+                or pid in getattr(self, "_provisional_project_ids", set())
+            ):
                 continue
             if pid not in client.sent_projects:
                 # 一处组装：花名册、目录状态、静默 unread 语义不能在各入口漂移。
@@ -3393,6 +3406,8 @@ class KnoweServer:
         raw = requested.strip()
         if not raw or len(raw) > 256:
             raise ProjectIdResolutionError(msg("server.py.106"))
+        if raw in getattr(self, "_provisional_project_ids", set()):
+            raise ProjectIdResolutionError("runtime project is not canonically published")
 
         # Group-domain callers may send the canonical opaque group_id.  Translate it
         # exactly once at the runtime seam; the historical engine/event store remains
@@ -3487,6 +3502,7 @@ class KnoweServer:
         *, request_project_id: str | None = None,
         roles: list[str] | None = None,
         register_group_metadata: bool = True,
+        publish_events: bool = True,
     ) -> str:
         """
         建项目的唯一实现：**定目录** + 建 hub + 起引擎 + 落盘 + 广播 + 让项目经理开口。
@@ -3496,7 +3512,8 @@ class KnoweServer:
         建群后逐个实例化 Worker 并拉入（照主管拉人路径），再 kickoff。
         缺省/空 = 不选，行为与旧版一致。
         """
-        project_id = self._canonical_project_id_from_request(project_id, allocate=True)
+        if not (not publish_events and project_id in self._provisional_project_ids):
+            project_id = self._canonical_project_id_from_request(project_id, allocate=True)
         self._assert_project_activatable(project_id)
         existed = self.hub.has(project_id)
 
@@ -3551,6 +3568,9 @@ class KnoweServer:
         #   前端可以显示它——「我选的目录到底有没有生效」这个问题，
         #   本来就该在屏幕上有答案，而不是让人去翻后端日志。
         effective_dir = str(eng.workspace_root)
+
+        if not publish_events:
+            return project_id
 
         created_event = self._project_created_payload(project_id)
         created_event["project_dir"] = effective_dir
@@ -3615,6 +3635,15 @@ class KnoweServer:
             )
 
         return project_id
+
+    async def _publish_prepared_duplicate_runtime(self, project_id: str) -> None:
+        """Publish a provisioned duplicate only after its canonical Group is durable."""
+        self._provisional_project_ids.discard(project_id)
+        created_event = self._project_created_payload(project_id)
+        known_dir = self.project_dirs.get(project_id)
+        if known_dir:
+            created_event["project_dir"] = known_dir
+        await self.hub.emit_no_seq(created_event)
 
     # ── create_project 指令 ──
     async def _cmd_create_project(self, client: Client, data: dict[str, Any]) -> None:
@@ -5710,17 +5739,32 @@ class KnoweServer:
                         group_id, name=name if isinstance(name, str) else None,
                         legacy_project_id=duplicate_runtime_id, request_id=request_id,
                     )
+                    needs_publication = (
+                        transaction.get("stage") == "prepared"
+                        or duplicate_runtime_id in self._provisional_project_ids
+                        or duplicate_runtime_id not in self.hub.projects
+                    )
+                    if transaction.get("stage") == "prepared":
+                        self._provisional_project_ids.add(duplicate_runtime_id)
                     if duplicate_runtime_id not in self.hub.projects:
                         duplicate_raw = transaction.get("group")
                         duplicate_name = (
                             str(duplicate_raw.get("name"))
                             if isinstance(duplicate_raw, dict) else str(name or "Group copy")
                         )
+                        if (
+                            not isinstance(duplicate_raw, dict)
+                            and transaction.get("stage") == "committed"
+                        ):
+                            duplicate_name = self.groups.get(str(transaction["group_id"])).name
                         await self.create_project(
                             duplicate_runtime_id, duplicate_name, project_dir,
                             register_group_metadata=False,
+                            publish_events=False,
                         )
                     group = self.groups.commit_duplicate(str(transaction["transaction_id"]))
+                    if needs_publication:
+                        await self._publish_prepared_duplicate_runtime(duplicate_runtime_id)
                     result = {
                         "group": group.to_dict(),
                         "group_id": group.group_id,

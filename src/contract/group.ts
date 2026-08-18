@@ -71,6 +71,23 @@ export const GroupSourceLinkSchema = z.object({
   created_at: z.string(),
 });
 
+export const CourseUnbindResponseSchema = z.object({
+  ok: z.literal(true),
+  group_id: GroupIdSchema,
+  project_id: z.string().min(1),
+  request_project_id: z.string().min(1).optional(),
+  removed: z.boolean(),
+}).strict();
+
+export const SourceUnlinkResponseSchema = z.object({
+  ok: z.literal(true),
+  group_id: GroupIdSchema,
+  project_id: z.string().min(1),
+  request_project_id: z.string().min(1).optional(),
+  removed: z.boolean(),
+  reference_count: z.number().int().nonnegative(),
+}).strict();
+
 export const GroupSchema = z.object({
   schema_version: z.literal(1),
   group_id: GroupIdSchema,
@@ -169,6 +186,8 @@ export type ExpertTemplateConfig = z.infer<typeof ExpertTemplateConfigSchema>;
 export type GroupAgent = z.infer<typeof GroupAgentSchema>;
 export type GroupCourseBinding = z.infer<typeof GroupCourseBindingSchema>;
 export type GroupSourceLink = z.infer<typeof GroupSourceLinkSchema>;
+export type CourseUnbindResponse = z.infer<typeof CourseUnbindResponseSchema>;
+export type SourceUnlinkResponse = z.infer<typeof SourceUnlinkResponseSchema>;
 export type Group = z.infer<typeof GroupSchema>;
 export type GroupRuntimeSummary = z.infer<typeof GroupRuntimeSummarySchema>;
 export type GroupDeletePreview = z.infer<typeof GroupDeletePreviewSchema>;

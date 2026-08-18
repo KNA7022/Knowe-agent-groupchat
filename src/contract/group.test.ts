@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  CourseUnbindResponseSchema,
   ExpertTemplateConfigSchema,
   GroupAgentSchema,
   GroupDeletionReceiptSchema,
   GroupSchema,
   GroupTransportIdentitySchema,
+  SourceUnlinkResponseSchema,
   withGroupTransportAlias,
 } from './group';
 import { validateInbound } from './envelope';
@@ -114,5 +116,14 @@ describe('Group domain contract', () => {
     };
     expect(GroupDeletionReceiptSchema.safeParse(receipt).success).toBe(true);
     expect(GroupDeletionReceiptSchema.safeParse({ ...receipt, group_name: 'secret' }).success).toBe(false);
+  });
+
+  it('strictly validates identity-bearing unbind responses and source counts', () => {
+    const base = { ok: true, group_id: groupId, project_id: 'legacy-p', removed: true };
+    expect(CourseUnbindResponseSchema.safeParse(base).success).toBe(true);
+    expect(CourseUnbindResponseSchema.safeParse({ ...base, extra: true }).success).toBe(false);
+    expect(SourceUnlinkResponseSchema.safeParse({ ...base, reference_count: 0 }).success).toBe(true);
+    expect(SourceUnlinkResponseSchema.safeParse({ ...base, reference_count: -1 }).success).toBe(false);
+    expect(SourceUnlinkResponseSchema.safeParse({ ...base, reference_count: 0.5 }).success).toBe(false);
   });
 });

@@ -639,20 +639,43 @@ class GroupRepository:
         for index, row in enumerate(payload["duplicate_transactions"]):
             if row.get("transaction_id") != transaction_id:
                 continue
+            if row.get("stage") == "deleted":
+                raise GroupDomainError("duplicate transaction target was deleted")
+            if row.get("stage") == "committed":
+                committed = next((
+                    item for item in payload["groups"]
+                    if item.get("group_id") == row.get("group_id")
+                ), None)
+                if not isinstance(committed, Mapping):
+                    raise GroupNotFoundError(
+                        f"committed duplicate group not found: {row.get('group_id')}"
+                    )
+                return Group.from_dict(committed)
             group_raw = row.get("group")
             if not isinstance(group_raw, Mapping):
                 raise GroupDomainError("duplicate transaction is missing Group configuration")
             duplicate = Group.from_dict(group_raw)
-            if row.get("stage") == "committed":
-                return duplicate
             if not any(item.get("group_id") == duplicate.group_id for item in payload["groups"]):
                 payload["groups"].append(duplicate.to_dict())
-            payload["duplicate_transactions"][index] = {
-                **row, "stage": "committed", "updated_at": utc_now(),
-            }
+            payload["duplicate_transactions"][index] = self._minimal_duplicate_transaction(
+                row, stage="committed",
+            )
             self._save_payload(payload)
             return duplicate
         raise GroupNotFoundError(f"duplicate transaction not found: {transaction_id}")
+
+    @staticmethod
+    def _minimal_duplicate_transaction(
+        row: Mapping[str, Any], *, stage: str,
+    ) -> dict[str, Any]:
+        """Keep only opaque routing/idempotency metadata after publication or deletion."""
+        return {
+            key: row.get(key)
+            for key in (
+                "transaction_id", "source_group_id", "group_id", "runtime_project_id",
+                "request_id", "created_at",
+            )
+        } | {"stage": stage, "updated_at": utc_now()}
 
     def duplicate_transaction(self, group_id: str, request_id: str) -> dict[str, Any] | None:
         return next((
@@ -906,6 +929,11 @@ class GroupRepository:
                 **row, "stage": "committed", "receipt": committed_receipt,
                 "updated_at": utc_now(),
             }
+            payload["duplicate_transactions"] = [
+                self._minimal_duplicate_transaction(item, stage="deleted")
+                if item.get("group_id") == group_id else item
+                for item in payload["duplicate_transactions"]
+            ]
             self._save_payload(payload)
             return GroupDeletionReceipt(
                 **{
@@ -927,27 +955,42 @@ def migrate_legacy_projects(data_root: str | os.PathLike[str]) -> dict[str, Any]
     """Run the Group migration with an outer rollback/report fence."""
     root = Path(data_root)
     repo = GroupRepository(root)
-    registry_before = repo.registry_path.read_bytes() if repo.registry_path.is_file() else None
-    source_before = _legacy_source_inventory(root)
+    registry_existed = repo.registry_path.is_file()
+    registry_before: bytes | None = None
+    source_before: dict[str, str | None] = {}
+    before_errors: dict[str, str] = {}
     try:
+        if registry_existed:
+            registry_before = repo.registry_path.read_bytes()
+        source_before, before_errors = _safe_legacy_source_inventory(root)
+        if before_errors:
+            details = "; ".join(f"{path}: {error}" for path, error in sorted(before_errors.items()))
+            raise OSError(f"legacy source inventory failed: {details}")
         return _migrate_legacy_projects_impl(root)
     except Exception as exc:
-        if registry_before is None:
-            repo.registry_path.unlink(missing_ok=True)
-        else:
+        if registry_before is not None:
             _atomic_write_bytes(repo.registry_path, registry_before)
+        elif not registry_existed:
+            repo.registry_path.unlink(missing_ok=True)
         report_path = root / "migration_reports" / "groups-v1.json"
-        source_after = _legacy_source_inventory(root)
+        source_after, after_errors = _safe_legacy_source_inventory(root)
+        all_paths = sorted(set(source_before) | set(source_after) | set(before_errors) | set(after_errors))
         evidence = [
             {
                 "path": path,
                 "before_sha256": digest,
                 "after_sha256": source_after.get(path),
-                "unchanged": source_after.get(path) == digest,
+                "before_error": before_errors.get(path),
+                "after_error": after_errors.get(path),
+                "unchanged": bool(
+                    digest and source_after.get(path) == digest
+                    and path not in before_errors and path not in after_errors
+                ),
             }
-            for path, digest in sorted(source_before.items())
+            for path in all_paths
+            for digest in (source_before.get(path),)
         ]
-        unchanged = all(item["unchanged"] for item in evidence)
+        unchanged = bool(evidence) and all(item["unchanged"] for item in evidence)
         _atomic_write_json(report_path, {
             "version": 1,
             "status": "failed",
@@ -961,14 +1004,17 @@ def migrate_legacy_projects(data_root: str | os.PathLike[str]) -> dict[str, Any]
         raise
 
 
-def _legacy_source_inventory(root: Path) -> dict[str, str]:
+def _legacy_source_inventory(root: Path) -> tuple[dict[str, str | None], dict[str, str]]:
+    """Inventory legacy inputs without allowing one unreadable file to hide the report."""
     registry = root / "projects.json"
     if not registry.is_file():
-        return {}
+        return {}, {}
     paths = [registry]
+    errors: dict[str, str] = {}
     try:
         projects = json.loads(registry.read_text("utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        errors["projects.json"] = f"{type(exc).__name__}: {str(exc)[:300]}"
         projects = []
     if isinstance(projects, list):
         for row in projects:
@@ -976,10 +1022,24 @@ def _legacy_source_inventory(root: Path) -> dict[str, str]:
                 roster = root / "events" / f"{_legacy_safe_name(row['project_id'])}_roster.jsonl"
                 if roster.is_file():
                     paths.append(roster)
-    return {
-        str(path.relative_to(root)).replace("\\", "/"): _sha256(path)
-        for path in paths
-    }
+    inventory: dict[str, str | None] = {}
+    for path in paths:
+        relative = str(path.relative_to(root)).replace("\\", "/")
+        try:
+            inventory[relative] = _sha256(path)
+        except Exception as exc:  # noqa: BLE001 - evidence must survive arbitrary hash/read faults
+            inventory[relative] = None
+            errors[relative] = f"{type(exc).__name__}: {str(exc)[:300]}"
+    return inventory, errors
+
+
+def _safe_legacy_source_inventory(
+    root: Path,
+) -> tuple[dict[str, str | None], dict[str, str]]:
+    try:
+        return _legacy_source_inventory(root)
+    except Exception as exc:  # noqa: BLE001 - reporting must outlive inventory implementation faults
+        return {}, {"<inventory>": f"{type(exc).__name__}: {str(exc)[:300]}"}
 
 
 def _migrate_legacy_projects_impl(data_root: str | os.PathLike[str]) -> dict[str, Any]:

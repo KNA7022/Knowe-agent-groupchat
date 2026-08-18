@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import backend.groups as groups_module
 from backend.groups import (
     ExpertTemplateConfig,
     GroupAgent,
@@ -139,7 +140,7 @@ def test_duplicate_commit_failure_is_hidden_and_resumable(
     repo.bind_course(source.group_id, "course_1")
     repo.link_source(source.group_id)
     transaction = repo.prepare_duplicate(
-        source.group_id, name="Copy", legacy_project_id="project_copy",
+        source.group_id, name="Private duplicate content", legacy_project_id="project_copy",
         request_id="gdup_retryable_1",
     )
     before = [group.group_id for group in repo.list_groups()]
@@ -159,6 +160,27 @@ def test_duplicate_commit_failure_is_hidden_and_resumable(
     assert copied.legacy_project_id == "project_copy"
     assert len(copied.course_bindings) == 1
     assert len(copied.source_links) == 1
+    assert repo.commit_duplicate(str(transaction["transaction_id"])).group_id == copied.group_id
+    persisted = repo._load_payload()  # noqa: SLF001
+    committed_tx = next(
+        row for row in persisted["duplicate_transactions"]
+        if row["transaction_id"] == transaction["transaction_id"]
+    )
+    assert committed_tx["stage"] == "committed"
+    assert "group" not in committed_tx
+    journal_json = json.dumps(committed_tx)
+    assert "Private duplicate content" not in journal_json
+    assert "course_1" not in journal_json
+
+    preview = repo.delete_preview(copied.group_id)
+    repo.confirmed_delete(copied.group_id, preview.confirmation_token)
+    deleted_tx = repo.duplicate_transaction(source.group_id, "gdup_retryable_1")
+    assert deleted_tx is not None and deleted_tx["stage"] == "deleted"
+    assert "group" not in deleted_tx
+    assert "Private duplicate content" not in json.dumps(deleted_tx)
+    assert "Private duplicate content" not in repo.registry_path.read_text("utf-8")
+    with pytest.raises(GroupDomainError, match="target was deleted"):
+        repo.commit_duplicate(str(transaction["transaction_id"]))
 
 
 def test_delete_commit_is_atomic_resumable_and_idempotent(
@@ -259,6 +281,44 @@ def test_migration_failure_rolls_back_new_registry_without_touching_source(
     assert evidence["events/old-a_roster.jsonl"]["before_sha256"] == evidence[
         "events/old-a_roster.jsonl"
     ]["after_sha256"]
+
+
+def test_migration_inventory_failure_reports_and_preserves_unreadable_roster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing_repo = GroupRepository(tmp_path)
+    existing_repo.create_group("Existing canonical Group")
+    registry_before = existing_repo.registry_path.read_bytes()
+    projects = json.dumps([{"project_id": "old-a", "name": "A"}]).encode("utf-8")
+    (tmp_path / "projects.json").write_bytes(projects)
+    events = tmp_path / "events"
+    events.mkdir()
+    roster = events / "old-a_roster.jsonl"
+    roster_bytes = b'{"agent_id":"legacy","role":"research"}\n'
+    roster.write_bytes(roster_bytes)
+    original_sha256 = groups_module._sha256  # noqa: SLF001
+    failed_once = False
+
+    def unreadable_once(path: Path) -> str:
+        nonlocal failed_once
+        if path == roster and not failed_once:
+            failed_once = True
+            raise PermissionError("simulated unreadable roster")
+        return original_sha256(path)
+
+    monkeypatch.setattr(groups_module, "_sha256", unreadable_once)
+    with pytest.raises(OSError, match="inventory failed"):
+        migrate_legacy_projects(tmp_path)
+
+    assert (tmp_path / "projects.json").read_bytes() == projects
+    assert roster.read_bytes() == roster_bytes
+    assert existing_repo.registry_path.read_bytes() == registry_before
+    report = json.loads((tmp_path / "migration_reports" / "groups-v1.json").read_text("utf-8"))
+    assert report["status"] == "failed"
+    evidence = {item["path"]: item for item in report["legacy_source_evidence"]}
+    assert set(evidence) == {"projects.json", "events/old-a_roster.jsonl"}
+    assert "PermissionError" in evidence["events/old-a_roster.jsonl"]["before_error"]
+    assert evidence["events/old-a_roster.jsonl"]["after_sha256"] == original_sha256(roster)
 
 
 def test_transport_alias_resolves_group_id_and_emits_both_ids(tmp_path: Path) -> None:

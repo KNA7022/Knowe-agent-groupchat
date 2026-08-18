@@ -1,12 +1,14 @@
 import { create } from 'zustand';
 
 import {
+  CourseUnbindResponseSchema,
   GroupDeletionReceiptSchema,
   GroupDeletePreviewSchema,
   GroupCourseBindingSchema,
   GroupRuntimeSummarySchema,
   GroupSchema,
   GroupSourceLinkSchema,
+  SourceUnlinkResponseSchema,
   type Group,
   type GroupAgent,
   type GroupCourseBinding,
@@ -224,10 +226,11 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
   async unbindCourse(groupId, courseId): Promise<boolean> {
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
-    const raw = await groupJson('/groups/course-unbind', {
+    const raw = CourseUnbindResponseSchema.parse(await groupJson('/groups/course-unbind', {
       ...transportIdentity(current), course_id: courseId,
-    }) as { removed?: unknown };
-    const removed = raw.removed === true;
+    }));
+    assertAddressedGroup(groupId, raw.group_id);
+    const removed = raw.removed;
     if (removed) set((state) => ({ groups: {
       ...state.groups,
       [groupId]: {
@@ -285,13 +288,14 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
   async unlinkSource(groupId, sourceId): Promise<boolean> {
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
-    const raw = await groupJson('/groups/source-unlink', {
+    const raw = SourceUnlinkResponseSchema.parse(await groupJson('/groups/source-unlink', {
       ...transportIdentity(current), source_id: sourceId,
-    }) as { removed?: unknown; reference_count?: unknown };
-    const removed = raw.removed === true;
+    }));
+    assertAddressedGroup(groupId, raw.group_id);
+    const removed = raw.removed;
     if (removed) set((state) => {
       const counts = { ...state.sourceReferenceCounts[groupId] };
-      const referenceCount = typeof raw.reference_count === 'number' ? raw.reference_count : 0;
+      const referenceCount = raw.reference_count;
       if (referenceCount > 0) counts[sourceId] = referenceCount;
       else delete counts[sourceId];
       return {
