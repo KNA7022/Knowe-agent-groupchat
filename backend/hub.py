@@ -60,6 +60,10 @@ class Client:
         self._live_replay_fenced = True
         self._live_replay_buffer: deque[dict[str, Any]] = deque()
         self._live_replay_overflow_projects: set[str] = set()
+        # Recovery ACKs are accepted only for a snapshot cursor issued to this
+        # authenticated live connection.  Reconnect intentionally starts empty.
+        self.task_runtime_recovery_notified: set[tuple[str, str, int]] = set()
+        self.task_runtime_recovery_snapshots: dict[tuple[str, str, int], str] = {}
 
     @property
     def alive(self) -> bool:

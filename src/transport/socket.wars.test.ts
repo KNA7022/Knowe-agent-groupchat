@@ -55,8 +55,7 @@ interface Harness {
   runtimeSnapshots: Array<{ groupId: string; snapshot: unknown }>;
 }
 
-function connect(opts: { ringMax?: number } = {}): Harness {
-  void opts;
+function connect(opts: { ringMax?: number; projectRuntime?: boolean } = {}): Harness {
   const events: InboundEvent[] = [];
   const statuses: ConnStatus[] = [];
   const epochResets: string[] = [];
@@ -78,7 +77,12 @@ function connect(opts: { ringMax?: number } = {}): Harness {
       getActiveProjectId: () => 'demo',
       onDiagnostic: recordDiagnostic,     // ★ 走廊接上真传输层
       onActivityLedger: (pid, activity) => ledger.push({ pid, activity }), // [v1.0.24.4]
-      onTaskRuntimeSnapshot: (groupId, snapshot) => runtimeSnapshots.push({ groupId, snapshot }),
+      onTaskRuntimeSnapshot: (groupId, snapshot) => {
+        if (opts.projectRuntime) {
+          useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId as GroupId, snapshot);
+        }
+        runtimeSnapshots.push({ groupId, snapshot });
+      },
     },
   });
   socket = s;
@@ -325,31 +329,95 @@ describe('W5 · seq 空洞', () => {
   });
 
   it('恢复控制帧明确指定后台项目时只刷新该项目并回传 token', async () => {
-    const h = connect();
+    useTaskRuntimeStore.getState().resetAll();
+    const h = connect({ projectRuntime: true });
     await until(() => h.statuses.includes('live'), 'live');
     const before = server.inbound.length;
+    const groupId = `grp_${'9'.repeat(32)}`;
+    const recoveryToken = 'recovery_background_once';
+    const snapshotCursor = 'a'.repeat(64);
     server.emitNoSeq({
       type: 'resync_required', project_id: 'project_background', last_seq: 9,
-      group_id: `grp_${'9'.repeat(32)}`, recovery_token: 'recovery_background_once',
+      group_id: groupId, recovery_token: recoveryToken, recovery_generation: 1,
     });
     await until(
       () => server.inbound.slice(before).some(
         (item) => item.type === 'request_snapshot'
           && item.project_id === 'project_background'
-          && item.recovery_token === 'recovery_background_once',
+          && item.recovery_token === recoveryToken
+          && item.recovery_generation === 1,
       ),
       'background recovery snapshot request',
     );
+    server.emitNoSeq({
+      type: 'resync_required', project_id: 'project_background', last_seq: 9,
+      group_id: groupId, recovery_token: recoveryToken, recovery_generation: 1,
+    });
+    await sleep(30);
+    expect(server.inbound.slice(before).filter(
+      (item) => item.type === 'request_snapshot' && item.recovery_token === recoveryToken,
+    )).toHaveLength(1);
     expect(server.inbound.slice(before).some(
       (item) => item.type === 'request_snapshot' && item.project_id === 'demo',
     )).toBe(false);
     server.emitNoSeq({
-      type: 'task_runtime_result', action: 'snapshot', request_id: 'recovery_background_once',
-      schema_version: 1, group_id: `grp_${'9'.repeat(32)}`,
-      task_runtime: { group_id: `grp_${'9'.repeat(32)}` },
+      type: 'task_runtime_result', action: 'snapshot', request_id: recoveryToken,
+      schema_version: 1, project_id: 'project_background', group_id: groupId,
+      recovery_token: recoveryToken, recovery_generation: 2,
+      snapshot_cursor: snapshotCursor,
+      task_runtime: {
+        schema_version: 1, group_id: groupId, runs: [], pending_approvals: [],
+        summary: {
+          active_primary_run_id: null, primary_task_status: null, queued_task_count: 0,
+          active_side_task_count: 0, pending_approval_count: 0,
+          budget_usage: {
+            wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0,
+          },
+          indexing_state: 'idle',
+        },
+      },
     });
     await until(() => h.runtimeSnapshots.length === 1, 'background Runtime snapshot handoff');
-    expect(h.runtimeSnapshots[0]?.groupId).toBe(`grp_${'9'.repeat(32)}`);
+    expect(h.runtimeSnapshots[0]?.groupId).toBe(groupId);
+    expect(useTaskRuntimeStore.getState().byGroup[groupId as GroupId]).toEqual([]);
+    await until(() => server.inbound.some(
+      (item) => item.type === 'task_runtime_recovery_ack'
+        && item.project_id === 'project_background'
+        && item.recovery_token === recoveryToken
+        && item.recovery_generation === 2
+        && item.snapshot_cursor === snapshotCursor,
+    ), 'renderer ack');
+    expect(h.statuses.at(-1)).toBe('live');
+  });
+
+  it('同一 durable token 断线重连后可重试；畸形快照不 ACK 且保持 resync', async () => {
+    const h = connect();
+    await until(() => h.statuses.includes('live'), 'live');
+    const groupId = `grp_${'8'.repeat(32)}`;
+    const notice = {
+      type: 'resync_required', project_id: 'project_retry', last_seq: 3,
+      group_id: groupId, recovery_token: 'recovery_retry', recovery_generation: 4,
+    } as const;
+    server.emitNoSeq(notice);
+    await until(() => server.inbound.filter(
+      (item) => item.type === 'request_snapshot' && item.recovery_token === 'recovery_retry',
+    ).length === 1, 'first recovery request');
+
+    server.restart();
+    await until(() => h.statuses.at(-1) === 'live', 'reconnected live', 6000);
+    server.emitNoSeq(notice);
+    await until(() => server.inbound.filter(
+      (item) => item.type === 'request_snapshot' && item.recovery_token === 'recovery_retry',
+    ).length === 2, 'same token retried', 6000);
+    server.emitNoSeq({
+      type: 'task_runtime_result', action: 'snapshot', request_id: 'recovery_retry',
+      schema_version: 1, project_id: 'project_retry', group_id: groupId,
+      recovery_token: 'recovery_retry', recovery_generation: 4,
+      snapshot_cursor: 'not-a-cursor', task_runtime: { group_id: groupId },
+    });
+    await sleep(50);
+    expect(server.inbound.some((item) => item.type === 'task_runtime_recovery_ack')).toBe(false);
+    expect(h.statuses.at(-1)).toBe('resync');
   });
 });
 

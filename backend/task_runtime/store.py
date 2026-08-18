@@ -7,6 +7,7 @@ The event journal is durable and append-only; reconnect never depends on a memor
 ring and therefore can prove whether a client cursor is contiguous.
 """
 
+import hashlib
 import json
 import logging
 import threading
@@ -184,12 +185,14 @@ class TaskRuntimeStore:
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS studycrew_live_recovery (
-                run_id TEXT PRIMARY KEY,
-                group_id TEXT NOT NULL,
+                group_id TEXT PRIMARY KEY,
                 through_seq INTEGER NOT NULL,
                 reason TEXT NOT NULL,
                 attempts INTEGER NOT NULL,
                 recovery_token TEXT NOT NULL UNIQUE,
+                generation INTEGER NOT NULL,
+                failure_count INTEGER NOT NULL,
+                cause_digest TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -220,6 +223,7 @@ class TaskRuntimeStore:
         self.db.ensure_columns("studycrew_approvals", {"request_key": "TEXT"})
         self.db.ensure_columns("studycrew_checkpoints", {"idempotency_key": "TEXT"})
         self.db.ensure_columns("studycrew_migration_tombstones", {"winner_id": "TEXT NOT NULL DEFAULT ''"})
+        self._migrate_group_live_recovery()
         self._migrate_v1_side_records()
         self.db.initialize(
             """
@@ -232,6 +236,65 @@ class TaskRuntimeStore:
               WHERE idempotency_key IS NOT NULL;
             """
         )
+
+    def _migrate_group_live_recovery(self) -> None:
+        """Collapse the preceding per-Run outbox markers into one lossless Group intent."""
+        with self.db.transaction() as conn:
+            columns = {
+                str(row["name"]): row for row in conn.execute(
+                    "PRAGMA table_info(studycrew_live_recovery)",
+                ).fetchall()
+            }
+            if "generation" in columns and int(columns["group_id"]["pk"]) == 1:
+                return
+            legacy = conn.execute(
+                "SELECT * FROM studycrew_live_recovery ORDER BY created_at, run_id",
+            ).fetchall()
+            conn.execute("DROP INDEX IF EXISTS idx_studycrew_live_recovery_group")
+            conn.execute(
+                "ALTER TABLE studycrew_live_recovery RENAME TO studycrew_live_recovery_run_scoped",
+            )
+            conn.execute(
+                """CREATE TABLE studycrew_live_recovery (
+                       group_id TEXT PRIMARY KEY,
+                       through_seq INTEGER NOT NULL,
+                       reason TEXT NOT NULL,
+                       attempts INTEGER NOT NULL,
+                       recovery_token TEXT NOT NULL UNIQUE,
+                       generation INTEGER NOT NULL,
+                       failure_count INTEGER NOT NULL,
+                       cause_digest TEXT NOT NULL,
+                       created_at TEXT NOT NULL,
+                       updated_at TEXT NOT NULL
+                   )""",
+            )
+            grouped: dict[str, list[Any]] = {}
+            for row in legacy:
+                grouped.setdefault(str(row["group_id"]), []).append(row)
+            for group_id, rows in grouped.items():
+                digest = ""
+                for row in rows:
+                    digest = hashlib.sha256(
+                        f"{digest}|{row['run_id']}|{row['through_seq']}|{row['reason']}".encode(),
+                    ).hexdigest()
+                newest = rows[-1]
+                conn.execute(
+                    """INSERT INTO studycrew_live_recovery(
+                           group_id, through_seq, reason, attempts, recovery_token,
+                           generation, failure_count, cause_digest, created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        group_id, max(int(row["through_seq"]) for row in rows),
+                        str(newest["reason"]), max(int(row["attempts"]) for row in rows),
+                        str(rows[0]["recovery_token"]), len(rows), len(rows), digest,
+                        str(rows[0]["created_at"]), str(newest["updated_at"]),
+                    ),
+                )
+            conn.execute("DROP TABLE studycrew_live_recovery_run_scoped")
+            conn.execute(
+                "CREATE INDEX idx_studycrew_live_recovery_group "
+                "ON studycrew_live_recovery(group_id, updated_at)",
+            )
 
     def _migrate_v1_side_records(self) -> None:
         """Normalize the immediately preceding Task Runtime v1 shape.
@@ -1156,50 +1219,76 @@ class TaskRuntimeStore:
 
     def record_live_recovery(
         self, *, run_id: str, group_id: str, through_seq: int, reason: str,
-        attempts: int, recovery_token: str, limit: int,
+        attempts: int, recovery_token: str,
     ) -> dict[str, Any]:
-        """Persist one coalesced affected-Group resync requirement with bounded retention."""
+        """Upsert one monotonic, lossless recovery generation for the affected Group."""
         now = utc_now()
         with self.db.transaction() as conn:
+            previous = conn.execute(
+                "SELECT * FROM studycrew_live_recovery WHERE group_id=?", (group_id,),
+            ).fetchone()
+            token = str(previous["recovery_token"]) if previous is not None else recovery_token
+            generation = (int(previous["generation"]) if previous is not None else 0) + 1
+            failure_count = (int(previous["failure_count"]) if previous is not None else 0) + 1
+            old_digest = str(previous["cause_digest"]) if previous is not None else ""
+            cause_digest = hashlib.sha256(
+                f"{old_digest}|{run_id}|{through_seq}|{reason}|{attempts}".encode(),
+            ).hexdigest()
+            created_at = str(previous["created_at"]) if previous is not None else now
             conn.execute(
                 """INSERT INTO studycrew_live_recovery(
-                       run_id, group_id, through_seq, reason, attempts, recovery_token,
-                       created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(run_id) DO UPDATE SET
-                     group_id=excluded.group_id,
+                       group_id, through_seq, reason, attempts, recovery_token,
+                       generation, failure_count, cause_digest, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(group_id) DO UPDATE SET
                      through_seq=MAX(studycrew_live_recovery.through_seq, excluded.through_seq),
                      reason=excluded.reason,
-                     attempts=excluded.attempts,
+                     attempts=MAX(studycrew_live_recovery.attempts, excluded.attempts),
+                     generation=excluded.generation,
+                     failure_count=excluded.failure_count,
+                     cause_digest=excluded.cause_digest,
                      updated_at=excluded.updated_at""",
-                (run_id, group_id, through_seq, reason, attempts, recovery_token, now, now),
-            )
-            conn.execute(
-                """DELETE FROM studycrew_live_recovery WHERE run_id IN (
-                       SELECT run_id FROM studycrew_live_recovery
-                       ORDER BY updated_at DESC, run_id DESC LIMIT -1 OFFSET ?
-                   )""",
-                (max(1, int(limit)),),
+                (
+                    group_id, through_seq, reason, attempts, token, generation,
+                    failure_count, cause_digest, created_at, now,
+                ),
             )
             row = conn.execute(
-                "SELECT * FROM studycrew_live_recovery WHERE run_id=?", (run_id,),
+                "SELECT * FROM studycrew_live_recovery WHERE group_id=?", (group_id,),
             ).fetchone()
-        if row is None:
-            return {}
-        return {key: row[key] for key in row.keys()}
+        return {} if row is None else {key: row[key] for key in row.keys()}
 
-    def live_recoveries(self) -> tuple[dict[str, Any], ...]:
+    def live_recoveries(
+        self, *, limit: int | None = None, after_group_id: str = "",
+    ) -> tuple[dict[str, Any], ...]:
         with self.db.transaction(immediate=False) as conn:
-            rows = conn.execute(
-                "SELECT * FROM studycrew_live_recovery ORDER BY updated_at, run_id"
-            ).fetchall()
+            if limit is None:
+                rows = conn.execute(
+                    "SELECT * FROM studycrew_live_recovery ORDER BY group_id",
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM studycrew_live_recovery
+                       WHERE group_id > ? ORDER BY group_id LIMIT ?""",
+                    (after_group_id, max(1, int(limit))),
+                ).fetchall()
         return tuple({key: row[key] for key in row.keys()} for row in rows)
 
-    def clear_live_recovery(self, run_id: str, recovery_token: str) -> bool:
+    def live_recovery(self, group_id: str) -> dict[str, Any] | None:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT * FROM studycrew_live_recovery WHERE group_id=?", (group_id,),
+            ).fetchone()
+        return None if row is None else {key: row[key] for key in row.keys()}
+
+    def clear_live_recovery(
+        self, group_id: str, recovery_token: str, generation: int,
+    ) -> bool:
         with self.db.transaction() as conn:
             cursor = conn.execute(
-                "DELETE FROM studycrew_live_recovery WHERE run_id=? AND recovery_token=?",
-                (run_id, recovery_token),
+                """DELETE FROM studycrew_live_recovery
+                   WHERE group_id=? AND recovery_token=? AND generation=?""",
+                (group_id, recovery_token, generation),
             )
         return cursor.rowcount == 1
 
@@ -1385,11 +1474,18 @@ class TaskRuntimeStore:
                 "executor_continuations": int(conn.execute(
                     "SELECT COUNT(*) FROM studycrew_executor_continuations WHERE group_id=?", (group_id,),
                 ).fetchone()[0]),
+                "live_recovery": int(conn.execute(
+                    "SELECT COUNT(*) FROM studycrew_live_recovery WHERE group_id=?", (group_id,),
+                ).fetchone()[0]),
+                "live_publication": int(conn.execute(
+                    "SELECT COUNT(*) FROM studycrew_live_publication WHERE group_id=?", (group_id,),
+                ).fetchone()[0]),
             }
             for table in (
                 "studycrew_checkpoints", "studycrew_tool_invocations",
                 "studycrew_permission_grants", "studycrew_approvals",
                 "studycrew_verifier_decisions", "studycrew_executor_continuations",
+                "studycrew_live_recovery", "studycrew_live_publication",
                 "studycrew_run_events", "studycrew_task_runs",
             ):
                 conn.execute(f"DELETE FROM {table} WHERE group_id=?", (group_id,))
@@ -1402,6 +1498,8 @@ class TaskRuntimeStore:
             "tools": "studycrew_tool_invocations", "checkpoints": "studycrew_checkpoints",
             "verifier_decisions": "studycrew_verifier_decisions",
             "executor_continuations": "studycrew_executor_continuations",
+            "live_recovery": "studycrew_live_recovery",
+            "live_publication": "studycrew_live_publication",
         }
         with self.db.transaction(immediate=False) as conn:
             return {

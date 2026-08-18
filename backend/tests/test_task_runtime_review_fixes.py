@@ -244,6 +244,7 @@ async def test_group_deletion_recovers_after_every_durable_boundary(
             "runs": 0, "events": 0, "approvals": 0, "grants": 0,
                 "tools": 0, "checkpoints": 0, "verifier_decisions": 0,
                 "executor_continuations": 0,
+                "live_recovery": 0, "live_publication": 0,
             }
         with pytest.raises(RuntimeNotFoundError):
             restarted.task_runtime.snapshot(group.group_id, run.run_id)  # type: ignore[union-attr]

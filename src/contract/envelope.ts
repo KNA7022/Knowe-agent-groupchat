@@ -909,6 +909,7 @@ export const ResyncRequiredSchema = z.object({
   project_id: z.string().optional(),
   group_id: z.string().regex(/^grp_[0-9a-f]{32}$/).optional(),
   recovery_token: z.string().optional(),
+  recovery_generation: z.number().int().positive().optional(),
   message: z.string().optional(),
 });
 export type ResyncRequired = z.infer<typeof ResyncRequiredSchema>;
@@ -934,6 +935,23 @@ export const TaskRuntimeResultSchema = z.object({
   group_id: z.string().regex(/^grp_[0-9a-f]{32}$/),
 }).passthrough();
 export type TaskRuntimeResult = z.infer<typeof TaskRuntimeResultSchema>;
+
+/** Runtime-only recovery response: every field participates in the ACK binding. */
+export const RecoveryTaskRuntimeSnapshotResultSchema = z.object({
+  type: z.literal('task_runtime_result'),
+  action: z.literal('snapshot'),
+  request_id: z.string().min(1),
+  schema_version: z.literal(1),
+  project_id: z.string().min(1),
+  group_id: z.string().regex(/^grp_[0-9a-f]{32}$/),
+  recovery_token: z.string().min(1),
+  recovery_generation: z.number().int().positive(),
+  snapshot_cursor: z.string().regex(/^[0-9a-f]{64}$/),
+  task_runtime: GroupRuntimeSnapshotSchema,
+}).strict();
+export type RecoveryTaskRuntimeSnapshotResult = z.infer<
+  typeof RecoveryTaskRuntimeSnapshotResultSchema
+>;
 
 export const TaskRuntimeEventSchema = z.object({
   type: z.literal('task_runtime_event'),
@@ -1193,8 +1211,19 @@ export const RequestSnapshotCmdSchema = z.object({
   type: z.literal('request_snapshot'),
   project_id: z.string(),            // [v2#8] 必填——根治多项目 resync 断腿
   recovery_token: z.string().optional(),
+  recovery_generation: z.number().int().positive().optional(),
 });
 export type RequestSnapshotCmd = z.infer<typeof RequestSnapshotCmdSchema>;
+
+export const TaskRuntimeRecoveryAckCmdSchema = z.object({
+  type: z.literal('task_runtime_recovery_ack'),
+  project_id: z.string().min(1),
+  group_id: z.string().regex(/^grp_[0-9a-f]{32}$/),
+  recovery_token: z.string().min(1),
+  recovery_generation: z.number().int().positive(),
+  snapshot_cursor: z.string().regex(/^[0-9a-f]{64}$/),
+});
+export type TaskRuntimeRecoveryAckCmd = z.infer<typeof TaskRuntimeRecoveryAckCmdSchema>;
 
 /** [v1.0.35.3] 上报已读水位：切群/聚焦/标记已读时发，后端据此推进 last_read_seq 并落盘。 */
 export const MarkReadCmdSchema = z.object({
@@ -1277,6 +1306,7 @@ export const OutboundCommandSchema = z.discriminatedUnion('type', [
   AddAgentsCmdSchema,
   ReplayRequestCmdSchema,
   RequestSnapshotCmdSchema,
+  TaskRuntimeRecoveryAckCmdSchema,
   MarkReadCmdSchema,
   SetProjectDirectoryCmdSchema,
   CancelProjectDirectoryCmdSchema,

@@ -187,3 +187,69 @@ the just-replayed roster/activity state. This round closes all three.
   blocked in its pre-existing fixture because it creates projects without the now
   mandatory project directory (`25 passed, 16 fixture errors` when audited alongside
   Hub unit tests).
+
+## Independent re-review fix round 3/5
+
+The second re-review found that recovery was acknowledged at the socket-write
+boundary, was keyed and capped per Run, and could leave a renderer permanently in
+`resync`. This round replaces that provisional behavior with a renderer-acknowledged,
+Group-coalesced durable protocol.
+
+### End-to-end renderer acknowledgement
+
+- A recovery notice now carries one Group token plus a monotonic generation. A
+  Runtime-only snapshot response binds canonical project, Group, token, generation,
+  and a deterministic snapshot cursor. The server retains the durable intent after
+  sending the response.
+- `task_runtime_recovery_ack` is accepted only on the authenticated connection that
+  was issued the matching snapshot cursor. Forged project/Group/token/generation or
+  cursor values cause zero durable mutation. If a new failure advances the generation
+  after snapshot issue, the stale ACK cannot clear it and the server advertises the
+  remaining generation.
+- The renderer treats request suppression as connection-scoped outstanding work.
+  Disconnect, reconnect and epoch reset allow the same durable token to retry. A
+  recovery response passes a strict schema, matching-address checks, and authoritative
+  store projection before the renderer clears its outstanding attempt, moves from
+  `resync` to `live`, and sends the ACK. Malformed or rejected snapshots remain in
+  `resync` and send no ACK.
+- Duplicate notices in one connection produce one concurrent request. If another
+  failed Run advances the Group while that request is outstanding, the same response
+  carries the latest generation rather than opening a second parallel handshake.
+
+### Lossless Group-coalesced recovery
+
+- `studycrew_live_recovery` is now keyed by canonical `group_id`. It retains one token,
+  monotonic generation, failure count, high-water metadata and a chained cause digest
+  for every affected Group. The previous Run-scoped schema migrates transactionally
+  and coalesces existing rows.
+- The old global `DELETE ... OFFSET 256` retention was removed. Durable correctness
+  work is bounded semantically by existing Groups and is never discarded. The live
+  dispatcher reads fixed 256-Group pages, yields fairly, and keeps only a 256-entry hot
+  cache; a restart test retains and notifies all 257 Groups, including the oldest.
+- Two failed Runs in one Group retain one row/token and one outstanding client frame;
+  the authoritative snapshot covers both Runs. Acknowledging one Group never clears
+  another. Temporary recovery-table write failure still has a bounded live-control
+  fallback while committed RunEvents remain the restart authority.
+
+### Atomic deletion lifecycle
+
+- `TaskRuntimeStore.delete_group()` deletes `studycrew_live_recovery` and
+  `studycrew_live_publication` inside the same transaction as Runs, events, approvals,
+  tools and checkpoints. Both tables are included in `group_content_counts()` and the
+  completion residual assertion.
+- A fault injected at the final Run deletion proves the entire transaction, including
+  both bridge tables, rolls back and the deletion intent is not marked complete. The
+  successful retry leaves every content count at zero before recording completion.
+
+### Round-3 acceptance evidence
+
+- Focused recovery protocol, real WebSocket/store, migration, paging and deletion
+  suite: `5 passed in 1.48s`.
+- Bridge plus recovery suites: `14 passed` (the final combined run below includes both).
+- Task 1–3 Group/Task Runtime regressions: `122 passed in 28.10s`.
+- Legacy Engine regressions: `26 passed, 10 subtests passed in 1.68s`.
+- Frontend real transport/store and Task Runtime/Group suites:
+  `5 files / 44 tests passed`.
+- Targeted Python compilation, ESLint, strict TypeScript compilation and
+  `git diff --check` all passed; Git emitted only the repository's existing Windows
+  LF-to-CRLF notices.

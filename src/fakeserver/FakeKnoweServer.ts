@@ -327,7 +327,14 @@ export class FakeKnoweServer {
       }
 
       case 'request_snapshot':
+        // Production recovery uses a Runtime-only response followed by an explicit
+        // renderer ACK. Tests inject that response deliberately; a generic state
+        // snapshot here would mask a stuck recovery state.
+        if (msg.recovery_token) return;
         this.snapshot((msg.project_id as string) || 'demo');
+        return;
+
+      case 'task_runtime_recovery_ack':
         return;
 
       case 'approve':

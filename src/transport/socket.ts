@@ -45,7 +45,11 @@ import type {
   ForwardedPayload,
   ActivityLedgerEntry,
 } from '../contract/envelope';
-import { validateInbound, NO_SEQ_EVENT_TYPES } from '../contract/envelope';
+import {
+  validateInbound,
+  NO_SEQ_EVENT_TYPES,
+  RecoveryTaskRuntimeSnapshotResultSchema,
+} from '../contract/envelope';
 import { runtimeWsUrl } from '../shared/runtimeEndpoints';
 import i18n from '../i18n';
 
@@ -373,20 +377,37 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
 
   // ── ④ 按项目去抖 resync（§2.3-d） ──
   const _resyncDebounce: Record<string, number> = {};
-  const _recoveryTokenByProject: Record<string, string> = {};
+  const _recoveryAttemptByProject: Record<string, {
+    token: string;
+    generation: number;
+    groupId: string;
+  }> = {};
 
-  function doRequestSnapshot(projectId: string, recoveryToken?: string): void {
+  function doRequestSnapshot(
+    projectId: string, recoveryToken?: string, recoveryGeneration?: number,
+    recoveryGroupId?: string,
+  ): void {
     const now = Date.now();
     const last = _resyncDebounce[projectId] ?? 0;
-    if (recoveryToken && _recoveryTokenByProject[projectId] === recoveryToken) return;
+    const recoveryAttempt = recoveryToken && recoveryGeneration && recoveryGroupId
+      ? { token: recoveryToken, generation: recoveryGeneration, groupId: recoveryGroupId }
+      : undefined;
+    const previous = _recoveryAttemptByProject[projectId];
+    if (recoveryAttempt && previous
+        && previous.token === recoveryAttempt.token
+        && previous.generation === recoveryAttempt.generation) return;
     if (!recoveryToken && now - last < RESYNC_DEBOUNCE_MS) {
       console.log('[socket] resync debounced for %s (last=%dms ago)', projectId, now - last);
       return;
     }
     _resyncDebounce[projectId] = now;
-    if (recoveryToken) _recoveryTokenByProject[projectId] = recoveryToken;
+    if (recoveryAttempt) _recoveryAttemptByProject[projectId] = recoveryAttempt;
     setStatus('resync');
-    sendRaw({ type: 'request_snapshot', project_id: projectId, recovery_token: recoveryToken });
+    sendRaw({
+      type: 'request_snapshot', project_id: projectId,
+      recovery_token: recoveryAttempt?.token,
+      recovery_generation: recoveryAttempt?.generation,
+    });
     console.log('[socket] request_snapshot sent for %s', projectId);
   }
 
@@ -629,6 +650,9 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
             summary: `检测到服务重启（last_seq=${lastSeq} < 水位=${curWatermark}）→ 清会话重建` });
           if (onEpochReset) onEpochReset(pid);
           callbacks.onTaskRuntimeEpochReset?.();
+          for (const key of Object.keys(_recoveryAttemptByProject)) {
+            delete _recoveryAttemptByProject[key];
+          }
           const projectCreated = handshakeProjects.get(pid);
           if (projectCreated) onEvent(projectCreated);
           if (onProjectDiscovered) {
@@ -678,7 +702,11 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
           : handshakeProjectId || getActiveProjectId?.() || DEFAULT_PROJECT;
         const recoveryToken = typeof rawObj.recovery_token === 'string'
           ? rawObj.recovery_token : undefined;
-        doRequestSnapshot(pid, recoveryToken);
+        const recoveryGeneration = typeof rawObj.recovery_generation === 'number'
+          ? rawObj.recovery_generation : undefined;
+        const recoveryGroupId = typeof rawObj.group_id === 'string'
+          ? rawObj.group_id : undefined;
+        doRequestSnapshot(pid, recoveryToken, recoveryGeneration, recoveryGroupId);
         break;
       }
 
@@ -747,10 +775,44 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
       }
 
       case 'task_runtime_result': {
-        if (rawObj.action === 'snapshot' && onTaskRuntimeSnapshot) {
+        if (rawObj.action !== 'snapshot') return;
+        if (rawObj.recovery_token === undefined) {
           const groupId = rawObj.group_id;
-          if (typeof groupId === 'string') onTaskRuntimeSnapshot(groupId, rawObj);
+          if (onTaskRuntimeSnapshot && typeof groupId === 'string') {
+            onTaskRuntimeSnapshot(groupId, rawObj);
+          }
+          return;
         }
+        const parsed = RecoveryTaskRuntimeSnapshotResultSchema.safeParse(rawObj);
+        if (!parsed.success) {
+          console.warn('[socket] malformed Task Runtime recovery snapshot rejected');
+          return;
+        }
+        const response = parsed.data;
+        const attempt = _recoveryAttemptByProject[response.project_id];
+        if (!attempt
+            || attempt.token !== response.recovery_token
+            || response.recovery_generation < attempt.generation
+            || attempt.groupId !== response.group_id
+            || response.request_id !== response.recovery_token
+            || response.task_runtime.group_id !== response.group_id
+            || !onTaskRuntimeSnapshot) return;
+        try {
+          onTaskRuntimeSnapshot(response.group_id, response.task_runtime);
+        } catch (error) {
+          console.warn('[socket] Task Runtime recovery projection rejected:', error);
+          return;
+        }
+        delete _recoveryAttemptByProject[response.project_id];
+        setStatus('live');
+        sendRaw({
+          type: 'task_runtime_recovery_ack',
+          project_id: response.project_id,
+          group_id: response.group_id,
+          recovery_token: response.recovery_token,
+          recovery_generation: response.recovery_generation,
+          snapshot_cursor: response.snapshot_cursor,
+        });
         return;
       }
 
@@ -781,6 +843,11 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
       if (ws !== thisSocket) {
         console.warn('[socket] stale onopen ignored (superseded by newer connect)');
         return;
+      }
+      // Attempt suppression is connection-scoped. Durable recovery tokens remain
+      // retryable until a strictly applied snapshot has been ACKed by the renderer.
+      for (const key of Object.keys(_recoveryAttemptByProject)) {
+        delete _recoveryAttemptByProject[key];
       }
       backoff = RECONNECT_BACKOFF_INITIAL_MS;
       const sock = thisSocket;
@@ -837,6 +904,9 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
     };
 
     ws.onclose = (event: CloseEvent) => {
+      for (const key of Object.keys(_recoveryAttemptByProject)) {
+        delete _recoveryAttemptByProject[key];
+      }
       // 4001: superseded by newer connection — yield, don't reconnect
       if (event?.code === 4001) {
         console.warn('[socket] superseded by a newer connection (code 4001) — yielding, will NOT reconnect');
@@ -889,6 +959,9 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
       handshakeBuffer = [];
       handshakeProjects.clear();
       handshakeProjectId = null;
+      for (const key of Object.keys(_recoveryAttemptByProject)) {
+        delete _recoveryAttemptByProject[key];
+      }
       if (ws) { ws.close(); }
       setStatus('closed');
     },

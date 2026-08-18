@@ -454,7 +454,8 @@ async def test_bridge_resources_are_bounded_and_poison_run_does_not_block_health
         for item in server.hub.projects["project_bridge_good"].ring.events()
     ))
     await _wait_for(lambda: any(
-        marker["run_id"] == bad.run_id and marker["reason"] == "journal_read_failed"
+        marker["group_id"] == bad_group.group_id
+        and marker["reason"] == "journal_read_failed"
         for marker in server.task_runtime_bridge_recovery_markers()
     ))
     assert bad_attempts == server.TASK_RUNTIME_DELIVERY_RETRIES + 1
@@ -495,7 +496,8 @@ async def test_bridge_resources_are_bounded_and_poison_run_does_not_block_health
         for item in server.hub.projects["project_bridge_good"].ring.events()
     ))
     await _wait_for(lambda: any(
-        marker["run_id"] == bad.run_id and marker["reason"] == "hub_broadcast_failed"
+        marker["group_id"] == bad_group.group_id
+        and marker["reason"] == "hub_broadcast_failed"
         for marker in server.task_runtime_bridge_recovery_markers()
     ))
     assert broadcast_attempts == server.TASK_RUNTIME_DELIVERY_RETRIES + 1
@@ -764,6 +766,7 @@ async def test_exhausted_delivery_directly_resyncs_affected_group_and_survives_r
     await server._cmd_request_snapshot(client, {  # noqa: SLF001
         "project_id": recovery["project_id"],
         "recovery_token": recovery["recovery_token"],
+        "recovery_generation": recovery["recovery_generation"],
     })
     snapshot = next(
         item for item in reversed(socket.messages)
@@ -775,6 +778,14 @@ async def test_exhausted_delivery_directly_resyncs_affected_group_and_survives_r
     )
     assert projected["last_seq"] == missed.seq
     assert projected["group_id"] == affected.group_id
+    assert len(server.task_runtime.store.live_recoveries()) == 1
+    await server._cmd_task_runtime_recovery_ack(client, {  # noqa: SLF001
+        "project_id": recovery["project_id"],
+        "group_id": affected.group_id,
+        "recovery_token": recovery["recovery_token"],
+        "recovery_generation": recovery["recovery_generation"],
+        "snapshot_cursor": snapshot["snapshot_cursor"],
+    })
     assert server.task_runtime.store.live_recoveries() == ()
 
     socket.messages.clear()
