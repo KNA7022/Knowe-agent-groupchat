@@ -463,6 +463,10 @@ class KnoweServer:
         self._task_runtime_recovery_flush_task: asyncio.Task[Any] | None = None
         self._task_runtime_recovery_watchdog_task: asyncio.Task[Any] | None = None
         self._task_runtime_recovery_degraded_fence_task: asyncio.Task[Any] | None = None
+        # Sessions entering two-phase disconnect remain here even if a transport
+        # collection is mutated.  This is the lifecycle authority for retirement
+        # participation until durable debt transfer completes.
+        self._task_runtime_recovery_retirement_blockers: set[Client] = set()
         self._task_runtime_event_drain_task: asyncio.Task[None] | None = None
         self._task_runtime_listener_service: TaskRuntimeService | None = self.task_runtime
         if self.task_runtime is not None:
@@ -1354,7 +1358,10 @@ class KnoweServer:
                     or not self._task_runtime_recovery_bridge_degraded
                 ):
                     return
-                clients = tuple(client for client in self.hub.clients if client.alive)
+                participants, _durable_debt = (
+                    self._task_runtime_recovery_retirement_state_locked()
+                )
+                clients = tuple(client for client in participants if client.alive)
             for client in clients:
                 await self._retire_task_runtime_recovery_client(
                     client, close_socket=True,
@@ -1421,6 +1428,44 @@ class KnoweServer:
                 self._task_runtime_recovery_bridge_degraded = False
         return progressed, complete
 
+    def _task_runtime_recovery_retirement_state_locked(
+        self,
+    ) -> tuple[tuple[Client, ...], bool]:
+        """Return every authority participating in recovery retirement.
+
+        This is the sole cohort/predicate for base and dirty compaction.  It
+        includes visible sessions, transports closing before handler cleanup,
+        fenced sessions whose debt handoff failed, lifecycle-reconciler owners,
+        and durable disconnect debt awaiting an authenticated replacement.
+        """
+        candidates = set(self.hub.clients) | set(
+            self._task_runtime_recovery_retirement_blockers
+        )
+        participants = tuple(
+            client for client in candidates
+            if not client.task_runtime_recovery_retirement_complete
+            and (
+                client.alive
+                or client.task_runtime_recovery_fenced
+                or not client.task_runtime_recovery_disconnect_debt_transferred
+                or (
+                    client.task_runtime_recovery_debt_reconcile_task is not None
+                    and not client.task_runtime_recovery_debt_reconcile_task.done()
+                )
+            )
+        )
+        service = self.task_runtime
+        durable_debt = False
+        if service is not None:
+            try:
+                durable_debt = service.store.has_live_recovery_disconnect_debt()
+            except Exception:  # noqa: BLE001 -- unknown debt state must fail closed
+                durable_debt = True
+                log.exception(
+                    "Could not inspect Task Runtime disconnect debt; retirement paused",
+                )
+        return participants, bool(durable_debt)
+
     async def _relieve_task_runtime_recovery_budget(self) -> bool:
         """Relieve dirty pressure without evicting a renderer that is progressing.
 
@@ -1440,17 +1485,25 @@ class KnoweServer:
             self._retire_task_runtime_recoveries_locked()
             after = service.store.live_recovery_dirty_count()
             progressed = after < before
-            alive = tuple(client for client in self.hub.clients if client.alive)
+            participants, durable_debt = (
+                self._task_runtime_recovery_retirement_state_locked()
+            )
             high_water = service.store.live_recovery_dirty_revision_high_water()
-            if not alive:
+            if not participants and not durable_debt:
                 service.store.retire_live_recovery_dirty_through(high_water)
                 return True
+            if durable_debt:
+                # A replacement owns an unconsumed suffix.  Its frontier is
+                # deliberately not approximated from unrelated live sessions.
+                return progressed
             minimum = min(
-                client.task_runtime_recovery_update_ack_revision for client in alive
+                client.task_runtime_recovery_update_ack_revision
+                for client in participants
             )
             now = time.monotonic()
             victims = tuple(
-                client for client in alive
+                client for client in participants
+                if client.alive
                 if client.task_runtime_recovery_update_ack_revision == minimum
                 and minimum < high_water
                 and self._client_recovery_progress_lease_expired_locked(client, now)
@@ -1562,8 +1615,11 @@ class KnoweServer:
                     or generation != self._task_runtime_event_bridge_generation
                 ):
                     return
+                participants, _durable_debt = (
+                    self._task_runtime_recovery_retirement_state_locked()
+                )
                 expired = tuple(
-                    client for client in self.hub.clients
+                    client for client in participants
                     if client.alive
                     and self._client_recovery_progress_lease_expired_locked(client, now)
                 )
@@ -1591,7 +1647,9 @@ class KnoweServer:
         """
         if client.task_runtime_recovery_retirement_complete:
             return True
-        client.task_runtime_recovery_fenced = True
+        with self._task_runtime_event_bridge_lock:
+            client.task_runtime_recovery_fenced = True
+            self._task_runtime_recovery_retirement_blockers.add(client)
         transferred = self._retain_client_recovery_on_disconnect(client)
         if transferred:
             self._complete_task_runtime_recovery_client_retirement(client)
@@ -1626,6 +1684,7 @@ class KnoweServer:
                 return
             client.task_runtime_recovery_retirement_complete = True
             self.hub.remove_client(client)
+            self._task_runtime_recovery_retirement_blockers.discard(client)
             self._retire_task_runtime_recoveries_locked()
 
     async def _reconcile_fenced_task_runtime_recovery_debt(self, client: Client) -> None:
@@ -1789,25 +1848,27 @@ class KnoweServer:
         service = self.task_runtime
         if service is None:
             return
-        alive = tuple(
-            client for client in self.hub.clients
-            if client.alive or (
-                client.task_runtime_recovery_fenced
-                and not client.task_runtime_recovery_disconnect_debt_transferred
-            )
-        )
-        if not alive:
+        participants, durable_debt = self._task_runtime_recovery_retirement_state_locked()
+        if not participants and not durable_debt:
             # With no live projection frontier, reconnect is satisfied by the latest
             # coalesced base row. Historical dirty entries have no remaining observer.
             service.store.retire_live_recovery_dirty_through(
                 service.store.live_recovery_dirty_revision_high_water(),
             )
             return
+        if durable_debt:
+            # Disconnect debt represents a suffix frontier owned by a future,
+            # authenticated replacement.  Until it consumes that debt, neither
+            # dirty/update nor base rows may be compacted through another client's
+            # watermark.
+            return
         update_frontier = min(
-            client.task_runtime_recovery_update_ack_revision for client in alive
+            client.task_runtime_recovery_update_ack_revision for client in participants
         )
         service.store.retire_live_recovery_dirty_through(update_frontier)
-        frontier = min(client.task_runtime_recovery_ack_revision for client in alive)
+        frontier = min(
+            client.task_runtime_recovery_ack_revision for client in participants
+        )
         for marker in service.store.retire_live_recoveries_through(frontier):
             group_id = str(marker["group_id"])
             token = str(marker["recovery_token"])
@@ -2120,9 +2181,16 @@ class KnoweServer:
                     before is None
                     or int(hot.get("generation") or 0) > int(before.get("generation") or 0)
                 )
+                and not (
+                    before is not None
+                    and int(before.get("disconnect_retry") or 0) == 1
+                )
             ):
                 # Persist-before-notify normally prevents this path. A compatibility
-                # slot from an older process must retry rather than serve stale durable state.
+                # slot from an older process must retry rather than serve stale durable
+                # state. Durable disconnect debt is the exception: an eligible
+                # replacement first consumes that older fence, then the flush owner
+                # can persist and advertise the coalesced latest generation.
                 return None
             if (
                 before is None
@@ -2286,6 +2354,10 @@ class KnoweServer:
                     marker is None
                     or int(fallback.get("generation") or 0)
                     > int(marker.get("generation") or 0)
+                )
+                and not (
+                    marker is not None
+                    and int(marker.get("disconnect_retry") or 0) == 1
                 )
             ):
                 return False

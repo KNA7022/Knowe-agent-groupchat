@@ -935,6 +935,7 @@ async def test_stalled_client_is_fenced_before_dirty_log_exceeds_budget(
     )
 
     latest_generation = 1
+    backpressured = False
     for index in range(update_count):
         latest_generation = index + 2
         with server._task_runtime_event_bridge_lock:  # noqa: SLF001
@@ -943,15 +944,27 @@ async def test_stalled_client_is_fenced_before_dirty_log_exceeds_budget(
             )
         assert server.task_runtime.store.live_recovery_dirty_count() <= 8
         assert server.task_runtime.store.live_recovery_dirty_count(group.group_id) <= 8
-        await _wait_for(
-            lambda: (
-                (row := server.task_runtime.store.live_recovery(group.group_id)) is not None
-                and int(row["generation"]) == latest_generation
-            ),
-        )
-        await server._notify_task_runtime_recoveries(fast)  # noqa: SLF001
-        while fast.task_runtime_recovery_notified:
-            assert _ack_next_notified_direct(server, fast) == latest_generation
+        if not backpressured:
+            await _wait_for(lambda: (
+                (
+                    (row := server.task_runtime.store.live_recovery(group.group_id))
+                    is not None
+                    and int(row["generation"]) == latest_generation
+                )
+                or (
+                    server.task_runtime.store.has_live_recovery_disconnect_debt()
+                    and server._task_runtime_event_bridge_recovery[group.group_id][  # noqa: SLF001
+                        "persisted"
+                    ] is False
+                )
+            ))
+            durable_now = server.task_runtime.store.live_recovery(group.group_id)
+            assert durable_now is not None
+            backpressured = int(durable_now["generation"]) < latest_generation
+            if not backpressured:
+                await server._notify_task_runtime_recoveries(fast)  # noqa: SLF001
+                while fast.task_runtime_recovery_notified:
+                    assert _ack_next_notified_direct(server, fast) == latest_generation
         assert server.task_runtime.store.live_recovery_dirty_count() <= 8
         _assert_window(fast)
         for stalled in stalled_clients:
@@ -962,14 +975,28 @@ async def test_stalled_client_is_fenced_before_dirty_log_exceeds_budget(
     assert fast.alive
     durable = server.task_runtime.store.live_recovery(group.group_id)
     assert durable is not None
-    assert int(durable["generation"]) == latest_generation
+    durable_generation = int(durable["generation"])
+    assert durable_generation < latest_generation
     assert int(durable["disconnect_retry"]) == 1
+    hot = server._task_runtime_event_bridge_recovery[group.group_id]  # noqa: SLF001
+    assert hot["persisted"] is False
+    assert int(hot["generation"]) == latest_generation
 
     replacement = Client(_OpenSocket())
     server._admit_task_runtime_client(replacement)  # noqa: SLF001
     await replacement.release_live_replay_fence()
     await server._notify_task_runtime_recoveries(replacement)  # noqa: SLF001
-    assert await _ack_next_notified(server, replacement) == latest_generation
+    # First consume the durable disconnect fence. The bounded hot generation can
+    # then flush and is delivered as the next authoritative recovery.
+    assert await _ack_next_notified(server, replacement) == durable_generation
+    await _wait_for(lambda: (
+        (row := server.task_runtime.store.live_recovery(group.group_id)) is not None
+        and int(row["generation"]) == latest_generation
+    ))
+    await server._notify_task_runtime_recoveries()  # noqa: SLF001
+    for client in (fast, replacement):
+        while client.task_runtime_recovery_notified:
+            assert _ack_next_notified_direct(server, client) == latest_generation
     assert server.task_runtime.store.live_recoveries() == ()
     assert server.task_runtime.store.live_recovery_dirty() == ()
     await _close(server)
@@ -1303,6 +1330,111 @@ async def test_handler_finally_keeps_debt_blocker_until_store_recovers(
     assert blocker not in server.hub.clients
     debt = server.task_runtime.store.live_recovery(group.group_id)
     assert debt is not None and int(debt["disconnect_retry"]) == 1
+    await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_budget_retirement_honors_failed_and_durable_disconnect_blockers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS", 0.01)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS", 0.02)
+    group = server.groups.create_group(
+        "Retirement frontier", legacy_project_id="project_retirement_frontier",
+    )
+    run = server.task_runtime.submit(
+        group.group_id, title="Frontier", request_key="retirement-frontier",
+    )
+    event = server.task_runtime.store.events_after(run.run_id, 0)[0]
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(  # noqa: SLF001
+            event, reason="frontier-base", attempts=4,
+        )
+
+    fast = Client(_OpenSocket())
+    transferred_blocker = Client(_OpenSocket())
+    failed_blocker = Client(_OpenSocket())
+    for client in (fast, transferred_blocker, failed_blocker):
+        server._admit_task_runtime_client(client)  # noqa: SLF001
+        await client.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries()  # noqa: SLF001
+    assert _ack_next_notified_direct(server, fast) == 1
+
+    # Freeze one immutable dirty update and let the fast renderer cover it. Both
+    # slow sessions still own the earlier frontier.
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(  # noqa: SLF001
+            event, reason="frontier-dirty", attempts=4,
+        )
+    await server._notify_task_runtime_recoveries(fast)  # noqa: SLF001
+    assert _ack_next_notified_direct(server, fast) == 2
+    assert server.task_runtime.store.live_recovery_dirty_count() == 1
+    assert server.task_runtime.store.live_recovery(group.group_id) is not None
+
+    original_transfer = server.task_runtime.store.mark_live_recoveries_disconnect_after
+    failed_store = True
+
+    def selective_transfer(*args: object, **kwargs: object) -> int:
+        if (
+            failed_store
+            and kwargs.get("fence_id") == failed_blocker.task_runtime_recovery_session_id
+        ):
+            raise OSError("second blocker debt store unavailable")
+        return original_transfer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        server.task_runtime.store,
+        "mark_live_recoveries_disconnect_after",
+        selective_transfer,
+    )
+    assert await server._retire_task_runtime_recovery_client(  # noqa: SLF001
+        transferred_blocker,
+    )
+    assert not await server._retire_task_runtime_recovery_client(  # noqa: SLF001
+        failed_blocker,
+    )
+    assert transferred_blocker not in server.hub.clients
+    assert failed_blocker in server.hub.clients
+    assert failed_blocker in server._task_runtime_recovery_retirement_blockers  # noqa: SLF001
+    assert server.task_runtime.store.has_live_recovery_disconnect_debt()
+
+    # The alive fast client, failed lifecycle blocker, and durable replacement
+    # debt all participate in one fail-closed frontier. No alternate no-client or
+    # high-water path may delete dirty1/base.
+    for _ in range(3):
+        assert not await server._relieve_task_runtime_recovery_budget()  # noqa: SLF001
+        assert server.task_runtime.store.live_recovery_dirty_count() == 1
+        assert server.task_runtime.store.live_recovery(group.group_id) is not None
+
+    failed_store = False
+    await _wait_for(lambda: failed_blocker.task_runtime_recovery_retirement_complete)
+    assert failed_blocker not in server.hub.clients
+    assert server.task_runtime.store.has_live_recovery_disconnect_debt()
+    assert server.task_runtime.store.live_recovery_dirty_count() == 1
+    # Even the Store-level compactor rejects bypassing unconsumed debt.
+    server.task_runtime.store.retire_live_recovery_dirty_through(
+        server.task_runtime.store.live_recovery_dirty_revision_high_water(),
+    )
+    assert server.task_runtime.store.live_recovery_dirty_count() == 1
+
+    # After the caught-up fast renderer leaves, durable debt is itself an
+    # authoritative participant; the no-client high-water shortcut stays closed.
+    assert await server._retire_task_runtime_recovery_client(fast)  # noqa: SLF001
+    assert not tuple(client for client in server.hub.clients if client.alive)
+    assert not await server._relieve_task_runtime_recovery_budget()  # noqa: SLF001
+    assert server.task_runtime.store.live_recovery_dirty_count() == 1
+
+    replacement = Client(_OpenSocket())
+    server._admit_task_runtime_client(replacement)  # noqa: SLF001
+    await replacement.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(replacement)  # noqa: SLF001
+    assert await _ack_next_notified(server, replacement) == 2
+    assert not server.task_runtime.store.has_live_recovery_disconnect_debt()
+    assert server.task_runtime.store.live_recovery_dirty_count() == 0
+    assert server.task_runtime.store.live_recoveries() == ()
     await _close(server)
 
 

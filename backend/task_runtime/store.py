@@ -1690,7 +1690,7 @@ class TaskRuntimeStore:
     def retire_live_recovery_dirty_through(
         self, queue_revision: int,
     ) -> tuple[dict[str, Any], ...]:
-        """Retire coalesced dirty rows covered by every current live session."""
+        """Retire covered dirty rows that have no durable disconnect debt."""
         frontier = max(0, int(queue_revision))
         if frontier <= 0:
             return ()
@@ -1699,17 +1699,31 @@ class TaskRuntimeStore:
                 """SELECT r.*, d.queue_revision AS dirty_queue_revision
                    FROM studycrew_live_recovery_dirty AS d
                    JOIN studycrew_live_recovery AS r ON r.group_id=d.group_id
-                   WHERE d.queue_revision <= ?
+                   WHERE d.queue_revision <= ? AND r.disconnect_retry=0
                    ORDER BY d.queue_revision, d.group_id""",
                 (frontier,),
             ).fetchall()
             if rows:
                 conn.execute(
                     """DELETE FROM studycrew_live_recovery_dirty
-                       WHERE queue_revision <= ?""",
+                       WHERE queue_revision <= ?
+                         AND EXISTS (
+                           SELECT 1 FROM studycrew_live_recovery AS recovery
+                           WHERE recovery.group_id=studycrew_live_recovery_dirty.group_id
+                             AND recovery.disconnect_retry=0
+                         )""",
                     (frontier,),
                 )
         return tuple({key: row[key] for key in row.keys()} for row in rows)
+
+    def has_live_recovery_disconnect_debt(self) -> bool:
+        """Whether any durable recovery row is reserved for a replacement session."""
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                """SELECT 1 FROM studycrew_live_recovery
+                   WHERE disconnect_retry=1 LIMIT 1""",
+            ).fetchone()
+        return row is not None
 
     def retire_live_recoveries_through(
         self, recovery_revision: int,
