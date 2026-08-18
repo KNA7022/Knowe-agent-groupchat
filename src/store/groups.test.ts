@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Group } from '../contract/group';
 import { useGroupStore } from './groups';
@@ -55,7 +55,13 @@ function group(groupId: typeof firstId | typeof secondId): Group {
 }
 
 describe('canonical Group store', () => {
-  beforeEach(() => useGroupStore.setState({ groups: {}, order: [], loading: false, error: null }));
+  beforeEach(() => useGroupStore.setState({
+    groups: {}, order: [], runtimeSummaries: {}, sourceReferenceCounts: {},
+    loading: false, error: null,
+  }));
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
 
   it('keeps independent groups isolated by opaque group_id', () => {
     useGroupStore.getState().ingest([group(firstId), group(secondId)]);
@@ -69,5 +75,84 @@ describe('canonical Group store', () => {
     const invalid = group(firstId);
     invalid.roster[1] = { ...invalid.roster[1]!, group_id: secondId };
     expect(() => useGroupStore.getState().ingest([invalid])).toThrow();
+  });
+
+  it('scopes binding, roster, source, and runtime operations to the addressed group_id', async () => {
+    useGroupStore.getState().ingest([group(firstId), group(secondId)]);
+    const secondBefore = structuredClone(useGroupStore.getState().groups[secondId]);
+    const now = '2026-08-18T00:00:00Z';
+    const binding = {
+      binding_id: `gcb_${'3'.repeat(32)}`,
+      group_id: firstId,
+      course_id: 'course-a',
+      created_at: now,
+    };
+    const link = {
+      link_id: `gsl_${'4'.repeat(32)}`,
+      group_id: firstId,
+      source_id: `src_${'5'.repeat(32)}`,
+      created_at: now,
+    };
+    const updated = group(firstId);
+    updated.roster[0] = { ...updated.roster[0]!, display_name: 'Lead' };
+    const summary = {
+      group_id: firstId,
+      lifecycle: 'active',
+      active_agent_count: 2,
+      course_binding_count: 0,
+      source_count: 0,
+      shared_source_count: 0,
+      budget: null,
+      updated_at: now,
+    };
+
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      const payload = path.endsWith('/course-bind') ? { binding }
+        : path.endsWith('/course-unbind') ? { removed: true }
+          : path.endsWith('/roster-update') ? { group: updated }
+            : path.endsWith('/source-link') ? { link, reference_count: 2 }
+              : path.endsWith('/source-unlink') ? { removed: true, reference_count: 1 }
+                : path.endsWith('/runtime-summary') ? { summary }
+                  : { error: `unexpected path: ${path}` };
+      return new Response(JSON.stringify(payload), {
+        status: 'error' in payload ? 404 : 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }));
+
+    await useGroupStore.getState().bindCourse(firstId, 'course-a');
+    expect(useGroupStore.getState().groups[firstId]?.course_bindings).toEqual([binding]);
+    await useGroupStore.getState().unbindCourse(firstId, 'course-a');
+    expect(useGroupStore.getState().groups[firstId]?.course_bindings).toEqual([]);
+    await useGroupStore.getState().updateRoster(firstId, updated.roster);
+    expect(useGroupStore.getState().groups[firstId]?.roster[0]?.display_name).toBe('Lead');
+    await useGroupStore.getState().linkSource(firstId, link.source_id);
+    expect(useGroupStore.getState().sourceReferenceCounts[firstId]?.[link.source_id]).toBe(2);
+    await useGroupStore.getState().unlinkSource(firstId, link.source_id);
+    expect(useGroupStore.getState().sourceReferenceCounts[firstId]?.[link.source_id]).toBe(1);
+    await useGroupStore.getState().loadRuntimeSummary(firstId);
+    expect(useGroupStore.getState().runtimeSummaries[firstId]).toEqual(summary);
+    expect(useGroupStore.getState().groups[secondId]).toEqual(secondBefore);
+    expect(useGroupStore.getState().runtimeSummaries[secondId]).toBeUndefined();
+    expect(useGroupStore.getState().sourceReferenceCounts[secondId]).toBeUndefined();
+  });
+
+  it('rejects an operation response projected for a different group_id', async () => {
+    useGroupStore.getState().ingest([group(firstId), group(secondId)]);
+    const before = structuredClone(useGroupStore.getState().groups);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      link: {
+        link_id: `gsl_${'6'.repeat(32)}`,
+        group_id: secondId,
+        source_id: `src_${'7'.repeat(32)}`,
+        created_at: '2026-08-18T00:00:00Z',
+      },
+      reference_count: 1,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
+
+    await expect(useGroupStore.getState().linkSource(firstId)).rejects.toThrow('addressed group_id');
+    expect(useGroupStore.getState().groups).toEqual(before);
+    expect(useGroupStore.getState().sourceReferenceCounts).toEqual({});
   });
 });

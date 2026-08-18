@@ -1074,8 +1074,22 @@ export const useKnoweStore = create<KnoweStore>()(
       const operationId = deleteOperationId();
       beginDeleteProgress(operationId, projectId);
       try {
+        const previewRaw = await projectMenuJson<unknown>('/groups/delete-preview', {
+          method: 'POST', body: JSON.stringify({ project_id: projectId }),
+        });
+        const preview = previewRaw && typeof previewRaw === 'object'
+          ? (previewRaw as { preview?: { confirmation_token?: unknown } }).preview
+          : null;
+        const confirmationToken = typeof preview?.confirmation_token === 'string'
+          ? preview.confirmation_token : '';
+        if (!confirmationToken) throw new Error(i18n.t('store.11'));
         const raw = await projectMenuJson<unknown>('/projects/permanent-delete', {
-          method: 'POST', body: JSON.stringify({ project_id: projectId, operation_id: operationId }),
+          method: 'POST',
+          body: JSON.stringify({
+            project_id: projectId,
+            operation_id: operationId,
+            confirmation_token: confirmationToken,
+          }),
         });
         const result = raw && typeof raw === 'object' ? raw as Record<string, unknown> : null;
         const canonicalProjectId = result && typeof result.project_id === 'string'

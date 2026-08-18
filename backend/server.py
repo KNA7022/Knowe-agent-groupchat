@@ -1016,6 +1016,7 @@ class KnoweServer:
 
     def _canonical_group_from_payload(
         self, payload: dict[str, Any], *, require_runtime: bool = True,
+        include_deleted: bool = False,
     ) -> tuple[str, str | None, str | None]:
         """Canonicalize ``group_id`` or legacy ``project_id`` at an HTTP boundary.
 
@@ -1025,23 +1026,28 @@ class KnoweServer:
         """
         raw_group = payload.get("group_id")
         raw_project = payload.get("project_id")
-        candidate = raw_group if isinstance(raw_group, str) and raw_group.strip() else raw_project
-        if not isinstance(candidate, str) or not candidate.strip():
+        candidates = [
+            value.strip() for value in (raw_group, raw_project)
+            if isinstance(value, str) and value.strip()
+        ]
+        if not candidates:
             raise ValueError("group_id or legacy project_id is required")
         if self.groups is None:
             raise ValueError("Group persistence is unavailable")
         try:
-            group_id = self.groups.resolve_group_id(candidate.strip())
-            runtime_id = self.groups.runtime_project_id(group_id) if require_runtime else None
+            resolved = [
+                self.groups.resolve_identity(value, include_deleted=include_deleted)
+                for value in candidates
+            ]
         except GroupNotFoundError as exc:
             raise ValueError(str(exc)) from exc
-        if isinstance(raw_group, str) and raw_group.strip() and isinstance(raw_project, str) and raw_project.strip():
-            try:
-                other_group = self.groups.resolve_group_id(raw_project.strip())
-            except GroupNotFoundError as exc:
-                raise ValueError("project_id alias does not identify this group") from exc
-            if other_group != group_id:
-                raise ValueError("group_id and project_id identify different groups")
+        if len({item[0] for item in resolved}) != 1:
+            raise ValueError("group_id and project_id identify different groups")
+        group_id = resolved[0][0]
+        runtime_ids = {item[1] for item in resolved if item[1]}
+        if len(runtime_ids) > 1:
+            raise ValueError("group_id and project_id identify different runtime adapters")
+        runtime_id = next(iter(runtime_ids), group_id) if require_runtime else None
         return group_id, runtime_id, raw_project.strip() if isinstance(raw_project, str) else None
 
     def _project_created_payload(self, project_id: str) -> dict[str, Any]:
@@ -1696,6 +1702,12 @@ class KnoweServer:
             for row in project_rows
             if isinstance(row, dict) and row.get("project_id")
         }
+        if self.groups is not None:
+            recovered_duplicates = self.groups.recover_duplicate_transactions(
+                self._persisted_project_ids,
+            )
+            if recovered_duplicates:
+                log.warning("recovered %d interrupted Group duplicate transaction(s)", len(recovered_duplicates))
 
         for row in project_rows:
             pid = row["project_id"]
@@ -3474,6 +3486,7 @@ class KnoweServer:
         self, project_id: str, project_name: str, project_dir: str | None = None,
         *, request_project_id: str | None = None,
         roles: list[str] | None = None,
+        register_group_metadata: bool = True,
     ) -> str:
         """
         建项目的唯一实现：**定目录** + 建 hub + 起引擎 + 落盘 + 广播 + 让项目经理开口。
@@ -3517,7 +3530,7 @@ class KnoweServer:
         # New Group metadata is created alongside the legacy runtime registry.  Existing
         # projects have already been copied by migration v3; this branch only covers a
         # freshly-created group arriving through an old create_project command.
-        if self.groups is not None:
+        if self.groups is not None and register_group_metadata:
             try:
                 group_id = self.groups.resolve_group_id(project_id)
                 self.groups.rename(group_id, proj.name)
@@ -4316,8 +4329,12 @@ class KnoweServer:
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError(msg("server.py.129"))
         try:
-            project_id = self._canonical_project_id_from_request(raw.strip())
-        except ProjectIdResolutionError as exc:
+            if getattr(self, "groups", None) is not None:
+                _group_id, runtime_id, _requested = self._canonical_group_from_payload(payload)
+                project_id = str(runtime_id)
+            else:
+                project_id = self._canonical_project_id_from_request(raw.strip())
+        except (ProjectIdResolutionError, ValueError) as exc:
             raise ValueError(str(exc)) from exc
         if project_id == PLATFORM_PROJECT_ID or _parse_dm(project_id) is not None:
             raise ValueError(msg("server.py.130"))
@@ -4342,14 +4359,22 @@ class KnoweServer:
         if requested == PLATFORM_PROJECT_ID or _parse_dm(requested) is not None:
             raise ValueError(msg("server.py.131"))
 
-        mapped = self._mapped_project_id(requested)
-        candidate = mapped or requested
+        if getattr(self, "groups", None) is not None:
+            group_id, runtime_id, request_project_id = self._canonical_group_from_payload(
+                payload, include_deleted=True,
+            )
+            candidate = str(runtime_id)
+            requested = request_project_id or requested
+        else:
+            group_id = ""
+            mapped = self._mapped_project_id(requested)
+            candidate = mapped or requested
         deleted = self._deleted_project_ids()
         if candidate in deleted:
             return candidate, requested, True
 
         try:
-            project_id = self._canonical_project_id_from_request(requested)
+            project_id = candidate if group_id else self._canonical_project_id_from_request(requested)
         except ProjectIdResolutionError as exc:
             raise ValueError(str(exc)) from exc
         if project_id == PLATFORM_PROJECT_ID or _parse_dm(project_id) is not None:
@@ -5489,6 +5514,9 @@ class KnoweServer:
     ) -> None:
         try:
             payload = self._decode_json_object(body_bytes)
+            confirmation_token = payload.get("confirmation_token")
+            if not isinstance(confirmation_token, str) or not confirmation_token:
+                raise ValueError("confirmation_token from delete-preview is required")
             raw_operation_id = payload.get("operation_id")
             operation_id = (
                 raw_operation_id.strip()
@@ -5497,22 +5525,19 @@ class KnoweServer:
                 else f"del_{uuid.uuid4().hex[:12]}"
             )
             project_id, requested_project_id, already_deleted = self._project_delete_target(payload)
-            group_preview = None
             group_id = self._group_id_for_runtime_project(project_id)
-            if group_id and self.groups is not None:
-                group_preview = self.groups.delete_preview(group_id)
-            result = (
-                await self._resume_committed_project_delete(project_id, operation_id)
-                if already_deleted
-                else await self._delete_project_permanently(project_id, operation_id)
+            if group_id is None and self.groups is not None:
+                transaction = self.groups.delete_transaction(project_id)
+                group_id = str(transaction.get("group_id")) if transaction else None
+            if group_id is None or self.groups is None:
+                raise ValueError("canonical Group metadata is required for confirmed deletion")
+            result, receipt = await self._run_confirmed_group_delete(
+                group_id, project_id, confirmation_token, operation_id=operation_id,
+                runtime_already_deleted=already_deleted,
             )
             result["request_project_id"] = requested_project_id
-            if group_preview is not None and self.groups is not None:
-                receipt = self.groups.confirmed_delete(
-                    group_preview.group_id, group_preview.confirmation_token,
-                )
-                result["group_id"] = group_preview.group_id
-                result["deletion_receipt"] = receipt.to_dict()
+            result["group_id"] = group_id
+            result["deletion_receipt"] = receipt.to_dict()
         except ValueError as exc:
             self._preview_error(writer, b"400 Bad Request", str(exc))
             return
@@ -5570,6 +5595,43 @@ class KnoweServer:
         body = json.dumps({"ok": True, **result}, ensure_ascii=False).encode("utf-8")
         self._write_http(writer, b"200 OK", body, b"application/json; charset=utf-8")
 
+    async def _run_confirmed_group_delete(
+        self,
+        group_id: str,
+        runtime_project_id: str,
+        confirmation_token: str,
+        *,
+        operation_id: str | None = None,
+        runtime_already_deleted: bool = False,
+    ) -> tuple[dict[str, Any], Any]:
+        """Resume the durable Group/runtime deletion state machine to completion."""
+        if self.groups is None:
+            raise ValueError("Group persistence is unavailable")
+        transaction = self.groups.prepare_delete(
+            group_id, confirmation_token, runtime_project_id=runtime_project_id,
+        )
+        stage = str(transaction.get("stage") or "prepared")
+        legacy_result: dict[str, Any] = {
+            "project_id": runtime_project_id,
+            "deleted": stage in {"runtime_deleted", "committed"},
+            "cleanup_pending": False,
+        }
+        if stage == "prepared":
+            if runtime_already_deleted or runtime_project_id in self._deleted_project_ids():
+                legacy_result = await self._resume_committed_project_delete(
+                    runtime_project_id, operation_id,
+                )
+            elif runtime_project_id in self.hub.projects:
+                legacy_result = await self._delete_project_permanently(
+                    runtime_project_id, operation_id,
+                )
+            elif runtime_project_id in self._persisted_project_ids:
+                raise ValueError("runtime project is persisted but not loaded; deletion cannot be confirmed")
+            transaction = self.groups.mark_runtime_deleted(str(transaction["transaction_id"]))
+        receipt = self.groups.commit_delete(str(transaction["transaction_id"]))
+        legacy_result["deleted"] = True
+        return legacy_result, receipt
+
     async def _serve_groups_list(self, writer: asyncio.StreamWriter) -> None:
         if self.groups is None:
             self._preview_error(writer, b"503 Service Unavailable", "Group persistence is unavailable")
@@ -5620,7 +5682,9 @@ class KnoweServer:
                     "project_id": runtime_id,
                 }
             else:
-                group_id, runtime_id, requested_project_id = self._canonical_group_from_payload(payload)
+                group_id, runtime_id, requested_project_id = self._canonical_group_from_payload(
+                    payload, include_deleted=path == "/groups/delete",
+                )
                 if path == "/groups/rename":
                     name = payload.get("name", payload.get("group_name", payload.get("project_name")))
                     if runtime_id in self.hub.projects:
@@ -5631,8 +5695,38 @@ class KnoweServer:
                     result = {"group": group.to_dict()}
                 elif path == "/groups/duplicate":
                     name = payload.get("name", payload.get("group_name"))
-                    group = self.groups.duplicate(group_id, name=name if isinstance(name, str) else None)
-                    result = {"group": group.to_dict()}
+                    project_dir = payload.get("project_dir")
+                    request_id = payload.get("request_id")
+                    if not isinstance(project_dir, str) or not project_dir.strip():
+                        raise ValueError("duplicate requires a distinct project_dir")
+                    if not isinstance(request_id, str) or not re.fullmatch(r"gdup_[A-Za-z0-9_-]{8,96}", request_id):
+                        raise ValueError("duplicate request_id is required")
+                    existing_tx = self.groups.duplicate_transaction(group_id, request_id)
+                    duplicate_runtime_id = (
+                        str(existing_tx["runtime_project_id"])
+                        if existing_tx is not None else self._allocate_canonical_project_id()
+                    )
+                    transaction = self.groups.prepare_duplicate(
+                        group_id, name=name if isinstance(name, str) else None,
+                        legacy_project_id=duplicate_runtime_id, request_id=request_id,
+                    )
+                    if duplicate_runtime_id not in self.hub.projects:
+                        duplicate_raw = transaction.get("group")
+                        duplicate_name = (
+                            str(duplicate_raw.get("name"))
+                            if isinstance(duplicate_raw, dict) else str(name or "Group copy")
+                        )
+                        await self.create_project(
+                            duplicate_runtime_id, duplicate_name, project_dir,
+                            register_group_metadata=False,
+                        )
+                    group = self.groups.commit_duplicate(str(transaction["transaction_id"]))
+                    result = {
+                        "group": group.to_dict(),
+                        "group_id": group.group_id,
+                        "project_id": duplicate_runtime_id,
+                        "source_group_id": group_id,
+                    }
                 elif path == "/groups/archive":
                     result = {"group": self.groups.archive(group_id).to_dict()}
                 elif path == "/groups/restore":
@@ -5643,18 +5737,13 @@ class KnoweServer:
                     token = payload.get("confirmation_token")
                     if not isinstance(token, str):
                         raise ValueError("confirmation_token is required")
-                    # Validate before touching runtime data; then perform its proven
-                    # transactional delete and finally commit the content-free receipt.
-                    current = self.groups.delete_preview(group_id)
-                    if current.confirmation_token != token:
-                        raise StaleDeletePreviewError("delete preview is stale or was not confirmed")
-                    legacy_result: dict[str, Any] | None = None
-                    if runtime_id and runtime_id in self.hub.projects:
-                        legacy_result = await self._delete_project_permanently(runtime_id)
-                    receipt = self.groups.confirmed_delete(group_id, token)
+                    legacy_result, receipt = await self._run_confirmed_group_delete(
+                        group_id, str(runtime_id), token,
+                        runtime_already_deleted=str(runtime_id) in self._deleted_project_ids(),
+                    )
                     result = {
                         "deleted": True, "receipt": receipt.to_dict(),
-                        "legacy_cleanup_pending": bool(legacy_result and legacy_result.get("cleanup_pending")),
+                        "legacy_cleanup_pending": bool(legacy_result.get("cleanup_pending")),
                     }
                 elif path == "/groups/course-bind":
                     course_id = payload.get("course_id")
@@ -5679,7 +5768,11 @@ class KnoweServer:
                     source_id = payload.get("source_id")
                     if not isinstance(source_id, str):
                         raise ValueError("source_id is required")
-                    result = {"removed": self.groups.unlink_source(group_id, source_id)}
+                    removed = self.groups.unlink_source(group_id, source_id)
+                    result = {
+                        "removed": removed,
+                        "reference_count": self.groups.source_reference_count(source_id),
+                    }
                 elif path == "/groups/roster-update":
                     raw_roster = payload.get("roster")
                     if not isinstance(raw_roster, list):

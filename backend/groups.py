@@ -163,6 +163,14 @@ class GroupAgent:
             raise GroupDomainError(f"{self.role} requires constrained expert configuration")
         if self.role not in EXPERT_ROLES and self.expert is not None:
             raise GroupDomainError("only expert roles may carry expert configuration")
+        if self.role in EXPERT_ROLES and self.expert is not None:
+            effective = tuple(dict.fromkeys(self.expert.allowed_tools))
+            supplied = tuple(dict.fromkeys(self.tool_overrides))
+            if supplied != effective:
+                raise GroupDomainError(
+                    "expert tool_overrides must exactly match constrained allowed_tools"
+                )
+            self.tool_overrides = effective
 
     def to_dict(self) -> dict[str, Any]:
         row = asdict(self)
@@ -372,12 +380,23 @@ class GroupRepository:
 
     def _load_payload(self) -> dict[str, Any]:
         if not self.registry_path.is_file():
-            return {"schema_version": GROUP_SCHEMA_VERSION, "revision": 0, "groups": [], "sources": []}
+            return {
+                "schema_version": GROUP_SCHEMA_VERSION, "revision": 0,
+                "groups": [], "sources": [], "deletion_transactions": [],
+                "deletion_receipts": [], "duplicate_transactions": [],
+            }
         raw = json.loads(self.registry_path.read_text("utf-8"))
         if not isinstance(raw, dict) or raw.get("schema_version") != GROUP_SCHEMA_VERSION:
             raise GroupDomainError("unsupported or corrupt Group registry")
         if not isinstance(raw.get("groups"), list) or not isinstance(raw.get("sources"), list):
             raise GroupDomainError("corrupt Group registry collections")
+        raw.setdefault("deletion_transactions", [])
+        raw.setdefault("deletion_receipts", [])
+        raw.setdefault("duplicate_transactions", [])
+        if not all(isinstance(raw.get(key), list) for key in (
+            "deletion_transactions", "deletion_receipts", "duplicate_transactions",
+        )):
+            raise GroupDomainError("corrupt Group transaction collections")
         return raw
 
     def _save_payload(self, payload: dict[str, Any]) -> None:
@@ -405,9 +424,43 @@ class GroupRepository:
                 return group.group_id
         raise GroupNotFoundError(f"group not found: {value}")
 
+    def resolve_identity(
+        self, value: str, *, include_deleted: bool = False,
+    ) -> tuple[str, str | None]:
+        value = str(value or "").strip()
+        payload = self._load_payload()
+        for raw in payload["groups"]:
+            if raw.get("group_id") == value or raw.get("legacy_project_id") == value:
+                return str(raw["group_id"]), _optional_text(raw.get("legacy_project_id"))
+        if include_deleted:
+            for raw in payload["deletion_transactions"]:
+                if raw.get("group_id") == value or raw.get("runtime_project_id") == value:
+                    return str(raw["group_id"]), _optional_text(raw.get("runtime_project_id"))
+        raise GroupNotFoundError(f"group not found: {value}")
+
     def runtime_project_id(self, value: str) -> str:
-        group = self.get(self.resolve_group_id(value))
-        return group.legacy_project_id or group.group_id
+        group_id, runtime_id = self.resolve_identity(value)
+        return runtime_id or group_id
+
+    @staticmethod
+    def _pending_delete(payload: Mapping[str, Any], group_id: str) -> dict[str, Any] | None:
+        return next((
+            row for row in payload.get("deletion_transactions") or ()
+            if row.get("group_id") == group_id and row.get("stage") != "committed"
+        ), None)
+
+    def _assert_mutable(self, payload: Mapping[str, Any], group_id: str) -> None:
+        if self._pending_delete(payload, group_id) is not None:
+            raise GroupDomainError("group deletion is already in progress")
+
+    @staticmethod
+    def _assert_source_unlocked(payload: Mapping[str, Any], source_id: str) -> None:
+        for row in payload.get("deletion_transactions") or ():
+            if row.get("stage") == "committed":
+                continue
+            locked = set(row.get("exclusive_source_ids") or ()) | set(row.get("shared_source_ids") or ())
+            if source_id in locked:
+                raise GroupDomainError("source ownership is locked by a pending group deletion")
 
     def create_group(
         self,
@@ -474,6 +527,7 @@ class GroupRepository:
     def _replace(self, updated: Group) -> Group:
         updated.validate()
         payload = self._load_payload()
+        self._assert_mutable(payload, updated.group_id)
         for index, raw in enumerate(payload["groups"]):
             if raw.get("group_id") == updated.group_id:
                 updated.updated_at = utc_now()
@@ -503,20 +557,118 @@ class GroupRepository:
             self._replace(group)
         return group
 
-    def duplicate(self, group_id: str, *, name: str | None = None) -> Group:
-        source = self.get(group_id)
-        experts = [agent.expert for agent in source.roster if agent.expert is not None]
-        optional = [agent.role for agent in source.roster if agent.role in OPTIONAL_BUILTIN_ROLES]
-        duplicate = self.create_group(
-            name or f"{source.name} copy", template=source.template, optional_roles=optional,
-            experts=[expert for expert in experts if expert is not None], budget=source.budget,
-            model_overrides=source.model_overrides, tool_overrides=source.tool_overrides,
+    def duplicate(
+        self, group_id: str, *, name: str | None = None,
+        legacy_project_id: str | None = None,
+    ) -> Group:
+        transaction = self.prepare_duplicate(
+            group_id, name=name,
+            legacy_project_id=legacy_project_id or opaque_id("runtime"),
         )
-        for binding in source.course_bindings:
-            self.bind_course(duplicate.group_id, binding.course_id)
+        return self.commit_duplicate(str(transaction["transaction_id"]))
+
+    def prepare_duplicate(
+        self, group_id: str, *, name: str | None = None,
+        legacy_project_id: str, request_id: str | None = None,
+    ) -> dict[str, Any]:
+        source = self.get(group_id)
+        payload = self._load_payload()
+        self._assert_mutable(payload, source.group_id)
+        existing = next((
+            row for row in payload["duplicate_transactions"]
+            if row.get("source_group_id") == group_id
+            and (
+                (request_id and row.get("request_id") == request_id)
+                or row.get("runtime_project_id") == legacy_project_id
+            )
+        ), None)
+        if existing is not None:
+            return dict(existing)
+        if legacy_project_id and any(
+            row.get("legacy_project_id") == legacy_project_id for row in payload["groups"]
+        ):
+            raise GroupDomainError(f"runtime project already belongs to a group: {legacy_project_id}")
         for link in source.source_links:
-            self.link_source(duplicate.group_id, link.source_id)
-        return self.get(duplicate.group_id)
+            self._assert_source_unlocked(payload, link.source_id)
+        duplicate_id = opaque_id("grp")
+        now = utc_now()
+        roster = [
+            GroupAgent(
+                agent_id=opaque_id("gag"), group_id=duplicate_id, role=agent.role,
+                display_name=agent.display_name, template_key=agent.template_key,
+                expert=agent.expert, model_override=agent.model_override,
+                tool_overrides=agent.tool_overrides, budget=agent.budget,
+                created_at=now, updated_at=now,
+            )
+            for agent in source.roster
+        ]
+        duplicate = Group(
+            group_id=duplicate_id,
+            name=_bounded_text(name or f"{source.name} copy", "group name", 160),
+            template=source.template, lifecycle=GroupLifecycle.ACTIVE, roster=roster,
+            course_bindings=[
+                GroupCourseBinding(opaque_id("gcb"), duplicate_id, item.course_id, now)
+                for item in source.course_bindings
+            ],
+            source_links=[
+                GroupSourceLink(opaque_id("gsl"), duplicate_id, item.source_id, now)
+                for item in source.source_links
+            ],
+            budget=source.budget, model_overrides=dict(source.model_overrides),
+            tool_overrides={key: list(value) for key, value in source.tool_overrides.items()},
+            created_at=now, updated_at=now, legacy_project_id=legacy_project_id,
+        )
+        duplicate.validate()
+        transaction = {
+            "transaction_id": opaque_id("gdup"),
+            "source_group_id": group_id,
+            "group_id": duplicate_id,
+            "runtime_project_id": legacy_project_id,
+            "request_id": request_id,
+            "stage": "prepared",
+            "group": duplicate.to_dict(),
+            "created_at": now,
+            "updated_at": now,
+        }
+        payload["duplicate_transactions"].append(transaction)
+        self._save_payload(payload)
+        return dict(transaction)
+
+    def commit_duplicate(self, transaction_id: str) -> Group:
+        payload = self._load_payload()
+        for index, row in enumerate(payload["duplicate_transactions"]):
+            if row.get("transaction_id") != transaction_id:
+                continue
+            group_raw = row.get("group")
+            if not isinstance(group_raw, Mapping):
+                raise GroupDomainError("duplicate transaction is missing Group configuration")
+            duplicate = Group.from_dict(group_raw)
+            if row.get("stage") == "committed":
+                return duplicate
+            if not any(item.get("group_id") == duplicate.group_id for item in payload["groups"]):
+                payload["groups"].append(duplicate.to_dict())
+            payload["duplicate_transactions"][index] = {
+                **row, "stage": "committed", "updated_at": utc_now(),
+            }
+            self._save_payload(payload)
+            return duplicate
+        raise GroupNotFoundError(f"duplicate transaction not found: {transaction_id}")
+
+    def duplicate_transaction(self, group_id: str, request_id: str) -> dict[str, Any] | None:
+        return next((
+            dict(row) for row in self._load_payload()["duplicate_transactions"]
+            if row.get("source_group_id") == group_id and row.get("request_id") == request_id
+        ), None)
+
+    def recover_duplicate_transactions(self, runtime_project_ids: Iterable[str]) -> list[str]:
+        available = set(runtime_project_ids)
+        recovered: list[str] = []
+        for row in list(self._load_payload()["duplicate_transactions"]):
+            if row.get("stage") != "prepared" or row.get("runtime_project_id") not in available:
+                continue
+            group = self.commit_duplicate(str(row["transaction_id"]))
+            recovered.append(group.group_id)
+        return recovered
 
     def bind_course(self, group_id: str, course_id: str) -> GroupCourseBinding:
         group = self.get(group_id)
@@ -555,12 +707,14 @@ class GroupRepository:
         sid = source_id or opaque_id("src")
         if not SOURCE_ID_PATTERN.fullmatch(sid):
             raise GroupDomainError("source_id must be an opaque src_<uuid> identifier")
+        payload = self._load_payload()
+        self._assert_mutable(payload, group.group_id)
+        self._assert_source_unlocked(payload, sid)
         existing = next((item for item in group.source_links if item.source_id == sid), None)
         if existing:
             return existing
         link = GroupSourceLink(opaque_id("gsl"), group.group_id, sid)
         group.source_links.append(link)
-        payload = self._load_payload()
         if not any(item.get("source_id") == sid for item in payload["sources"]):
             payload["sources"].append({"source_id": sid, "created_at": utc_now()})
         for index, raw in enumerate(payload["groups"]):
@@ -573,12 +727,14 @@ class GroupRepository:
 
     def unlink_source(self, group_id: str, source_id: str) -> bool:
         group = self.get(group_id)
+        payload = self._load_payload()
+        self._assert_mutable(payload, group.group_id)
+        self._assert_source_unlocked(payload, source_id)
         kept = [item for item in group.source_links if item.source_id != source_id]
         changed = len(kept) != len(group.source_links)
         if not changed:
             return False
         group.source_links = kept
-        payload = self._load_payload()
         for index, raw in enumerate(payload["groups"]):
             if raw.get("group_id") == group.group_id:
                 group.updated_at = utc_now()
@@ -629,17 +785,31 @@ class GroupRepository:
             shared_source_ids=shared, source_reference_counts=refs,
         )
 
-    def confirmed_delete(self, group_id: str, confirmation_token: str) -> GroupDeletionReceipt:
+    def prepare_delete(
+        self, group_id: str, confirmation_token: str, *, runtime_project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Durably record delete intent and its future content-free receipt.
+
+        This is the first write in the cross-layer state machine.  Once present, all
+        group/source mutations are fenced until the transaction commits or is retried.
+        """
+        payload = self._load_payload()
+        existing = next((
+            row for row in payload["deletion_transactions"]
+            if row.get("group_id") == group_id
+        ), None)
+        if existing is not None:
+            if existing.get("confirmation_token") != confirmation_token:
+                raise StaleDeletePreviewError("delete preview is stale or was not confirmed")
+            return dict(existing)
+
         preview = self.delete_preview(group_id)
         if not confirmation_token or confirmation_token != preview.confirmation_token:
             raise StaleDeletePreviewError("delete preview is stale or was not confirmed")
-        payload = self._load_payload()
-        payload["groups"] = [row for row in payload["groups"] if row.get("group_id") != group_id]
-        payload["sources"] = [
-            row for row in payload["sources"]
-            if row.get("source_id") not in set(preview.exclusive_source_ids)
-        ]
-        self._save_payload(payload)
+        for source_id in (*preview.exclusive_source_ids, *preview.shared_source_ids):
+            self._assert_source_unlocked(payload, source_id)
+        group = self.get(group_id)
+        runtime_id = runtime_project_id or group.legacy_project_id or group.group_id
         receipt = GroupDeletionReceipt(
             receipt_id=opaque_id("gdr"), group_id=group_id, deleted_at=utc_now(),
             removed_agent_count=preview.agent_count,
@@ -648,14 +818,109 @@ class GroupRepository:
             deleted_source_ids=preview.exclusive_source_ids,
             retained_shared_source_ids=preview.shared_source_ids,
         )
-        receipts: list[dict[str, Any]] = []
-        if self.receipts_path.is_file():
-            loaded = json.loads(self.receipts_path.read_text("utf-8"))
-            if isinstance(loaded, list):
-                receipts = loaded
-        receipts.append(receipt.to_dict())
-        _atomic_write_json(self.receipts_path, receipts)
-        return receipt
+        transaction = {
+            "transaction_id": opaque_id("gdt"),
+            "group_id": group_id,
+            "runtime_project_id": runtime_id,
+            "confirmation_token": confirmation_token,
+            "stage": "prepared",
+            "exclusive_source_ids": list(preview.exclusive_source_ids),
+            "shared_source_ids": list(preview.shared_source_ids),
+            "source_reference_counts": dict(preview.source_reference_counts),
+            "receipt": receipt.to_dict(),
+            "created_at": utc_now(),
+            "updated_at": utc_now(),
+        }
+        payload = self._load_payload()
+        if self._pending_delete(payload, group_id) is not None:
+            return dict(self._pending_delete(payload, group_id) or transaction)
+        payload["deletion_transactions"].append(transaction)
+        self._save_payload(payload)
+        return dict(transaction)
+
+    def delete_transaction(self, identity: str) -> dict[str, Any] | None:
+        value = str(identity or "").strip()
+        for row in self._load_payload()["deletion_transactions"]:
+            if row.get("group_id") == value or row.get("runtime_project_id") == value:
+                return dict(row)
+        return None
+
+    def mark_runtime_deleted(self, transaction_id: str) -> dict[str, Any]:
+        payload = self._load_payload()
+        for index, row in enumerate(payload["deletion_transactions"]):
+            if row.get("transaction_id") != transaction_id:
+                continue
+            if row.get("stage") == "committed":
+                return dict(row)
+            updated = {**row, "stage": "runtime_deleted", "updated_at": utc_now()}
+            payload["deletion_transactions"][index] = updated
+            self._save_payload(payload)
+            return dict(updated)
+        raise GroupNotFoundError(f"delete transaction not found: {transaction_id}")
+
+    def commit_delete(self, transaction_id: str) -> GroupDeletionReceipt:
+        """Atomically commit Group/source removal and its durable receipt."""
+        payload = self._load_payload()
+        for index, row in enumerate(payload["deletion_transactions"]):
+            if row.get("transaction_id") != transaction_id:
+                continue
+            receipt_raw = row.get("receipt")
+            if not isinstance(receipt_raw, Mapping):
+                raise GroupDomainError("delete transaction is missing its durable receipt")
+            receipt = GroupDeletionReceipt(
+                receipt_id=str(receipt_raw["receipt_id"]), group_id=str(receipt_raw["group_id"]),
+                deleted_at=str(receipt_raw["deleted_at"]),
+                removed_agent_count=int(receipt_raw["removed_agent_count"]),
+                removed_course_binding_count=int(receipt_raw["removed_course_binding_count"]),
+                removed_source_link_count=int(receipt_raw["removed_source_link_count"]),
+                deleted_source_ids=tuple(str(x) for x in receipt_raw.get("deleted_source_ids") or ()),
+                retained_shared_source_ids=tuple(str(x) for x in receipt_raw.get("retained_shared_source_ids") or ()),
+                schema_version=int(receipt_raw.get("schema_version") or GROUP_SCHEMA_VERSION),
+            )
+            if row.get("stage") == "committed":
+                return receipt
+            if row.get("stage") != "runtime_deleted":
+                raise GroupDomainError("runtime deletion has not completed")
+            group_id = str(row["group_id"])
+            payload["groups"] = [
+                item for item in payload["groups"] if item.get("group_id") != group_id
+            ]
+            # Re-evaluate ownership at commit. Pending source locks make this stable,
+            # while the guard prevents deleting a source newly referenced elsewhere.
+            candidates = set(str(x) for x in row.get("exclusive_source_ids") or ())
+            deletable = {
+                source_id for source_id in candidates
+                if self._reference_count_from_payload(payload, source_id) == 0
+            }
+            payload["sources"] = [
+                item for item in payload["sources"] if item.get("source_id") not in deletable
+            ]
+            committed_receipt = receipt.to_dict()
+            committed_receipt["deleted_source_ids"] = sorted(deletable)
+            if not any(
+                item.get("receipt_id") == receipt.receipt_id
+                for item in payload["deletion_receipts"]
+            ):
+                payload["deletion_receipts"].append(committed_receipt)
+            payload["deletion_transactions"][index] = {
+                **row, "stage": "committed", "receipt": committed_receipt,
+                "updated_at": utc_now(),
+            }
+            self._save_payload(payload)
+            return GroupDeletionReceipt(
+                **{
+                    **receipt.__dict__,
+                    "deleted_source_ids": tuple(sorted(deletable)),
+                }
+            )
+        raise GroupNotFoundError(f"delete transaction not found: {transaction_id}")
+
+    def confirmed_delete(self, group_id: str, confirmation_token: str) -> GroupDeletionReceipt:
+        """Repository-only deletion uses the same resumable state machine."""
+        transaction = self.prepare_delete(group_id, confirmation_token)
+        if transaction.get("stage") == "prepared":
+            transaction = self.mark_runtime_deleted(str(transaction["transaction_id"]))
+        return self.commit_delete(str(transaction["transaction_id"]))
 
 
 def migrate_legacy_projects(data_root: str | os.PathLike[str]) -> dict[str, Any]:
@@ -663,8 +928,7 @@ def migrate_legacy_projects(data_root: str | os.PathLike[str]) -> dict[str, Any]
     root = Path(data_root)
     repo = GroupRepository(root)
     registry_before = repo.registry_path.read_bytes() if repo.registry_path.is_file() else None
-    source_registry = root / "projects.json"
-    source_digest = _sha256(source_registry) if source_registry.is_file() else None
+    source_before = _legacy_source_inventory(root)
     try:
         return _migrate_legacy_projects_impl(root)
     except Exception as exc:
@@ -673,19 +937,49 @@ def migrate_legacy_projects(data_root: str | os.PathLike[str]) -> dict[str, Any]
         else:
             _atomic_write_bytes(repo.registry_path, registry_before)
         report_path = root / "migration_reports" / "groups-v1.json"
-        unchanged = (
-            source_digest is None
-            or (source_registry.is_file() and _sha256(source_registry) == source_digest)
-        )
+        source_after = _legacy_source_inventory(root)
+        evidence = [
+            {
+                "path": path,
+                "before_sha256": digest,
+                "after_sha256": source_after.get(path),
+                "unchanged": source_after.get(path) == digest,
+            }
+            for path, digest in sorted(source_before.items())
+        ]
+        unchanged = all(item["unchanged"] for item in evidence)
         _atomic_write_json(report_path, {
             "version": 1,
             "status": "failed",
             "error_type": type(exc).__name__,
             "error": str(exc)[:1000],
             "legacy_source_unchanged": unchanged,
+            "legacy_source_evidence": evidence,
+            "backup_manifest": "migration_backups/groups-v1/manifest.json",
             "failed_at": utc_now(),
         })
         raise
+
+
+def _legacy_source_inventory(root: Path) -> dict[str, str]:
+    registry = root / "projects.json"
+    if not registry.is_file():
+        return {}
+    paths = [registry]
+    try:
+        projects = json.loads(registry.read_text("utf-8"))
+    except (OSError, json.JSONDecodeError):
+        projects = []
+    if isinstance(projects, list):
+        for row in projects:
+            if isinstance(row, Mapping) and isinstance(row.get("project_id"), str):
+                roster = root / "events" / f"{_legacy_safe_name(row['project_id'])}_roster.jsonl"
+                if roster.is_file():
+                    paths.append(roster)
+    return {
+        str(path.relative_to(root)).replace("\\", "/"): _sha256(path)
+        for path in paths
+    }
 
 
 def _migrate_legacy_projects_impl(data_root: str | os.PathLike[str]) -> dict[str, Any]:

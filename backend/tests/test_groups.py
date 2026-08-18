@@ -59,6 +59,16 @@ def test_expert_configuration_cannot_override_platform_policy() -> None:
             "name": "unsafe", "specialty": "anything", "allowed_tools": ["shell_admin"],
         })
 
+    group_id = opaque_id("grp")
+    expert = ExpertTemplateConfig.from_payload({
+        "name": "safe", "specialty": "analysis", "allowed_tools": ["read"],
+    })
+    with pytest.raises(GroupDomainError, match="tool_overrides"):
+        GroupAgent(
+            agent_id=opaque_id("gag"), group_id=group_id, role="expert",
+            display_name="safe", expert=expert, tool_overrides=("shell_admin",),
+        )
+
 
 def test_group_isolation_shared_source_counts_and_content_free_receipt(tmp_path: Path) -> None:
     repo = GroupRepository(tmp_path)
@@ -83,7 +93,12 @@ def test_group_isolation_shared_source_counts_and_content_free_receipt(tmp_path:
 
     with pytest.raises(StaleDeletePreviewError):
         repo.confirmed_delete(first.group_id, "not-confirmed")
-    receipt = repo.confirmed_delete(first.group_id, preview.confirmation_token)
+    second_preview = repo.delete_preview(second.group_id)
+    transaction = repo.prepare_delete(first.group_id, preview.confirmation_token)
+    with pytest.raises(GroupDomainError, match="source ownership is locked"):
+        repo.prepare_delete(second.group_id, second_preview.confirmation_token)
+    repo.mark_runtime_deleted(str(transaction["transaction_id"]))
+    receipt = repo.commit_delete(str(transaction["transaction_id"]))
     assert receipt.deleted_source_ids == (exclusive,)
     assert receipt.retained_shared_source_ids == (shared,)
     assert repo.source_reference_count(shared) == 1
@@ -91,6 +106,12 @@ def test_group_isolation_shared_source_counts_and_content_free_receipt(tmp_path:
     assert "First" not in receipt_json
     assert "path" not in receipt_json
     assert "content" not in receipt_json
+    with pytest.raises(StaleDeletePreviewError):
+        repo.confirmed_delete(second.group_id, second_preview.confirmation_token)
+    current_second = repo.delete_preview(second.group_id)
+    second_receipt = repo.confirmed_delete(second.group_id, current_second.confirmation_token)
+    assert second_receipt.deleted_source_ids == (shared,)
+    assert repo.source_reference_count(shared) == 0
 
 
 def test_duplicate_gets_new_opaque_ids_and_references_shared_sources(tmp_path: Path) -> None:
@@ -107,6 +128,70 @@ def test_duplicate_gets_new_opaque_ids_and_references_shared_sources(tmp_path: P
     )
     assert copied.course_bindings[0].binding_id != repo.get(source.group_id).course_bindings[0].binding_id
     assert repo.source_reference_count(source_id) == 2
+    assert copied.legacy_project_id and copied.legacy_project_id != source.legacy_project_id
+
+
+def test_duplicate_commit_failure_is_hidden_and_resumable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = GroupRepository(tmp_path)
+    source = repo.create_group("Source", legacy_project_id="project_source")
+    repo.bind_course(source.group_id, "course_1")
+    repo.link_source(source.group_id)
+    transaction = repo.prepare_duplicate(
+        source.group_id, name="Copy", legacy_project_id="project_copy",
+        request_id="gdup_retryable_1",
+    )
+    before = [group.group_id for group in repo.list_groups()]
+    original = repo._save_payload  # noqa: SLF001
+
+    def fail_commit(_payload):
+        raise OSError("duplicate commit interrupted")
+
+    monkeypatch.setattr(repo, "_save_payload", fail_commit)
+    with pytest.raises(OSError, match="interrupted"):
+        repo.commit_duplicate(str(transaction["transaction_id"]))
+    assert [group.group_id for group in repo.list_groups()] == before
+
+    monkeypatch.setattr(repo, "_save_payload", original)
+    copied = repo.commit_duplicate(str(transaction["transaction_id"]))
+    assert copied.group_id not in before
+    assert copied.legacy_project_id == "project_copy"
+    assert len(copied.course_bindings) == 1
+    assert len(copied.source_links) == 1
+
+
+def test_delete_commit_is_atomic_resumable_and_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = GroupRepository(tmp_path)
+    group = repo.create_group("Delete me", legacy_project_id="project_delete")
+    source_id = repo.link_source(group.group_id).source_id
+    preview = repo.delete_preview(group.group_id)
+    transaction = repo.prepare_delete(
+        group.group_id, preview.confirmation_token, runtime_project_id="project_delete",
+    )
+    repo.mark_runtime_deleted(str(transaction["transaction_id"]))
+    original = repo._save_payload  # noqa: SLF001
+
+    def fail_atomic_commit(_payload):
+        raise OSError("registry receipt commit interrupted")
+
+    monkeypatch.setattr(repo, "_save_payload", fail_atomic_commit)
+    with pytest.raises(OSError, match="receipt"):
+        repo.commit_delete(str(transaction["transaction_id"]))
+    assert repo.get(group.group_id).group_id == group.group_id
+    assert repo.source_reference_count(source_id) == 1
+    assert repo._load_payload()["deletion_receipts"] == []  # noqa: SLF001
+
+    monkeypatch.setattr(repo, "_save_payload", original)
+    receipt = repo.commit_delete(str(transaction["transaction_id"]))
+    retried = repo.commit_delete(str(transaction["transaction_id"]))
+    assert retried == receipt
+    assert repo.delete_transaction(group.group_id)["stage"] == "committed"  # type: ignore[index]
+    payload = repo._load_payload()  # noqa: SLF001
+    assert len(payload["deletion_receipts"]) == 1
+    assert source_id not in {row["source_id"] for row in payload["sources"]}
 
 
 def test_backup_first_migration_inserts_verifier_and_restricts_legacy_experts(tmp_path: Path) -> None:
@@ -144,6 +229,10 @@ def test_migration_failure_rolls_back_new_registry_without_touching_source(
         {"project_id": "old-b", "name": "B"},
     ]).encode("utf-8")
     (tmp_path / "projects.json").write_bytes(source)
+    events = tmp_path / "events"
+    events.mkdir()
+    roster_source = b'{"event":"roster","agent":"legacy"}\n'
+    (events / "old-a_roster.jsonl").write_bytes(roster_source)
     original = GroupRepository.create_group
     calls = 0
 
@@ -159,10 +248,17 @@ def test_migration_failure_rolls_back_new_registry_without_touching_source(
         migrate_legacy_projects(tmp_path)
 
     assert (tmp_path / "projects.json").read_bytes() == source
+    assert (events / "old-a_roster.jsonl").read_bytes() == roster_source
     assert not (tmp_path / "groups" / "v1" / "registry.json").exists()
     failure = json.loads((tmp_path / "migration_reports" / "groups-v1.json").read_text("utf-8"))
     assert failure["status"] == "failed"
     assert failure["legacy_source_unchanged"] is True
+    evidence = {item["path"]: item for item in failure["legacy_source_evidence"]}
+    assert set(evidence) == {"projects.json", "events/old-a_roster.jsonl"}
+    assert evidence["projects.json"]["before_sha256"] == evidence["projects.json"]["after_sha256"]
+    assert evidence["events/old-a_roster.jsonl"]["before_sha256"] == evidence[
+        "events/old-a_roster.jsonl"
+    ]["after_sha256"]
 
 
 def test_transport_alias_resolves_group_id_and_emits_both_ids(tmp_path: Path) -> None:

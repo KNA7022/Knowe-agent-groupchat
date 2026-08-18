@@ -38,6 +38,23 @@ export const GroupAgentSchema = z.object({
   budget: z.number().int().nonnegative().nullable().optional(),
   created_at: z.string(),
   updated_at: z.string(),
+}).superRefine((agent, context) => {
+  if (agent.role !== 'expert' && agent.role !== 'legacy_expert') return;
+  if (!agent.expert) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'expert agents require constrained expert configuration',
+    });
+    return;
+  }
+  const effective = [...new Set(agent.tool_overrides)];
+  const allowed = [...new Set(agent.expert.allowed_tools)];
+  if (effective.length !== allowed.length || effective.some((tool) => !allowed.includes(tool))) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'expert tool_overrides must match constrained allowed_tools',
+    });
+  }
 });
 
 export const GroupCourseBindingSchema = z.object({

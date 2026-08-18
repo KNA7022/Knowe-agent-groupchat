@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   ExpertTemplateConfigSchema,
+  GroupAgentSchema,
   GroupDeletionReceiptSchema,
   GroupSchema,
   GroupTransportIdentitySchema,
@@ -65,6 +66,24 @@ describe('Group domain contract', () => {
       system_prompt: 'override',
     };
     expect(ExpertTemplateConfigSchema.safeParse(expert).success).toBe(false);
+  });
+
+  it('rejects an expert effective-tool override outside its constrained allowlist', () => {
+    const expertAgent = {
+      ...agent('coordinator', 'd'),
+      role: 'expert',
+      expert: {
+        name: 'Proof specialist',
+        specialty: 'analysis',
+        responsibilities: [],
+        allowed_tools: ['read'],
+        platform_policy_locked: true,
+      },
+      tool_overrides: ['shell_admin'],
+    };
+    expect(GroupAgentSchema.safeParse(expertAgent).success).toBe(false);
+    expertAgent.tool_overrides = ['read'];
+    expect(GroupAgentSchema.safeParse(expertAgent).success).toBe(true);
   });
 
   it('accepts canonical and legacy transport identities during migration', () => {
