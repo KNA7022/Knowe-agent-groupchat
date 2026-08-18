@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any, Callable, Iterable
 
 from websockets.protocol import State
@@ -128,6 +128,8 @@ class Project:
 # ═══════════════════════════════════════════════════════════════
 
 class Hub:
+    IDEMPOTENCY_CACHE_MAX = 4096
+
     def __init__(self, store: Any | None = None) -> None:
         self.projects: dict[str, Project] = {}
         self.clients: set[Client] = set()
@@ -141,7 +143,7 @@ class Hub:
         # project_id -> deterministic projection event_id -> committed envelope.
         # The cache is backed by the durable event log on first lookup so outbox replay
         # after a process restart cannot create a second user/UI message.
-        self._idempotent_events: dict[str, dict[str, dict[str, Any]]] = {}
+        self._idempotent_events: dict[str, OrderedDict[str, dict[str, Any]]] = {}
         # Migration-window identity adapter.  The runtime remains keyed by its stable
         # historical project_id, while transport envelopes additionally expose the
         # canonical Group identity.  The server installs this resolver after startup.
@@ -175,12 +177,13 @@ class Hub:
         event_id: str,
         proj: Project,
     ) -> dict[str, Any] | None:
-        cache = self._idempotent_events.setdefault(project_id, {})
+        cache = self._idempotent_events.setdefault(project_id, OrderedDict())
         if event_id in cache:
+            cache.move_to_end(event_id)
             return dict(cache[event_id])
         for candidate in reversed(proj.ring.events()):
             if candidate.get("event_id") == event_id:
-                cache[event_id] = dict(candidate)
+                self._remember_idempotent_event(project_id, event_id, candidate)
                 return dict(candidate)
         if self.store is not None:
             try:
@@ -189,9 +192,19 @@ class Hub:
                 durable = []
             for candidate in reversed(durable):
                 if candidate.get("event_id") == event_id:
-                    cache[event_id] = dict(candidate)
+                    self._remember_idempotent_event(project_id, event_id, candidate)
                     return dict(candidate)
         return None
+
+    def _remember_idempotent_event(
+        self, project_id: str, event_id: str, event: dict[str, Any],
+    ) -> None:
+        """Bound the hot cache; ring/durable history remains the exact authority."""
+        cache = self._idempotent_events.setdefault(project_id, OrderedDict())
+        cache[event_id] = dict(event)
+        cache.move_to_end(event_id)
+        while len(cache) > self.IDEMPOTENCY_CACHE_MAX:
+            cache.popitem(last=False)
 
     # ── 客户端 ──
     def add_client(self, client: Client) -> None:
@@ -349,8 +362,13 @@ class Hub:
     ) -> tuple[list[dict[str, Any]], bool, str, int]:
         """Take the replay slice and its Hub high-water mark under the emit lock."""
         async with self._seq_lock:
-            events, gap, source = self.replay(project_id, since_seq)
-            cursor = self.get_or_create(project_id).seq
+            project = self.get_or_create(project_id)
+            # A client watermark above this epoch cannot be used as a delta cursor.
+            # Replay the complete new-epoch history so the subsequent lower
+            # replay_complete cursor can rebuild conversation without another snapshot.
+            effective_since = 0 if since_seq > project.seq else since_seq
+            events, gap, source = self.replay(project_id, effective_since)
+            cursor = project.seq
         return events, gap, source, cursor
 
     def durable_conversation(self, project_id: str) -> list[dict[str, Any]]:
@@ -397,9 +415,19 @@ class Hub:
 
     # ── 发事件：引擎级（盖 seq、进 ring、广播） ──
     async def emit(self, project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        event, _created = await self.emit_with_status(project_id, payload)
+        return event
+
+    async def emit_with_status(
+        self, project_id: str, payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
         """
         引擎级事件的唯一出口：
           注入 project_id / project_name / ts → 锁内盖 seq → 进 ring → 校验 → 广播。
+
+        The status bit is false when ``event_id`` resolves to an existing durable
+        envelope.  Recovery publishers use it to avoid rebroadcasting an already-live
+        RunEvent after their bounded cursor cache has evicted the run.
         """
         etype = payload.get("type")
         if etype in NO_SEQ_EVENT_TYPES:
@@ -428,11 +456,11 @@ class Hub:
                         # a nondeterministic model rerun must not create a second user
                         # bubble or replace that response.
                         if event_id.startswith("coordmsg_"):
-                            return existing
+                            return existing, False
                         raise ContractViolation(
                             f"event_id {event_id!r} 已用于不同 payload，拒绝覆盖"
                         )
-                    return existing
+                    return existing, False
             proj.seq += 1
             event["seq"] = proj.seq
             proj.ring.append(event)
@@ -445,10 +473,10 @@ class Hub:
                 _store.defer_bg(lambda: _store.save_seq_watermark(_pid, _seq),
                                 description=f"{_pid} seq 高水位")
             if isinstance(event_id, str) and event_id:
-                self._idempotent_events.setdefault(project_id, {})[event_id] = dict(event)
+                self._remember_idempotent_event(project_id, event_id, event)
 
         await self.broadcast(event)
-        return event
+        return event, True
 
     # ── 发事件：服务器级（无 seq，旁路） ──
     async def emit_no_seq(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -459,7 +487,7 @@ class Hub:
         await self.broadcast(event)
         return event
 
-    async def send_to(self, client: Client, payload: dict[str, Any]) -> None:
+    async def send_to(self, client: Client, payload: dict[str, Any]) -> bool:
         """点对点（握手回放、pong）。不进 ring、不广播。"""
         event = self._with_group_identity(dict(payload))
         pid = event.get("project_id")
@@ -467,7 +495,7 @@ class Hub:
             event = self._filter_public_text(pid, event)
         else:
             event = sanitize_event(event, {})
-        await client.send(event)
+        return await client.send(event)
 
     # ── 广播 ──
     async def broadcast(self, event: dict[str, Any], targets: Iterable[Client] | None = None) -> None:
@@ -492,6 +520,7 @@ class Hub:
     async def snapshot(
         self, project_id: str,
         activity: list[dict[str, Any]] | None = None,
+        task_runtime: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         state_snapshot：**本身消耗一个 seq 并写入 ring**（PROTOCOL.md §e）。
@@ -521,6 +550,8 @@ class Hub:
             }
             if activity is not None:
                 event["activity"] = list(activity)
+            if task_runtime is not None:
+                event["task_runtime"] = dict(task_runtime)
             event = self._with_group_identity(event)
             event = self._filter_public_text(project_id, event)
             proj.ring.append(event)

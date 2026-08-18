@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from websockets.protocol import State
 
-from backend.hub import Client
+from backend.hub import Client, Hub
 from backend import server as server_module
 from backend.server import KnoweServer
 from backend.task_runtime.contracts import RiskLevel, RunEvent, TaskStatus
@@ -65,6 +65,17 @@ async def _close(server: KnoweServer) -> None:
         server.task_runtime.close()
     if server.store is not None:
         server.store.close(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_new_epoch_cursor_replays_complete_new_history() -> None:
+    hub = Hub()
+    await hub.emit("epoch", {
+        "type": "message", "agent_id": "coordinator", "content": "new epoch",
+    })
+    events, gap, source, cursor = await hub.replay_with_cursor("epoch", 99)
+    assert not gap and source == "ring" and cursor == 1
+    assert [(item["seq"], item["content"]) for item in events] == [(1, "new epoch")]
 
 
 @pytest.mark.asyncio
@@ -221,15 +232,17 @@ async def test_shutdown_fences_racing_callback_and_restart_reconciles_gap(
 
     entered = asyncio.Event()
     release = asyncio.Event()
-    original_emit = server.hub.emit
+    original_emit = server.hub.emit_with_status
 
-    async def delayed_emit(project_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def delayed_emit(
+        project_id: str, payload: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
         if payload.get("event", {}).get("public_payload", {}).get("label") == "racing":
             entered.set()
             await release.wait()
         return await original_emit(project_id, payload)
 
-    monkeypatch.setattr(server.hub, "emit", delayed_emit)
+    monkeypatch.setattr(server.hub, "emit_with_status", delayed_emit)
     await asyncio.to_thread(
         server.task_runtime.checkpoint,
         group.group_id, run.run_id,
@@ -461,12 +474,12 @@ async def test_bridge_resources_are_bounded_and_poison_run_does_not_block_health
     original_broadcast = server._broadcast_task_runtime_event  # noqa: SLF001
     broadcast_attempts = 0
 
-    async def failing_broadcast(event: RunEvent) -> bool:
+    async def failing_broadcast(event: RunEvent, *, recovering: bool = False) -> bool:
         nonlocal broadcast_attempts
         if event.run_id == bad.run_id:
             broadcast_attempts += 1
             return False
-        return await original_broadcast(event)
+        return await original_broadcast(event, recovering=recovering)
 
     monkeypatch.setattr(server, "_broadcast_task_runtime_event", failing_broadcast)
     await asyncio.to_thread(
@@ -590,3 +603,203 @@ async def test_run_lifecycle_owns_bridge_loop_and_unregisters_on_shutdown(
     assert not server._task_runtime_event_bridge_active  # noqa: SLF001
     assert server._task_runtime_event_bridge_loop is None  # noqa: SLF001
     assert server._task_runtime_listener_service is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_cursor_capacity_uses_durable_publication_and_stable_hub_event_identity(
+    tmp_path: Path,
+) -> None:
+    """A real retained run remains exact-once after active and terminal LRU eviction."""
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    project_id = "project_20260819030303"
+    group = server.groups.create_group("Cursor cap", legacy_project_id=project_id)
+    server.hub.get_or_create(project_id, "Cursor cap")
+    retained = server.task_runtime.submit(
+        group.group_id, title="Retained", request_key="cursor-cap-retained",
+    )
+    for index in range(server.TASK_RUNTIME_ACTIVE_CURSOR_MAX):
+        server.task_runtime.submit(
+            group.group_id, title=f"Queued {index}", request_key=f"cursor-cap-{index}",
+        )
+
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    assert retained.run_id not in server._task_runtime_event_bridge_last_seq  # noqa: SLF001
+    socket = OpenCaptureSocket()
+    client = Client(socket)
+    server.hub.add_client(client)
+    await server._do_replay(client, {  # noqa: SLF001
+        "project_id": project_id, "since_seq": 0,
+    })
+    await client.release_live_replay_fence()
+    socket.messages.clear()
+
+    server.task_runtime.checkpoint(
+        group.group_id, retained.run_id, label="after-eviction",
+        request_key="cursor-cap-after-eviction",
+    )
+    next_event = server.task_runtime.store.events_after(retained.run_id, 1)[-1]
+    await _wait_for(lambda: any(
+        item.get("event", {}).get("event_id") == next_event.event_id
+        for item in socket.messages
+    ), timeout=5)
+    live = [
+        item["event"]["seq"] for item in socket.messages
+        if item.get("type") == "task_runtime_event"
+        and item.get("event", {}).get("run_id") == retained.run_id
+    ]
+    assert live == [2]
+
+    first = server.task_runtime.store.events_after(retained.run_id, 0)[0]
+    for index in range(server.TASK_RUNTIME_TERMINAL_CURSOR_MAX + 1):
+        with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+            server._set_task_runtime_cursor_locked(  # noqa: SLF001
+                f"run_{index + 10_000:032x}", group.group_id, 9, terminal=True,
+            )
+    server._on_task_runtime_event(first)  # noqa: SLF001
+    await asyncio.sleep(0.1)
+    assert [
+        item for item in socket.messages
+        if item.get("event", {}).get("event_id") == first.event_id
+    ] == []
+
+    assert server.store is not None
+    server.store.flush(timeout=10)
+    hub_rows = [
+        item for item in server.store.load_all_events(project_id)
+        if item.get("type") == "task_runtime_event"
+    ]
+    nested_ids = [item["event"]["event_id"] for item in hub_rows]
+    assert nested_ids.count(next_event.event_id) == 1
+    assert all(item.get("event_id") == item["event"]["event_id"] for item in hub_rows)
+    assert all(
+        len(cache) <= server.hub.IDEMPOTENCY_CACHE_MAX
+        for cache in server.hub._idempotent_events.values()  # noqa: SLF001
+    )
+
+    token = server.groups.delete_preview(group.group_id).confirmation_token
+    await server._run_confirmed_group_delete(group.group_id, project_id, token)  # noqa: SLF001
+    assert server.task_runtime.store.live_publication_cursor(retained.run_id) is None
+    recreated = server.groups.create_group("Recreated", legacy_project_id=project_id)
+    server.hub.get_or_create(project_id, "Recreated")
+    socket.messages.clear()
+    fresh = server.task_runtime.submit(
+        recreated.group_id, title="Fresh", request_key="cursor-cap-fresh",
+    )
+    await _wait_for(lambda: any(
+        item.get("event", {}).get("run_id") == fresh.run_id for item in socket.messages
+    ), timeout=5)
+    assert [
+        item["event"]["seq"] for item in socket.messages
+        if item.get("event", {}).get("run_id") == fresh.run_id
+    ] == [1]
+    await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_exhausted_delivery_directly_resyncs_affected_group_and_survives_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    active = server.groups.create_group("Active", legacy_project_id="project_recovery_active")
+    affected = server.groups.create_group(
+        "Affected", legacy_project_id="project_recovery_background",
+    )
+    server.hub.get_or_create("project_recovery_active", "Active")
+    server.hub.get_or_create("project_recovery_background", "Affected")
+    active_run = server.task_runtime.submit(
+        active.group_id, title="Healthy", request_key="recovery-healthy",
+    )
+    affected_run = server.task_runtime.submit(
+        affected.group_id, title="Affected", request_key="recovery-affected",
+    )
+    socket = OpenCaptureSocket()
+    client = Client(socket)
+    server.hub.add_client(client)
+    await client.release_live_replay_fence()
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    socket.messages.clear()
+
+    original_broadcast = server.hub.broadcast
+
+    async def fail_affected(event: dict[str, Any], targets=None) -> None:
+        if (
+            event.get("type") == "task_runtime_event"
+            and event.get("event", {}).get("public_payload", {}).get("label") == "unique-final"
+        ):
+            raise OSError("broadcast unavailable")
+        await original_broadcast(event, targets)
+
+    monkeypatch.setattr(server.hub, "broadcast", fail_affected)
+    server.task_runtime.checkpoint(
+        affected.group_id, affected_run.run_id, label="unique-final",
+        request_key="recovery-unique-final",
+    )
+    missed = server.task_runtime.store.events_after(affected_run.run_id, 1)[-1]
+    server.task_runtime.checkpoint(
+        active.group_id, active_run.run_id, label="healthy-final",
+        request_key="recovery-healthy-final",
+    )
+    healthy = server.task_runtime.store.events_after(active_run.run_id, 1)[-1]
+    await _wait_for(lambda: any(
+        item.get("event", {}).get("event_id") == healthy.event_id for item in socket.messages
+    ), timeout=5)
+    await _wait_for(lambda: any(
+        item.get("type") == "resync_required"
+        and item.get("project_id") == "project_recovery_background"
+        for item in socket.messages
+    ), timeout=5)
+    assert not any(
+        item.get("event", {}).get("event_id") == missed.event_id for item in socket.messages
+    )
+    recovery = next(
+        item for item in socket.messages
+        if item.get("type") == "resync_required"
+        and item.get("project_id") == "project_recovery_background"
+    )
+    markers = server.task_runtime.store.live_recoveries()
+    assert len(markers) == 1 and markers[0]["recovery_token"] == recovery["recovery_token"]
+
+    await server._cmd_request_snapshot(client, {  # noqa: SLF001
+        "project_id": recovery["project_id"],
+        "recovery_token": recovery["recovery_token"],
+    })
+    snapshot = next(
+        item for item in reversed(socket.messages)
+        if item.get("type") == "task_runtime_result" and item.get("action") == "snapshot"
+    )
+    projected = next(
+        item for item in snapshot["task_runtime"]["runs"]
+        if item["run_id"] == affected_run.run_id
+    )
+    assert projected["last_seq"] == missed.seq
+    assert projected["group_id"] == affected.group_id
+    assert server.task_runtime.store.live_recoveries() == ()
+
+    socket.messages.clear()
+    monkeypatch.setattr(server.hub, "broadcast", original_broadcast)
+    monkeypatch.setattr(server.hub, "broadcast", fail_affected)
+    server.task_runtime.checkpoint(
+        affected.group_id, affected_run.run_id, label="unique-final",
+        request_key="recovery-after-ack",
+    )
+    await _wait_for(lambda: bool(server.task_runtime.store.live_recoveries()), timeout=5)
+    persisted_token = str(server.task_runtime.store.live_recoveries()[0]["recovery_token"])
+    monkeypatch.setattr(server.hub, "broadcast", original_broadcast)
+    await _close(server)
+
+    restarted = KnoweServer(str(tmp_path))
+    assert restarted.task_runtime is not None
+    restarted._start_task_runtime_event_bridge()  # noqa: SLF001
+    restarted_socket = OpenCaptureSocket()
+    restarted_client = Client(restarted_socket)
+    restarted.hub.add_client(restarted_client)
+    await restarted_client.release_live_replay_fence()
+    await restarted._notify_task_runtime_recoveries(restarted_client)  # noqa: SLF001
+    replayed_marker = next(
+        item for item in restarted_socket.messages if item.get("type") == "resync_required"
+    )
+    assert replayed_marker["project_id"] == "project_recovery_background"
+    assert replayed_marker["recovery_token"] == persisted_token
+    await _close(restarted)

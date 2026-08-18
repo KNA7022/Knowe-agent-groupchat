@@ -659,6 +659,7 @@ export interface KnoweStore {
 
   // ── Actions: Epoch reset ──
   clearProject: (projectId: string) => void;
+  calibrateActivity: (projectId: string, activity: ActivityLedgerEntry[]) => void;
 
   // ── Actions: Project auto-register ──
   ensureProject: (projectId: string, projectName?: string) => void;

@@ -496,6 +496,7 @@ export const App: React.FC = () => {
           useKnoweStore.getState().calibrateActivity(pid, activity),
         onTaskRuntimeSnapshot: (groupId, snapshot) =>
           useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId as GroupId, snapshot),
+        onTaskRuntimeEpochReset: () => useTaskRuntimeStore.getState().resetAll(),
         getActiveProjectId: () => useKnoweStore.getState().activeProjectId,
         // [v0.13 卡片] 目录失效 → 弹出聊天区内恢复卡片（不再开原生目录对话框）。
         onProjectDirectoryRequired: (event) => openDirectoryRequest(event),

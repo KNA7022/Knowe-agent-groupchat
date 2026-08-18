@@ -183,6 +183,26 @@ class TaskRuntimeStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS studycrew_live_recovery (
+                run_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                through_seq INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                recovery_token TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_studycrew_live_recovery_group
+              ON studycrew_live_recovery(group_id, updated_at);
+            CREATE TABLE IF NOT EXISTS studycrew_live_publication (
+                run_id TEXT PRIMARY KEY,
+                group_id TEXT NOT NULL,
+                last_seq INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_studycrew_live_publication_group
+              ON studycrew_live_publication(group_id);
             CREATE TABLE IF NOT EXISTS studycrew_migration_tombstones (
                 tombstone_id TEXT PRIMARY KEY,
                 record_type TEXT NOT NULL,
@@ -1133,6 +1153,105 @@ class TaskRuntimeStore:
                 "SELECT * FROM studycrew_group_deletions ORDER BY created_at"
             ).fetchall()
         return tuple({key: str(row[key]) for key in row.keys()} for row in rows)
+
+    def record_live_recovery(
+        self, *, run_id: str, group_id: str, through_seq: int, reason: str,
+        attempts: int, recovery_token: str, limit: int,
+    ) -> dict[str, Any]:
+        """Persist one coalesced affected-Group resync requirement with bounded retention."""
+        now = utc_now()
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO studycrew_live_recovery(
+                       run_id, group_id, through_seq, reason, attempts, recovery_token,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(run_id) DO UPDATE SET
+                     group_id=excluded.group_id,
+                     through_seq=MAX(studycrew_live_recovery.through_seq, excluded.through_seq),
+                     reason=excluded.reason,
+                     attempts=excluded.attempts,
+                     updated_at=excluded.updated_at""",
+                (run_id, group_id, through_seq, reason, attempts, recovery_token, now, now),
+            )
+            conn.execute(
+                """DELETE FROM studycrew_live_recovery WHERE run_id IN (
+                       SELECT run_id FROM studycrew_live_recovery
+                       ORDER BY updated_at DESC, run_id DESC LIMIT -1 OFFSET ?
+                   )""",
+                (max(1, int(limit)),),
+            )
+            row = conn.execute(
+                "SELECT * FROM studycrew_live_recovery WHERE run_id=?", (run_id,),
+            ).fetchone()
+        if row is None:
+            return {}
+        return {key: row[key] for key in row.keys()}
+
+    def live_recoveries(self) -> tuple[dict[str, Any], ...]:
+        with self.db.transaction(immediate=False) as conn:
+            rows = conn.execute(
+                "SELECT * FROM studycrew_live_recovery ORDER BY updated_at, run_id"
+            ).fetchall()
+        return tuple({key: row[key] for key in row.keys()} for row in rows)
+
+    def clear_live_recovery(self, run_id: str, recovery_token: str) -> bool:
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM studycrew_live_recovery WHERE run_id=? AND recovery_token=?",
+                (run_id, recovery_token),
+            )
+        return cursor.rowcount == 1
+
+    def clear_group_live_recovery(self, group_id: str) -> int:
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM studycrew_live_recovery WHERE group_id=?", (group_id,),
+            )
+        return max(0, int(cursor.rowcount))
+
+    def record_live_publication(self, *, run_id: str, group_id: str, last_seq: int) -> None:
+        """Durable per-run handoff cursor; memory LRUs are only an acceleration layer."""
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO studycrew_live_publication(run_id, group_id, last_seq, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(run_id) DO UPDATE SET
+                     group_id=excluded.group_id,
+                     last_seq=MAX(studycrew_live_publication.last_seq, excluded.last_seq),
+                     updated_at=excluded.updated_at""",
+                (run_id, group_id, max(0, int(last_seq)), utc_now()),
+            )
+
+    def record_group_live_publication(self, group_id: str, cursors: Mapping[str, int]) -> None:
+        if not cursors:
+            return
+        now = utc_now()
+        with self.db.transaction() as conn:
+            for run_id, last_seq in cursors.items():
+                conn.execute(
+                    """INSERT INTO studycrew_live_publication(run_id, group_id, last_seq, updated_at)
+                       VALUES (?, ?, ?, ?)
+                       ON CONFLICT(run_id) DO UPDATE SET
+                         group_id=excluded.group_id,
+                         last_seq=MAX(studycrew_live_publication.last_seq, excluded.last_seq),
+                         updated_at=excluded.updated_at""",
+                    (run_id, group_id, max(0, int(last_seq)), now),
+                )
+
+    def live_publication_cursor(self, run_id: str) -> int | None:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT last_seq FROM studycrew_live_publication WHERE run_id=?", (run_id,),
+            ).fetchone()
+        return None if row is None else int(row["last_seq"])
+
+    def clear_group_live_publication(self, group_id: str) -> int:
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                "DELETE FROM studycrew_live_publication WHERE group_id=?", (group_id,),
+            )
+        return max(0, int(cursor.rowcount))
 
     def save_checkpoint(
         self, checkpoint: Checkpoint, run: TaskRun, *, idempotency_key: str,

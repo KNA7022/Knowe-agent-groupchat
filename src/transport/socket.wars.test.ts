@@ -29,6 +29,10 @@ import { FakeKnoweServer, sleep } from '../fakeserver/FakeKnoweServer';
 import {
   getCorridorState, resetCorridor, record as recordDiagnostic,
 } from '../observe/corridor';
+import { taskRunFixture } from '../contract/taskRuntime.fixture';
+import { useKnoweStore } from '../store/store';
+import { useTaskRuntimeStore } from '../store/taskRuntime';
+import type { GroupId } from '../contract/group';
 
 // jsdom 没有 WebSocket，把 Node 的 ws 顶上去（这样测的就是真连接）
 import WS from 'ws';
@@ -48,6 +52,7 @@ interface Harness {
   epochResets: string[];
   echoLost: string[];
   ledger: Array<{ pid: string; activity: unknown[] }>;
+  runtimeSnapshots: Array<{ groupId: string; snapshot: unknown }>;
 }
 
 function connect(opts: { ringMax?: number } = {}): Harness {
@@ -57,6 +62,7 @@ function connect(opts: { ringMax?: number } = {}): Harness {
   const epochResets: string[] = [];
   const echoLost: string[] = [];
   const ledger: Array<{ pid: string; activity: unknown[] }> = [];
+  const runtimeSnapshots: Array<{ groupId: string; snapshot: unknown }> = [];
 
   const s = createSocket({
     url: server.url,
@@ -72,11 +78,12 @@ function connect(opts: { ringMax?: number } = {}): Harness {
       getActiveProjectId: () => 'demo',
       onDiagnostic: recordDiagnostic,     // ★ 走廊接上真传输层
       onActivityLedger: (pid, activity) => ledger.push({ pid, activity }), // [v1.0.24.4]
+      onTaskRuntimeSnapshot: (groupId, snapshot) => runtimeSnapshots.push({ groupId, snapshot }),
     },
   });
   socket = s;
   s.connect();
-  return { socket: s, events, statuses, epochResets, echoLost, ledger };
+  return { socket: s, events, statuses, epochResets, echoLost, ledger, runtimeSnapshots };
 }
 
 /** 等到条件成立，或超时炸掉（带上现场，方便查） */
@@ -129,6 +136,117 @@ describe('W1 · 纪元锁死（server 重启）', () => {
     expect(h.socket.watermarks.demo!).toBeLessThan(oldWatermark);
     expect(getCorridorState().epochResets).toBeGreaterThan(0);   // 走廊留痕
   });
+
+  it('真实 store 按新纪元顺序重建项目、花名册、活动、会话和 Runtime', async () => {
+    const groupId = `grp_${'1'.repeat(32)}` as GroupId;
+    const oldRunId = `run_${'a'.repeat(32)}`;
+    const newRunId = `run_${'b'.repeat(32)}`;
+    const runtimeSnapshot = (runId: string, title: string) => ({
+      schema_version: 1,
+      group_id: groupId,
+      runs: [taskRunFixture({
+        run_id: runId, task_id: `task_${runId.slice(4)}`, group_id: groupId,
+        title, last_seq: 1, version: 1,
+      })],
+      pending_approvals: [],
+      summary: {
+        active_primary_run_id: runId, primary_task_status: 'running', queued_task_count: 0,
+        active_side_task_count: 0, pending_approval_count: 0,
+        budget_usage: {
+          wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0,
+        },
+        indexing_state: 'idle',
+      },
+    });
+
+    useKnoweStore.getState().clearProject('demo');
+    useTaskRuntimeStore.getState().resetAll();
+    const statuses: ConnStatus[] = [];
+    const s = createSocket({
+      url: server.url,
+      callbacks: {
+        onEvent: (event) => {
+          if (event.type === 'task_runtime_event') {
+            useTaskRuntimeStore.getState().applyEvent(event.group_id as GroupId, event.event);
+          } else {
+            useKnoweStore.getState().handleEvent(event);
+          }
+        },
+        onStatus: (status) => {
+          statuses.push(status);
+          useKnoweStore.getState().setConnStatus(status);
+        },
+        onEpochReset: (pid) => useKnoweStore.getState().clearProject(pid),
+        onProjectDiscovered: (pid, name) => useKnoweStore.getState().ensureProject(pid, name),
+        onActivityLedger: (pid, activity) =>
+          useKnoweStore.getState().calibrateActivity(pid, activity),
+        onTaskRuntimeEpochReset: () => useTaskRuntimeStore.getState().resetAll(),
+        onTaskRuntimeSnapshot: (gid, snapshot) =>
+          useTaskRuntimeStore.getState().ingestGroupSnapshot(gid as GroupId, snapshot),
+        getActiveProjectId: () => 'demo',
+      },
+    });
+    socket = s;
+    s.connect();
+    await until(() => statuses.at(-1) === 'live', 'old epoch live');
+    server.emitNoSeq({
+      type: 'project_created', project_id: 'demo', project_name: 'Old project',
+      members: [{ id: 'old_agent', role: 'Coach', name: 'Old member' }],
+    });
+    server.say('demo', 'old_agent', 'old-world', 2);
+    await until(
+      () => useKnoweStore.getState().convs.demo?.items.some(
+        (item) => item.kind === 'agent' && item.text === 'old-world',
+      ) === true,
+      'old epoch projected',
+    );
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(
+      groupId, runtimeSnapshot(oldRunId, 'Old runtime'),
+    );
+
+    server.replayProjectCreated = [{
+      type: 'project_created', project_id: 'demo', project_name: 'New project',
+      members: [{ id: 'new_agent', role: 'Coach', name: 'New member' }],
+    }];
+    server.replayActivity = [{
+      agent_id: 'new_agent', scope_id: 'new-scope', channel_id: 'demo', started_at: 42,
+    }];
+    server.replayTaskRuntimeGroups = [runtimeSnapshot(newRunId, 'New runtime')];
+    server.restart();
+    server.emit('demo', { type: 'message', agent_id: 'new_agent', content: 'new-world' });
+
+    await until(() => statuses.at(-1) === 'live', 'new epoch live', 6000);
+    await until(
+      () => useKnoweStore.getState().convs.demo?.items.some(
+        (item) => item.kind === 'agent' && item.text === 'new-world',
+      ) === true,
+      'new conversation projected',
+      6000,
+    );
+    const conversation = useKnoweStore.getState().convs.demo!;
+    expect(conversation.projectName).toBe('New project');
+    expect(conversation.members.some((member) => member.id === 'old_agent')).toBe(false);
+    expect(conversation.members.find((member) => member.id === 'new_agent')?.state).toBe('busy');
+    expect(conversation.items.some(
+      (item) => item.kind === 'agent' && item.text.startsWith('old-'),
+    )).toBe(false);
+    expect(useTaskRuntimeStore.getState().byRun[oldRunId]).toBeUndefined();
+    expect(useTaskRuntimeStore.getState().byRun[newRunId]?.run.title).toBe('New runtime');
+
+    server.emit('demo', {
+      type: 'task_runtime_event', event_id: `evt_${'c'.repeat(32)}`, group_id: groupId,
+      event: {
+        event_id: `evt_${'c'.repeat(32)}`, run_id: newRunId, group_id: groupId,
+        seq: 2, version: 2, event_type: 'status_changed',
+        public_payload: { status: 'running' }, sensitivity: 'public',
+        created_at: '2026-08-19T00:00:00Z', schema_version: 1,
+      },
+    });
+    await until(
+      () => useTaskRuntimeStore.getState().byRun[newRunId]?.run.last_seq === 2,
+      'post-epoch runtime delta',
+    );
+  }, 10_000);
 });
 
 describe('W2 · 静默丢弃', () => {
@@ -204,6 +322,34 @@ describe('W5 · seq 空洞', () => {
     );
     expect(getCorridorState().seqDropped).toBeGreaterThan(0);
     expect(getCorridorState().entries.some((e) => e.verdict === 'gap')).toBe(true);
+  });
+
+  it('恢复控制帧明确指定后台项目时只刷新该项目并回传 token', async () => {
+    const h = connect();
+    await until(() => h.statuses.includes('live'), 'live');
+    const before = server.inbound.length;
+    server.emitNoSeq({
+      type: 'resync_required', project_id: 'project_background', last_seq: 9,
+      group_id: `grp_${'9'.repeat(32)}`, recovery_token: 'recovery_background_once',
+    });
+    await until(
+      () => server.inbound.slice(before).some(
+        (item) => item.type === 'request_snapshot'
+          && item.project_id === 'project_background'
+          && item.recovery_token === 'recovery_background_once',
+      ),
+      'background recovery snapshot request',
+    );
+    expect(server.inbound.slice(before).some(
+      (item) => item.type === 'request_snapshot' && item.project_id === 'demo',
+    )).toBe(false);
+    server.emitNoSeq({
+      type: 'task_runtime_result', action: 'snapshot', request_id: 'recovery_background_once',
+      schema_version: 1, group_id: `grp_${'9'.repeat(32)}`,
+      task_runtime: { group_id: `grp_${'9'.repeat(32)}` },
+    });
+    await until(() => h.runtimeSnapshots.length === 1, 'background Runtime snapshot handoff');
+    expect(h.runtimeSnapshots[0]?.groupId).toBe(`grp_${'9'.repeat(32)}`);
   });
 });
 

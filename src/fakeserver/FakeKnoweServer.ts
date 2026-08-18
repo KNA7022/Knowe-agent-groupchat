@@ -55,6 +55,8 @@ export interface FakeServerOptions {
   handshakeTimeoutMs?: number;
   /** [v1.0.24.4] replay_complete 附带的权威活动账本（测试账本转交用） */
   replayActivity?: Json[];
+  replayProjectCreated?: Json[];
+  replayTaskRuntimeGroups?: Json[];
 }
 
 interface ProjectState {
@@ -116,6 +118,8 @@ export class FakeKnoweServer {
 
   /** [v1.0.24.4] replay_complete 携带的权威活动账本（测试注入） */
   replayActivity: Json[] | undefined = undefined;
+  replayProjectCreated: Json[] | undefined = undefined;
+  replayTaskRuntimeGroups: Json[] | undefined = undefined;
 
   constructor(opts: FakeServerOptions = {}) {
     this.wantPort = opts.port ?? 0;
@@ -123,6 +127,8 @@ export class FakeKnoweServer {
     this.handshakeTimeoutMs = opts.handshakeTimeoutMs ?? 5000;
     // [v1.0.24.4] 账本注入（测试用），缺省不带字段 = 等价旧后端。
     this.replayActivity = opts.replayActivity;
+    this.replayProjectCreated = opts.replayProjectCreated;
+    this.replayTaskRuntimeGroups = opts.replayTaskRuntimeGroups;
   }
 
   get url(): string {
@@ -343,13 +349,17 @@ export class FakeKnoweServer {
 
   private doReplay(client: ClientState, msg: Json): void {
     const pid = (msg.project_id as string) || 'demo';
-    const since = Number(msg.since_seq ?? 0);
+    const requestedSince = Number(msg.since_seq ?? 0);
     const p = this.project(pid);
+    const since = requestedSince > p.seq ? 0 : requestedSince;
 
     // 补发这个客户端没收过的 project_created
     for (const [id, proj] of this.projects) {
       if (!client.sentProjects.has(id)) {
-        this.sendTo(client, { type: 'project_created', project_id: id, project_name: proj.name });
+        const injected = this.replayProjectCreated?.find((item) => item.project_id === id);
+        this.sendTo(client, injected || {
+          type: 'project_created', project_id: id, project_name: proj.name,
+        });
         client.sentProjects.add(id);
       }
     }
@@ -373,6 +383,9 @@ export class FakeKnoweServer {
     const complete: Json = { type: 'replay_complete', project_id: pid, last_seq: p.seq };
     // [v1.0.24.4] 测试可注入账本：无配置则不带字段（等价旧后端）。
     if (this.replayActivity) complete.activity = this.replayActivity;
+    if (this.replayTaskRuntimeGroups) {
+      complete.task_runtime_groups = this.replayTaskRuntimeGroups;
+    }
     this.sendTo(client, complete);
   }
 

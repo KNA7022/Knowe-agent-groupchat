@@ -1,0 +1,189 @@
+# Task 3A implementation report
+
+## Status
+
+DONE
+
+## Production boundary
+
+- `KnoweServer` now owns a thread-safe Task Runtime notification ingress and captures its asyncio loop only after the real WebSocket `serve(...)` lifecycle has entered. Constructor-time and pre-listen commits remain durable and are reconciled by replay/snapshot instead of borrowing an incidental caller loop.
+- Synchronous journal listeners only enqueue committed `RunEvent` notifications. A single loop-owned drain reads the authoritative journal, repairs same-run callback inversions through the notification sequence, and serially publishes to the canonical Group Hub.
+- Live publication tracks per-run sequence high-water marks and event IDs. Duplicate/idempotent listener notifications do not create a second Hub frame. Cross-run FIFO retains the expiry-to-follow-on-scheduler causal order.
+- Shutdown first fences acceptance under the ingress lock, advances the bridge generation, clears queued callbacks, removes the service listener, releases the loop reference, and cancels an in-flight drain before Hub/project shutdown. A racing stale callback cannot publish or mutate Hub state. A later lifecycle registers against the current service and takes a fresh durable baseline.
+- Task Runtime store listener registration/removal is now thread-safe and idempotent. No async Hub API is called from Timer or scheduler threads.
+- Existing canonical `group_id` resolution, legacy runtime project compatibility, Hub public-text filtering, and `RunEvent.to_public_dict()` redaction remain on the only outbound path.
+
+## Acceptance tests
+
+Added `backend/tests/test_task_runtime_live_event_bridge.py`:
+
+- A real `KnoweServer` on a genuinely running asyncio loop with an actual open Hub `Client` and actual approval `threading.Timer` proves exactly one live `approval_resolved`, followed by ordered `routing` then `running` frames for the next queued run, without a read/snapshot/reconnect. It also proves all socket sends occur on the owning loop thread and the durable journal contains one expiry event.
+- A 12-event foreign-thread checkpoint burst proves ordered per-run live delivery. Re-delivering the same committed notification twice proves exactly-once event-ID behavior.
+- A delayed Hub boundary races shutdown against a foreign-thread callback. The in-flight frame is cancelled before Hub mutation, later stopped-state commits remain durable only, replay exposes the gap, a fresh lifecycle emits no historical duplicates, and a new post-restart event is live.
+- Updated the older direct-transport live-event test to explicitly enter/exit the same bridge lifecycle; unit construction alone no longer captures pytest's incidental loop.
+
+## Exact verification evidence
+
+- Task 1–3 Group/Task Runtime regressions:
+  - `py -3.12 -m pytest -q backend/tests/test_groups.py backend/tests/test_group_http.py backend/tests/test_task_runtime.py backend/tests/test_task_runtime_review_fixes.py backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_rereview_round3.py backend/tests/test_task_runtime_rereview_round4.py backend/tests/test_task_runtime_rereview_round5.py backend/tests/test_task_runtime_live_event_bridge.py`
+  - Result: `111 passed in 13.51s`.
+- Legacy Engine regressions:
+  - `py -3.12 -m pytest -q backend/tests/test_worker_completion_v1.py backend/tests/test_runtime_impl_v10184.py backend/tests/test_coordinator_no_reply.py`
+  - Result: `26 passed, 10 subtests passed in 1.61s`.
+- Frontend Task Runtime/Group regressions:
+  - `npm exec vitest run -- src/contract/taskRuntime.test.ts src/store/taskRuntime.test.ts src/contract/group.test.ts src/store/groups.test.ts --pool=forks --poolOptions.forks.singleFork=true`
+  - Result: `4 files / 26 tests passed`.
+- `py -3.12 -m py_compile` passed for Server, Task Runtime store/service, and the new bridge test.
+- Targeted ESLint and strict TypeScript compilation passed with no diagnostics.
+- `git diff --check` passed; Git printed only the repository's existing Windows LF-to-CRLF notices.
+
+## Scope boundary
+
+Task 4 status-bar UI and all later gateway/RAG work were not started. The broad repository typecheck baseline was not changed by this remediation; prior reports already document its unrelated legacy failures.
+
+## Independent review fix round 1/5
+
+The first Task 3A review found two Important handoff/resource-policy gaps and one
+Minor lifecycle-test gap. This round closes all three without entering Task 4.
+
+### I1 — monotonic per-client replay/live handoff
+
+- Every new `Hub.Client` now starts behind a bounded live-broadcast fence. Point-to-point
+  replay frames bypass the fence; broadcasts remain ordered in its queue until
+  `replay_complete` has been written. The fence drains to empty while still closed to new
+  direct sends, then atomically switches the client to live delivery.
+- `Hub.replay_with_cursor()` captures the replay slice and Hub high-water cursor under the
+  same sequence lock used by `emit()`. `replay_complete.last_seq` is therefore the cursor
+  represented by replay, never a later live event that happens to have incremented the
+  Project while snapshot serialization awaits.
+- The reconnect response now contains authoritative Task Runtime snapshots for every local
+  Group (`task_runtime_groups`) while retaining the current-Group `task_runtime` field for
+  compatibility. Events from background Groups can therefore converge without a cold-store
+  HTTP fallback.
+- The frontend installs every Task Runtime snapshot before processing buffered replay data,
+  treats events already represented by that snapshot as duplicates, applies later events
+  contiguously, and advances the Hub watermark with `max(local, replay_cursor)` rather than
+  rolling it backward. Genuine epoch reset now reconstructs directly from replay/snapshot
+  instead of requiring a second snapshot request.
+- The configured WebSocket URL is now preserved when adding authentication, allowing the
+  real transport regression server to exercise the production socket implementation. The
+  existing `stop_worker` command was added to the outbound contract so the changed transport
+  passes targeted strict compilation.
+
+### I2 — bounded ownership and finite failure policy
+
+- Removed the redundant forever-growing published-event ID set. Durable per-run sequence
+  high-water marks are sufficient for listener duplicate suppression.
+- Active cursors are an LRU capped at 2,048 runs. Terminal runs move to a separate 256-entry
+  tombstone LRU, and confirmed/reconciled Group deletion removes active, terminal, queued,
+  and recovery bookkeeping for that Group.
+- Pre-activation notifications are not stored. The durable journal/snapshot is the only
+  pre-listen authority.
+- Live ingress is capped at 2,048 unique `(run_id, seq)` notifications and coalesces duplicate
+  callbacks. Overflow creates one bounded opaque recovery marker per run, with at most 256
+  markers, and logs that durable replay is required.
+- Journal-read and Hub-broadcast failures retry at most three times with bounded exponential
+  delay and go to the same bounded recovery diagnostics. Retries move behind other queued
+  work, so one poison run cannot block an unaffected Group. Restart takes a fresh durable
+  baseline and replay returns the missed event exactly once.
+
+### Acceptance coverage added
+
+- A blocked real `replay_complete` send races Task Runtime commits in two Groups plus an
+  ordinary Hub message. Wire order proves all snapshots precede live deltas, both run cursors
+  are contiguous, each racing event appears once, and the next live event applies normally.
+- More than 4,000 pre-activation callbacks leave no pending memory. More than 4,000 active
+  synthetic notifications cap at the ingress policy, and 300 committed checkpoints keep
+  cursor ownership constant without an event-ID cache.
+- Permanent journal and broadcast faults each stop after four total attempts while a healthy
+  Group continues live. Terminal transition leaves active retention, actual confirmed Group
+  deletion removes all related state, and restart/replay obtains missed durable data once.
+- A test enters the actual `KnoweServer.run()`/`serve` context, proves the bridge owns that
+  server loop, triggers shutdown, and proves listener removal plus loop-reference release.
+
+### Fix-round exact evidence
+
+- Focused Task 3A bridge suite: `6 passed in 5.31s`.
+- Combined Group/Task Runtime suites: `114 passed in 15.42s`.
+- Legacy Engine suites: `26 passed, 10 subtests passed in 1.66s`.
+- Frontend transport wars plus Task Runtime/Group contract-store suites:
+  `5 files / 41 tests passed`.
+- Targeted Python compilation, ESLint, strict TypeScript compilation, and
+  `git diff --check` passed. Git emitted only the repository's existing Windows
+  LF-to-CRLF notices.
+
+## Independent re-review fix round 2/5
+
+The first re-review exposed three remaining production-boundary gaps: bounded
+cursor eviction could replay already published RunEvents, terminal live-delivery
+failure was not observable to a connected affected Group, and epoch reset erased
+the just-replayed roster/activity state. This round closes all three.
+
+### Stable exact-once publication beyond memory cursor capacity
+
+- Every Task Runtime Hub envelope now uses the nested immutable `RunEvent.event_id`
+  as its top-level idempotency identity. `Hub.emit_with_status()` distinguishes a
+  newly committed envelope from an existing ring/durable envelope, so scanning a
+  run journal after an LRU miss advances the bridge cursor without broadcasting
+  the old event again.
+- Hub's hot idempotency lookup is an explicit 4,096-entry per-project LRU. The ring
+  and durable event log remain the authority on cache miss; event-id memory no
+  longer grows forever.
+- `studycrew_live_publication` stores a durable per-run handoff high-water. A
+  successful reconnect snapshot records every represented run, and each successful
+  live delivery advances it. Active/terminal in-memory LRUs are therefore only an
+  acceleration layer: eviction, delayed callbacks and restart never reinterpret a
+  known run as cursor zero. Confirmed Group deletion removes publication state.
+- When a client watermark belongs to an older epoch (`since_seq` above the new Hub
+  cursor), replay now starts at zero under the same cursor lock. The lower
+  `replay_complete` can reconstruct actual new-epoch chat history without an extra
+  snapshot request.
+
+### Durable, affected-Group recovery handoff
+
+- Exhaustion and queue overflow upsert one coalesced recovery intent per run in the
+  bounded `studycrew_live_recovery` table. Startup reloads the latest 256 intents;
+  deletion removes them.
+- The loop-owned bridge sends `resync_required` directly to connected clients with
+  canonical `project_id`, `group_id` and an opaque recovery token. It does not reuse
+  the failed Task Runtime data-broadcast path, does not notify one client twice for
+  the same token, and does not clear the intent merely because notification was
+  attempted.
+- The renderer honors an explicit `resync_required.project_id`, returns the recovery
+  token in `request_snapshot`, and does not substitute the active Group. The server
+  replies on a direct `task_runtime_result(snapshot)` control path, so Task Runtime
+  can converge even while ordinary Hub broadcast remains faulty. Only a successful
+  addressed snapshot handoff clears the durable marker.
+
+### Complete epoch reconstruction
+
+- During handshake the transport retains each authoritative `project_created`.
+  When a lower epoch cursor is detected it clears old chat and all old Task Runtime
+  projections, reapplies new project metadata/roster, applies the authoritative
+  activity ledger, drains replayed chat, installs all Runtime snapshots, then drains
+  Runtime deltas, advances the new watermark, and only then returns to `live`.
+- The app now exposes an explicit Runtime epoch reset action; missing Groups/runs
+  from the new authoritative snapshot set cannot survive from the prior server.
+- FakeKnoweServer gained injectable replay roster, activity and Runtime snapshots so
+  the real WebSocket and real Zustand stores exercise the same ordering as production.
+
+### Round-2 acceptance evidence
+
+- Focused Task 3A bridge suite: `9 passed in 17.62s`.
+- Production-cap regressions create more than 2,048 retained runs, evict a real run,
+  deliver only its next sequence, ignore a delayed old callback after terminal LRU
+  eviction, prove one durable Hub envelope per nested event ID, and prove delete /
+  recreate isolation.
+- Failure regressions exhaust delivery, keep a healthy Group live, directly converge
+  the affected background Group without reconnect or unrelated traffic, acknowledge
+  only after snapshot handoff, and reload an unacknowledged token after restart.
+- Combined Group/Task Runtime suites: `116 passed in 29.44s`.
+- Legacy Engine suites: `26 passed, 10 subtests passed in 1.38s`.
+- Frontend real transport plus Task Runtime/Group contract-store suites:
+  `5 files / 43 tests passed`.
+- Targeted Python compilation, ESLint, strict TypeScript compilation and
+  `git diff --check` passed. The broad TypeScript baseline still reports the
+  previously documented unrelated legacy failures. The legacy E2E file remains
+  blocked in its pre-existing fixture because it creates projects without the now
+  mandatory project directory (`25 passed, 16 fixture errors` when audited alongside
+  Hub unit tests).

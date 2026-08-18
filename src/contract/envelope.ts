@@ -865,6 +865,8 @@ export const StateSnapshotSchema = z.object({
    * [v1.0.24.4] 该群引擎的权威活动账本（可选）。旧后端不带此字段 → 前端退回现状不校准。
    */
   activity: z.array(ActivityLedgerEntrySchema).optional(),
+  /** Affected-Group Task Runtime baseline used to acknowledge live recovery. */
+  task_runtime: GroupRuntimeSnapshotSchema.optional(),
 });
 export type StateSnapshot = z.infer<typeof StateSnapshotSchema>;
 
@@ -904,6 +906,9 @@ export type ReplayComplete = z.infer<typeof ReplayCompleteSchema>;
 export const ResyncRequiredSchema = z.object({
   type: z.literal('resync_required'),
   last_seq: z.number().int().min(0),
+  project_id: z.string().optional(),
+  group_id: z.string().regex(/^grp_[0-9a-f]{32}$/).optional(),
+  recovery_token: z.string().optional(),
   message: z.string().optional(),
 });
 export type ResyncRequired = z.infer<typeof ResyncRequiredSchema>;
@@ -932,6 +937,7 @@ export type TaskRuntimeResult = z.infer<typeof TaskRuntimeResultSchema>;
 
 export const TaskRuntimeEventSchema = z.object({
   type: z.literal('task_runtime_event'),
+  event_id: z.string().regex(/^evt_[0-9a-f]{32}$/).optional(),
   project_id: z.string(),
   project_name: z.string(),
   group_id: z.string().regex(/^grp_[0-9a-f]{32}$/),
@@ -1186,6 +1192,7 @@ export type ReplayRequestCmd = z.infer<typeof ReplayRequestCmdSchema>;
 export const RequestSnapshotCmdSchema = z.object({
   type: z.literal('request_snapshot'),
   project_id: z.string(),            // [v2#8] 必填——根治多项目 resync 断腿
+  recovery_token: z.string().optional(),
 });
 export type RequestSnapshotCmd = z.infer<typeof RequestSnapshotCmdSchema>;
 

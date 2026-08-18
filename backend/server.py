@@ -82,6 +82,7 @@ from .task_runtime.contracts import (
     RunEvent,
     RunKind,
     TaskStatus as ControlTaskStatus,
+    opaque_id,
 )
 from .tools_knowe import resolve_in_sandbox            # [v0.36] /preview 复用沙箱路径解析
 from .tools_knowe import KNOWN_ROLES, _next_agent_id   # [主动拉入worker] 职能白名单 + id 生成
@@ -1065,7 +1066,7 @@ class KnoweServer:
             raise GroupNotFoundError("Group persistence is unavailable")
         return self.groups.runtime_project_id(group_id)
 
-    def _task_runtime_cursor_locked(self, run_id: str) -> int:
+    def _task_runtime_cursor_locked(self, run_id: str) -> int | None:
         row = self._task_runtime_event_bridge_last_seq.get(run_id)
         if row is not None:
             self._task_runtime_event_bridge_last_seq.move_to_end(run_id)
@@ -1074,7 +1075,7 @@ class KnoweServer:
         if row is not None:
             self._task_runtime_event_bridge_terminal_seq.move_to_end(run_id)
             return row[0]
-        return 0
+        return None
 
     def _set_task_runtime_cursor_locked(
         self, run_id: str, group_id: str, seq: int, *, terminal: bool,
@@ -1100,13 +1101,30 @@ class KnoweServer:
     def _record_task_runtime_recovery_locked(
         self, event: RunEvent, *, reason: str, attempts: int,
     ) -> None:
+        previous = self._task_runtime_event_bridge_recovery.get(event.run_id) or {}
         marker = {
             "run_id": event.run_id,
             "group_id": event.group_id,
             "through_seq": event.seq,
             "reason": reason,
             "attempts": attempts,
+            "recovery_token": str(previous.get("recovery_token") or opaque_id("recovery")),
+            "notified_clients": set(previous.get("notified_clients") or ()),
         }
+        service = self.task_runtime
+        if service is not None:
+            try:
+                stored = service.store.record_live_recovery(
+                    run_id=event.run_id, group_id=event.group_id,
+                    through_seq=event.seq, reason=reason, attempts=attempts,
+                    recovery_token=marker["recovery_token"],
+                    limit=self.TASK_RUNTIME_RECOVERY_MARKER_MAX,
+                )
+                if stored:
+                    marker["recovery_token"] = str(stored["recovery_token"])
+                    marker["through_seq"] = int(stored["through_seq"])
+            except Exception:  # noqa: BLE001 -- in-memory marker still makes failure visible
+                log.exception("Could not persist Task Runtime recovery marker for %s", event.run_id)
         self._task_runtime_event_bridge_recovery[event.run_id] = marker
         self._task_runtime_event_bridge_recovery.move_to_end(event.run_id)
         while len(self._task_runtime_event_bridge_recovery) > self.TASK_RUNTIME_RECOVERY_MARKER_MAX:
@@ -1149,11 +1167,82 @@ class KnoweServer:
                 (item[0].run_id, item[0].seq)
                 for item in self._task_runtime_event_bridge_pending
             }
+        if self.task_runtime is not None:
+            self.task_runtime.store.clear_group_live_recovery(group_id)
+            self.task_runtime.store.clear_group_live_publication(group_id)
 
     def task_runtime_bridge_recovery_markers(self) -> tuple[dict[str, Any], ...]:
         """Bounded diagnostics; payloads contain only opaque identity and cursor metadata."""
         with self._task_runtime_event_bridge_lock:
-            return tuple(dict(item) for item in self._task_runtime_event_bridge_recovery.values())
+            return tuple({
+                key: value for key, value in item.items() if key != "notified_clients"
+            } for item in self._task_runtime_event_bridge_recovery.values())
+
+    async def _notify_task_runtime_recoveries(self, client: Client | None = None) -> None:
+        """Directly request an affected-Group snapshot; never reuse the failed data broadcast."""
+        targets = (client,) if client is not None else tuple(self.hub.clients)
+        for target in targets:
+            if not target.alive:
+                continue
+            with self._task_runtime_event_bridge_lock:
+                pending = tuple(self._task_runtime_event_bridge_recovery.values())
+            for marker in pending:
+                notified = marker.get("notified_clients")
+                if isinstance(notified, set) and target.id in notified:
+                    continue
+                try:
+                    project_id = self._runtime_project_id_for_group(str(marker["group_id"]))
+                    sent = await self.hub.send_to(target, {
+                        "type": "resync_required",
+                        "project_id": project_id,
+                        "group_id": str(marker["group_id"]),
+                        "last_seq": self.hub.get_or_create(project_id).seq,
+                        "recovery_token": str(marker["recovery_token"]),
+                        "message": "Task Runtime live delivery requires an authoritative snapshot",
+                    })
+                except (GroupNotFoundError, ProjectClosingError):
+                    continue
+                if sent:
+                    with self._task_runtime_event_bridge_lock:
+                        current = self._task_runtime_event_bridge_recovery.get(str(marker["run_id"]))
+                        if current is not None and current.get("recovery_token") == marker.get("recovery_token"):
+                            current.setdefault("notified_clients", set()).add(target.id)
+
+    def _ack_task_runtime_recovery(self, group_id: str, recovery_token: str) -> bool:
+        """Clear a durable recovery intent only after its addressed snapshot handoff."""
+        if not recovery_token:
+            return False
+        matched_run = ""
+        with self._task_runtime_event_bridge_lock:
+            for run_id, marker in self._task_runtime_event_bridge_recovery.items():
+                if marker.get("group_id") == group_id and marker.get("recovery_token") == recovery_token:
+                    matched_run = run_id
+                    break
+        if not matched_run or self.task_runtime is None:
+            return False
+        if not self.task_runtime.store.clear_live_recovery(matched_run, recovery_token):
+            return False
+        with self._task_runtime_event_bridge_lock:
+            current = self._task_runtime_event_bridge_recovery.get(matched_run)
+            if current is not None and current.get("recovery_token") == recovery_token:
+                self._task_runtime_event_bridge_recovery.pop(matched_run, None)
+        return True
+
+    def _record_task_runtime_snapshot_publication(self, snapshot: dict[str, Any]) -> None:
+        if self.task_runtime is None:
+            return
+        group_id = snapshot.get("group_id")
+        runs = snapshot.get("runs")
+        if not isinstance(group_id, str) or not isinstance(runs, list):
+            return
+        cursors = {
+            str(run["run_id"]): int(run["last_seq"])
+            for run in runs
+            if isinstance(run, dict)
+            and isinstance(run.get("run_id"), str)
+            and isinstance(run.get("last_seq"), int)
+        }
+        self.task_runtime.store.record_group_live_publication(group_id, cursors)
 
     def _on_task_runtime_event(self, event: RunEvent) -> None:
         """Accept a committed event from any thread without touching async Hub state."""
@@ -1175,10 +1264,12 @@ class KnoweServer:
                 self._task_runtime_event_bridge_pending.clear()
                 self._task_runtime_event_bridge_pending_keys.clear()
                 return
-            if event.seq <= self._task_runtime_cursor_locked(event.run_id):
+            cursor = self._task_runtime_cursor_locked(event.run_id)
+            if cursor is not None and event.seq <= cursor:
                 return
-            if not self._enqueue_task_runtime_event_locked(event):
-                return
+            # Even when the bounded data queue is full, schedule the loop-owned drain:
+            # it will publish a direct recovery control frame for the coalesced marker.
+            self._enqueue_task_runtime_event_locked(event)
             if self._task_runtime_event_bridge_scheduled:
                 return
             self._task_runtime_event_bridge_scheduled = True
@@ -1234,6 +1325,17 @@ class KnoweServer:
             self._task_runtime_event_bridge_pending.clear()
             self._task_runtime_event_bridge_pending_keys.clear()
             self._task_runtime_event_bridge_recovery.clear()
+            for marker in service.store.live_recoveries():
+                run_id = str(marker["run_id"])
+                self._task_runtime_event_bridge_recovery[run_id] = {
+                    "run_id": run_id,
+                    "group_id": str(marker["group_id"]),
+                    "through_seq": int(marker["through_seq"]),
+                    "reason": str(marker["reason"]),
+                    "attempts": int(marker["attempts"]),
+                    "recovery_token": str(marker["recovery_token"]),
+                    "notified_clients": set(),
+                }
             self._task_runtime_event_bridge_generation += 1
             self._task_runtime_event_bridge_loop = loop
             self._task_runtime_event_bridge_active = True
@@ -1291,17 +1393,23 @@ class KnoweServer:
                         return
                     if not self._task_runtime_event_bridge_pending:
                         self._task_runtime_event_bridge_scheduled = False
-                        return
-                    notification, attempts = self._task_runtime_event_bridge_pending.popleft()
-                    self._task_runtime_event_bridge_pending_keys.discard(
-                        (notification.run_id, notification.seq),
-                    )
+                        notification = None
+                    else:
+                        notification, attempts = self._task_runtime_event_bridge_pending.popleft()
+                        self._task_runtime_event_bridge_pending_keys.discard(
+                            (notification.run_id, notification.seq),
+                        )
+                if notification is None:
+                    await self._notify_task_runtime_recoveries()
+                    return
 
                 service = self.task_runtime
                 if service is None:
                     return
                 with self._task_runtime_event_bridge_lock:
                     last_seq = self._task_runtime_cursor_locked(notification.run_id)
+                if last_seq is None:
+                    last_seq = service.store.live_publication_cursor(notification.run_id) or 0
                 if notification.seq <= last_seq:
                     continue
                 try:
@@ -1332,6 +1440,7 @@ class KnoweServer:
                             "Task Runtime live journal read exhausted; durable replay required for %s",
                             notification.run_id,
                         )
+                        await self._notify_task_runtime_recoveries()
                     continue
 
                 delivery_failed = False
@@ -1347,7 +1456,9 @@ class KnoweServer:
                             "Task Runtime live event identity mismatch: %s", event.event_id,
                         )
                         continue
-                    delivered = await self._broadcast_task_runtime_event(event)
+                    delivered = await self._broadcast_task_runtime_event(
+                        event, recovering=attempts > 0,
+                    )
                     if not delivered:
                         delivery_failed = True
                         break
@@ -1360,6 +1471,9 @@ class KnoweServer:
                             event.run_id, event.group_id, event.seq,
                             terminal=current.status.terminal,
                         )
+                    service.store.record_live_publication(
+                        run_id=event.run_id, group_id=event.group_id, last_seq=event.seq,
+                    )
                 if delivery_failed:
                     retry = attempts + 1
                     with self._task_runtime_event_bridge_lock:
@@ -1376,21 +1490,28 @@ class KnoweServer:
                             "Task Runtime live broadcast exhausted; durable replay required for %s",
                             notification.run_id,
                         )
+                        await self._notify_task_runtime_recoveries()
         finally:
             current = asyncio.current_task()
             with self._task_runtime_event_bridge_lock:
                 if self._task_runtime_event_drain_task is current:
                     self._task_runtime_event_drain_task = None
 
-    async def _broadcast_task_runtime_event(self, event: RunEvent) -> bool:
+    async def _broadcast_task_runtime_event(
+        self, event: RunEvent, *, recovering: bool = False,
+    ) -> bool:
         try:
             project_id = self._runtime_project_id_for_group(event.group_id)
-            await self.hub.emit(project_id, {
+            _envelope, created = await self.hub.emit_with_status(project_id, {
                 "type": "task_runtime_event",
+                "event_id": event.event_id,
                 "group_id": event.group_id,
                 "event": event.to_public_dict(),
             })
-            return True
+            # A cursor-LRU miss may rediscover old durable events: existing IDs are a
+            # successful no-op.  During a retry, however, an existing envelope means the
+            # first broadcast faulted after commit, so the affected client needs resync.
+            return created or not recovering
         except (GroupNotFoundError, ProjectClosingError):
             return True
         except Exception:  # noqa: BLE001 -- durable replay remains authoritative
@@ -3059,6 +3180,7 @@ class KnoweServer:
                     "last_seq": project.seq if project is not None else 0,
                     "message": "Live replay buffer exceeded its bounded policy",
                 })
+            await self._notify_task_runtime_recoveries(client)
             async for raw in ws:
                 await self._on_frame(client, raw)
         except websockets.ConnectionClosed:
@@ -3209,9 +3331,9 @@ class KnoweServer:
         complete["activity"] = self._open_activity_all()
         # StudyCrew task state is a separate authoritative projection.  It rides the
         # existing reconnect response but is never reconstructed from chat text.
+        runtime_snapshots: list[dict[str, Any]] = []
         if self.task_runtime is not None and dm_group_id is None:
             group_id = self._group_id_for_runtime_project(project_id)
-            runtime_snapshots: list[dict[str, Any]] = []
             if self.groups is not None:
                 for group in self.groups.list_groups(include_archived=True):
                     with contextlib.suppress(RuntimeConflictError, RuntimeNotFoundError):
@@ -3235,7 +3357,10 @@ class KnoweServer:
                 log.warning("[%s] 磁盘写失败累计 %d 次（持久化队列）", project_id, failures)
         if not events and not gap:
             complete["note"] = "no history"
-        await self.hub.send_to(client, complete)
+        handed_off = await self.hub.send_to(client, complete)
+        if handed_off:
+            for snapshot in runtime_snapshots:
+                self._record_task_runtime_snapshot_publication(snapshot)
 
         log.info("[%s] client %s replayed %d events since %d via %s (last_seq=%d)",
                  project_id, client.id, len(events), since_seq, source, replay_cursor)
@@ -4608,10 +4733,33 @@ class KnoweServer:
             )
             return
         project_id = self._canonical_project_id_from_request(project_id)
+        group_id = self._group_id_for_runtime_project(project_id)
+        runtime_snapshot = None
+        if self.task_runtime is not None and group_id is not None:
+            with contextlib.suppress(RuntimeConflictError, RuntimeNotFoundError):
+                runtime_snapshot = self.task_runtime.group_snapshot(group_id)
+        recovery_token = data.get("recovery_token")
+        if (
+            runtime_snapshot is not None
+            and group_id is not None
+            and isinstance(recovery_token, str)
+            and recovery_token
+        ):
+            handed_off = await self.hub.send_to(client, {
+                "type": "task_runtime_result", "action": "snapshot",
+                "request_id": recovery_token, "schema_version": 1,
+                "group_id": group_id, "task_runtime": runtime_snapshot,
+            })
+            if handed_off:
+                self._record_task_runtime_snapshot_publication(runtime_snapshot)
+                self._ack_task_runtime_recovery(group_id, recovery_token)
+            return
         # [v1.0.24.4] 快照附带权威活动账本（全量）：前端重建现场时忙碌状态一次对齐。
         await self.hub.snapshot(
-            project_id, activity=self._open_activity_all(),
+            project_id, activity=self._open_activity_all(), task_runtime=runtime_snapshot,
         )
+        if runtime_snapshot is not None:
+            self._record_task_runtime_snapshot_publication(runtime_snapshot)
 
     # ── replay_request（非首帧 → 拒绝，前端应改用 request_snapshot） ──
     async def _cmd_replay_request(self, client: Client, data: dict[str, Any]) -> None:

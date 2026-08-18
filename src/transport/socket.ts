@@ -109,6 +109,8 @@ export interface SocketCallbacks {
   onActivityLedger?: (projectId: string, activity: ActivityLedgerEntry[]) => void;
   /** StudyCrew authoritative Task Runtime snapshot carried by reconnect completion. */
   onTaskRuntimeSnapshot?: (groupId: string, snapshot: unknown) => void;
+  /** Clear prior-server Task Runtime projections before a complete epoch rebuild. */
+  onTaskRuntimeEpochReset?: () => void;
   /** Get current active project id (for replay_request project context) */
   getActiveProjectId?: () => ProjectId | null;
   /** 系统级项目目录恢复请求；不进入聊天时间线。 */
@@ -294,6 +296,7 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
   let handshakeBuffer: Array<{ seq: number; event: InboundEvent }> = [];
   let handshakeActive = false;
   let handshakeProjectId: string | null = null;
+  const handshakeProjects = new Map<string, InboundEvent>();
 
   function pushHandshake(event: InboundEvent, seq: number, pid: string): void {
     if (handshakeBuffer.length >= HANDSHAKE_BUFFER_MAX) {
@@ -305,10 +308,13 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
     handshakeBuffer.push({ seq, event });
   }
 
-  function drainHandshake(): void {
+  function drainHandshake(beforeTaskRuntimeEvents?: () => void): void {
     handshakeActive = false;
     handshakeProjectId = null;
-    if (handshakeBuffer.length === 0) return;
+    if (handshakeBuffer.length === 0) {
+      beforeTaskRuntimeEvents?.();
+      return;
+    }
 
     // Sort by seq
     handshakeBuffer.sort((a, b) => a.seq - b.seq);
@@ -326,6 +332,7 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
     console.log('[socket] draining handshake buffer: %d events → %d after dedup',
       handshakeBuffer.length, deduped.length);
 
+    const accepted: InboundEvent[] = [];
     for (const { seq, event } of deduped) {
       const projId = (event as Record<string, unknown>).project_id as string
         || DEFAULT_PROJECT;
@@ -346,7 +353,19 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
         console.warn('[socket] global dup drop project=%s seq=%d type=%s', projId, seq, event.type);
         continue;
       }
-      onEvent(event);
+      accepted.push(event);
+    }
+
+    if (beforeTaskRuntimeEvents) {
+      for (const event of accepted) {
+        if (event.type !== 'task_runtime_event') onEvent(event);
+      }
+      beforeTaskRuntimeEvents();
+      for (const event of accepted) {
+        if (event.type === 'task_runtime_event') onEvent(event);
+      }
+    } else {
+      for (const event of accepted) onEvent(event);
     }
 
     handshakeBuffer = [];
@@ -354,17 +373,20 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
 
   // ── ④ 按项目去抖 resync（§2.3-d） ──
   const _resyncDebounce: Record<string, number> = {};
+  const _recoveryTokenByProject: Record<string, string> = {};
 
-  function doRequestSnapshot(projectId: string): void {
+  function doRequestSnapshot(projectId: string, recoveryToken?: string): void {
     const now = Date.now();
     const last = _resyncDebounce[projectId] ?? 0;
-    if (now - last < RESYNC_DEBOUNCE_MS) {
+    if (recoveryToken && _recoveryTokenByProject[projectId] === recoveryToken) return;
+    if (!recoveryToken && now - last < RESYNC_DEBOUNCE_MS) {
       console.log('[socket] resync debounced for %s (last=%dms ago)', projectId, now - last);
       return;
     }
     _resyncDebounce[projectId] = now;
+    if (recoveryToken) _recoveryTokenByProject[projectId] = recoveryToken;
     setStatus('resync');
-    sendRaw({ type: 'request_snapshot', project_id: projectId });
+    sendRaw({ type: 'request_snapshot', project_id: projectId, recovery_token: recoveryToken });
     console.log('[socket] request_snapshot sent for %s', projectId);
   }
 
@@ -540,6 +562,11 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
       diag({ type: ev.type, projectId: projId, seq: snapSeq, verdict: 'applied',
         summary: i18n.t('socket.05') });
       onEvent(ev);
+      const runtimeSnapshot = (rawObj as { task_runtime?: unknown }).task_runtime;
+      if (onTaskRuntimeSnapshot && runtimeSnapshot && typeof runtimeSnapshot === 'object') {
+        const groupId = (runtimeSnapshot as { group_id?: unknown }).group_id;
+        if (typeof groupId === 'string') onTaskRuntimeSnapshot(groupId, runtimeSnapshot);
+      }
       return;
     }
 
@@ -580,6 +607,7 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
         const lastSeq = rcEv.last_seq;
         const runtimeSnapshot = (rawObj as { task_runtime?: unknown }).task_runtime;
         const runtimeSnapshots = (rawObj as { task_runtime_groups?: unknown }).task_runtime_groups;
+        const rcActivity = (rawObj as { activity?: unknown }).activity;
         const installRuntimeSnapshots = (): void => {
           if (!onTaskRuntimeSnapshot) return;
           const snapshots = Array.isArray(runtimeSnapshots)
@@ -600,34 +628,43 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
           diag({ type: 'replay_complete', projectId: pid, seq: lastSeq, verdict: 'epoch',  // [v0.3-走廊]
             summary: `检测到服务重启（last_seq=${lastSeq} < 水位=${curWatermark}）→ 清会话重建` });
           if (onEpochReset) onEpochReset(pid);
-          installRuntimeSnapshots();
+          callbacks.onTaskRuntimeEpochReset?.();
+          const projectCreated = handshakeProjects.get(pid);
+          if (projectCreated) onEvent(projectCreated);
+          if (onProjectDiscovered) {
+            const projectName = projectCreated && 'project_name' in projectCreated
+              ? String((projectCreated as { project_name?: unknown }).project_name || '') || undefined
+              : undefined;
+            onProjectDiscovered(pid, projectName);
+          }
+          if (onActivityLedger && Array.isArray(rcActivity)) {
+            onActivityLedger(pid, rcActivity as ActivityLedgerEntry[]);
+          }
           _resetGlobalSeen();
           setWatermark(pid, 0);
-          if (handshakeActive) drainHandshake();
+          if (handshakeActive) drainHandshake(installRuntimeSnapshots);
+          else installRuntimeSnapshots();
           setWatermark(pid, Math.max(getWatermark(pid), lastSeq));
+          handshakeProjects.clear();
           setStatus('live');
           return;
         }
 
-        // Snapshot is the Task Runtime baseline. It must land before any live events
-        // buffered during replay; older/equal buffered events then deduplicate against
-        // the snapshot while newer events apply contiguously.
-        installRuntimeSnapshots();
-
         // The server fence guarantees this buffer contains replay frames only; live
         // frames follow replay_complete on the wire. Apply replay against the previous
         // cursor, then advance monotonically to the authoritative handoff cursor.
-        if (handshakeActive) drainHandshake();
-        setWatermark(pid, Math.max(getWatermark(pid), curWatermark, lastSeq));
-        setStatus('live');
-        // [v1.0.24.4] 账本转交：只在正常支转（纪元校准支随后必有快照自带账本）。
-        // 旧后端不带 activity 字段 → 不触发 → 完全退回现状行为。
-        const rcActivity = (rawObj as { activity?: unknown }).activity;
         if (onActivityLedger && Array.isArray(rcActivity)) {
           onActivityLedger(pid, rcActivity as ActivityLedgerEntry[]);
         }
         // Auto-register project if store doesn't have it yet
         if (onProjectDiscovered) onProjectDiscovered(pid, undefined);
+        // Chat replay is projected first.  The authoritative Runtime baseline then
+        // lands before any buffered Runtime deltas, preserving both domain orders.
+        if (handshakeActive) drainHandshake(installRuntimeSnapshots);
+        else installRuntimeSnapshots();
+        setWatermark(pid, Math.max(getWatermark(pid), curWatermark, lastSeq));
+        setStatus('live');
+        handshakeProjects.clear();
         return;
       }
 
@@ -635,8 +672,13 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
         console.warn('[socket] resync_required — requesting snapshot');
         diag({ type: 'resync_required', verdict: 'gap',            // [v0.3-走廊]
           summary: i18n.t('socket.02') });
-        const pid = handshakeProjectId || getActiveProjectId?.() || DEFAULT_PROJECT;
-        doRequestSnapshot(pid);
+        const explicitProject = rawObj.project_id;
+        const pid = typeof explicitProject === 'string' && explicitProject
+          ? explicitProject
+          : handshakeProjectId || getActiveProjectId?.() || DEFAULT_PROJECT;
+        const recoveryToken = typeof rawObj.recovery_token === 'string'
+          ? rawObj.recovery_token : undefined;
+        doRequestSnapshot(pid, recoveryToken);
         break;
       }
 
@@ -654,7 +696,8 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
         const contractObj = { ...rawObj };
         delete contractObj.request_project_id;
         const ev = validateInbound(contractObj);
-        if (ev) {
+        if (ev?.type === 'project_created') {
+          if (handshakeActive) handshakeProjects.set(ev.project_id, ev);
           if (typeof requestProjectId === 'string' && requestProjectId) {
             onEvent(Object.assign({}, ev, { request_project_id: requestProjectId }) as InboundEvent);
           } else {
@@ -703,6 +746,14 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
         return;
       }
 
+      case 'task_runtime_result': {
+        if (rawObj.action === 'snapshot' && onTaskRuntimeSnapshot) {
+          const groupId = rawObj.group_id;
+          if (typeof groupId === 'string') onTaskRuntimeSnapshot(groupId, rawObj);
+        }
+        return;
+      }
+
       default:
         break;
     }
@@ -738,6 +789,7 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
       // Enter handshaking
       handshakeActive = true;
       handshakeBuffer = [];
+      handshakeProjects.clear();
       handshakeProjectId = getActiveProjectId?.() ?? DEFAULT_PROJECT;
       setStatus('handshaking');
 
@@ -835,6 +887,7 @@ export function createSocket({ url = runtimeWsUrl(), callbacks }: SocketConfig):
       stopEchoCheck();
       handshakeActive = false;
       handshakeBuffer = [];
+      handshakeProjects.clear();
       handshakeProjectId = null;
       if (ws) { ws.close(); }
       setStatus('closed');

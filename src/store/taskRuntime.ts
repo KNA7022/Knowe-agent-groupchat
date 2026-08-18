@@ -31,6 +31,7 @@ interface TaskRuntimeState {
   byGroup: Record<string, string[]>;
   approvals: Record<string, ApprovalRequest>;
   error: string | null;
+  resetAll: () => void;
   ingestGroupSnapshot: (groupId: GroupId, raw: unknown) => void;
   applyEvent: (groupId: GroupId, raw: unknown) => boolean;
   reconcile: (groupId: GroupId, runId: string) => Promise<void>;
@@ -63,6 +64,10 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   byGroup: {},
   approvals: {},
   error: null,
+
+  resetAll(): void {
+    set({ byRun: {}, byGroup: {}, approvals: {}, error: null });
+  },
 
   ingestGroupSnapshot(groupId, raw): void {
     const outer = raw && typeof raw === 'object' ? raw as Record<string, unknown> : null;
