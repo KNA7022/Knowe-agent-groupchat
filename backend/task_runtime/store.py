@@ -41,6 +41,16 @@ class RuntimeStoreError(RuntimeError):
     pass
 
 
+class RecoveryDirtyBudgetError(RuntimeStoreError):
+    """A frozen recovery-update log reached its configured hard bound."""
+
+    def __init__(self, group_id: str, *, global_count: int, group_count: int) -> None:
+        super().__init__(f"recovery dirty-log budget exhausted for {group_id}")
+        self.group_id = group_id
+        self.global_count = max(0, int(global_count))
+        self.group_count = max(0, int(group_count))
+
+
 def _dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -1366,7 +1376,9 @@ class TaskRuntimeStore:
     def record_live_recovery(
         self, *, run_id: str, group_id: str, through_seq: int, reason: str,
         attempts: int, recovery_token: str, run_version: int | None = None,
-        dirty_revision_floor: int = 0,
+        dirty_revision_floor: int = 0, generation_floor: int = 0,
+        failure_count_floor: int = 0, dirty_global_limit: int | None = None,
+        dirty_group_limit: int | None = None,
     ) -> dict[str, Any]:
         """Upsert a mutable generation without moving its immutable queue position."""
         now = utc_now()
@@ -1375,8 +1387,14 @@ class TaskRuntimeStore:
                 "SELECT * FROM studycrew_live_recovery WHERE group_id=?", (group_id,),
             ).fetchone()
             token = str(previous["recovery_token"]) if previous is not None else recovery_token
-            generation = (int(previous["generation"]) if previous is not None else 0) + 1
-            failure_count = (int(previous["failure_count"]) if previous is not None else 0) + 1
+            generation = max(
+                (int(previous["generation"]) if previous is not None else 0) + 1,
+                max(0, int(generation_floor)),
+            )
+            failure_count = max(
+                (int(previous["failure_count"]) if previous is not None else 0) + 1,
+                max(0, int(failure_count_floor)),
+            )
             old_digest = str(previous["cause_digest"]) if previous is not None else ""
             cause_digest = hashlib.sha256(
                 f"{old_digest}|{run_id}|{through_seq}|{run_version or through_seq}|{reason}|{attempts}".encode(),
@@ -1441,6 +1459,25 @@ class TaskRuntimeStore:
                         ),
                     )
                 else:
+                    global_count = int(conn.execute(
+                        "SELECT COUNT(*) FROM studycrew_live_recovery_dirty",
+                    ).fetchone()[0])
+                    group_count = int(conn.execute(
+                        """SELECT COUNT(*) FROM studycrew_live_recovery_dirty
+                           WHERE group_id=?""",
+                        (group_id,),
+                    ).fetchone()[0])
+                    if (
+                        dirty_global_limit is not None
+                        and global_count >= max(1, int(dirty_global_limit))
+                    ) or (
+                        dirty_group_limit is not None
+                        and group_count >= max(1, int(dirty_group_limit))
+                    ):
+                        raise RecoveryDirtyBudgetError(
+                            group_id, global_count=global_count,
+                            group_count=group_count,
+                        )
                     conn.execute(
                         """UPDATE studycrew_runtime_counters SET value=MAX(value, ?)
                            WHERE name='live_recovery_dirty_revision'""",
@@ -1633,6 +1670,21 @@ class TaskRuntimeStore:
                 """SELECT value FROM studycrew_runtime_counters
                    WHERE name='live_recovery_dirty_revision'""",
             ).fetchone()
+        return 0 if row is None else max(0, int(row[0]))
+
+    def live_recovery_dirty_count(self, group_id: str | None = None) -> int:
+        """Return durable dirty-log occupancy without exposing recovery content."""
+        with self.db.transaction(immediate=False) as conn:
+            if group_id is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM studycrew_live_recovery_dirty",
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """SELECT COUNT(*) FROM studycrew_live_recovery_dirty
+                       WHERE group_id=?""",
+                    (group_id,),
+                ).fetchone()
         return 0 if row is None else max(0, int(row[0]))
 
     def retire_live_recovery_dirty_through(
@@ -2050,4 +2102,4 @@ class TaskRuntimeStore:
             }
 
 
-__all__ = ["RuntimeStoreError", "TaskRuntimeStore"]
+__all__ = ["RecoveryDirtyBudgetError", "RuntimeStoreError", "TaskRuntimeStore"]

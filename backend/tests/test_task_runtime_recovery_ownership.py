@@ -8,6 +8,7 @@ import pytest
 from backend.hub import Client
 from backend.server import KnoweServer
 from backend.tests.test_task_runtime_recovery_ack import _OpenSocket, _close, _wait_for
+from backend.task_runtime.store import RecoveryDirtyBudgetError
 
 
 def _assert_window(client: Client) -> None:
@@ -42,6 +43,85 @@ def _seed(server: KnoweServer, count: int) -> list[str]:
             recovery_token=f"recovery_{index:032x}",
         )
     return groups
+
+
+def test_dirty_global_budget_rolls_back_producer_generation(tmp_path: Path) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.task_runtime is not None
+    store = server.task_runtime.store
+    groups = _seed(server, 5)
+    for index, group_id in enumerate(groups[:4]):
+        updated = store.record_live_recovery(
+            run_id=f"run_{index:032x}", group_id=group_id, through_seq=2,
+            reason="global-budget", attempts=4,
+            recovery_token=f"recovery_{index:032x}",
+            dirty_global_limit=4, dirty_group_limit=10,
+        )
+        dirty = store.live_recovery_dirty_marker(group_id)
+        assert dirty is not None
+        assert store.freeze_live_recovery_dirty(
+            int(dirty["dirty_queue_revision"]), group_id=group_id,
+            recovery_token=str(updated["recovery_token"]),
+            generation=int(updated["generation"]),
+        ) is not None
+    with pytest.raises(RecoveryDirtyBudgetError):
+        store.record_live_recovery(
+            run_id="run_00000000000000000000000000000004",
+            group_id=groups[4], through_seq=2, reason="global-budget",
+            attempts=4, recovery_token="recovery_00000000000000000000000000000004",
+            dirty_global_limit=4, dirty_group_limit=10,
+        )
+    assert store.live_recovery_dirty_count() == 4
+    unchanged = store.live_recovery(groups[4])
+    assert unchanged is not None and int(unchanged["generation"]) == 1
+    server.task_runtime.close()
+
+
+async def _ack_next_notified(server: KnoweServer, client: Client) -> int:
+    key = min(
+        client.task_runtime_recovery_notified,
+        key=lambda item: client.task_runtime_recovery_revisions[item],
+    )
+    project_id = server._runtime_project_id_for_group(key[0])  # noqa: SLF001
+    before = sum(
+        row.get("type") == "task_runtime_result" for row in client.ws.messages
+    )
+    await server._cmd_request_snapshot(client, {  # noqa: SLF001
+        "project_id": project_id,
+        "recovery_token": key[1],
+        "recovery_generation": key[2],
+    })
+    responses = [
+        row for row in client.ws.messages if row.get("type") == "task_runtime_result"
+    ]
+    assert len(responses) == before + 1
+    response = responses[-1]
+    await server._cmd_task_runtime_recovery_ack(client, {  # noqa: SLF001
+        "project_id": project_id,
+        "group_id": key[0],
+        "recovery_token": response["recovery_token"],
+        "recovery_generation": response["recovery_generation"],
+        "snapshot_cursor": response["snapshot_cursor"],
+    })
+    _assert_window(client)
+    return int(response["recovery_generation"])
+
+
+def _ack_next_notified_direct(server: KnoweServer, client: Client) -> int:
+    """Exercise ACK/CAS/retirement without serializing the already-covered snapshot path."""
+    key = min(
+        client.task_runtime_recovery_notified,
+        key=lambda item: client.task_runtime_recovery_revisions[item],
+    )
+    cursor = "f" * 64
+    client.task_runtime_recovery_notified.remove(key)
+    client.task_runtime_recovery_snapshots[key] = cursor
+    assert server._ack_task_runtime_recovery(  # noqa: SLF001
+        client, group_id=key[0], recovery_token=key[1],
+        generation=key[2], snapshot_cursor=cursor,
+    )
+    _assert_window(client)
+    return key[2]
 
 
 @pytest.mark.asyncio
@@ -802,7 +882,167 @@ async def test_session_admission_baseline_prevents_late_predebt_claim(
 
 
 @pytest.mark.asyncio
-async def test_volatile_store_failure_uses_changed_group_stream_without_base_rewind(
+@pytest.mark.parametrize("update_count", [200, 1000])
+async def test_stalled_client_is_fenced_before_dirty_log_exceeds_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, update_count: int,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_DIRTY_GLOBAL_MAX", 8)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_DIRTY_GROUP_MAX", 8)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_ACK_LEASE_SECONDS", 60.0)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS", 0.001)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS", 0.01)
+    project_id = f"project_budget_{update_count}"
+    group = server.groups.create_group("Budget", legacy_project_id=project_id)
+    run = server.task_runtime.submit(
+        group.group_id, title="Budget", request_key=f"budget-{update_count}",
+    )
+    event = server.task_runtime.store.events_after(run.run_id, 0)[0]
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(  # noqa: SLF001
+            event, reason="budget-base", attempts=4,
+        )
+
+    fast = Client(_OpenSocket())
+    stalled_clients = (Client(_OpenSocket()), Client(_OpenSocket()))
+    for client in (fast, *stalled_clients):
+        server._admit_task_runtime_client(client)  # noqa: SLF001
+        await client.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries()  # noqa: SLF001
+    assert _ack_next_notified_direct(server, fast) == 1
+    assert all(
+        len(stalled.task_runtime_recovery_notified) == 1
+        for stalled in stalled_clients
+    )
+
+    latest_generation = 1
+    for index in range(update_count):
+        latest_generation = index + 2
+        with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+            server._record_task_runtime_recovery_locked(  # noqa: SLF001
+                event, reason=f"budget-update-{index}", attempts=4,
+            )
+        assert server.task_runtime.store.live_recovery_dirty_count() <= 8
+        assert server.task_runtime.store.live_recovery_dirty_count(group.group_id) <= 8
+        await _wait_for(
+            lambda: (
+                (row := server.task_runtime.store.live_recovery(group.group_id)) is not None
+                and int(row["generation"]) == latest_generation
+            ),
+        )
+        await server._notify_task_runtime_recoveries(fast)  # noqa: SLF001
+        while fast.task_runtime_recovery_notified:
+            assert _ack_next_notified_direct(server, fast) == latest_generation
+        assert server.task_runtime.store.live_recovery_dirty_count() <= 8
+        _assert_window(fast)
+        for stalled in stalled_clients:
+            _assert_window(stalled)
+
+    assert all(stalled.task_runtime_recovery_fenced for stalled in stalled_clients)
+    assert all(stalled not in server.hub.clients for stalled in stalled_clients)
+    assert fast.alive
+    durable = server.task_runtime.store.live_recovery(group.group_id)
+    assert durable is not None
+    assert int(durable["generation"]) == latest_generation
+    assert int(durable["disconnect_retry"]) == 1
+
+    replacement = Client(_OpenSocket())
+    server._admit_task_runtime_client(replacement)  # noqa: SLF001
+    await replacement.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(replacement)  # noqa: SLF001
+    assert await _ack_next_notified(server, replacement) == latest_generation
+    assert server.task_runtime.store.live_recoveries() == ()
+    assert server.task_runtime.store.live_recovery_dirty() == ()
+    await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_recovery_ack_lease_fences_no_progress_and_reconnects_latest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_ACK_LEASE_SECONDS", 0.05)
+    group = server.groups.create_group("Lease", legacy_project_id="project_lease")
+    run = server.task_runtime.submit(group.group_id, title="Lease", request_key="lease")
+    event = server.task_runtime.store.events_after(run.run_id, 0)[0]
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(  # noqa: SLF001
+            event, reason="lease", attempts=4,
+        )
+    stalled = Client(_OpenSocket())
+    server._admit_task_runtime_client(stalled)  # noqa: SLF001
+    await stalled.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(stalled)  # noqa: SLF001
+    assert stalled.task_runtime_recovery_progress_deadline is not None
+    await _wait_for(lambda: stalled.task_runtime_recovery_fenced, timeout=1)
+    debt = server.task_runtime.store.live_recovery(group.group_id)
+    assert debt is not None and int(debt["disconnect_retry"]) == 1
+
+    replacement = Client(_OpenSocket())
+    server._admit_task_runtime_client(replacement)  # noqa: SLF001
+    await replacement.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(replacement)  # noqa: SLF001
+    assert await _ack_next_notified(server, replacement) == 1
+    assert server.task_runtime.store.live_recoveries() == ()
+    await _close(server)
+    assert server._task_runtime_recovery_watchdog_task is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_fence_debt_write_retries_before_releasing_retirement_blocker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS", 0.01)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS", 0.02)
+    group = server.groups.create_group("Debt retry", legacy_project_id="project_debt_retry")
+    run = server.task_runtime.submit(
+        group.group_id, title="Debt", request_key="debt-retry",
+    )
+    event = server.task_runtime.store.events_after(run.run_id, 0)[0]
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(  # noqa: SLF001
+            event, reason="debt-retry", attempts=4,
+        )
+    client = Client(_OpenSocket())
+    server._admit_task_runtime_client(client)  # noqa: SLF001
+    await client.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+
+    original = server.task_runtime.store.mark_live_recoveries_disconnect_after
+    attempts = 0
+
+    def transient(*args: object, **kwargs: object) -> int:
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise OSError("transient debt-store outage")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        server.task_runtime.store, "mark_live_recoveries_disconnect_after", transient,
+    )
+    await server._fence_task_runtime_recovery_client(client)  # noqa: SLF001
+    assert client in server.hub.clients
+    assert not client.task_runtime_recovery_disconnect_debt_transferred
+    await _wait_for(
+        lambda: client.task_runtime_recovery_disconnect_debt_transferred,
+    )
+    assert attempts == 3
+    assert client not in server.hub.clients
+    debt = server.task_runtime.store.live_recovery(group.group_id)
+    assert debt is not None and int(debt["disconnect_retry"]) == 1
+    await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_failed_persistence_flushes_latest_before_notice_without_new_event(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     server = KnoweServer(str(tmp_path))
@@ -814,19 +1054,55 @@ async def test_volatile_store_failure_uses_changed_group_stream_without_base_rew
     )
     event = server.task_runtime.store.events_after(run.run_id, 0)[0]
 
-    def unavailable(**_kwargs: object) -> dict[str, object]:
-        raise OSError("injected recovery-table outage")
-
-    monkeypatch.setattr(server.task_runtime.store, "record_live_recovery", unavailable)
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
     with server._task_runtime_event_bridge_lock:  # noqa: SLF001
         server._record_task_runtime_recovery_locked(  # noqa: SLF001
-            event, reason="volatile-one", attempts=4,
+            event, reason="durable-one", attempts=4,
         )
     client = Client(_OpenSocket())
     server._admit_task_runtime_client(client)  # noqa: SLF001
     await client.release_live_replay_fence()
     await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
     first = next(row for row in client.ws.messages if row.get("type") == "resync_required")
+    original_record = server.task_runtime.store.record_live_recovery
+    unavailable = True
+    store_attempts = 0
+
+    def flaky(**kwargs: object) -> dict[str, object]:
+        nonlocal store_attempts
+        store_attempts += 1
+        if unavailable:
+            raise OSError("injected recovery-table outage")
+        return original_record(**kwargs)
+
+    monkeypatch.setattr(server.task_runtime.store, "record_live_recovery", flaky)
+    latest_generation = 1001
+    for generation in range(2, latest_generation + 1):
+        with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+            server._record_task_runtime_recovery_locked(  # noqa: SLF001
+                event, reason=f"volatile-{generation}", attempts=4,
+            )
+    durable = server.task_runtime.store.live_recovery(group.group_id)
+    assert durable is not None and int(durable["generation"]) == 1
+    hot = server._task_runtime_event_bridge_recovery[group.group_id]  # noqa: SLF001
+    assert hot["persisted"] is False and int(hot["generation"]) == latest_generation
+    assert "volatile_dirty_entries" not in hot
+    assert store_attempts < 20
+    await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+    assert len([row for row in client.ws.messages if row.get("type") == "resync_required"]) == 1
+
+    unavailable = False
+    await _wait_for(
+        lambda: (
+            (row := server.task_runtime.store.live_recovery(group.group_id)) is not None
+            and int(row["generation"]) == latest_generation
+        ),
+    )
+    await _wait_for(
+        lambda: server._task_runtime_event_bridge_recovery[group.group_id]["persisted"]  # noqa: SLF001
+    )
+    # The already-issued generation-1 notice upgrades to the now-durable latest
+    # snapshot; no unpersisted generation was ever advertised.
     await server._cmd_request_snapshot(client, {  # noqa: SLF001
         "project_id": project_id, "recovery_token": first["recovery_token"],
         "recovery_generation": first["recovery_generation"],
@@ -835,38 +1111,72 @@ async def test_volatile_store_failure_uses_changed_group_stream_without_base_rew
         row for row in reversed(client.ws.messages)
         if row.get("type") == "task_runtime_result"
     )
+    assert response["recovery_generation"] == latest_generation
     await server._cmd_task_runtime_recovery_ack(client, {  # noqa: SLF001
         "project_id": project_id, "group_id": group.group_id,
         "recovery_token": response["recovery_token"],
         "recovery_generation": response["recovery_generation"],
         "snapshot_cursor": response["snapshot_cursor"],
     })
-    base_frontier = client.task_runtime_recovery_ack_revision
-
-    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
-        server._record_task_runtime_recovery_locked(  # noqa: SLF001
-            event, reason="volatile-two", attempts=4,
-        )
-    await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
-    notices = [
-        row for row in client.ws.messages if row.get("type") == "resync_required"
-    ]
-    assert len(notices) == 2
-    assert notices[-1]["group_id"] == group.group_id
-    assert notices[-1]["recovery_generation"] == 2
-    assert client.task_runtime_recovery_ack_revision == base_frontier
-    assert next(iter(client.task_runtime_recovery_kinds.values())) == "update"
-    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
-        server._record_task_runtime_recovery_locked(  # noqa: SLF001
-            event, reason="volatile-three", attempts=4,
-        )
-        hot = server._task_runtime_event_bridge_recovery[group.group_id]  # noqa: SLF001
-        assert [
-            (int(item["queue_revision"]), int(item["generation"]), bool(item["frozen"]))
-            for item in hot["volatile_dirty_entries"]
-        ] == [(1, 2, True), (2, 3, False)]
+    assert server.task_runtime.store.live_recoveries() == ()
+    assert server.task_runtime.store.live_recovery_dirty() == ()
     _assert_window(client)
     await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_persistence_flush_isolates_poison_group_and_cancels_on_shutdown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    groups = [
+        server.groups.create_group(
+            name, legacy_project_id=f"project_flush_{name.lower()}",
+        )
+        for name in ("Poison", "Healthy")
+    ]
+    events = []
+    for index, group in enumerate(groups):
+        run = server.task_runtime.submit(
+            group.group_id, title=group.name, request_key=f"flush-{index}",
+        )
+        events.append(server.task_runtime.store.events_after(run.run_id, 0)[0])
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    for event in events:
+        with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+            server._record_task_runtime_recovery_locked(  # noqa: SLF001
+                event, reason="flush-base", attempts=4,
+            )
+
+    original_record = server.task_runtime.store.record_live_recovery
+    fail_all = True
+
+    def selective(**kwargs: object) -> dict[str, object]:
+        if fail_all or kwargs.get("group_id") == groups[0].group_id:
+            raise OSError("poison recovery row")
+        return original_record(**kwargs)
+
+    monkeypatch.setattr(server.task_runtime.store, "record_live_recovery", selective)
+    for event in events:
+        with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+            server._record_task_runtime_recovery_locked(  # noqa: SLF001
+                event, reason="flush-update", attempts=4,
+            )
+    fail_all = False
+    await _wait_for(
+        lambda: (
+            (row := server.task_runtime.store.live_recovery(groups[1].group_id)) is not None
+            and int(row["generation"]) == 2
+        ),
+    )
+    poison = server.task_runtime.store.live_recovery(groups[0].group_id)
+    assert poison is not None and int(poison["generation"]) == 1
+    assert server._task_runtime_event_bridge_recovery[groups[0].group_id]["persisted"] is False  # noqa: SLF001
+    assert server._task_runtime_event_bridge_recovery[groups[1].group_id]["persisted"] is True  # noqa: SLF001
+    assert server._task_runtime_recovery_flush_task is not None  # noqa: SLF001
+    await _close(server)
+    assert server._task_runtime_recovery_flush_task is None  # noqa: SLF001
 
 
 def test_recovery_revision_never_reuses_after_full_table_retirement(tmp_path: Path) -> None:

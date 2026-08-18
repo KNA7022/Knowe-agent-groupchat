@@ -71,6 +71,7 @@ from .groups import (
     StaleDeletePreviewError,
 )
 from .task_runtime import RuntimeConflictError, RuntimeNotFoundError, TaskRuntimeService
+from .task_runtime.store import RecoveryDirtyBudgetError
 from .task_runtime.contracts import (
     AgentPhase,
     BudgetLimits as ControlBudgetLimits,
@@ -417,6 +418,12 @@ class KnoweServer:
     TASK_RUNTIME_RECOVERY_MARKER_MAX = 256
     TASK_RUNTIME_RECOVERY_SNAPSHOT_RETRIES = 8
     TASK_RUNTIME_RECOVERY_SEND_TIMEOUT_SECONDS = 10.0
+    TASK_RUNTIME_RECOVERY_ACK_LEASE_SECONDS = 30.0
+    TASK_RUNTIME_RECOVERY_DIRTY_GLOBAL_MAX = 256
+    TASK_RUNTIME_RECOVERY_DIRTY_GROUP_MAX = 32
+    TASK_RUNTIME_RECOVERY_FLUSH_BACKLOG_MAX = 256
+    TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS = 0.02
+    TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS = 2.0
     TASK_RUNTIME_DELIVERY_RETRIES = 3
 
     def __init__(self, data_dir: str | None = None) -> None:
@@ -447,6 +454,8 @@ class KnoweServer:
         self._task_runtime_recovery_update_revision = 0
         self._task_runtime_recovery_reconcile_tasks: set[asyncio.Task[Any]] = set()
         self._task_runtime_recovery_write_tasks: set[asyncio.Task[Any]] = set()
+        self._task_runtime_recovery_flush_task: asyncio.Task[Any] | None = None
+        self._task_runtime_recovery_watchdog_task: asyncio.Task[Any] | None = None
         self._task_runtime_event_drain_task: asyncio.Task[None] | None = None
         self._task_runtime_listener_service: TaskRuntimeService | None = self.task_runtime
         if self.task_runtime is not None:
@@ -1111,7 +1120,9 @@ class KnoweServer:
         previous = self._task_runtime_event_bridge_recovery.get(event.group_id) or {}
         marker = {
             "group_id": event.group_id,
+            "affected_run_id": event.run_id,
             "through_seq": event.seq,
+            "through_version": event.version,
             "reason": reason,
             "attempts": attempts,
             "recovery_token": str(previous.get("recovery_token") or opaque_id("recovery")),
@@ -1121,7 +1132,7 @@ class KnoweServer:
             "persisted": False,
         }
         service = self.task_runtime
-        if service is not None:
+        if service is not None and previous.get("persisted") is not False:
             try:
                 stored = service.store.record_live_recovery(
                     run_id=event.run_id, group_id=event.group_id,
@@ -1129,21 +1140,30 @@ class KnoweServer:
                     recovery_token=marker["recovery_token"],
                     run_version=event.version,
                     dirty_revision_floor=self._task_runtime_recovery_update_revision,
+                    generation_floor=int(marker["generation"]),
+                    failure_count_floor=int(marker["failure_count"]),
+                    dirty_global_limit=self.TASK_RUNTIME_RECOVERY_DIRTY_GLOBAL_MAX,
+                    dirty_group_limit=self.TASK_RUNTIME_RECOVERY_DIRTY_GROUP_MAX,
                 )
                 if stored:
                     marker = dict(stored)
                     marker["persisted"] = True
-            except Exception:  # noqa: BLE001 -- in-memory marker still makes failure visible
+            except RecoveryDirtyBudgetError:
+                marker["persistence_error"] = "dirty_budget"
+            except Exception:  # noqa: BLE001 -- bounded hot marker is retried by lifecycle owner
+                marker["persistence_error"] = "store_unavailable"
                 log.exception("Could not persist Task Runtime recovery marker for %s", event.run_id)
+        elif service is not None:
+            # Once a Group is hot, producers only coalesce its latest authoritative
+            # generation. The lifecycle worker owns retry cadence and error logging.
+            marker["persistence_error"] = str(
+                previous.get("persistence_error") or "store_unavailable"
+            )
         durable_revision = int(marker.get("recovery_revision") or 0)
         if durable_revision:
             self._task_runtime_recovery_revision = max(
                 self._task_runtime_recovery_revision, durable_revision,
             )
-        else:
-            self._task_runtime_recovery_revision += 1
-            marker["recovery_revision"] = self._task_runtime_recovery_revision
-        dirty = None
         if service is not None and marker.get("persisted") is not False:
             dirty = service.store.live_recovery_dirty_marker(event.group_id)
             if dirty is not None:
@@ -1151,31 +1171,27 @@ class KnoweServer:
                     self._task_runtime_recovery_update_revision,
                     int(dirty.get("dirty_queue_revision") or 0),
                 )
-        elif int(previous.get("generation") or 0) > 0:
-            entries = [
-                dict(item) for item in previous.get("volatile_dirty_entries", ())
-                if isinstance(item, dict)
-            ]
-            if entries and not bool(entries[-1].get("frozen")):
-                entries[-1]["generation"] = int(marker["generation"])
-            else:
-                self._task_runtime_recovery_update_revision += 1
-                entries.append({
-                    "queue_revision": self._task_runtime_recovery_update_revision,
-                    "generation": int(marker["generation"]),
-                    "frozen": False,
-                })
-            marker["volatile_dirty_entries"] = entries
-            marker["dirty_queue_revision"] = int(entries[-1]["queue_revision"])
-            marker["dirty_frozen"] = int(bool(entries[-1].get("frozen")))
-            dirty = marker
-        # Frozen entries keep their exact owned/applied slot until contiguous
-        # compaction. A newer generation lives in a later entry, so no client cursor
-        # or in-window identity is rewritten here.
+        elif event.group_id not in self._task_runtime_event_bridge_recovery:
+            pending = sum(
+                item.get("persisted") is False
+                for item in self._task_runtime_event_bridge_recovery.values()
+            )
+            if pending >= self.TASK_RUNTIME_RECOVERY_FLUSH_BACKLOG_MAX:
+                raise RuntimeError("Task Runtime recovery persistence backlog is full")
+        # Unpersisted state is one coalesced latest marker per Group and is never
+        # client-visible. The lifecycle flush owner makes it durable before notice.
         self._task_runtime_event_bridge_recovery[event.group_id] = marker
         self._task_runtime_event_bridge_recovery.move_to_end(event.group_id)
         while len(self._task_runtime_event_bridge_recovery) > self.TASK_RUNTIME_RECOVERY_MARKER_MAX:
-            self._task_runtime_event_bridge_recovery.popitem(last=False)
+            evictable = next((
+                group_id for group_id, item in self._task_runtime_event_bridge_recovery.items()
+                if item.get("persisted") is not False and group_id != event.group_id
+            ), None)
+            if evictable is None:
+                break
+            self._task_runtime_event_bridge_recovery.pop(evictable, None)
+        if marker.get("persisted") is False:
+            self._schedule_task_runtime_recovery_flush_locked()
 
     def _enqueue_task_runtime_event_locked(self, event: RunEvent, attempts: int = 0) -> bool:
         key = (event.run_id, event.seq)
@@ -1246,51 +1262,6 @@ class KnoweServer:
             | set(client.task_runtime_recovery_applied)
         )
 
-    def _volatile_dirty_next_locked(
-        self, after_revision: int,
-    ) -> dict[str, Any] | None:
-        candidates: list[dict[str, Any]] = []
-        for marker in self._task_runtime_event_bridge_recovery.values():
-            if marker.get("persisted") is not False:
-                continue
-            for entry in marker.get("volatile_dirty_entries", ()):
-                if (
-                    isinstance(entry, dict)
-                    and int(entry.get("queue_revision") or 0) > after_revision
-                ):
-                    candidate = dict(marker)
-                    candidate["generation"] = int(entry.get("generation") or 0)
-                    candidate["dirty_queue_revision"] = int(
-                        entry.get("queue_revision") or 0
-                    )
-                    candidate["dirty_frozen"] = int(bool(entry.get("frozen")))
-                    candidates.append(candidate)
-        return min(
-            candidates,
-            key=lambda item: int(item["dirty_queue_revision"]),
-            default=None,
-        )
-
-    def _freeze_volatile_dirty_locked(
-        self, *, group_id: str, revision: int, generation: int,
-    ) -> dict[str, Any] | None:
-        marker = self._task_runtime_event_bridge_recovery.get(group_id)
-        if marker is None or marker.get("persisted") is not False:
-            return None
-        for entry in marker.get("volatile_dirty_entries", ()):
-            if (
-                isinstance(entry, dict)
-                and int(entry.get("queue_revision") or 0) == revision
-                and int(entry.get("generation") or 0) == generation
-            ):
-                entry["frozen"] = True
-                frozen = dict(marker)
-                frozen["generation"] = generation
-                frozen["dirty_queue_revision"] = revision
-                frozen["dirty_frozen"] = 1
-                return frozen
-        return None
-
     def _track_task_runtime_recovery_task(
         self, task: asyncio.Task[Any], *, reconciler: bool,
     ) -> asyncio.Task[Any]:
@@ -1318,13 +1289,183 @@ class KnoweServer:
             asyncio.create_task(coroutine, name=name), reconciler=True,
         )
 
+    def _schedule_task_runtime_recovery_flush_locked(self) -> None:
+        """Request a flush from any journal-listener thread without issuing hot state."""
+        loop = self._task_runtime_event_bridge_loop
+        generation = self._task_runtime_event_bridge_generation
+        if not self._task_runtime_event_bridge_active or loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._ensure_task_runtime_recovery_flush, generation)
+
+    def _ensure_task_runtime_recovery_flush(self, generation: int) -> None:
+        with self._task_runtime_event_bridge_lock:
+            if (
+                not self._task_runtime_event_bridge_active
+                or generation != self._task_runtime_event_bridge_generation
+            ):
+                return
+            task = self._task_runtime_recovery_flush_task
+            if task is not None and not task.done():
+                return
+            task = self._track_task_runtime_recovery_task(
+                asyncio.create_task(
+                    self._flush_task_runtime_recoveries(generation),
+                    name="task-runtime-recovery-persistence-flush",
+                ),
+                reconciler=True,
+            )
+            self._task_runtime_recovery_flush_task = task
+
+    async def _relieve_task_runtime_recovery_budget(self) -> bool:
+        """Fence minimum-frontier blockers before retrying a bounded dirty append."""
+        service = self.task_runtime
+        if service is None:
+            return False
+        with self._task_runtime_event_bridge_lock:
+            alive = tuple(client for client in self.hub.clients if client.alive)
+            high_water = service.store.live_recovery_dirty_revision_high_water()
+            if not alive:
+                service.store.retire_live_recovery_dirty_through(high_water)
+                return True
+            minimum = min(
+                client.task_runtime_recovery_update_ack_revision for client in alive
+            )
+            # First compact anything all live clients have already covered. This often
+            # resolves a race between the latest ACK and the producer transaction.
+            self._retire_task_runtime_recoveries_locked()
+            victims = tuple(
+                client for client in alive
+                if client.task_runtime_recovery_update_ack_revision == minimum
+                and minimum < high_water
+            )
+        if not victims:
+            return False
+        for victim in victims:
+            await self._fence_task_runtime_recovery_client(victim)
+        return True
+
+    async def _flush_task_runtime_recoveries(self, generation: int) -> None:
+        """Persist bounded hot markers with per-Group isolation and bounded backoff."""
+        delay = max(0.001, self.TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS)
+        try:
+            while True:
+                with self._task_runtime_event_bridge_lock:
+                    if (
+                        not self._task_runtime_event_bridge_active
+                        or generation != self._task_runtime_event_bridge_generation
+                    ):
+                        return
+                    pending = tuple(
+                        dict(marker)
+                        for marker in self._task_runtime_event_bridge_recovery.values()
+                        if marker.get("persisted") is False
+                    )
+                if not pending:
+                    return
+                service = self.task_runtime
+                if service is None:
+                    return
+                progressed = False
+                budget_blocked = False
+                for marker in pending:
+                    try:
+                        stored = service.store.record_live_recovery(
+                            run_id=str(marker["affected_run_id"]),
+                            group_id=str(marker["group_id"]),
+                            through_seq=int(marker["through_seq"]),
+                            reason=str(marker["reason"]),
+                            attempts=int(marker["attempts"]),
+                            recovery_token=str(marker["recovery_token"]),
+                            run_version=int(marker["through_version"]),
+                            dirty_revision_floor=self._task_runtime_recovery_update_revision,
+                            generation_floor=int(marker["generation"]),
+                            failure_count_floor=int(marker["failure_count"]),
+                            dirty_global_limit=self.TASK_RUNTIME_RECOVERY_DIRTY_GLOBAL_MAX,
+                            dirty_group_limit=self.TASK_RUNTIME_RECOVERY_DIRTY_GROUP_MAX,
+                        )
+                    except RecoveryDirtyBudgetError:
+                        budget_blocked = True
+                        continue
+                    except Exception:  # noqa: BLE001 -- retry each Group independently
+                        continue
+                    durable = dict(stored)
+                    durable["persisted"] = True
+                    group_id = str(durable["group_id"])
+                    with self._task_runtime_event_bridge_lock:
+                        current = self._task_runtime_event_bridge_recovery.get(group_id)
+                        if current is None or current.get("persisted") is not False:
+                            continue
+                        if str(current.get("recovery_token")) != str(durable["recovery_token"]):
+                            continue
+                        if int(current.get("generation") or 0) <= int(durable["generation"]):
+                            self._task_runtime_event_bridge_recovery[group_id] = durable
+                        else:
+                            # A newer coalesced hot generation arrived during this write.
+                            # Retain it, but bind it to the now-durable immutable base row.
+                            current["recovery_revision"] = int(
+                                durable.get("recovery_revision") or 0
+                            )
+                            current["recovery_token"] = str(durable["recovery_token"])
+                        self._task_runtime_recovery_revision = max(
+                            self._task_runtime_recovery_revision,
+                            int(durable.get("recovery_revision") or 0),
+                        )
+                    progressed = True
+                if budget_blocked:
+                    progressed = await self._relieve_task_runtime_recovery_budget() or progressed
+                if progressed:
+                    delay = max(0.001, self.TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS)
+                    await self._notify_task_runtime_recoveries()
+                    await asyncio.sleep(0)
+                    continue
+                await asyncio.sleep(delay)
+                delay = min(
+                    self.TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS,
+                    max(delay * 2, self.TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS),
+                )
+        finally:
+            current_task = asyncio.current_task()
+            with self._task_runtime_event_bridge_lock:
+                if self._task_runtime_recovery_flush_task is current_task:
+                    self._task_runtime_recovery_flush_task = None
+
+    async def _task_runtime_recovery_progress_watchdog(self, generation: int) -> None:
+        """Fence clients whose renderer ACK frontier stops progressing."""
+        while True:
+            lease = max(0.01, self.TASK_RUNTIME_RECOVERY_ACK_LEASE_SECONDS)
+            await asyncio.sleep(min(1.0, max(0.01, lease / 4)))
+            now = time.monotonic()
+            with self._task_runtime_event_bridge_lock:
+                if (
+                    not self._task_runtime_event_bridge_active
+                    or generation != self._task_runtime_event_bridge_generation
+                ):
+                    return
+                expired = tuple(
+                    client for client in self.hub.clients
+                    if client.alive
+                    and client.task_runtime_recovery_progress_deadline is not None
+                    and client.task_runtime_recovery_progress_deadline <= now
+                    and bool(self._client_recovery_keys(client))
+                )
+            for client in expired:
+                await self._fence_task_runtime_recovery_client(client)
+
     async def _fence_task_runtime_recovery_client(self, client: Client) -> None:
         """Discharge an ambiguous socket by fencing it before freeing owned slots."""
         if client.task_runtime_recovery_fenced:
             return
         client.task_runtime_recovery_fenced = True
-        self._retain_client_recovery_on_disconnect(client)
-        self.hub.remove_client(client)
+        transferred = self._retain_client_recovery_on_disconnect(client)
+        if transferred:
+            self.hub.remove_client(client)
+            with self._task_runtime_event_bridge_lock:
+                self._retire_task_runtime_recoveries_locked()
+        else:
+            self._spawn_task_runtime_reconciler(
+                self._reconcile_fenced_task_runtime_recovery_debt(client),
+                name=f"task-runtime-recovery-debt-reconcile-{client.id}",
+            )
         close = getattr(client.ws, "close", None)
         if callable(close):
             try:
@@ -1333,6 +1474,21 @@ class KnoweServer:
                     await asyncio.wait_for(result, timeout=1.0)
             except BaseException:  # the connection is already fenced from authority
                 pass
+
+    async def _reconcile_fenced_task_runtime_recovery_debt(self, client: Client) -> None:
+        """Keep a failed fence in retirement minima until its debt is durable."""
+        delay = max(0.01, self.TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS)
+        while client.task_runtime_recovery_fenced:
+            await asyncio.sleep(delay)
+            if self._retain_client_recovery_on_disconnect(client):
+                self.hub.remove_client(client)
+                with self._task_runtime_event_bridge_lock:
+                    self._retire_task_runtime_recoveries_locked()
+                return
+            delay = min(
+                self.TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS,
+                max(delay * 2, self.TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS),
+            )
 
     def _admit_task_runtime_client(self, client: Client) -> None:
         """Atomically bind the durable debt epoch before publishing a live session."""
@@ -1375,8 +1531,17 @@ class KnoweServer:
         for key, task in tuple(client.task_runtime_recovery_send_tasks.items()):
             if key not in keys and task.done():
                 client.task_runtime_recovery_send_tasks.pop(key, None)
+        if not keys:
+            client.task_runtime_recovery_progress_deadline = None
         if client.task_runtime_recovery_slot_count > client.TASK_RUNTIME_RECOVERY_WINDOW_MAX:
             raise RuntimeError("Task Runtime recovery ownership exceeded its hard window")
+
+    def _start_client_recovery_ack_lease_locked(self, client: Client) -> None:
+        now = time.monotonic()
+        client.task_runtime_recovery_last_progress_at = now
+        client.task_runtime_recovery_progress_deadline = (
+            now + max(0.01, self.TASK_RUNTIME_RECOVERY_ACK_LEASE_SECONDS)
+        )
 
     def _drop_client_recovery_key_locked(
         self, client: Client, key: tuple[str, str, int],
@@ -1438,6 +1603,10 @@ class KnoweServer:
                     )
                 compacted[kind].append((key, revision))
         self._normalize_client_recovery_slots_locked(client)
+        if compacted["base"] or compacted["update"]:
+            self._start_client_recovery_ack_lease_locked(client)
+            if not self._client_recovery_keys(client):
+                client.task_runtime_recovery_progress_deadline = None
         return compacted["base"], compacted["update"]
 
     def _retire_task_runtime_recoveries_locked(self) -> None:
@@ -1445,30 +1614,24 @@ class KnoweServer:
         service = self.task_runtime
         if service is None:
             return
-        alive = tuple(client for client in self.hub.clients if client.alive)
+        alive = tuple(
+            client for client in self.hub.clients
+            if client.alive or (
+                client.task_runtime_recovery_fenced
+                and not client.task_runtime_recovery_disconnect_debt_transferred
+            )
+        )
         if not alive:
+            # With no live projection frontier, reconnect is satisfied by the latest
+            # coalesced base row. Historical dirty entries have no remaining observer.
+            service.store.retire_live_recovery_dirty_through(
+                service.store.live_recovery_dirty_revision_high_water(),
+            )
             return
         update_frontier = min(
             client.task_runtime_recovery_update_ack_revision for client in alive
         )
         service.store.retire_live_recovery_dirty_through(update_frontier)
-        for marker in self._task_runtime_event_bridge_recovery.values():
-            if marker.get("persisted") is not False:
-                continue
-            retained = [
-                item for item in marker.get("volatile_dirty_entries", ())
-                if isinstance(item, dict)
-                and int(item.get("queue_revision") or 0) > update_frontier
-            ]
-            marker["volatile_dirty_entries"] = retained
-            if retained:
-                marker["dirty_queue_revision"] = int(
-                    retained[-1].get("queue_revision") or 0
-                )
-                marker["dirty_frozen"] = int(bool(retained[-1].get("frozen")))
-            else:
-                marker.pop("dirty_queue_revision", None)
-                marker.pop("dirty_frozen", None)
         frontier = min(client.task_runtime_recovery_ack_revision for client in alive)
         for marker in service.store.retire_live_recoveries_through(frontier):
             group_id = str(marker["group_id"])
@@ -1519,6 +1682,8 @@ class KnoweServer:
                     if sent and target.alive:
                         target.task_runtime_recovery_reserved.discard(key)
                         target.task_runtime_recovery_notified.add(key)
+                        if target.task_runtime_recovery_progress_deadline is None:
+                            self._start_client_recovery_ack_lease_locked(target)
                     else:
                         self._drop_client_recovery_key_locked(target, key)
                         refill = target.alive and refill_on_failure
@@ -1568,13 +1733,7 @@ class KnoweServer:
                     token = str(marker["recovery_token"])
                     generation = int(marker["generation"])
                 elif kind == "update":
-                    frozen = self._freeze_volatile_dirty_locked(
-                        group_id=group_id, revision=revision,
-                        generation=generation,
-                    )
-                    if frozen is None:
-                        return "stale"
-                    marker = frozen
+                    return "stale"
                 notice_key = (group_id, token, generation)
                 target.task_runtime_recovery_reserved.add(notice_key)
                 target.task_runtime_recovery_revisions[notice_key] = revision
@@ -1724,41 +1883,8 @@ class KnoweServer:
                         break
                     await asyncio.sleep(0)
 
-                # A recovery-table write failure is represented by the bounded hot
-                # cache and can only reserve remaining slots through the same cap check.
-                with self._task_runtime_event_bridge_lock:
-                    hot_markers = tuple(
-                        marker for marker in self._task_runtime_event_bridge_recovery.values()
-                        if marker.get("persisted") is False
-                    )
-                hot_candidates: list[tuple[int, int, str, dict[str, Any]]] = []
-                for marker in hot_markers:
-                    base_revision = int(marker.get("recovery_revision") or 0)
-                    if base_revision > target.task_runtime_recovery_after_revision:
-                        hot_candidates.append((0, base_revision, "base", dict(marker)))
-                        continue
-                    for entry in marker.get("volatile_dirty_entries", ()):
-                        if not isinstance(entry, dict):
-                            continue
-                        update_revision = int(entry.get("queue_revision") or 0)
-                        if update_revision <= target.task_runtime_recovery_update_after_revision:
-                            continue
-                        candidate = dict(marker)
-                        candidate["generation"] = int(entry.get("generation") or 0)
-                        candidate["dirty_queue_revision"] = update_revision
-                        candidate["dirty_frozen"] = int(bool(entry.get("frozen")))
-                        hot_candidates.append((1, update_revision, "update", candidate))
-                for _stream, revision, kind, marker in sorted(hot_candidates):
-                    outcome = await send_marker(target, marker, kind=kind)
-                    if outcome != "sent":
-                        break
-                    if kind == "update":
-                        target.task_runtime_recovery_update_after_revision = revision
-                    else:
-                        target.task_runtime_recovery_after_revision = revision
-                    available -= 1
-                    if available == 0:
-                        break
+                # Unpersisted hot markers are deliberately absent here. The flush
+                # owner persists them first and then schedules this notifier.
 
         results = await asyncio.gather(
             *(fill_target(target) for target in targets), return_exceptions=True,
@@ -1810,10 +1936,19 @@ class KnoweServer:
             return None
         for _attempt in range(self.TASK_RUNTIME_RECOVERY_SNAPSHOT_RETRIES):
             before = service.store.live_recovery(group_id)
-            if before is None:
-                with self._task_runtime_event_bridge_lock:
-                    hot = self._task_runtime_event_bridge_recovery.get(group_id)
-                    before = dict(hot) if hot is not None else None
+            with self._task_runtime_event_bridge_lock:
+                hot = self._task_runtime_event_bridge_recovery.get(group_id)
+                hot = dict(hot) if hot is not None else None
+            if (
+                hot is not None and hot.get("persisted") is False
+                and (
+                    before is None
+                    or int(hot.get("generation") or 0) > int(before.get("generation") or 0)
+                )
+            ):
+                # Persist-before-notify normally prevents this path. A compatibility
+                # slot from an older process must retry rather than serve stale durable state.
+                return None
             if (
                 before is None
                 or str(before.get("recovery_token")) != recovery_token
@@ -1822,10 +1957,6 @@ class KnoweServer:
                 return None
             snapshot = service.group_snapshot(group_id)
             after = service.store.live_recovery(group_id)
-            if after is None and before.get("persisted") is False:
-                with self._task_runtime_event_bridge_lock:
-                    hot = self._task_runtime_event_bridge_recovery.get(group_id)
-                    after = dict(hot) if hot is not None else None
             if (
                 after is None
                 or self._task_runtime_marker_identity(before)
@@ -1839,9 +1970,6 @@ class KnoweServer:
             # durable generation, closing the final validation/issuance race.
             with self._task_runtime_event_bridge_lock:
                 final = service.store.live_recovery(group_id)
-                if final is None and after.get("persisted") is False:
-                    hot = self._task_runtime_event_bridge_recovery.get(group_id)
-                    final = dict(hot) if hot is not None else None
                 if (
                     final is None
                     or self._task_runtime_marker_identity(final)
@@ -1858,19 +1986,6 @@ class KnoweServer:
                 revision = client.task_runtime_recovery_revisions.get(prior, 0)
                 if kind == "update":
                     dirty = service.store.live_recovery_dirty_entry(revision)
-                    if dirty is None and final.get("persisted") is False:
-                        hot = self._task_runtime_event_bridge_recovery.get(group_id)
-                        dirty = None
-                        if hot is not None:
-                            entry = next((
-                                item for item in hot.get("volatile_dirty_entries", ())
-                                if isinstance(item, dict)
-                                and int(item.get("queue_revision") or 0) == revision
-                            ), None)
-                            if entry is not None:
-                                dirty = dict(hot)
-                                dirty["generation"] = int(entry.get("generation") or 0)
-                                dirty["dirty_queue_revision"] = revision
                     if (
                         dirty is None
                         or str(dirty.get("group_id")) != group_id
@@ -1990,14 +2105,21 @@ class KnoweServer:
             revision = client.task_runtime_recovery_revisions.get(key, 0)
             marker = self.task_runtime.store.live_recovery(group_id)
             fallback = self._task_runtime_event_bridge_recovery.get(group_id)
-            if marker is None and fallback is not None and fallback.get("persisted") is False:
-                marker = fallback
+            if (
+                fallback is not None and fallback.get("persisted") is False
+                and (
+                    marker is None
+                    or int(fallback.get("generation") or 0)
+                    > int(marker.get("generation") or 0)
+                )
+            ):
+                return False
             if marker is None or self._task_runtime_marker_identity(marker)[:2] != (
                 recovery_token, generation,
             ):
                 return False
             if marker.get("persisted") is not False:
-                if int(marker.get("disconnect_retry") or 0):
+                if kind == "base" and int(marker.get("disconnect_retry") or 0):
                     try:
                         consumed = self.task_runtime.store.consume_live_recovery_disconnect(
                             group_id, recovery_token, generation,
@@ -2025,10 +2147,6 @@ class KnoweServer:
                     dirty = self.task_runtime.store.live_recovery_dirty_next(
                         client.task_runtime_recovery_update_ack_revision,
                     )
-                    if dirty is None:
-                        dirty = self._volatile_dirty_next_locked(
-                            client.task_runtime_recovery_update_ack_revision,
-                        )
                     if (
                         dirty is None
                         or str(dirty.get("group_id")) != compacted_key[0]
@@ -2036,23 +2154,14 @@ class KnoweServer:
                         or int(dirty.get("generation") or 0) > compacted_key[2]
                     ):
                         break
-                    if dirty.get("persisted") is not False:
-                        dirty = self.task_runtime.store.freeze_live_recovery_dirty(
-                            int(dirty.get("dirty_queue_revision") or 0),
-                            group_id=compacted_key[0],
-                            recovery_token=compacted_key[1],
-                            generation=int(dirty.get("generation") or 0),
-                        )
-                        if dirty is None:
-                            break
-                    else:
-                        dirty = self._freeze_volatile_dirty_locked(
-                            group_id=compacted_key[0],
-                            revision=int(dirty.get("dirty_queue_revision") or 0),
-                            generation=int(dirty.get("generation") or 0),
-                        )
-                        if dirty is None:
-                            break
+                    dirty = self.task_runtime.store.freeze_live_recovery_dirty(
+                        int(dirty.get("dirty_queue_revision") or 0),
+                        group_id=compacted_key[0],
+                        recovery_token=compacted_key[1],
+                        generation=int(dirty.get("generation") or 0),
+                    )
+                    if dirty is None:
+                        break
                     client.task_runtime_recovery_applied.add(compacted_key)
                     client.task_runtime_recovery_revisions[compacted_key] = int(
                         dirty.get("dirty_queue_revision") or 0,
@@ -2063,15 +2172,15 @@ class KnoweServer:
             self._retire_task_runtime_recoveries_locked()
         return True
 
-    def _retain_client_recovery_on_disconnect(self, client: Client) -> None:
+    def _retain_client_recovery_on_disconnect(self, client: Client) -> bool:
         """Persist a retry fence for recovery obligations lost with this socket."""
         service = self.task_runtime
         if service is None:
-            return
+            return False
         disconnected_at_ns = time.time_ns()
         with self._task_runtime_event_bridge_lock:
             if client.task_runtime_recovery_disconnect_debt_transferred:
-                return
+                return True
             # A live pager owns the entire durable suffix, not merely its current
             # four slots. One SQLite statement freezes that exact queue suffix; the
             # handler's later ``finally`` invocation is an in-memory one-shot no-op.
@@ -2085,7 +2194,10 @@ class KnoweServer:
                     disconnected_at_ns=disconnected_at_ns,
                 )
             except Exception:  # noqa: BLE001 -- Hub cleanup must still complete
-                log.exception("Could not retain Task Runtime disconnect retry suffix")
+                if client.task_runtime_recovery_debt_retry_count == 0:
+                    log.exception("Could not retain Task Runtime disconnect retry suffix")
+                client.task_runtime_recovery_debt_retry_count += 1
+                return False
             else:
                 client.task_runtime_recovery_disconnect_debt_transferred = True
             for task in tuple(client.task_runtime_recovery_send_tasks.values()):
@@ -2101,6 +2213,8 @@ class KnoweServer:
             client.task_runtime_recovery_kinds.clear()
             client.task_runtime_recovery_order.clear()
             client.task_runtime_recovery_update_order.clear()
+            client.task_runtime_recovery_progress_deadline = None
+        return True
 
     def _record_task_runtime_snapshot_publication(self, snapshot: dict[str, Any]) -> None:
         if self.task_runtime is None:
@@ -2219,6 +2333,16 @@ class KnoweServer:
             self._task_runtime_event_bridge_active = True
             self._task_runtime_event_bridge_stopped = False
             self._task_runtime_event_bridge_scheduled = False
+            watchdog = self._track_task_runtime_recovery_task(
+                asyncio.create_task(
+                    self._task_runtime_recovery_progress_watchdog(
+                        self._task_runtime_event_bridge_generation,
+                    ),
+                    name="task-runtime-recovery-progress-watchdog",
+                ),
+                reconciler=True,
+            )
+            self._task_runtime_recovery_watchdog_task = watchdog
 
     async def _stop_task_runtime_event_bridge(self) -> None:
         """Atomically fence callbacks and cancel queued live publication."""
@@ -2249,6 +2373,8 @@ class KnoweServer:
                 set(self._task_runtime_recovery_write_tasks)
                 | set(self._task_runtime_recovery_reconcile_tasks)
             )
+            self._task_runtime_recovery_flush_task = None
+            self._task_runtime_recovery_watchdog_task = None
             for task in owned_tasks:
                 if not task.done():
                     task.cancel()

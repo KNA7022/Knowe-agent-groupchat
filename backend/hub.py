@@ -59,6 +59,7 @@ class Client:
         self.task_runtime_recovery_fenced = False
         self.task_runtime_recovery_session_id = secrets.token_urlsafe(24)
         self.task_runtime_recovery_disconnect_debt_transferred = False
+        self.task_runtime_recovery_debt_retry_count = 0
         # ``-1`` means this Client bypassed the server admission boundary (tests or
         # legacy callers) and therefore cannot claim any disconnect debt.
         self.task_runtime_recovery_disconnect_epoch_baseline = -1
@@ -86,6 +87,10 @@ class Client:
         self.task_runtime_recovery_update_order: deque[tuple[str, str, int]] = deque()
         self.task_runtime_recovery_update_ack_revision = 0
         self.task_runtime_recovery_update_after_revision = 0
+        # A successful notice starts a bounded renderer-ACK lease. Only contiguous
+        # base/update progress renews it; transport liveness alone is insufficient.
+        self.task_runtime_recovery_last_progress_at = time.monotonic()
+        self.task_runtime_recovery_progress_deadline: float | None = None
         self.task_runtime_recovery_send_tasks: dict[
             tuple[str, str, int], asyncio.Task[bool]
         ] = {}
