@@ -644,6 +644,8 @@ export type ProjectDirectoryInfo = z.infer<typeof ProjectDirectoryInfoSchema>;
  */
 export const ProjectCreatedSchema = z.object({
   type: z.literal('project_created'),
+  /** Canonical domain identity; emitted together with project_id during migration. */
+  group_id: z.string().regex(/^grp_[0-9a-f]{32}$/).optional(),
   project_id: z.string(),
   project_name: z.string().optional(),
   seq: z.number().int().min(0).optional(),
@@ -1104,6 +1106,8 @@ export type RejectCmd = z.infer<typeof RejectCmdSchema>;
  */
 export const CreateProjectCmdSchema = z.object({
   type: z.literal('create_project'),
+  /** New callers use group_id; project_id remains a transport alias for old clients. */
+  group_id: z.string().regex(/^grp_[0-9a-f]{32}$/).optional(),
   project_id: z.string(),
   project_name: z.string(),
   project_dir: z.string().optional(),
@@ -1363,7 +1367,17 @@ export function validateInbound(raw: unknown): InboundEvent | null {
     console.error('[contract] 入站事件校验失败', result.error.issues, raw);
     return null;
   }
-  return result.data;
+  // Most historical event schemas intentionally enumerate their payload field-by-field,
+  // so Zod strips unknown keys. Preserve the canonical migration identity after the
+  // legacy schema has validated the rest of the frame; project_id remains available.
+  const data = result.data as InboundEvent & { group_id?: string };
+  const candidate = raw && typeof raw === 'object'
+    ? (raw as { group_id?: unknown }).group_id
+    : undefined;
+  if (typeof candidate === 'string' && /^grp_[0-9a-f]{32}$/.test(candidate)) {
+    data.group_id = candidate;
+  }
+  return data;
 }
 
 /**

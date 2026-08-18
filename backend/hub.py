@@ -111,6 +111,24 @@ class Hub:
         # The cache is backed by the durable event log on first lookup so outbox replay
         # after a process restart cannot create a second user/UI message.
         self._idempotent_events: dict[str, dict[str, dict[str, Any]]] = {}
+        # Migration-window identity adapter.  The runtime remains keyed by its stable
+        # historical project_id, while transport envelopes additionally expose the
+        # canonical Group identity.  The server installs this resolver after startup.
+        self.group_id_resolver: Callable[[str], str | None] | None = None
+
+    def _with_group_identity(self, event: dict[str, Any]) -> dict[str, Any]:
+        project_id = event.get("project_id")
+        if not isinstance(project_id, str) or self.group_id_resolver is None:
+            return event
+        try:
+            group_id = self.group_id_resolver(project_id)
+        except Exception:
+            group_id = None
+        if not group_id:
+            return event
+        enriched = dict(event)
+        enriched["group_id"] = group_id
+        return enriched
 
     @staticmethod
     def _idempotency_payload(event: dict[str, Any]) -> dict[str, Any]:
@@ -355,6 +373,7 @@ class Hub:
         # user_echo 的契约里没有 project_name 字段（envelope.ts 逐字段核对过）——不能塞
         if etype != "user_echo":
             event["project_name"] = proj.name
+        event = self._with_group_identity(event)
         event = self._filter_public_text(project_id, event)
 
         async with self._seq_lock:          # ★ 单点盖号：跨项目也串行，杜绝竞态
@@ -393,7 +412,7 @@ class Hub:
 
     # ── 发事件：服务器级（无 seq，旁路） ──
     async def emit_no_seq(self, payload: dict[str, Any]) -> dict[str, Any]:
-        event = dict(payload)
+        event = self._with_group_identity(dict(payload))
         pid = event.get("project_id")
         if isinstance(pid, str):
             event = self._filter_public_text(pid, event)
@@ -402,7 +421,7 @@ class Hub:
 
     async def send_to(self, client: Client, payload: dict[str, Any]) -> None:
         """点对点（握手回放、pong）。不进 ring、不广播。"""
-        event = dict(payload)
+        event = self._with_group_identity(dict(payload))
         pid = event.get("project_id")
         if isinstance(pid, str):
             event = self._filter_public_text(pid, event)
@@ -462,6 +481,7 @@ class Hub:
             }
             if activity is not None:
                 event["activity"] = list(activity)
+            event = self._with_group_identity(event)
             event = self._filter_public_text(project_id, event)
             proj.ring.append(event)
             if self.store is not None:

@@ -52,7 +52,7 @@ SCHEMA_VERSION_FILENAME = "schema_version"
 
 #: 当前软件对应的数据格式版本。发版时如有数据格式变更：注册迁移函数并把这里 +1。
 #: 必须 >= 1，且必须等于 MIGRATIONS 的最大 key（没有迁移的中间版本允许缺失）。
-CURRENT_DATA_SCHEMA_VERSION = 2
+CURRENT_DATA_SCHEMA_VERSION = 3
 
 #: 迁移注册表：{目标版本: 迁移函数}，**有序字典**，按 key 升序执行。
 #: 函数签名：fn(data_root: Path) -> None。必须幂等。
@@ -61,6 +61,12 @@ MIGRATIONS: dict[int, Callable[[Path], None]] = {
     # 按天轮转机制惰性归档（mtime 判断自动切分压缩），SQLite 侧由
     # storage_migrator 在启动时执行。此处仅让数据版本前进，标记优化已启用。
     2: lambda root: None,
+    # StudyCrew Group v1 is a copy-only migration.  It creates and verifies a backup
+    # before writing the new registry and never rewrites/removes projects.json or a
+    # legacy roster.  The migration function is idempotent by legacy_project_id.
+    3: lambda root: __import__(
+        "backend.groups", fromlist=["migrate_legacy_projects"]
+    ).migrate_legacy_projects(root),
 }
 
 

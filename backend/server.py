@@ -41,6 +41,7 @@ import sys
 import time                     # [v0.44.8] 置顶「后来者居上」的单调排序戳
 import uuid
 from contextvars import ContextVar
+from dataclasses import asdict
 from datetime import datetime            # [v0.38] /history 按日期过滤 & ts 解析
 from http import HTTPStatus
 from pathlib import Path
@@ -58,6 +59,14 @@ from knowe_storage._sqlite import (
 from websockets.asyncio.server import ServerConnection, serve
 
 from .agents.zinnia import PLATFORM_PROJECT_ID, ZINNIA, ZinniaAgent, new_project_id
+from .groups import (
+    GroupAgent,
+    GroupDomainError,
+    GroupNotFoundError,
+    GroupRepository,
+    GroupTemplate,
+    StaleDeletePreviewError,
+)
 from .tools_knowe import resolve_in_sandbox            # [v0.36] /preview 复用沙箱路径解析
 from .tools_knowe import KNOWN_ROLES, _next_agent_id   # [主动拉入worker] 职能白名单 + id 生成
 
@@ -389,7 +398,9 @@ class KnoweServer:
         raw_dir = CONFIG.data_dir if data_dir is None else data_dir
         self.store: Store | None = Store(raw_dir) if raw_dir else None
         self.data_root = Path(raw_dir or "./data").expanduser().resolve()
+        self.groups: GroupRepository | None = GroupRepository(self.data_root) if raw_dir else None
         self.hub = Hub(store=self.store)
+        self.hub.group_id_resolver = self._group_id_for_runtime_project
         self.engines: dict[str, ProjectEngine] = {}
         self.platform: ProjectEngine | None = None   # [v0.4] 知知常驻的平台引擎
         # [v1.0.13 R1] Process-local serialization plus durable history/event-id
@@ -989,6 +1000,50 @@ class KnoweServer:
         row = self._conversation_state(project_id)
         eng.apply_conversation_preferences(**row)
 
+    def _group_id_for_runtime_project(self, project_id: str) -> str | None:
+        """Return canonical Group identity for one legacy runtime conversation key."""
+        if self.groups is None or project_id == PLATFORM_PROJECT_ID or _parse_dm(project_id):
+            return None
+        try:
+            return self.groups.resolve_group_id(project_id)
+        except GroupNotFoundError:
+            return None
+
+    def _runtime_project_id_for_group(self, group_id: str) -> str:
+        if self.groups is None:
+            raise GroupNotFoundError("Group persistence is unavailable")
+        return self.groups.runtime_project_id(group_id)
+
+    def _canonical_group_from_payload(
+        self, payload: dict[str, Any], *, require_runtime: bool = True,
+    ) -> tuple[str, str | None, str | None]:
+        """Canonicalize ``group_id`` or legacy ``project_id`` at an HTTP boundary.
+
+        Returns ``(group_id, runtime_project_id, requested_project_id)``.  New domain
+        handlers use group_id internally; only callers delegating to the historical
+        chat engine consume runtime_project_id.
+        """
+        raw_group = payload.get("group_id")
+        raw_project = payload.get("project_id")
+        candidate = raw_group if isinstance(raw_group, str) and raw_group.strip() else raw_project
+        if not isinstance(candidate, str) or not candidate.strip():
+            raise ValueError("group_id or legacy project_id is required")
+        if self.groups is None:
+            raise ValueError("Group persistence is unavailable")
+        try:
+            group_id = self.groups.resolve_group_id(candidate.strip())
+            runtime_id = self.groups.runtime_project_id(group_id) if require_runtime else None
+        except GroupNotFoundError as exc:
+            raise ValueError(str(exc)) from exc
+        if isinstance(raw_group, str) and raw_group.strip() and isinstance(raw_project, str) and raw_project.strip():
+            try:
+                other_group = self.groups.resolve_group_id(raw_project.strip())
+            except GroupNotFoundError as exc:
+                raise ValueError("project_id alias does not identify this group") from exc
+            if other_group != group_id:
+                raise ValueError("group_id and project_id identify different groups")
+        return group_id, runtime_id, raw_project.strip() if isinstance(raw_project, str) else None
+
     def _project_created_payload(self, project_id: str) -> dict[str, Any]:
         """兼容刷新帧：旧前端不认识新事件，也能借它触发 HTTP 对账。"""
         proj = self.hub.projects[project_id]
@@ -1000,6 +1055,9 @@ class KnoweServer:
             # muted / folded 是全局静默：旧客户端只认识 unread_count，也不能被它点亮。
             "unread_count": 0 if state["muted"] or state["folded"] else self.hub.unread_count(project_id),
         }
+        group_id = self._group_id_for_runtime_project(project_id)
+        if group_id:
+            payload["group_id"] = group_id
         known_dir = self.project_dirs.get(project_id)
         if known_dir:
             payload["project_dir"] = known_dir
@@ -1207,6 +1265,17 @@ class KnoweServer:
                     )
                     self._persisted_project_ids.add(project_id)
 
+                if self.groups is not None:
+                    try:
+                        self.groups.rename(self.groups.resolve_group_id(project_id), new_name)
+                    except GroupNotFoundError:
+                        # Direct unit construction may bypass startup migration.  Keep
+                        # the compatibility registry self-healing at the mutation seam.
+                        self.groups.create_group(
+                            new_name, template=GroupTemplate.CUSTOM,
+                            legacy_project_id=project_id,
+                        )
+
                 if self._save_project_dirs() is False:
                     raise OSError(msg("server.py.047"))
                 if self._save_project_dir_status() is False:
@@ -1224,6 +1293,11 @@ class KnoweServer:
                         )
                     except Exception:  # noqa: BLE001
                         log.exception(msg("server.py.049"), project_id)
+                if self.groups is not None:
+                    try:
+                        self.groups.rename(self.groups.resolve_group_id(project_id), old_name)
+                    except Exception:  # noqa: BLE001 -- preserve original rename failure
+                        log.exception("[%s] Group metadata rename rollback failed", project_id)
                 if old_dir is not None:
                     self.project_dirs[project_id] = old_dir
                 else:
@@ -1294,6 +1368,7 @@ class KnoweServer:
         log.info(msg("server.py.055"), project_id, old_name, new_name)
         return {
             "project_id": project_id,
+            "group_id": self._group_id_for_runtime_project(project_id),
             "project_name": new_name,
             "old_project_name": old_name,
             "project_dir": effective_dir or "",
@@ -2440,7 +2515,9 @@ class KnoweServer:
                      project_id, client.id, since_seq)
         else:
             for ev in events:
-                await client.send(ev)
+                # Enrich legacy durable rows with canonical group_id at the final
+                # transport boundary without rewriting historical JSONL content.
+                await self.hub.send_to(client, ev)
 
         complete: dict[str, Any] = {
             "type": "replay_complete",
@@ -2478,6 +2555,25 @@ class KnoweServer:
         if frame is None:
             await self._server_error(client, msg("server.py.257"))
             return
+
+        # Migration-window transport alias: new callers send group_id, old callers
+        # continue sending project_id.  Handlers below keep their proven runtime logic
+        # and receive only the legacy key after the identities have been cross-checked.
+        wire_group_id = frame.get("group_id")
+        if isinstance(wire_group_id, str) and wire_group_id.strip():
+            try:
+                runtime_project_id = self._runtime_project_id_for_group(wire_group_id.strip())
+                legacy_value = frame.get("project_id")
+                if isinstance(legacy_value, str) and legacy_value.strip():
+                    legacy_runtime = self._canonical_project_id_from_request(legacy_value.strip())
+                    if legacy_runtime != runtime_project_id:
+                        raise ProjectIdResolutionError(
+                            "group_id and project_id identify different groups"
+                        )
+                frame["project_id"] = runtime_project_id
+            except (GroupNotFoundError, ProjectIdResolutionError) as exc:
+                await self._server_error(client, str(exc))
+                return
 
         mtype = frame.get("type")
         try:
@@ -3286,6 +3382,16 @@ class KnoweServer:
         if not raw or len(raw) > 256:
             raise ProjectIdResolutionError(msg("server.py.106"))
 
+        # Group-domain callers may send the canonical opaque group_id.  Translate it
+        # exactly once at the runtime seam; the historical engine/event store remains
+        # keyed by its project id during the migration compatibility window.
+        groups = getattr(self, "groups", None)
+        if groups is not None:
+            try:
+                return groups.runtime_project_id(raw)
+            except GroupNotFoundError:
+                pass
+
         if raw == PLATFORM_PROJECT_ID:
             if allocate:
                 raise ProjectIdResolutionError(msg("server.py.107"))
@@ -3407,6 +3513,20 @@ class KnoweServer:
             )
             self._persisted_project_ids.add(project_id)
             self._write_projects_index()          # [v0.12 D 6a/6d] 刷新人读索引
+
+        # New Group metadata is created alongside the legacy runtime registry.  Existing
+        # projects have already been copied by migration v3; this branch only covers a
+        # freshly-created group arriving through an old create_project command.
+        if self.groups is not None:
+            try:
+                group_id = self.groups.resolve_group_id(project_id)
+                self.groups.rename(group_id, proj.name)
+            except GroupNotFoundError:
+                self.groups.create_group(
+                    proj.name,
+                    template=GroupTemplate.CUSTOM,
+                    legacy_project_id=project_id,
+                )
 
         # [v0.16] 项目一建好，就把 internal memory/context.md 落出来（哪怕还没内容）。
         try:
@@ -3876,6 +3996,20 @@ class KnoweServer:
                 "/projects/fold": {"POST"},
                 "/projects/rename": {"POST"},
                 "/projects/permanent-delete": {"POST"},
+                "/groups": {"GET"},
+                "/groups/create": {"POST"},
+                "/groups/rename": {"POST"},
+                "/groups/duplicate": {"POST"},
+                "/groups/archive": {"POST"},
+                "/groups/restore": {"POST"},
+                "/groups/delete-preview": {"POST"},
+                "/groups/delete": {"POST"},
+                "/groups/course-bind": {"POST"},
+                "/groups/course-unbind": {"POST"},
+                "/groups/source-link": {"POST"},
+                "/groups/source-unlink": {"POST"},
+                "/groups/roster-update": {"POST"},
+                "/groups/runtime-summary": {"POST"},
                 "/agents/permanent-delete": {"POST"},
                 "/preview/resolve": {"GET"},
                 "/files/reveal": {"POST"},
@@ -4011,6 +4145,16 @@ class KnoweServer:
                 # [v0.44.8] 群聊列表右键菜单。状态以后端为真源，所有窗口经广播/HTTP 对账。
                 if path == "/projects/menu-state" and method == "GET":
                     await self._serve_project_menu_state(writer)
+                    await writer.drain()
+                    return
+
+                if path == "/groups" and method == "GET":
+                    await self._serve_groups_list(writer)
+                    await writer.drain()
+                    return
+
+                if path.startswith("/groups/") and method == "POST":
+                    await self._serve_group_operation(writer, path, body_bytes)
                     await writer.drain()
                     return
 
@@ -4168,7 +4312,7 @@ class KnoweServer:
         return payload
 
     def _menu_project_id(self, payload: dict[str, Any]) -> str:
-        raw = payload.get("project_id")
+        raw = payload.get("group_id") or payload.get("project_id")
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError(msg("server.py.129"))
         try:
@@ -4191,7 +4335,7 @@ class KnoweServer:
         "project does not exist".  ``requested`` is echoed so the renderer can reconcile
         an old optimistic alias with the authoritative id.
         """
-        raw = payload.get("project_id")
+        raw = payload.get("group_id") or payload.get("project_id")
         if not isinstance(raw, str) or not raw.strip():
             raise ValueError(msg("server.py.129"))
         requested = raw.strip()
@@ -5353,12 +5497,22 @@ class KnoweServer:
                 else f"del_{uuid.uuid4().hex[:12]}"
             )
             project_id, requested_project_id, already_deleted = self._project_delete_target(payload)
+            group_preview = None
+            group_id = self._group_id_for_runtime_project(project_id)
+            if group_id and self.groups is not None:
+                group_preview = self.groups.delete_preview(group_id)
             result = (
                 await self._resume_committed_project_delete(project_id, operation_id)
                 if already_deleted
                 else await self._delete_project_permanently(project_id, operation_id)
             )
             result["request_project_id"] = requested_project_id
+            if group_preview is not None and self.groups is not None:
+                receipt = self.groups.confirmed_delete(
+                    group_preview.group_id, group_preview.confirmation_token,
+                )
+                result["group_id"] = group_preview.group_id
+                result["deletion_receipt"] = receipt.to_dict()
         except ValueError as exc:
             self._preview_error(writer, b"400 Bad Request", str(exc))
             return
@@ -5416,6 +5570,151 @@ class KnoweServer:
         body = json.dumps({"ok": True, **result}, ensure_ascii=False).encode("utf-8")
         self._write_http(writer, b"200 OK", body, b"application/json; charset=utf-8")
 
+    async def _serve_groups_list(self, writer: asyncio.StreamWriter) -> None:
+        if self.groups is None:
+            self._preview_error(writer, b"503 Service Unavailable", "Group persistence is unavailable")
+            return
+        groups = [group.to_dict() for group in self.groups.list_groups(include_archived=True)]
+        body = json.dumps(
+            {"ok": True, "schema_version": 1, "groups": groups}, ensure_ascii=False,
+        ).encode("utf-8")
+        self._write_http(writer, b"200 OK", body, b"application/json; charset=utf-8")
+
+    async def _serve_group_operation(
+        self, writer: asyncio.StreamWriter, path: str, body_bytes: bytes,
+    ) -> None:
+        """Versioned Group lifecycle API with project_id accepted only as an alias."""
+        if self.groups is None:
+            self._preview_error(writer, b"503 Service Unavailable", "Group persistence is unavailable")
+            return
+        try:
+            payload = self._decode_json_object(body_bytes)
+            if path == "/groups/create":
+                name = payload.get("name", payload.get("group_name", payload.get("project_name")))
+                if not isinstance(name, str):
+                    raise ValueError("group name is required")
+                template = GroupTemplate(str(payload.get("template") or GroupTemplate.CUSTOM.value))
+                optional_roles = payload.get("optional_roles") or []
+                experts = payload.get("experts") or []
+                if not isinstance(optional_roles, list) or not isinstance(experts, list):
+                    raise ValueError("optional_roles and experts must be arrays")
+                # The existing chat runtime needs an opaque adapter id.  It is not a
+                # user-derived filename and remains hidden behind canonical group_id.
+                runtime_id = self._allocate_canonical_project_id()
+                group = self.groups.create_group(
+                    name, template=template, optional_roles=optional_roles, experts=experts,
+                    budget=payload.get("budget"), legacy_project_id=runtime_id,
+                    model_overrides=payload.get("model_overrides") if isinstance(payload.get("model_overrides"), dict) else None,
+                    tool_overrides=payload.get("tool_overrides") if isinstance(payload.get("tool_overrides"), dict) else None,
+                )
+                project_dir = payload.get("project_dir")
+                try:
+                    await self.create_project(runtime_id, group.name, project_dir)
+                except Exception:
+                    preview = self.groups.delete_preview(group.group_id)
+                    self.groups.confirmed_delete(group.group_id, preview.confirmation_token)
+                    raise
+                result: dict[str, Any] = {
+                    "group": self.groups.get(group.group_id).to_dict(),
+                    "group_id": group.group_id,
+                    "project_id": runtime_id,
+                }
+            else:
+                group_id, runtime_id, requested_project_id = self._canonical_group_from_payload(payload)
+                if path == "/groups/rename":
+                    name = payload.get("name", payload.get("group_name", payload.get("project_name")))
+                    if runtime_id in self.hub.projects:
+                        await self._rename_project(str(runtime_id), name)
+                        group = self.groups.get(group_id)
+                    else:
+                        group = self.groups.rename(group_id, str(name or ""))
+                    result = {"group": group.to_dict()}
+                elif path == "/groups/duplicate":
+                    name = payload.get("name", payload.get("group_name"))
+                    group = self.groups.duplicate(group_id, name=name if isinstance(name, str) else None)
+                    result = {"group": group.to_dict()}
+                elif path == "/groups/archive":
+                    result = {"group": self.groups.archive(group_id).to_dict()}
+                elif path == "/groups/restore":
+                    result = {"group": self.groups.restore(group_id).to_dict()}
+                elif path == "/groups/delete-preview":
+                    result = {"preview": self.groups.delete_preview(group_id).to_dict()}
+                elif path == "/groups/delete":
+                    token = payload.get("confirmation_token")
+                    if not isinstance(token, str):
+                        raise ValueError("confirmation_token is required")
+                    # Validate before touching runtime data; then perform its proven
+                    # transactional delete and finally commit the content-free receipt.
+                    current = self.groups.delete_preview(group_id)
+                    if current.confirmation_token != token:
+                        raise StaleDeletePreviewError("delete preview is stale or was not confirmed")
+                    legacy_result: dict[str, Any] | None = None
+                    if runtime_id and runtime_id in self.hub.projects:
+                        legacy_result = await self._delete_project_permanently(runtime_id)
+                    receipt = self.groups.confirmed_delete(group_id, token)
+                    result = {
+                        "deleted": True, "receipt": receipt.to_dict(),
+                        "legacy_cleanup_pending": bool(legacy_result and legacy_result.get("cleanup_pending")),
+                    }
+                elif path == "/groups/course-bind":
+                    course_id = payload.get("course_id")
+                    if not isinstance(course_id, str):
+                        raise ValueError("course_id is required")
+                    result = {"binding": asdict(self.groups.bind_course(group_id, course_id))}
+                elif path == "/groups/course-unbind":
+                    course_id = payload.get("course_id")
+                    if not isinstance(course_id, str):
+                        raise ValueError("course_id is required")
+                    result = {"removed": self.groups.unbind_course(group_id, course_id)}
+                elif path == "/groups/source-link":
+                    source_id = payload.get("source_id")
+                    if source_id is not None and not isinstance(source_id, str):
+                        raise ValueError("source_id must be a string")
+                    link = self.groups.link_source(group_id, source_id)
+                    result = {
+                        "link": asdict(link),
+                        "reference_count": self.groups.source_reference_count(link.source_id),
+                    }
+                elif path == "/groups/source-unlink":
+                    source_id = payload.get("source_id")
+                    if not isinstance(source_id, str):
+                        raise ValueError("source_id is required")
+                    result = {"removed": self.groups.unlink_source(group_id, source_id)}
+                elif path == "/groups/roster-update":
+                    raw_roster = payload.get("roster")
+                    if not isinstance(raw_roster, list):
+                        raise ValueError("roster must be an array")
+                    roster = [
+                        GroupAgent.from_dict(row) if isinstance(row, dict) else row
+                        for row in raw_roster
+                    ]
+                    result = {"group": self.groups.update_roster(group_id, roster).to_dict()}
+                elif path == "/groups/runtime-summary":
+                    summary = self.groups.runtime_summary(group_id)
+                    result = {
+                        "summary": {
+                            **asdict(summary),
+                            "lifecycle": summary.lifecycle.value,
+                        },
+                    }
+                else:
+                    self._preview_error(writer, b"404 Not Found", "not found")
+                    return
+                result.setdefault("group_id", group_id)
+                result.setdefault("project_id", runtime_id)
+                if requested_project_id:
+                    result["request_project_id"] = requested_project_id
+        except (ValueError, GroupDomainError) as exc:
+            self._preview_error(writer, b"400 Bad Request", str(exc))
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("Group operation failed: %s", path)
+            self._preview_error(writer, b"500 Internal Server Error", "Group operation failed")
+            return
+
+        body = json.dumps({"ok": True, **result}, ensure_ascii=False).encode("utf-8")
+        self._write_http(writer, b"200 OK", body, b"application/json; charset=utf-8")
+
     async def _serve_project_menu_state(self, writer: asyncio.StreamWriter) -> None:
         body = json.dumps(
             {"ok": True, "version": 1, "projects": self._conversation_state_rows()},
@@ -5444,6 +5743,7 @@ class KnoweServer:
         body = json.dumps(
             {
                 "ok": True,
+                "group_id": self._group_id_for_runtime_project(project_id),
                 "project_id": project_id,
                 "project_name": self.hub.projects[project_id].name,
                 **row,
