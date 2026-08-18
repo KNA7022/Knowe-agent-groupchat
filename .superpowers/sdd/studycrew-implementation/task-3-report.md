@@ -179,3 +179,70 @@ Frontend probes cover forged envelopes/snapshots, unsupported versions and IDs, 
 - The authoritative chat route is now ahead of legacy execution and its events are broadcast/replayable, but the historical worker engine is not yet converted into a step-by-step Task Runtime executor. That later Harness integration must consume the existing state-machine interfaces rather than bypass them.
 - The App consumes public events and reconnect snapshots and resynchronizes gaps. The visual Agent status bar/event drawer remains intentionally deferred to Task 4.
 - The current SQLite transaction/CAS and scheduler lease are correct for the single-desktop deployment. A future multi-process or remote deployment would need a database/lease design appropriate to that topology; multi-tenant deployment is explicitly outside the approved product scope.
+
+## Independent re-review fix round 2/5
+
+The first re-review found one remaining Critical and seven Important issues. This round closes all eight while preserving the previously accepted deletion-token, Verifier, approval-scope, finite-number, versioned-contract, and live transport behavior.
+
+### Durable deletion mutation fence (C1)
+
+- A `studycrew_group_deletions` row is now a permanent SQLite mutation fence. `create_run()` and every run mutation inspect it inside their write transaction, closing the cleanup-to-Group-commit race even across independent service instances.
+- Service entry points additionally reject a prepared GroupRepository delete transaction before the Task Runtime intent has been copied. Submit, route, approval, grant revocation, tool, checkpoint, Verifier, resume/control, scheduler dispatch, and Agent updates cannot mutate a fenced Group.
+- Scheduler candidate selection excludes either Group or runtime deletion intent, while the transactional fence still wins if deletion begins after selection.
+- Cleanup and both service/server startup reconciliation re-sweep every deletion intent, including a previously marked-complete intent. Residue written by an older binary or pre-fence race is removed rather than bricking startup; canonical deleted content remains unreadable.
+
+### Stable idempotency winners (I2, I6)
+
+- Approval requests, approval resolution/grants, checkpoints, Verifier decisions, and both authorized/blocked tool preparations reload and return the committed side record after the atomic event transaction.
+- A loser that observes the winning `(run_id, idempotency_key)` event can no longer return its locally generated approval, grant, checkpoint, decision, or invocation identity.
+- Deterministic two-service barriers force both callers past the initial empty lookup. All callers receive the same durable ID/payload; tool budget/audit is recorded exactly once.
+
+### Crash-held scheduler lease recovery (I3)
+
+- A failed startup lease acquisition reads the durable expiry and arms a daemon retry timer for just after that boundary. If another process renews the lease, `schedule()` arms the next bounded retry.
+- The retry runs under the service lifecycle lock. `close()` cancels the timer, fences callbacks, conditionally releases its own lease, and closes the store without a watcher/use-after-close race.
+- A short-expiry crash-owner probe verifies that an eligible queued run starts without any external message or mutation.
+
+### Centralized public-value DLP (I7)
+
+- Backend and frontend public contracts now classify credential values (Authorization/Bearer, API keys, tokens, passwords, cookies) plus contact/identity PII, student identifiers, numeric grades/ranks/GPA, detectable name/course-schedule associations, and identifiable private-note markers.
+- Public TaskRun titles/summaries, Agent status, approval summary, checkpoint label, tool summary, nested event values, and migration output use the same classification boundary. Normal message routing never copies user text into public status; raw content remains only in the sensitive event column.
+- TaskRun and route/run events expose only a fixed-label `data_classification`/`classification` list. Arbitrary classification strings cannot be used to smuggle content.
+- Exact probes `张三成绩95分，排名第2` and `Authorization: Bearer sk-secret` are rejected by public contracts and absent from title, snapshot, replayable events, and public Hub payloads.
+
+### Replay identity and cursor binding (I9)
+
+- `RuntimeReplaySchema` binds its snapshot run and every event to the outer run/group, binds snapshot cursors to both its nested run and replay tail, requires a snapshot only for a gap, and validates contiguous non-gap event sequence/tail.
+- The store repeats identity and local-cursor checks before any mutation. Forged gap snapshots and non-gap events reject with the requested projection unchanged and no cross-run map entry.
+
+### Forward migration (N1)
+
+- Runtime schema initialization now creates base tables first, then performs one transactional/idempotent v1 migration before creating the pending-approval and idempotency indexes.
+- Existing approvals, grants, tools, TaskRuns, Agent public statuses, and public events receive safe purpose/scope/disposition/classification defaults and public-value scrubbing before hydration.
+- Multiple legacy pending approvals are ordered deterministically by `(run_id, created_at, approval_id)`. The first remains pending; each loser becomes rejected and receives an opaque tombstone containing loser ID, winner ID, run ID, resolution, and migration time—never the private request body.
+- A crash rolls the migration back; a crash after migration but before index creation is safe to rerun. Seeded prior-v1 rows open successfully on two consecutive restarts.
+
+### Trusted production completion bridge (N2)
+
+- `ProjectEngine.submit_tracked()` attaches a trusted Future to the actual queued Engine turn. The Engine loop resolves it only after the Coordinator/Agent turn exits and classifies success, cancellation, execution exception, or executor-precondition failure.
+- Server bridge tasks translate that trusted outcome into `begin_verification`, the mandatory Group Verifier AgentRun, an evidence/version-bound decision, and terminal completion. No client-controlled Verifier approval is introduced.
+- Successful and partial results bind an opaque Engine completion evidence reference. Failed execution is verified as failed without fabricating positive evidence. Directory, workspace, attachment, submission, and Engine exceptions no longer strand running capacity.
+- Stable executor-derived keys make duplicate lifecycle notifications no-ops. Terminal completion calls the scheduler, allowing the next queued primary to start.
+
+### Round-2 regression evidence
+
+- `py -3.12 -m pytest backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime.py backend/tests/test_task_runtime_review_fixes.py -q` -> `47 passed in 6.63s`.
+- `py -3.12 -m pytest backend/tests/test_groups.py backend/tests/test_group_http.py backend/tests/test_task_runtime.py backend/tests/test_task_runtime_review_fixes.py backend/tests/test_task_runtime_rereview_round2.py -q` -> `71 passed in 9.84s`.
+- `npm test -- --run src/contract/taskRuntime.test.ts src/store/taskRuntime.test.ts src/contract/group.test.ts` -> `3 files passed, 19 tests passed`.
+- `npx tsc --noEmit --target ES2020 --module ESNext --moduleResolution bundler --strict --skipLibCheck --esModuleInterop --jsx react-jsx src/contract/taskRuntime.ts src/contract/envelope.ts src/store/taskRuntime.ts` -> pass.
+- Focused ESLint over the Task Runtime contract/store, App/transport integration, fixtures, and tests -> pass with no diagnostics.
+- Python compilation of Engine, Server, Task Runtime contracts/store/service, and round-2 probes -> pass.
+- `git diff --check` -> no whitespace errors; only the repository's Windows LF-to-CRLF notices.
+
+The round-2 backend probes include deterministic late-submit/side-record/dispatch deletion races, post-commit residue restart cleanup, two-service idempotency winners, crash-lease automatic retry and watcher shutdown, exact value-DLP strings, prior-v1 migration/deduplication, trusted live Engine completion, duplicate notification idempotency, next-run scheduling, and verified partial/failed outcomes. Frontend probes cover forged nested gap snapshots and non-gap events with zero projection mutation.
+
+### Baseline note and remaining planned boundary
+
+- `backend/tests/test_worker_completion_v1.py` remains green. In the adjacent `test_engine_display_name.py` run, three existing locale expectations still fail because production returns `Leader` while the tests expect `Coordinator`; this is unrelated to the tracked-turn bridge and was not changed.
+- The previous report's statement that legacy execution had no terminal bridge is superseded by this round. The Engine is now connected at its real turn-completion boundary, while deeper per-step Agent/Tool execution projection remains a later Harness integration.
+- Task 4 visual status bar/event drawer and Task 5 full Tool Gateway/DLP/MCP internals remain intentionally outside this patch.

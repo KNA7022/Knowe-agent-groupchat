@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   RunEventSchema,
+  RuntimeReplaySchema,
   TaskRunSchema,
   ToolInvocationSchema,
 } from './taskRuntime';
@@ -78,6 +79,42 @@ describe('Task Runtime public contracts', () => {
     expect(() => RunEventSchema.parse({
       ...base, public_payload: { status: 'running', summary: 'student@example.edu' },
     })).toThrow(/private data/);
+    for (const value of ['张三成绩95分，排名第2', 'Authorization: Bearer sk-secret']) {
+      expect(() => RunEventSchema.parse({
+        ...base, event_type: 'message_routed',
+        public_payload: { route_label: 'queue_new', summary: value },
+      })).toThrow(/private data/);
+      expect(() => TaskRunSchema.parse(taskRunFixture({ title: value }))).toThrow(/sensitive/);
+    }
+  });
+
+  it('binds every replay snapshot/event and cursor to the addressed run', () => {
+    const snapshot = taskRunFixture({ version: 3, last_seq: 3 });
+    const base = {
+      schema_version: 1, run_id: runId, group_id: groupId,
+      after_seq: 1, last_seq: 3, version: 3, gap: true, events: [],
+      snapshot: { schema_version: 1, run: snapshot, last_seq: 3, version: 3 },
+    };
+    expect(RuntimeReplaySchema.parse(base).snapshot?.run.run_id).toBe(runId);
+    expect(() => RuntimeReplaySchema.parse({
+      ...base,
+      snapshot: {
+        ...base.snapshot,
+        run: taskRunFixture({ run_id: `run_${'8'.repeat(32)}`, version: 3, last_seq: 3 }),
+      },
+    })).toThrow(/identity/);
+    expect(() => RuntimeReplaySchema.parse({
+      ...base, snapshot: { ...base.snapshot, last_seq: 2 },
+    })).toThrow(/cursor/);
+    expect(() => RuntimeReplaySchema.parse({
+      ...base, gap: false, snapshot: null, last_seq: 2, version: 2,
+      events: [{
+        event_id: `evt_${'9'.repeat(32)}`, run_id: `run_${'8'.repeat(32)}`,
+        group_id: groupId, seq: 2, version: 2, event_type: 'status_changed',
+        public_payload: { status: 'running' }, sensitivity: 'public',
+        created_at: '2026-08-18T00:00:01Z', schema_version: 1,
+      }],
+    })).toThrow(/identity/);
   });
 
   it('rejects a forged live envelope whose group differs from its RunEvent', () => {

@@ -48,7 +48,7 @@ _PRIVATE_PUBLIC_KEYS = {
 }
 
 _PUBLIC_EVENT_FIELDS: dict[str, frozenset[str]] = {
-    "run_queued": frozenset({"status", "kind", "route_label", "summary"}),
+    "run_queued": frozenset({"status", "kind", "route_label", "summary", "classification"}),
     "status_changed": frozenset({"from", "status", "summary", "blocking_reason", "failure_type"}),
     "agent_phase_changed": frozenset({"agent_id", "role", "phase", "operation_summary", "blocking_reason"}),
     "budget_updated": frozenset({"usage", "limits", "exhausted_dimension", "status"}),
@@ -56,7 +56,7 @@ _PUBLIC_EVENT_FIELDS: dict[str, frozenset[str]] = {
     "approval_requested": frozenset({"status", "approval"}),
     "approval_resolved": frozenset({"status", "approval_id", "resolution", "failure_type"}),
     "checkpoint_created": frozenset({"label"}),
-    "message_routed": frozenset({"route_label", "summary"}),
+    "message_routed": frozenset({"route_label", "summary", "classification"}),
     "restart_recovery": frozenset({"status", "blocking_reason"}),
     "tool_prepared": frozenset({"status", "invocation_id", "tool_name", "disposition", "usage"}),
     "verifier_decision": frozenset({"status", "decision_id", "outcome", "approved", "evidence_count"}),
@@ -69,11 +69,44 @@ _ID_PATTERNS = {
     "invocation_id": re.compile(r"^tool_[0-9a-f]{32}$"), "checkpoint_id": re.compile(r"^ckp_[0-9a-f]{32}$"),
     "decision_id": re.compile(r"^vfd_[0-9a-f]{32}$"), "group_id": re.compile(r"^grp_[0-9a-f]{32}$"),
 }
-_PUBLIC_PII_PATTERNS = (
-    re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"),
-    re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
-    re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)"),
+_PUBLIC_VALUE_CLASSIFIERS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("credential", re.compile(
+        r"(?i)(?:authorization\s*:\s*bearer\s+\S+|\bbearer\s+(?:sk-|pk-|tok_)?[A-Za-z0-9._-]{6,}|"
+        r"\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|cookie)\s*[:=]\s*\S+|"
+        r"\bsk-[A-Za-z0-9._-]{6,})"
+    )),
+    ("contact_pii", re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")),
+    ("contact_pii", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")),
+    ("identity_pii", re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)")),
+    ("student_identifier", re.compile(r"(?i)(?:学号|student\s*id)\s*[:：#]?\s*[A-Za-z0-9_-]{4,}")),
+    ("academic_record", re.compile(
+        r"(?i)(?:成绩|分数|绩点|排名|名次|grade|score|class\s+rank|academic\s+rank)\s*(?:为|是|[:：]?\s*)?(?:第\s*)?\d+(?:\.\d+)?(?:\s*[分名])?"
+    )),
+    ("name_pii", re.compile(r"[\u4e00-\u9fff]{2,4}(?=.{0,10}(?:成绩|分数|绩点|排名|名次))")),
+    ("timetable_association", re.compile(
+        r"(?:[\u4e00-\u9fff]{2,4}的(?:课表|课程表|上课时间)|姓名\s*[:：]\s*[\u4e00-\u9fff]{2,4}.{0,12}(?:课表|课程表|上课时间))"
+    )),
+    ("private_note", re.compile(r"(?i)(?:私人|私密|个人)笔记|private\s+(?:note|journal)")),
 )
+_PUBLIC_CLASSIFICATION_LABELS = frozenset(label for label, _pattern in _PUBLIC_VALUE_CLASSIFIERS)
+
+
+def classify_public_text(value: str) -> tuple[str, ...]:
+    """Return content classifications without retaining or echoing the value."""
+    text = str(value or "")
+    return tuple(dict.fromkeys(
+        label for label, pattern in _PUBLIC_VALUE_CLASSIFIERS if pattern.search(text)
+    ))
+
+
+def safe_public_text(value: str, *, fallback: str) -> tuple[str, tuple[str, ...]]:
+    classifications = classify_public_text(value)
+    return (fallback, classifications) if classifications else (str(value), ())
+
+
+def assert_public_text(value: str, *, field_name: str) -> None:
+    if classify_public_text(value):
+        raise ValueError(f"sensitive value is forbidden in public field: {field_name}")
 
 
 def _schema_version(raw: Mapping[str, Any]) -> int:
@@ -102,8 +135,8 @@ def assert_public_payload(event_type: str, value: Mapping[str, Any]) -> None:
         elif isinstance(item, (list, tuple)):
             for child in item:
                 walk(child)
-        elif isinstance(item, str) and any(pattern.search(item) for pattern in _PUBLIC_PII_PATTERNS):
-            raise ValueError("PII is forbidden in public payload")
+        elif isinstance(item, str) and classify_public_text(item):
+            raise ValueError("PII or credential value is forbidden in public payload")
 
     walk(value)
     allowed = _PUBLIC_EVENT_FIELDS.get(event_type)
@@ -112,6 +145,11 @@ def assert_public_payload(event_type: str, value: Mapping[str, Any]) -> None:
     extra = set(value) - allowed
     if extra:
         raise ValueError(f"unsupported public payload fields for {event_type}: {sorted(extra)}")
+    if "classification" in value:
+        labels = value["classification"]
+        if (not isinstance(labels, (list, tuple))
+                or not set(str(item) for item in labels).issubset(_PUBLIC_CLASSIFICATION_LABELS)):
+            raise ValueError("invalid public data classification metadata")
 
 
 class TaskStatus(str, Enum):
@@ -309,6 +347,8 @@ class AgentRun:
         _validate_contract(self.schema_version, agent_run_id=self.agent_run_id, run_id=self.run_id)
         if not self.agent_id.strip() or not self.role.strip() or self.version < 1:
             raise ValueError("AgentRun agent_id, role and positive version are required")
+        assert_public_text(self.operation_summary, field_name="AgentRun.operation_summary")
+        assert_public_text(self.blocking_reason, field_name="AgentRun.blocking_reason")
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -383,6 +423,7 @@ class ApprovalRequest:
             raise ValueError("approval purpose is required")
         if self.status not in {"pending", "approved", "rejected"}:
             raise ValueError("invalid approval status")
+        assert_public_text(self.summary, field_name="ApprovalRequest.summary")
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -444,6 +485,7 @@ class ToolInvocation:
             raise ValueError("tool name, idempotency key and purpose are required")
         if self.disposition not in {"created", "requires_new_approval", "recovered_blocked"}:
             raise ValueError("invalid tool disposition")
+        assert_public_text(self.public_summary, field_name="ToolInvocation.public_summary")
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -468,6 +510,7 @@ class Checkpoint:
         )
         if self.seq < 1 or self.version < 1 or not self.label.strip():
             raise ValueError("checkpoint seq, version and label are required")
+        assert_public_text(self.label, field_name="Checkpoint.label")
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -495,6 +538,7 @@ class TaskRun:
     failure_type: FailureType | None = None
     public_summary: str = ""
     blocking_reason: str = ""
+    data_classification: tuple[str, ...] = ()
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     started_at: str | None = None
@@ -513,6 +557,11 @@ class TaskRun:
             raise ValueError("side runs must be low-risk and read-only")
         if self.queue_class is QueueClass.INDEX and self.kind is not RunKind.SIDE:
             raise ValueError("index jobs use isolated side-run capacity")
+        assert_public_text(self.title, field_name="TaskRun.title")
+        assert_public_text(self.public_summary, field_name="TaskRun.public_summary")
+        assert_public_text(self.blocking_reason, field_name="TaskRun.blocking_reason")
+        if not set(self.data_classification).issubset(_PUBLIC_CLASSIFICATION_LABELS):
+            raise ValueError("TaskRun data classification contains an unsupported label")
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -538,6 +587,7 @@ class TaskRun:
             failure_type=FailureType(str(raw["failure_type"])) if raw.get("failure_type") else None,
             public_summary=str(raw.get("public_summary") or ""),
             blocking_reason=str(raw.get("blocking_reason") or ""),
+            data_classification=tuple(str(item) for item in raw.get("data_classification") or ()),
             created_at=str(raw.get("created_at") or utc_now()), updated_at=str(raw.get("updated_at") or utc_now()),
             started_at=str(raw["started_at"]) if raw.get("started_at") else None,
             finished_at=str(raw["finished_at"]) if raw.get("finished_at") else None,
@@ -550,5 +600,6 @@ __all__ = [
     "BudgetLimits", "BudgetUsage", "Checkpoint", "EvidenceRef", "FailureType",
     "PermissionGrant", "QueueClass", "RiskLevel", "RouteLabel", "RunEvent",
     "RunKind", "TaskRun", "TaskStatus", "ToolInvocation", "assert_public_payload",
-    "VerifierDecision", "opaque_id", "utc_now",
+    "VerifierDecision", "assert_public_text", "classify_public_text", "safe_public_text",
+    "opaque_id", "utc_now",
 ]

@@ -285,7 +285,9 @@ async def test_live_chat_and_http_mutations_broadcast_replayable_public_events(
     })
     await asyncio.sleep(0.05)
     runs = server.task_runtime.store.list_runs(group_id=group.group_id)  # type: ignore[union-attr]
-    assert len(runs) == 1 and runs[0].status is TaskStatus.RUNNING
+    # The authoritative execution bridge now reflects the directory precondition
+    # failure as terminal instead of leaking primary capacity indefinitely.
+    assert len(runs) == 1 and runs[0].status is TaskStatus.FAILED
     public = [
         event for event in server.hub.projects["project_live"].ring.events()
         if event.get("type") == "task_runtime_event"

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { taskRunFixture } from '../contract/taskRuntime.fixture';
 import { useTaskRuntimeStore } from './taskRuntime';
@@ -41,6 +41,10 @@ function snapshot(runs: unknown[] = [taskRunFixture()], pendingApprovals: unknow
 describe('authoritative Task Runtime projection', () => {
   beforeEach(() => {
     useTaskRuntimeStore.setState({ byRun: {}, byGroup: {}, approvals: {}, error: null });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it('ingests a group snapshot and applies only contiguous monotonic events', () => {
@@ -107,5 +111,36 @@ describe('authoritative Task Runtime projection', () => {
     expect(useTaskRuntimeStore.getState().applyEvent(groupId, event(2, 3))).toBe(false);
     expect(useTaskRuntimeStore.getState().applyEvent(groupId, event(4, 5))).toBe(false);
     expect(useTaskRuntimeStore.getState().byRun[runId]?.needsResync).toBe(true);
+  });
+
+  it.each([
+    {
+      name: 'gap snapshot',
+      replay: {
+        schema_version: 1, run_id: runId, group_id: groupId,
+        after_seq: 1, last_seq: 3, version: 3, gap: true, events: [],
+        snapshot: {
+          schema_version: 1,
+          run: taskRunFixture({ run_id: `run_${'8'.repeat(32)}`, version: 3, last_seq: 3 }),
+          last_seq: 3, version: 3,
+        },
+      },
+    },
+    {
+      name: 'contiguous event',
+      replay: {
+        schema_version: 1, run_id: runId, group_id: groupId,
+        after_seq: 1, last_seq: 2, version: 2, gap: false, snapshot: null,
+        events: [event(2, 2, { run_id: `run_${'8'.repeat(32)}` })],
+      },
+    },
+  ])('rejects a forged nested $name without cross-run mutation', async ({ replay }) => {
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot());
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(replay), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    })));
+    await expect(useTaskRuntimeStore.getState().reconcile(groupId, runId)).rejects.toThrow(/replay/i);
+    expect(useTaskRuntimeStore.getState().byRun[runId]?.run.last_seq).toBe(1);
+    expect(useTaskRuntimeStore.getState().byRun[`run_${'8'.repeat(32)}`]).toBeUndefined();
   });
 });

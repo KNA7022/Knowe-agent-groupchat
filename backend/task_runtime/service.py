@@ -5,7 +5,6 @@ from __future__ import annotations
 import threading
 import sqlite3
 import math
-import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,10 +30,11 @@ from .contracts import (
     TaskStatus,
     ToolInvocation,
     VerifierDecision,
+    classify_public_text,
     opaque_id,
     utc_now,
 )
-from .store import TaskRuntimeStore
+from .store import RuntimeStoreError, TaskRuntimeStore
 
 
 class RuntimeNotFoundError(RuntimeError):
@@ -113,21 +113,38 @@ class TaskRuntimeService:
     GLOBAL_INDEX_LIMIT = 1
     GROUP_SIDE_LIMIT = 2
     ROUTE_AUTO_CONFIDENCE = 0.85
+    SCHEDULER_LEASE_SECONDS = 30.0
 
     def __init__(self, data_root: str | Path, groups: GroupRepository) -> None:
         self.groups = groups
         self.store = TaskRuntimeStore(Path(data_root) / "runtime" / "task-runtime-v1.sqlite3")
         self._lock = threading.RLock()
         self._scheduler_owner = opaque_id("lease")
-        self.recovery_report = self.recover_after_restart()
-        self.recovery_report["deletions"] = self.reconcile_group_deletions()
+        self._scheduler_retry: threading.Timer | None = None
+        self._closed = False
+        self.recovery_report = {"deletions": self.reconcile_group_deletions()}
+        self.recovery_report.update(self.recover_after_restart())
         self.recovery_report["scheduled_runs"] = [run.run_id for run in self.schedule()]
 
     def add_event_listener(self, listener: Any) -> None:
         self.store.add_event_listener(listener)
 
     def close(self) -> None:
-        self.store.close()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            timer = self._scheduler_retry
+            self._scheduler_retry = None
+            if timer is not None:
+                timer.cancel()
+            self.store.release_scheduler_lease(self._scheduler_owner)
+            self.store.close()
+
+    def _assert_group_mutable(self, group_id: str) -> None:
+        transaction = self.groups.delete_transaction(group_id)
+        if transaction is not None or self.store.group_is_deleting(group_id):
+            raise RuntimeConflictError("Task Runtime group is fenced for deletion")
 
     def _canonical_group(self, group_id: str, *, require_active: bool = False) -> str:
         """Internal calls require the canonical opaque ID, never the legacy alias."""
@@ -139,8 +156,10 @@ class TaskRuntimeService:
             raise RuntimeConflictError("archived groups cannot start or resume tasks")
         return group.group_id
 
-    def _owned_run(self, run_id: str, group_id: str) -> TaskRun:
+    def _owned_run(self, run_id: str, group_id: str, *, allow_deleting: bool = False) -> TaskRun:
         canonical = self._canonical_group(group_id)
+        if not allow_deleting:
+            self._assert_group_mutable(canonical)
         run = self.store.get_run(run_id)
         if run is None:
             raise RuntimeNotFoundError(f"run not found: {run_id}")
@@ -162,8 +181,10 @@ class TaskRuntimeService:
         parent_run_id: str | None = None,
         budget_limits: BudgetLimits | None = None,
         public_summary: str = "",
+        data_classification: tuple[str, ...] = (),
     ) -> TaskRun:
         canonical = self._canonical_group(group_id, require_active=True)
+        self._assert_group_mutable(canonical)
         if parent_run_id:
             self._owned_run(parent_run_id, canonical)
         run = TaskRun(
@@ -171,6 +192,7 @@ class TaskRuntimeService:
             kind=kind, title=title, queue_class=queue_class, route_label=route_label,
             read_only=read_only, risk=risk, parent_run_id=parent_run_id,
             budget_limits=budget_limits or BudgetLimits(), public_summary=public_summary,
+            data_classification=tuple(dict.fromkeys(data_classification)),
         )
         stored, _event, _created = self.store.create_run(run, request_key=request_key)
         if stored.group_id != canonical:
@@ -326,7 +348,10 @@ class TaskRuntimeService:
                 "outcome": outcome.value, "approved": approved, "evidence_count": len(evidence),
             }, idempotency_key=request_key, transaction_hook=persist,
         )
-        return decision
+        winner = self.store.verifier_decision_by_request_key(run_id, request_key)
+        if winner is None:
+            raise RuntimeConflictError("Verifier decision idempotency winner is unavailable")
+        return winner
 
     def complete(
         self, group_id: str, run_id: str, *, outcome: TaskStatus,
@@ -363,6 +388,50 @@ class TaskRuntimeService:
         )
         self.schedule()
         return completed
+
+    def finalize_trusted_execution(
+        self, group_id: str, run_id: str, *, execution_key: str,
+        outcome: TaskStatus, evidence: tuple[EvidenceRef, ...] = (),
+        summary: str = "Task execution completed",
+    ) -> TaskRun:
+        """Bridge a trusted executor lifecycle into mandatory Verifier completion.
+
+        This is not exposed as a client decision endpoint.  Every step has a stable
+        executor-derived idempotency key, and the persisted Group Verifier remains the
+        sole producer of the version/evidence-bound completion decision.
+        """
+        if outcome not in {TaskStatus.SUCCEEDED, TaskStatus.PARTIAL, TaskStatus.FAILED}:
+            raise ValueError("trusted execution outcome must be terminal and verifiable")
+        current = self._owned_run(run_id, group_id)
+        if current.status.terminal:
+            return current
+        if current.status is TaskStatus.RUNNING:
+            current = self.begin_verification(
+                group_id, run_id, request_key=f"executor:{execution_key}:begin-verification",
+            )
+        if current.status is not TaskStatus.VERIFYING:
+            raise RuntimeConflictError(
+                f"trusted executor cannot finalize a {current.status.value} run"
+            )
+        group = self.groups.get(current.group_id)
+        verifier = next((agent for agent in group.roster if agent.role == "verifier"), None)
+        if verifier is None:
+            raise RuntimeConflictError("mandatory Group Verifier is unavailable")
+        current = self.update_agent(
+            group_id, run_id, agent_id=verifier.agent_id, role="verifier",
+            phase=AgentPhase.VERIFYING, operation_summary="Verifying executor evidence",
+            idempotency_key=f"executor:{execution_key}:verifier-agent",
+        )
+        self.record_verifier_decision(
+            group_id, run_id, verifier_agent_id=verifier.agent_id,
+            outcome=outcome, approved=True, evidence=evidence,
+            reason="Trusted executor lifecycle verified",
+            request_key=f"executor:{execution_key}:verifier-decision",
+        )
+        return self.complete(
+            group_id, run_id, outcome=outcome,
+            request_key=f"executor:{execution_key}:complete", summary=summary,
+        )
 
     def consume_budget(
         self, group_id: str, run_id: str, delta: BudgetUsage, *, request_key: str,
@@ -447,7 +516,10 @@ class TaskRuntimeService:
             )
         except sqlite3.IntegrityError as exc:
             raise RuntimeConflictError("a pending approval already gates this task") from exc
-        return approval
+        winner = self.store.approval_by_request_key(request_key)
+        if winner is None:
+            raise RuntimeConflictError("approval idempotency winner is unavailable")
+        return winner
 
     def resolve_approval(
         self, group_id: str, approval_id: str, *, approved: bool,
@@ -459,7 +531,7 @@ class TaskRuntimeService:
             raise RuntimeNotFoundError(f"approval not found in group: {approval_id}")
         if approval.status != "pending":
             run = self._owned_run(approval.run_id, canonical)
-            return approval, None, run
+            return approval, self.store.grant_for_approval(approval_id), run
         requested = set(approval.requested_capabilities)
         narrowed = tuple(capabilities) if capabilities else approval.requested_capabilities
         if not set(narrowed).issubset(requested):
@@ -528,7 +600,11 @@ class TaskRuntimeService:
                 transaction_hook=persist_rejection,
             )
             self.schedule()
-        return resolved, grant, run
+        durable_approval = self.store.get_approval(approval_id)
+        if durable_approval is None:
+            raise RuntimeConflictError("resolved approval is unavailable")
+        durable_grant = self.store.grant_for_approval(approval_id) if approved else None
+        return durable_approval, durable_grant, self.store.get_run(run.run_id) or run
 
     def prepare_tool(
         self, group_id: str, run_id: str, *, tool_name: str,
@@ -575,7 +651,10 @@ class TaskRuntimeService:
                         conn, blocked,
                     ),
                 )
-                return blocked
+                winner = self.store.tool_by_key(run_id, idempotency_key)
+                if winner is None:
+                    raise RuntimeConflictError("tool idempotency winner is unavailable")
+                return winner
         invocation = ToolInvocation(
             invocation_id=opaque_id("tool"), run_id=run.run_id, group_id=run.group_id,
             tool_name=tool_name, idempotency_key=idempotency_key, risk=risk,
@@ -616,7 +695,10 @@ class TaskRuntimeService:
             if duplicate is not None:
                 return duplicate
             raise
-        return invocation
+        winner = self.store.tool_by_key(run_id, idempotency_key)
+        if winner is None:
+            raise RuntimeConflictError("tool idempotency winner is unavailable")
+        return winner
 
     def checkpoint(self, group_id: str, run_id: str, *, label: str, request_key: str) -> Checkpoint:
         run = self._owned_run(run_id, group_id)
@@ -640,17 +722,20 @@ class TaskRuntimeService:
             idempotency_key=request_key,
             transaction_hook=persist_checkpoint,
         )
-        return checkpoint
+        winner = self.store.checkpoint_by_key(run_id, request_key)
+        if winner is None:
+            raise RuntimeConflictError("checkpoint idempotency winner is unavailable")
+        return winner
 
     def snapshot(self, group_id: str, run_id: str) -> dict[str, Any]:
-        run = self._owned_run(run_id, group_id)
+        run = self._owned_run(run_id, group_id, allow_deleting=True)
         return {"schema_version": 1, "run": run.to_public_dict(),
                 "last_seq": run.last_seq, "version": run.version}
 
     def replay(
         self, group_id: str, run_id: str, *, after_seq: int, after_version: int | None = None,
     ) -> dict[str, Any]:
-        run = self._owned_run(run_id, group_id)
+        run = self._owned_run(run_id, group_id, allow_deleting=True)
         after_seq = int(after_seq)
         version_ahead = after_version is not None and int(after_version) > run.version
         cursor_ahead = after_seq > run.last_seq
@@ -705,6 +790,7 @@ class TaskRuntimeService:
     def suspend_group(self, group_id: str, *, reason: str) -> tuple[str, ...]:
         """Fence all work before a Group archive/delete lifecycle transition."""
         canonical = self._canonical_group(group_id, require_active=True)
+        self._assert_group_mutable(canonical)
         changed: list[str] = []
         with self._lock:
             for run in self.store.list_runs(group_id=canonical, statuses=_NONTERMINAL):
@@ -734,22 +820,23 @@ class TaskRuntimeService:
         return self.store.prepare_group_deletion(canonical, group_transaction_id)
 
     def clean_prepared_group_deletion(self, group_id: str) -> dict[str, int]:
-        intents = {item["group_id"]: item for item in self.store.pending_group_deletions()}
+        intents = {item["group_id"]: item for item in self.store.group_deletion_intents()}
         intent = intents.get(group_id)
         if intent is None:
             raise RuntimeConflictError("Task Runtime deletion intent is required")
-        if intent["stage"] == "prepared":
-            with self._lock:
-                # Confirmation was already validated and fenced in GroupRepository.
-                if self._group_is_active(group_id):
-                    self.suspend_group(group_id, reason="Group deletion confirmed")
-                counts = self.store.delete_group(group_id)
+        with self._lock:
+            # The durable intent itself is the mutation fence.  Re-clean on every
+            # reconciliation so a row written by an older binary or a pre-fence race
+            # can never brick startup after the canonical Group commit.
+            counts = self.store.delete_group(group_id)
+            if intent["stage"] != "complete":
                 self.store.set_group_deletion_stage(group_id, "runtime_cleaned")
-                return counts
-        return {"runs": 0, "events": 0, "approvals": 0, "grants": 0,
-                "tools": 0, "checkpoints": 0, "verifier_decisions": 0}
+            return counts
 
     def complete_group_deletion(self, group_id: str) -> None:
+        # Idempotently sweep legacy/race residue before marking completion.  The
+        # deletion row remains as a permanent write fence without retaining content.
+        self.store.delete_group(group_id)
         remaining = self.store.group_content_counts(group_id)
         if any(remaining.values()):
             raise RuntimeConflictError(f"Task Runtime content remains after deletion: {remaining}")
@@ -757,11 +844,10 @@ class TaskRuntimeService:
 
     def reconcile_group_deletions(self) -> list[dict[str, str]]:
         report: list[dict[str, str]] = []
-        for intent in self.store.pending_group_deletions():
+        for intent in self.store.group_deletion_intents():
             group_id = intent["group_id"]
             transaction = self.groups.delete_transaction(group_id)
-            if intent["stage"] == "prepared":
-                self.clean_prepared_group_deletion(group_id)
+            self.clean_prepared_group_deletion(group_id)
             if transaction is None or transaction.get("stage") == "committed":
                 self.complete_group_deletion(group_id)
                 report.append({"group_id": group_id, "status": "complete"})
@@ -788,23 +874,60 @@ class TaskRuntimeService:
 
     def _group_is_active(self, group_id: str) -> bool:
         try:
-            return self.groups.get(group_id).lifecycle is GroupLifecycle.ACTIVE
+            return (
+                self.groups.get(group_id).lifecycle is GroupLifecycle.ACTIVE
+                and self.groups.delete_transaction(group_id) is None
+                and not self.store.group_is_deleting(group_id)
+            )
         except GroupNotFoundError:
             return False
 
     def schedule(self) -> tuple[TaskRun, ...]:
+        if self._closed:
+            return ()
         now = datetime.now(timezone.utc)
-        expires = now + timedelta(seconds=30)
+        expires = now + timedelta(seconds=self.SCHEDULER_LEASE_SECONDS)
         if not self.store.acquire_scheduler_lease(
             self._scheduler_owner,
             now=now.isoformat().replace("+00:00", "Z"),
             expires_at=expires.isoformat().replace("+00:00", "Z"),
         ):
+            self._arm_scheduler_retry(self.store.scheduler_lease_expiry())
             return ()
         try:
             return self._schedule_under_lease()
         finally:
             self.store.release_scheduler_lease(self._scheduler_owner)
+
+    def _arm_scheduler_retry(self, expires_at: str | None) -> None:
+        if self._closed:
+            return
+        try:
+            expiry = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            delay = max(0.01, (expiry - datetime.now(timezone.utc)).total_seconds() + 0.02)
+        except (TypeError, ValueError):
+            delay = max(0.05, self.SCHEDULER_LEASE_SECONDS)
+        with self._lock:
+            current = self._scheduler_retry
+            if current is not None and current.is_alive():
+                return
+            timer = threading.Timer(delay, self._retry_scheduler_after_lease)
+            timer.daemon = True
+            self._scheduler_retry = timer
+            timer.start()
+
+    def _retry_scheduler_after_lease(self) -> None:
+        with self._lock:
+            self._scheduler_retry = None
+            if self._closed:
+                return
+            try:
+                self.schedule()
+            except Exception:  # noqa: BLE001 -- background retry is best-effort and bounded
+                # A competing healthy instance may have renewed the lease; schedule()
+                # arms the next expiry retry in that case.  Other errors remain visible
+                # through normal foreground operations without killing this watcher.
+                return
 
     def _schedule_under_lease(self) -> tuple[TaskRun, ...]:
         """Dispatch queued work within all local limits using durable group rotation."""
@@ -868,16 +991,20 @@ class TaskRuntimeService:
             ], "index")[:max(0, index_capacity)]
             started: list[TaskRun] = []
             for run in primary + side + index:
-                routed = self.transition(
-                    run.group_id, run.run_id, TaskStatus.ROUTING,
-                    idempotency_key=f"dispatch:{run.run_id}:{run.version}",
-                    summary="Coordinator routed task",
-                )
-                running = self.transition(
-                    run.group_id, run.run_id, TaskStatus.RUNNING,
-                    idempotency_key=f"start:{run.run_id}:{routed.version}",
-                    summary="Task running",
-                )
+                try:
+                    routed = self.transition(
+                        run.group_id, run.run_id, TaskStatus.ROUTING,
+                        idempotency_key=f"dispatch:{run.run_id}:{run.version}",
+                        summary="Coordinator routed task",
+                    )
+                    running = self.transition(
+                        run.group_id, run.run_id, TaskStatus.RUNNING,
+                        idempotency_key=f"start:{run.run_id}:{routed.version}",
+                        summary="Task running",
+                    )
+                except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError):
+                    # A concurrent durable delete fence wins over dispatch.
+                    continue
                 lane = "index" if run.queue_class is QueueClass.INDEX else run.kind.value
                 self.store.set_scheduler_cursor(lane, run.group_id)
                 started.append(running)
@@ -890,7 +1017,8 @@ class TaskRuntimeService:
     ) -> dict[str, Any]:
         if not math.isfinite(confidence) or not 0 <= confidence <= 1:
             raise ValueError("route confidence must be finite and between 0 and 1")
-        sensitive_outbound = sensitive_outbound or self._contains_pii_or_secret(content)
+        classifications = classify_public_text(content)
+        sensitive_outbound = sensitive_outbound or bool(classifications)
         canonical = self._canonical_group(group_id, require_active=True)
         primary = next((
             run for run in reversed(self.store.list_runs(group_id=canonical))
@@ -907,7 +1035,8 @@ class TaskRuntimeService:
         if label is RouteLabel.SUPPLEMENT_CURRENT and primary is not None and not requires_approval:
             updated, event, _created = self.store.change_run(
                 primary.run_id, event_type="message_routed",
-                public_payload={"route_label": label.value, "summary": "Message supplements current task"},
+                public_payload={"route_label": label.value, "summary": "Message supplements current task",
+                                "classification": list(classifications)},
                 idempotency_key=request_key,
                 sensitive_payload={"content": content}, sensitivity="private",
             )
@@ -916,18 +1045,20 @@ class TaskRuntimeService:
 
         kind = RunKind.SIDE if label is RouteLabel.SIDE_ANSWER and not requires_approval else RunKind.PRIMARY
         protected = requires_approval or sensitive_outbound
-        public_title = "Sensitive or uncertain request awaiting confirmation" if protected else (content[:120] or "New task")
-        public_summary = "Request requires routing confirmation" if protected else content[:160]
+        public_title = "Protected request awaiting confirmation" if protected else "New read-only task"
+        public_summary = "Request requires routing confirmation" if protected else "Read-only request accepted"
         run = self.submit(
             canonical, title=public_title, request_key=request_key,
             kind=kind, route_label=label, read_only=(kind is RunKind.SIDE),
             risk=RiskLevel.LOW if read_only and not writes else RiskLevel.MEDIUM,
             parent_run_id=primary.run_id if kind is RunKind.SIDE and primary else None,
             public_summary=public_summary,
+            data_classification=classifications,
         )
         self.store.change_run(
             run.run_id, event_type="message_routed",
-            public_payload={"route_label": label.value, "summary": public_summary},
+            public_payload={"route_label": label.value, "summary": public_summary,
+                            "classification": list(classifications)},
             sensitive_payload={"content": content}, sensitivity="private",
             idempotency_key=f"route-content:{request_key}",
         )
@@ -954,13 +1085,7 @@ class TaskRuntimeService:
 
     @staticmethod
     def _contains_pii_or_secret(content: str) -> bool:
-        patterns = (
-            r"(?i)\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|authorization|cookie)\b",
-            r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
-            r"(?<!\d)1[3-9]\d{9}(?!\d)",
-            r"(?<!\d)\d{17}[0-9Xx](?!\d)",
-        )
-        return any(re.search(pattern, content) for pattern in patterns)
+        return bool(classify_public_text(content))
 
     @staticmethod
     def _normalize_operation_scope(value: Mapping[str, str] | None) -> dict[str, str]:

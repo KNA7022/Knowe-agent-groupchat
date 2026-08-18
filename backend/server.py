@@ -72,6 +72,7 @@ from .task_runtime.contracts import (
     AgentPhase,
     BudgetLimits as ControlBudgetLimits,
     BudgetUsage as ControlBudgetUsage,
+    EvidenceRef,
     QueueClass,
     RiskLevel,
     RouteLabel,
@@ -485,6 +486,7 @@ class KnoweServer:
         self._project_internal_io_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._restart_tasks: dict[str, asyncio.Task[None]] = {}
         self._purge_tasks: set[asyncio.Task[Any]] = set()
+        self._task_runtime_bridge_tasks: set[asyncio.Task[Any]] = set()
         self._shutdown_event = asyncio.Event()
         self._last_pinned_at = 0
 
@@ -1059,6 +1061,67 @@ class KnoweServer:
             return
         except Exception:  # noqa: BLE001 -- durable replay remains authoritative
             log.exception("Task Runtime live event broadcast failed: %s", event.event_id)
+
+    def _track_task_runtime_bridge(self, coroutine: Any, *, run_id: str) -> None:
+        task = asyncio.create_task(coroutine, name=f"task-runtime-bridge:{run_id}")
+        self._task_runtime_bridge_tasks.add(task)
+
+        def settled(done: asyncio.Task[Any]) -> None:
+            self._task_runtime_bridge_tasks.discard(done)
+            if not done.cancelled():
+                with contextlib.suppress(Exception):
+                    done.result()
+
+        task.add_done_callback(settled)
+
+    async def _bridge_task_runtime_execution(
+        self, *, group_id: str, run_id: str, project_id: str,
+        execution_key: str, completion: Any,
+    ) -> None:
+        try:
+            result = await completion if isinstance(completion, asyncio.Future) else completion
+            result_map = result if isinstance(result, dict) else {}
+            raw_outcome = str(result_map.get("outcome") or "succeeded")
+            outcome = {
+                "succeeded": ControlTaskStatus.SUCCEEDED,
+                "partial": ControlTaskStatus.PARTIAL,
+            }.get(raw_outcome, ControlTaskStatus.FAILED)
+            digest = hashlib.sha256(
+                f"{group_id}\0{run_id}\0{execution_key}".encode("utf-8")
+            ).hexdigest()
+            evidence = () if outcome is ControlTaskStatus.FAILED else (
+                EvidenceRef(
+                    evidence_id=f"engine-{digest[:20]}",
+                    source_id=f"legacy-engine-{hashlib.sha256(project_id.encode('utf-8')).hexdigest()[:16]}",
+                    version_id=f"turn-{digest[20:40]}",
+                    locator="engine:turn-completion",
+                ),
+            )
+            if self.task_runtime is not None:
+                self.task_runtime.finalize_trusted_execution(
+                    group_id, run_id, execution_key=execution_key,
+                    outcome=outcome, evidence=evidence,
+                    summary="Task completed" if outcome is not ControlTaskStatus.FAILED else "Task failed",
+                )
+        except (RuntimeConflictError, RuntimeNotFoundError):
+            # Deletion/cancellation fences always win over a late legacy callback.
+            return
+        except Exception:  # noqa: BLE001 -- reflect bridge failures without orphaning the loop
+            log.exception("Task Runtime execution bridge failed for %s", run_id)
+
+    def _finish_routed_runtime_immediately(
+        self, *, group_id: str | None, run_id: str | None,
+        project_id: str, execution_key: str | None, outcome: str,
+    ) -> None:
+        if not group_id or not run_id or not execution_key:
+            return
+        self._track_task_runtime_bridge(
+            self._bridge_task_runtime_execution(
+                group_id=group_id, run_id=run_id, project_id=project_id,
+                execution_key=execution_key, completion={"outcome": outcome},
+            ),
+            run_id=run_id,
+        )
 
     def _canonical_group_from_payload(
         self, payload: dict[str, Any], *, require_runtime: bool = True,
@@ -2910,6 +2973,8 @@ class KnoweServer:
         # engine/model execution.  Explicit DM channels above remain private Agent
         # conversations and intentionally do not create or alter a Group TaskRun.
         group_id = self._group_id_for_runtime_project(project_id)
+        runtime_run_id: str | None = None
+        runtime_execution_key: str | None = None
         if self.task_runtime is not None and group_id is not None:
             route_confidence = data.get("route_confidence", 1.0)
             if isinstance(route_confidence, bool) or not isinstance(route_confidence, (int, float)):
@@ -2927,6 +2992,10 @@ class KnoweServer:
                 sensitive_outbound=bool(data.get("sensitive_outbound")),
                 explicit_new_task=bool(data.get("explicit_new_task")),
             )
+            run_payload = route_result.get("run")
+            if isinstance(run_payload, dict) and isinstance(run_payload.get("run_id"), str):
+                runtime_run_id = str(run_payload["run_id"])
+                runtime_execution_key = f"chat:{project_id}:{cmid if isinstance(cmid, str) else runtime_run_id}"
             # Ambiguous, write-capable, or sensitive requests stop at the durable
             # approval gate.  The public RunEvent is already broadcast by the same
             # listener used for HTTP mutations and is replayable after reconnect.
@@ -2936,12 +3005,20 @@ class KnoweServer:
         # [v0.13 3b] 目录每次发言都复核。失效时 Harness 接管回复，绝不触发 LLM。
         if not self._project_dir_is_valid(project_id):
             await self._respond_directory_required(project_id)
+            self._finish_routed_runtime_immediately(
+                group_id=group_id, run_id=runtime_run_id, project_id=project_id,
+                execution_key=runtime_execution_key, outcome="failed",
+            )
             return
 
         try:
             eng = self.engine_for(project_id)
         except WorkspaceUnavailable:
             await self._respond_directory_required(project_id)
+            self._finish_routed_runtime_immediately(
+                group_id=group_id, run_id=runtime_run_id, project_id=project_id,
+                execution_key=runtime_execution_key, outcome="failed",
+            )
             return
 
         # [v0.15] 知知每次开口前都先读一版刚汇总的全局状态。
@@ -2953,6 +3030,10 @@ class KnoweServer:
         #   任一附件不合格 → 友好打回、**不触发 LLM**（原子性）。
         ok, att_parts = await self._prepare_attachments(project_id, COORDINATOR, att_records)
         if not ok:
+            self._finish_routed_runtime_immediately(
+                group_id=group_id, run_id=runtime_run_id, project_id=project_id,
+                execution_key=runtime_execution_key, outcome="failed",
+            )
             return
 
         # [v1.0.23.1] 转发 → LLM 模板后端构造：路由在用户配言（content）上解析
@@ -2993,8 +3074,39 @@ class KnoweServer:
                 if isinstance(result, Exception):
                     log.exception(msg("server.py.091"), project_id,
                                   exc_info=(type(result), result, result.__traceback__))
+            if group_id and runtime_run_id and runtime_execution_key:
+                outcome = "failed" if any(isinstance(result, Exception) for result in results) else "succeeded"
+                self._track_task_runtime_bridge(
+                    self._bridge_task_runtime_execution(
+                        group_id=group_id, run_id=runtime_run_id, project_id=project_id,
+                        execution_key=runtime_execution_key,
+                        completion={"outcome": outcome},
+                    ),
+                    run_id=runtime_run_id,
+                )
             return
-        await eng.submit(llm_content, attachments=att_parts)
+        try:
+            if group_id and runtime_run_id and runtime_execution_key and hasattr(eng, "submit_tracked"):
+                completion = await eng.submit_tracked(llm_content, attachments=att_parts)
+                self._track_task_runtime_bridge(
+                    self._bridge_task_runtime_execution(
+                        group_id=group_id, run_id=runtime_run_id, project_id=project_id,
+                        execution_key=runtime_execution_key, completion=completion,
+                    ),
+                    run_id=runtime_run_id,
+                )
+            else:
+                await eng.submit(llm_content, attachments=att_parts)
+                self._finish_routed_runtime_immediately(
+                    group_id=group_id, run_id=runtime_run_id, project_id=project_id,
+                    execution_key=runtime_execution_key, outcome="succeeded",
+                )
+        except Exception:
+            self._finish_routed_runtime_immediately(
+                group_id=group_id, run_id=runtime_run_id, project_id=project_id,
+                execution_key=runtime_execution_key, outcome="failed",
+            )
+            raise
 
     # ── [v0.37] 群内 Agent 私聊 ──
     def _dm_channel_name(self, group_id: str, agent_id: str) -> str:
@@ -5821,7 +5933,7 @@ class KnoweServer:
             return
         runtime_intents = {
             intent["group_id"]: intent
-            for intent in self.task_runtime.store.pending_group_deletions()
+            for intent in self.task_runtime.store.group_deletion_intents()
         }
         group_transactions = {
             str(transaction["group_id"]): transaction
@@ -7258,6 +7370,13 @@ class KnoweServer:
                         if not task.done():
                             task.cancel()
                     await asyncio.gather(*purge_tasks, return_exceptions=True)
+
+            bridge_tasks = list(self._task_runtime_bridge_tasks)
+            if bridge_tasks:
+                for task in bridge_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*bridge_tasks, return_exceptions=True)
 
             try:
                 await asyncio.wait_for(self._update_harness_now(), timeout=2.0)

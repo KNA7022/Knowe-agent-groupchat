@@ -226,6 +226,20 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       if (replay.group_id !== groupId || replay.run_id !== runId) {
         throw new Error('Task Runtime replay crosses the addressed identity boundary');
       }
+      if (replay.after_seq !== current.run.last_seq) {
+        throw new Error('Task Runtime replay does not match the requested local cursor');
+      }
+      if (replay.snapshot && (
+        replay.snapshot.run.run_id !== runId
+        || replay.snapshot.run.group_id !== groupId
+        || replay.snapshot.run.last_seq !== replay.snapshot.last_seq
+        || replay.snapshot.run.version !== replay.snapshot.version
+      )) {
+        throw new Error('Task Runtime replay snapshot identity/cursor mismatch');
+      }
+      if (replay.events.some((event) => event.run_id !== runId || event.group_id !== groupId)) {
+        throw new Error('Task Runtime replay event identity mismatch');
+      }
       if (replay.gap) {
         if (!replay.snapshot) throw new Error('Replay gap has no authoritative snapshot');
         set((state) => ({

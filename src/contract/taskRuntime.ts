@@ -19,6 +19,27 @@ export const FailureTypeSchema = z.enum([
   'parameter_error', 'transient_provider_failure', 'permission_denied',
   'budget_exhausted', 'verification_failed', 'irreversible_side_effect',
 ]);
+const PublicClassificationSchema = z.enum([
+  'credential', 'contact_pii', 'identity_pii', 'student_identifier',
+  'academic_record', 'name_pii', 'timetable_association', 'private_note',
+]);
+
+const publicValueIsSensitive = (value: unknown): boolean => {
+  if (Array.isArray(value)) return value.some(publicValueIsSensitive);
+  if (typeof value === 'string') {
+    return /(?:authorization\s*:\s*bearer\s+\S+|\bbearer\s+(?:sk-|pk-|tok_)?[A-Za-z0-9._-]{6,}|\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|cookie)\s*[:=]\s*\S+|\bsk-[A-Za-z0-9._-]{6,})/i.test(value)
+      || /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(value)
+      || /(^|\D)1[3-9]\d{9}(\D|$)/.test(value)
+      || /(^|\D)\d{17}[0-9Xx](\D|$)/.test(value)
+      || /(?:学号|student\s*id)\s*[:：#]?\s*[A-Za-z0-9_-]{4,}/i.test(value)
+      || /(?:成绩|分数|绩点|排名|名次|grade|score|class\s+rank|academic\s+rank)\s*(?:为|是|[:：]?\s*)?(?:第\s*)?\d+(?:\.\d+)?(?:\s*[分名])?/i.test(value)
+      || /[\u4e00-\u9fff]{2,4}(?=.{0,10}(?:成绩|分数|绩点|排名|名次))/.test(value)
+      || /(?:[\u4e00-\u9fff]{2,4}的(?:课表|课程表|上课时间)|姓名\s*[:：]\s*[\u4e00-\u9fff]{2,4}.{0,12}(?:课表|课程表|上课时间))/.test(value)
+      || /(?:私人|私密|个人)笔记|private\s+(?:note|journal)/i.test(value);
+  }
+  if (!value || typeof value !== 'object') return false;
+  return Object.values(value as Record<string, unknown>).some(publicValueIsSensitive);
+};
 
 export const BudgetLimitsSchema = z.object({
   wall_clock_seconds: z.number().int().nonnegative(),
@@ -56,7 +77,11 @@ export const AgentRunSchema = z.object({
   version: z.number().int().positive(),
   updated_at: z.string().min(1),
   schema_version: TaskRuntimeSchemaVersionSchema,
-}).strict();
+}).strict().superRefine((agent, context) => {
+  if (publicValueIsSensitive([agent.operation_summary, agent.blocking_reason])) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'sensitive Agent status text' });
+  }
+});
 
 export const TaskRunSchema = z.object({
   run_id: z.string().regex(/^run_[0-9a-f]{32}$/),
@@ -79,6 +104,7 @@ export const TaskRunSchema = z.object({
   failure_type: FailureTypeSchema.nullable(),
   public_summary: z.string(),
   blocking_reason: z.string(),
+  data_classification: z.array(PublicClassificationSchema).default([]),
   created_at: z.string().min(1),
   updated_at: z.string().min(1),
   started_at: z.string().nullable(),
@@ -97,10 +123,13 @@ export const TaskRunSchema = z.object({
       message: 'index jobs must use isolated side-run capacity',
     });
   }
+  if (publicValueIsSensitive([run.title, run.public_summary, run.blocking_reason])) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'sensitive TaskRun public text' });
+  }
 });
 
 const publicEventFields: Record<string, ReadonlySet<string>> = {
-  run_queued: new Set(['status', 'kind', 'route_label', 'summary']),
+  run_queued: new Set(['status', 'kind', 'route_label', 'summary', 'classification']),
   status_changed: new Set(['from', 'status', 'summary', 'blocking_reason', 'failure_type']),
   agent_phase_changed: new Set(['agent_id', 'role', 'phase', 'operation_summary', 'blocking_reason']),
   budget_updated: new Set(['usage', 'limits', 'exhausted_dimension', 'status']),
@@ -108,7 +137,7 @@ const publicEventFields: Record<string, ReadonlySet<string>> = {
   approval_requested: new Set(['status', 'approval']),
   approval_resolved: new Set(['status', 'approval_id', 'resolution', 'failure_type']),
   checkpoint_created: new Set(['label']),
-  message_routed: new Set(['route_label', 'summary']),
+  message_routed: new Set(['route_label', 'summary', 'classification']),
   restart_recovery: new Set(['status', 'blocking_reason']),
   tool_prepared: new Set(['status', 'invocation_id', 'tool_name', 'disposition', 'usage']),
   verifier_decision: new Set(['status', 'decision_id', 'outcome', 'approved', 'evidence_count']),
@@ -123,11 +152,7 @@ const PublicPayloadSchema = z.record(z.unknown()).superRefine((payload, context)
   ]);
   const walk = (value: unknown): boolean => {
     if (Array.isArray(value)) return value.some(walk);
-    if (typeof value === 'string') {
-      return /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(value)
-        || /(^|\D)1[3-9]\d{9}(\D|$)/.test(value)
-        || /(^|\D)\d{17}[0-9Xx](\D|$)/.test(value);
-    }
+    if (typeof value === 'string') return publicValueIsSensitive(value);
     if (!value || typeof value !== 'object') return false;
     return Object.entries(value).some(([key, child]) => privateKeys.has(key.toLowerCase()) || walk(child));
   };
@@ -156,6 +181,10 @@ export const RunEventSchema = z.object({
   const extra = Object.keys(event.public_payload).filter((field) => !fields.has(field));
   if (extra.length) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: `unsupported public fields: ${extra.join(',')}` });
+  }
+  if ('classification' in event.public_payload
+      && !z.array(PublicClassificationSchema).safeParse(event.public_payload.classification).success) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'invalid public classification metadata' });
   }
 });
 
@@ -239,7 +268,38 @@ export const RuntimeReplaySchema = z.object({
     last_seq: z.number().int().nonnegative(),
     version: z.number().int().positive(),
   }).strict().nullable(),
-}).strict();
+}).strict().superRefine((replay, context) => {
+  const issue = (message: string) => context.addIssue({ code: z.ZodIssueCode.custom, message });
+  if (replay.snapshot) {
+    if (replay.snapshot.run.run_id !== replay.run_id
+        || replay.snapshot.run.group_id !== replay.group_id) {
+      issue('replay snapshot crosses the addressed identity boundary');
+    }
+    if (replay.snapshot.last_seq !== replay.snapshot.run.last_seq
+        || replay.snapshot.version !== replay.snapshot.run.version
+        || replay.snapshot.last_seq !== replay.last_seq
+        || replay.snapshot.version !== replay.version) {
+      issue('replay snapshot cursor does not match its nested run');
+    }
+  }
+  if (replay.gap && !replay.snapshot) issue('replay gap requires an authoritative snapshot');
+  if (!replay.gap && replay.snapshot) issue('contiguous replay must not replace with a snapshot');
+  replay.events.forEach((event, index) => {
+    if (event.run_id !== replay.run_id || event.group_id !== replay.group_id) {
+      issue('replay event crosses the addressed identity boundary');
+    }
+    if (event.seq !== replay.after_seq + index + 1) issue('replay event sequence is not contiguous');
+  });
+  if (!replay.gap) {
+    const last = replay.events[replay.events.length - 1];
+    if (last && (last.seq !== replay.last_seq || last.version !== replay.version)) {
+      issue('replay event tail does not match the replay cursor');
+    }
+    if (!last && replay.after_seq !== replay.last_seq) {
+      issue('empty replay does not match the requested cursor');
+    }
+  }
+});
 
 export const GroupRuntimeSnapshotSchema = z.object({
   schema_version: TaskRuntimeSchemaVersionSchema,

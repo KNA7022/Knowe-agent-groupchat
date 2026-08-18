@@ -2493,7 +2493,13 @@ class ProjectEngine:
         # 它拿着的旧世代也写不进卡面。
         self._feedback_gen[card_id] = self._feedback_gen.get(card_id, 0) + 1
 
-    async def submit(self, content: str, attachments: list[dict[str, Any]] | None = None) -> None:
+    async def submit(
+        self,
+        content: str,
+        attachments: list[dict[str, Any]] | None = None,
+        *,
+        _completion_future: asyncio.Future[dict[str, Any]] | None = None,
+    ) -> None:
         if getattr(self, "_stopping", False) or getattr(self, "_stopped", False):
             raise RuntimeError(msg("engine.095"))
         # 用户发新消息 → 挂起的审批全部作废（§三）。
@@ -2512,7 +2518,20 @@ class ProjectEngine:
         #   这里不用重复做。（cancel_all 只 set_result；真正的 _settle 在 propose
         #   协程恢复时跑，那时回调自然触发。）
 
-        await self.inbox.put({"content": content, "target": None, "_attachments": attachments})
+        envelope: dict[str, Any] = {
+            "content": content, "target": None, "_attachments": attachments,
+        }
+        if _completion_future is not None:
+            envelope["_turn_completion_future"] = _completion_future
+        await self.inbox.put(envelope)
+
+    async def submit_tracked(
+        self, content: str, attachments: list[dict[str, Any]] | None = None,
+    ) -> asyncio.Future[dict[str, Any]]:
+        """Queue a normal turn and return its trusted Engine lifecycle future."""
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        await self.submit(content, attachments=attachments, _completion_future=future)
+        return future
 
     def dispatch_frozen(self) -> bool:
         """
@@ -4757,12 +4776,17 @@ class ProjectEngine:
             structured_notification = notification_from_unknown(envelope.get("_structured_notification"))
             turn_idempotency_key = str(envelope.get("_idempotency_key") or "").strip() or None
             turn_attachments = envelope.get("_attachments")
+            turn_completion = envelope.get("_turn_completion_future")
+            if not isinstance(turn_completion, asyncio.Future):
+                turn_completion = None
             if not isinstance(turn_attachments, list) or not turn_attachments:
                 turn_attachments = None
             notification_token: contextvars.Token[str | None] | None = None
             structured_token: contextvars.Token[dict[str, Any] | None] | None = None
             idempotency_token: contextvars.Token[str | None] | None = None
             notification_ok = True
+            turn_outcome = "succeeded"
+            turn_error = ""
             notification_priority = "background"
             if completion_notification_id:
                 prior = self._read_completion_notification(completion_notification_id) or {}
@@ -4849,17 +4873,27 @@ class ProjectEngine:
                                 derived_from="single_agent_turn_settled",
                             )
                 else:
-                    await self._harness_turn(
+                    harness_ok = await self._harness_turn(
                         content, envelope.get("target"),
                         internal=bool(envelope.get("internal")),   # [v0.31 Bug2] 永不静默策略要认「这话是不是用户说的」
                     )
+                    if not harness_ok:
+                        notification_ok = False
+                        turn_outcome = "failed"
+                        turn_error = "executor_precondition_failed"
             except ApprovalCancelled:
+                turn_outcome = "cancelled"
+                turn_error = "approval_cancelled"
                 log.info("[%s] 回合被新消息打断，收摊", self.project_id)
             except asyncio.CancelledError:
                 notification_ok = False
+                turn_outcome = "cancelled"
+                turn_error = "engine_cancelled"
                 raise
             except Exception as exc:              # ★ 引擎不许因为一个回合倒下
                 notification_ok = False
+                turn_outcome = "failed"
+                turn_error = type(exc).__name__
                 error_type = type(exc).__name__
                 log.exception("[%s] 回合异常（%s）", self.project_id, error_type)
                 await self.hub.emit(self.project_id, {
@@ -4886,12 +4920,18 @@ class ProjectEngine:
                         error="" if notification_ok else "coordinator_turn_failed_or_cancelled",
                         structured_notification=structured_notification,
                     )
+                if turn_completion is not None and not turn_completion.done():
+                    turn_completion.set_result({
+                        "outcome": turn_outcome,
+                        "error_type": turn_error,
+                        "project_id": self.project_id,
+                    })
 
     # ═══════════════════════════════════════════════════════════
     # Harness：一个回合 + 链式调度
     # ═══════════════════════════════════════════════════════════
     async def _harness_turn(self, content: str, target: str | None,
-                            *, internal: bool = False) -> None:
+                            *, internal: bool = False) -> bool:
         """Run a Coordinator turn and always drain already-committed Worker tasks.
 
         ``propose_next`` commits the TaskEnvelope from inside the model/tool turn.  Any
@@ -4900,7 +4940,7 @@ class ProjectEngine:
         drained in ``finally`` rather than only on the all-success path.
         """
         try:
-            await self._harness_turn_impl(content, target, internal=internal)
+            return await self._harness_turn_impl(content, target, internal=internal)
         finally:
             try:
                 self._spawn_pending_workers()
@@ -4910,7 +4950,7 @@ class ProjectEngine:
                 log.exception("[%s] 拉起已提交 Worker 队列失败；任务保留待重试", self.project_id)
 
     async def _harness_turn_impl(self, content: str, target: str | None,
-                                 *, internal: bool = False) -> None:
+                                 *, internal: bool = False) -> bool:
         # [v0.6b] ★ 没有可用模型就别往下走。
         #   不拦的话：ProviderClient 会带一个 `Bearer `（空的）去请求，httpx 当场
         #   LocalProtocolError，AgentLoop 把它塞进 result.error，引擎照常发一条
@@ -4943,7 +4983,7 @@ class ProjectEngine:
                     + msg("engine.190")
                 ),
             })
-            return
+            return False
         if coord_binding is None and not legacy_env_ok:
             await self.emit({
                 "type": "error",
@@ -4954,9 +4994,10 @@ class ProjectEngine:
                     + msg("engine.193")
                 ),
             })
-            return
+            return False
 
         await self._process_turn(content, target, internal=internal)
+        return True
 
     # ═══════════════════════════════════════════════════════════════
     # [v0.29 问题一] ★ Worker 的回合，从主循环里搬出来

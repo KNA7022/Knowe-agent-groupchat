@@ -26,6 +26,7 @@ from .contracts import (
     TaskStatus,
     ToolInvocation,
     VerifierDecision,
+    classify_public_text,
     opaque_id,
     utc_now,
 )
@@ -99,8 +100,6 @@ class TaskRuntimeStore:
             );
             CREATE INDEX IF NOT EXISTS idx_studycrew_approvals_group
               ON studycrew_approvals(group_id, status, created_at);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_studycrew_one_pending_approval
-              ON studycrew_approvals(run_id) WHERE status='pending';
 
             CREATE TABLE IF NOT EXISTS studycrew_permission_grants (
                 grant_id TEXT PRIMARY KEY,
@@ -164,14 +163,28 @@ class TaskRuntimeStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS studycrew_migration_tombstones (
+                tombstone_id TEXT PRIMARY KEY,
+                record_type TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                winner_id TEXT NOT NULL,
+                resolution TEXT NOT NULL,
+                migrated_at TEXT NOT NULL,
+                UNIQUE(record_type, record_id)
+            );
             """
         )
         # Development snapshots may have been created by an earlier Task Runtime v1
         # build.  Keep this migration idempotent before enforcing new key indexes.
         self.db.ensure_columns("studycrew_approvals", {"request_key": "TEXT"})
         self.db.ensure_columns("studycrew_checkpoints", {"idempotency_key": "TEXT"})
+        self.db.ensure_columns("studycrew_migration_tombstones", {"winner_id": "TEXT NOT NULL DEFAULT ''"})
+        self._migrate_v1_side_records()
         self.db.initialize(
             """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_studycrew_one_pending_approval
+              ON studycrew_approvals(run_id) WHERE status='pending';
             CREATE UNIQUE INDEX IF NOT EXISTS idx_studycrew_approval_request_key
               ON studycrew_approvals(request_key) WHERE request_key IS NOT NULL;
             CREATE UNIQUE INDEX IF NOT EXISTS idx_studycrew_checkpoint_request_key
@@ -179,6 +192,148 @@ class TaskRuntimeStore:
               WHERE idempotency_key IS NOT NULL;
             """
         )
+
+    def _migrate_v1_side_records(self) -> None:
+        """Normalize the immediately preceding Task Runtime v1 shape.
+
+        The migration deliberately runs before the new unique pending-approval index.
+        It is one SQLite transaction, uses deterministic winners, and retains only an
+        opaque audit tombstone for superseded approvals.
+        """
+        migrated_at = utc_now()
+        with self.db.transaction() as conn:
+            for row in conn.execute("SELECT * FROM studycrew_run_events").fetchall():
+                raw = _loads(row["public_payload_json"])
+                labels: list[str] = []
+
+                def scrub(value: Any) -> Any:
+                    if isinstance(value, dict):
+                        return {str(key): scrub(item) for key, item in value.items()}
+                    if isinstance(value, list):
+                        return [scrub(item) for item in value]
+                    if isinstance(value, str):
+                        found = classify_public_text(value)
+                        if found:
+                            labels.extend(found)
+                            return "Protected status"
+                    return value
+
+                scrubbed = scrub(raw)
+                if labels and str(row["event_type"]) in {"run_queued", "message_routed"}:
+                    scrubbed["classification"] = list(dict.fromkeys(labels))
+                conn.execute(
+                    "UPDATE studycrew_run_events SET public_payload_json=? WHERE event_id=?",
+                    (_dumps(scrubbed), str(row["event_id"])),
+                )
+
+            for row in conn.execute("SELECT * FROM studycrew_task_runs").fetchall():
+                raw = _loads(row["payload_json"])
+                labels: list[str] = list(raw.get("data_classification") or ())
+                for field_name, fallback in (
+                    ("title", "Protected task"),
+                    ("public_summary", "Protected task status"),
+                    ("blocking_reason", "Protected task is waiting"),
+                ):
+                    value = str(raw.get(field_name) or "")
+                    found = classify_public_text(value)
+                    if found:
+                        raw[field_name] = fallback
+                        labels.extend(found)
+                for agent in raw.get("agent_runs") or ():
+                    if not isinstance(agent, dict):
+                        continue
+                    for field_name, fallback in (
+                        ("operation_summary", "Agent operation protected"),
+                        ("blocking_reason", "Agent is waiting"),
+                    ):
+                        found = classify_public_text(str(agent.get(field_name) or ""))
+                        if found:
+                            agent[field_name] = fallback
+                            labels.extend(found)
+                raw["data_classification"] = list(dict.fromkeys(str(item) for item in labels))
+                conn.execute(
+                    "UPDATE studycrew_task_runs SET payload_json=? WHERE run_id=?",
+                    (_dumps(raw), str(row["run_id"])),
+                )
+
+            approval_rows = conn.execute(
+                "SELECT * FROM studycrew_approvals ORDER BY run_id, created_at, approval_id"
+            ).fetchall()
+            pending_winner: dict[str, str] = {}
+            for row in approval_rows:
+                raw = _loads(row["payload_json"])
+                raw.setdefault("requested_capabilities", [])
+                raw.setdefault("tool_name", "")
+                raw.setdefault("operation_scope", {})
+                raw.setdefault("purpose", "legacy_confirm_route")
+                raw.setdefault("schema_version", 1)
+                raw.setdefault("status", str(row["status"] or "pending"))
+                if classify_public_text(str(raw.get("summary") or "")):
+                    raw["summary"] = "Protected approval request"
+                status = str(row["status"] or raw.get("status") or "pending")
+                run_id = str(row["run_id"])
+                if status == "pending" and run_id in pending_winner:
+                    status = "rejected"
+                    raw["status"] = status
+                    raw["summary"] = "Superseded during Task Runtime migration"
+                    raw["resolved_at"] = migrated_at
+                    conn.execute(
+                        """INSERT OR IGNORE INTO studycrew_migration_tombstones(
+                               tombstone_id, record_type, record_id, run_id, winner_id,
+                               resolution, migrated_at
+                           ) VALUES (?, 'approval', ?, ?, ?, 'superseded_duplicate_pending', ?)""",
+                        (f"mig_{str(row['approval_id']).replace('_', '')[:32]}",
+                         str(row["approval_id"]), run_id, pending_winner[run_id], migrated_at),
+                    )
+                elif status == "pending":
+                    pending_winner[run_id] = str(row["approval_id"])
+                raw["status"] = status
+                conn.execute(
+                    """UPDATE studycrew_approvals
+                       SET status=?, payload_json=?, resolved_at=? WHERE approval_id=?""",
+                    (status, _dumps(raw), raw.get("resolved_at"), str(row["approval_id"])),
+                )
+
+            for row in conn.execute("SELECT * FROM studycrew_permission_grants").fetchall():
+                raw = _loads(row["payload_json"])
+                raw.setdefault("tool_name", "")
+                raw.setdefault("operation_scope", {})
+                raw.setdefault("purpose", "legacy_approved_operation")
+                raw.setdefault("schema_version", 1)
+                conn.execute(
+                    "UPDATE studycrew_permission_grants SET payload_json=? WHERE grant_id=?",
+                    (_dumps(raw), str(row["grant_id"])),
+                )
+
+            for row in conn.execute("SELECT * FROM studycrew_tool_invocations").fetchall():
+                raw = _loads(row["payload_json"])
+                raw.setdefault("operation_scope", {})
+                raw.setdefault("purpose", "legacy_execute_tool")
+                raw.setdefault(
+                    "disposition",
+                    "recovered_blocked" if str(row["status"]) == "recovered_blocked" else "created",
+                )
+                raw.setdefault("schema_version", 1)
+                if classify_public_text(str(raw.get("public_summary") or "")):
+                    raw["public_summary"] = "Protected tool operation"
+                conn.execute(
+                    "UPDATE studycrew_tool_invocations SET payload_json=? WHERE invocation_id=?",
+                    (_dumps(raw), str(row["invocation_id"])),
+                )
+
+    @staticmethod
+    def _assert_group_mutable_in_transaction(conn: Any, group_id: str) -> None:
+        fenced = conn.execute(
+            "SELECT 1 FROM studycrew_group_deletions WHERE group_id=? LIMIT 1", (group_id,),
+        ).fetchone()
+        if fenced is not None:
+            raise RuntimeStoreError(f"Task Runtime group is fenced for deletion: {group_id}")
+
+    def group_is_deleting(self, group_id: str) -> bool:
+        with self.db.transaction(immediate=False) as conn:
+            return conn.execute(
+                "SELECT 1 FROM studycrew_group_deletions WHERE group_id=? LIMIT 1", (group_id,),
+            ).fetchone() is not None
 
     def close(self) -> None:
         self.db.close()
@@ -201,6 +356,7 @@ class TaskRuntimeStore:
         if not request_key.strip():
             raise ValueError("request_key is required")
         with self.db.transaction() as conn:
+            self._assert_group_mutable_in_transaction(conn, run.group_id)
             existing = conn.execute(
                 "SELECT payload_json FROM studycrew_task_runs WHERE request_key=?", (request_key,),
             ).fetchone()
@@ -217,7 +373,8 @@ class TaskRuntimeStore:
                 event_id=opaque_id("evt"), run_id=run.run_id, group_id=run.group_id,
                 seq=1, version=1, event_type="run_queued",
                 public_payload={"status": run.status.value, "kind": run.kind.value,
-                                "route_label": run.route_label.value, "summary": run.public_summary},
+                                "route_label": run.route_label.value, "summary": run.public_summary,
+                                "classification": list(run.data_classification)},
             )
             conn.execute(
                 """INSERT INTO studycrew_task_runs(
@@ -276,6 +433,12 @@ class TaskRuntimeStore:
         if not idempotency_key.strip():
             raise ValueError("idempotency_key is required")
         with self.db.transaction() as conn:
+            owner_row = conn.execute(
+                "SELECT group_id FROM studycrew_task_runs WHERE run_id=?", (run_id,),
+            ).fetchone()
+            if owner_row is None:
+                raise RuntimeStoreError(f"run not found: {run_id}")
+            self._assert_group_mutable_in_transaction(conn, str(owner_row["group_id"]))
             duplicate = conn.execute(
                 "SELECT * FROM studycrew_run_events WHERE run_id=? AND idempotency_key=?",
                 (run_id, idempotency_key),
@@ -363,6 +526,7 @@ class TaskRuntimeStore:
 
     def save_approval(self, approval: ApprovalRequest, *, request_key: str | None = None) -> None:
         with self.db.transaction() as conn:
+            self._assert_group_mutable_in_transaction(conn, approval.group_id)
             self.upsert_approval_in_transaction(conn, approval, request_key=request_key)
 
     @staticmethod
@@ -429,6 +593,7 @@ class TaskRuntimeStore:
 
     def save_grant(self, grant: PermissionGrant) -> None:
         with self.db.transaction() as conn:
+            self._assert_group_mutable_in_transaction(conn, grant.group_id)
             self.insert_grant_in_transaction(conn, grant)
 
     def grant_for_approval(self, approval_id: str) -> PermissionGrant | None:
@@ -454,6 +619,7 @@ class TaskRuntimeStore:
 
     def revoke_group_grants(self, group_id: str) -> int:
         with self.db.transaction() as conn:
+            self._assert_group_mutable_in_transaction(conn, group_id)
             cursor = conn.execute(
                 "DELETE FROM studycrew_permission_grants WHERE group_id=?", (group_id,),
             )
@@ -471,6 +637,7 @@ class TaskRuntimeStore:
 
     def save_tool(self, invocation: ToolInvocation) -> tuple[ToolInvocation, bool]:
         with self.db.transaction() as conn:
+            self._assert_group_mutable_in_transaction(conn, invocation.group_id)
             existing = conn.execute(
                 "SELECT payload_json FROM studycrew_tool_invocations WHERE run_id=? AND idempotency_key=?",
                 (invocation.run_id, invocation.idempotency_key),
@@ -539,6 +706,7 @@ class TaskRuntimeStore:
             if row is None:
                 raise RuntimeStoreError(f"tool invocation not found: {invocation_id}")
             current = self._tool_from_raw(_loads(row["payload_json"]))
+            self._assert_group_mutable_in_transaction(conn, current.group_id)
             blocked = replace(
                 current, status="recovered_blocked", replay_allowed=False,
                 disposition="recovered_blocked",
@@ -567,6 +735,32 @@ class TaskRuntimeStore:
             row = conn.execute(
                 "SELECT payload_json FROM studycrew_verifier_decisions WHERE run_id=? ORDER BY run_version DESC LIMIT 1",
                 (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        raw = _loads(row["payload_json"])
+        return VerifierDecision(
+            decision_id=str(raw["decision_id"]), run_id=str(raw["run_id"]),
+            task_id=str(raw["task_id"]), group_id=str(raw["group_id"]),
+            verifier_agent_id=str(raw["verifier_agent_id"]), run_version=int(raw["run_version"]),
+            outcome=TaskStatus(str(raw["outcome"])), approved=bool(raw["approved"]),
+            evidence=tuple(EvidenceRef.from_dict(item) for item in raw.get("evidence") or ()),
+            reason=str(raw.get("reason") or ""), created_at=str(raw.get("created_at") or utc_now()),
+            schema_version=int(raw.get("schema_version", 1)),
+        )
+
+    def verifier_decision_by_request_key(
+        self, run_id: str, request_key: str,
+    ) -> VerifierDecision | None:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                """SELECT decision.payload_json
+                   FROM studycrew_run_events AS event
+                   JOIN studycrew_verifier_decisions AS decision
+                     ON decision.run_id=event.run_id AND decision.run_version=event.version
+                   WHERE event.run_id=? AND event.idempotency_key=?
+                     AND event.event_type='verifier_decision'""",
+                (run_id, request_key),
             ).fetchone()
         if row is None:
             return None
@@ -636,10 +830,18 @@ class TaskRuntimeStore:
             ).fetchall()
         return tuple({key: str(row[key]) for key in row.keys()} for row in rows)
 
+    def group_deletion_intents(self) -> tuple[dict[str, str], ...]:
+        with self.db.transaction(immediate=False) as conn:
+            rows = conn.execute(
+                "SELECT * FROM studycrew_group_deletions ORDER BY created_at"
+            ).fetchall()
+        return tuple({key: str(row[key]) for key in row.keys()} for row in rows)
+
     def save_checkpoint(
         self, checkpoint: Checkpoint, run: TaskRun, *, idempotency_key: str,
     ) -> None:
         with self.db.transaction() as conn:
+            self._assert_group_mutable_in_transaction(conn, checkpoint.group_id)
             self.insert_checkpoint_in_transaction(
                 conn, checkpoint, run, idempotency_key=idempotency_key,
             )
@@ -724,6 +926,13 @@ class TaskRuntimeStore:
                 "SELECT owner FROM studycrew_scheduler_lease WHERE lease_name='global'",
             ).fetchone()
         return row is not None and str(row["owner"]) == owner
+
+    def scheduler_lease_expiry(self) -> str | None:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT expires_at FROM studycrew_scheduler_lease WHERE lease_name='global'",
+            ).fetchone()
+        return None if row is None else str(row["expires_at"])
 
     def release_scheduler_lease(self, owner: str) -> None:
         with self.db.transaction() as conn:
