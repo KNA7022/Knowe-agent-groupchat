@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,7 @@ from websockets.protocol import State
 from backend.hub import Client
 from backend.server import KnoweServer
 from backend.tests.test_task_runtime_recovery_ack import _OpenSocket, _close, _wait_for
-from backend.task_runtime.store import RecoveryDirtyBudgetError
+from backend.task_runtime.store import RecoveryDirtyBudgetError, RuntimeStoreError
 
 
 def _assert_window(client: Client) -> None:
@@ -88,6 +90,110 @@ def test_dirty_global_budget_rolls_back_producer_generation(tmp_path: Path) -> N
     assert store.live_recovery_dirty_count() == 4
     unchanged = store.live_recovery(groups[4])
     assert unchanged is not None and int(unchanged["generation"]) == 1
+    server.task_runtime.close()
+
+
+def test_exact_clear_cannot_bypass_disconnect_debt_or_claim(
+    tmp_path: Path,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.task_runtime is not None
+    store = server.task_runtime.store
+    group_id = _seed(server, 1)[0]
+    token = "recovery_00000000000000000000000000000000"
+    updated = store.record_live_recovery(
+        run_id="run_00000000000000000000000000000000",
+        group_id=group_id, through_seq=2, reason="exact-clear-debt",
+        attempts=4, recovery_token=token,
+    )
+    generation = int(updated["generation"])
+    assert generation == 2
+    assert store.live_recovery_dirty_count(group_id) == 1
+    assert store.mark_live_recoveries_disconnect_after(
+        0, update_revision=0, fence_id="fence_exact_clear",
+        disconnected_at_ns=1,
+    ) == 1
+    before = store.live_recovery(group_id)
+    assert before is not None and int(before["disconnect_retry"]) == 1
+
+    assert not store.clear_live_recovery(group_id, "forged-token", generation)
+    assert not store.clear_live_recovery(group_id, token, generation + 1)
+    assert not store.clear_live_recovery(group_id, token, generation)
+    assert store.live_recovery(group_id) == before
+    assert store.live_recovery_dirty_count(group_id) == 1
+    with pytest.raises(RuntimeStoreError, match="deletion intent"):
+        store.clear_group_live_recovery(group_id)
+    assert store.live_recovery(group_id) == before
+    assert store.live_recovery_dirty_count(group_id) == 1
+
+    epoch = store.live_recovery_disconnect_epoch()
+    assert not store.consume_live_recovery_disconnect(
+        group_id, "forged-token", generation,
+        claim_id="claim_forged", claim_after_epoch=epoch,
+    )
+    assert store.consume_live_recovery_disconnect(
+        group_id, token, generation,
+        claim_id="claim_exact", claim_after_epoch=epoch,
+    )
+    assert store.clear_live_recovery(group_id, token, generation)
+    assert store.live_recovery(group_id) is None
+    assert store.live_recovery_dirty_count(group_id) == 0
+    server.task_runtime.close()
+
+
+def test_exact_clear_racing_disconnect_mark_is_atomic(tmp_path: Path) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.task_runtime is not None
+    store = server.task_runtime.store
+    for index in range(12):
+        group_id = f"grp_{index + 100:032x}"
+        run_id = f"run_{index + 100:032x}"
+        token = f"recovery_{index + 100:032x}"
+        store.record_live_recovery(
+            run_id=run_id, group_id=group_id, through_seq=1,
+            reason="clear-race-base", attempts=4, recovery_token=token,
+        )
+        updated = store.record_live_recovery(
+            run_id=run_id, group_id=group_id, through_seq=2,
+            reason="clear-race-dirty", attempts=4, recovery_token=token,
+        )
+        generation = int(updated["generation"])
+        barrier = threading.Barrier(2)
+
+        def clear_exact() -> bool:
+            barrier.wait(timeout=2)
+            return store.clear_live_recovery(group_id, token, generation)
+
+        def mark_debt() -> int:
+            barrier.wait(timeout=2)
+            return store.mark_live_recoveries_disconnect_after(
+                0, update_revision=0, fence_id=f"fence_race_{index}",
+                disconnected_at_ns=index + 1,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            clear_future = pool.submit(clear_exact)
+            mark_future = pool.submit(mark_debt)
+            cleared = clear_future.result(timeout=5)
+            marked = mark_future.result(timeout=5)
+        # SQLite's immediate transactions choose exactly one legal serial order:
+        # clear wins before debt exists, or debt wins and exact clear is a no-op.
+        assert not (cleared and marked > 0)
+        row = store.live_recovery(group_id)
+        if marked > 0:
+            assert not cleared
+            assert row is not None and int(row["disconnect_retry"]) == 1
+            assert store.live_recovery_dirty_count(group_id) == 1
+            assert store.consume_live_recovery_disconnect(
+                group_id, token, generation,
+                claim_id=f"claim_race_{index}",
+                claim_after_epoch=store.live_recovery_disconnect_epoch(),
+            )
+            assert store.clear_live_recovery(group_id, token, generation)
+        else:
+            assert cleared
+            assert row is None
+            assert store.live_recovery_dirty_count(group_id) == 0
     server.task_runtime.close()
 
 

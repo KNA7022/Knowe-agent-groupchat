@@ -430,10 +430,21 @@ def test_group_deletion_atomically_cleans_bridge_rows_and_rolls_back_fault(tmp_p
     assert server.groups is not None and server.task_runtime is not None
     group = server.groups.create_group("Delete bridge")
     run = server.task_runtime.submit(group.group_id, title="Delete", request_key="delete-bridge")
-    server.task_runtime.store.record_live_recovery(
+    marker = server.task_runtime.store.record_live_recovery(
         run_id=run.run_id, group_id=group.group_id, through_seq=1,
         reason="delete", attempts=4, recovery_token=opaque_id("recovery"),
     )
+    marker = server.task_runtime.store.record_live_recovery(
+        run_id=run.run_id, group_id=group.group_id, through_seq=2,
+        reason="delete-dirty", attempts=4,
+        recovery_token=str(marker["recovery_token"]),
+    )
+    assert server.task_runtime.store.mark_live_recoveries_disconnect_after(
+        0, update_revision=0, fence_id="delete-confirmed-debt",
+        disconnected_at_ns=1,
+    ) == 1
+    assert int(marker["generation"]) == 2
+    assert server.task_runtime.store.live_recovery_dirty_count(group.group_id) == 1
     server.task_runtime.store.record_live_publication(
         run_id=run.run_id, group_id=group.group_id, last_seq=1,
     )
@@ -447,6 +458,9 @@ def test_group_deletion_atomically_cleans_bridge_rows_and_rolls_back_fault(tmp_p
         server.task_runtime.complete_group_deletion(group.group_id)
     counts = server.task_runtime.store.group_content_counts(group.group_id)
     assert counts["runs"] == counts["live_recovery"] == counts["live_publication"] == 1
+    debt = server.task_runtime.store.live_recovery(group.group_id)
+    assert debt is not None and int(debt["disconnect_retry"]) == 1
+    assert server.task_runtime.store.live_recovery_dirty_count(group.group_id) == 1
     intent = next(
         item for item in server.task_runtime.store.group_deletion_intents()
         if item["group_id"] == group.group_id
@@ -456,6 +470,7 @@ def test_group_deletion_atomically_cleans_bridge_rows_and_rolls_back_fault(tmp_p
         conn.execute("DROP TRIGGER fail_group_delete")
     server.task_runtime.complete_group_deletion(group.group_id)
     assert not any(server.task_runtime.store.group_content_counts(group.group_id).values())
+    assert server.task_runtime.store.live_recovery_dirty_count(group.group_id) == 0
     intent = next(
         item for item in server.task_runtime.store.group_deletion_intents()
         if item["group_id"] == group.group_id
@@ -886,6 +901,16 @@ async def test_restart_mid_page_keeps_every_unacknowledged_durable_group(
     while second.task_runtime_recovery_notified:
         group_id, token, generation = min(second.task_runtime_recovery_notified)
         delivered.add(group_id)
+        marker = resumed.task_runtime.store.live_recovery(group_id)
+        assert marker is not None
+        if int(marker["disconnect_retry"]):
+            assert resumed.task_runtime.store.consume_live_recovery_disconnect(
+                group_id, token, generation,
+                claim_id=second.task_runtime_recovery_session_id,
+                claim_after_epoch=(
+                    second.task_runtime_recovery_disconnect_epoch_baseline
+                ),
+            )
         assert resumed.task_runtime.store.clear_live_recovery(group_id, token, generation)
         second.task_runtime_recovery_notified.discard((group_id, token, generation))
         await resumed._notify_task_runtime_recoveries(second)  # noqa: SLF001

@@ -1233,8 +1233,10 @@ class KnoweServer:
         self._task_runtime_event_bridge_pending_keys.add(key)
         return True
 
-    def _prune_task_runtime_bridge_group(self, group_id: str) -> None:
-        """Remove bounded live-delivery bookkeeping when Group content is deleted."""
+    def _prune_task_runtime_bridge_group(
+        self, group_id: str, *, confirmed_group_delete: bool = False,
+    ) -> None:
+        """Remove hot bookkeeping; force durable cleanup only after Group deletion."""
         with self._task_runtime_event_bridge_lock:
             for rows in (
                 self._task_runtime_event_bridge_last_seq,
@@ -1272,7 +1274,7 @@ class KnoweServer:
                     if item[0] != group_id
                 }
                 self._normalize_client_recovery_slots_locked(client)
-        if self.task_runtime is not None:
+        if self.task_runtime is not None and confirmed_group_delete:
             self.task_runtime.store.clear_group_live_recovery(group_id)
             self.task_runtime.store.clear_group_live_publication(group_id)
 
@@ -1943,8 +1945,6 @@ class KnoweServer:
             try:
                 project_id = self._runtime_project_id_for_group(group_id)
             except (GroupNotFoundError, ProjectClosingError):
-                if marker.get("persisted") is not False:
-                    service.store.clear_group_live_recovery(group_id)
                 return "retired"
             with self._task_runtime_event_bridge_lock:
                 self._normalize_client_recovery_slots_locked(target)
@@ -8125,7 +8125,9 @@ class KnoweServer:
         if self.task_runtime is not None:
             self.task_runtime.complete_group_deletion(group_id)
             await self._task_runtime_delete_boundary("after_runtime_complete", group_id)
-        self._prune_task_runtime_bridge_group(group_id)
+        self._prune_task_runtime_bridge_group(
+            group_id, confirmed_group_delete=True,
+        )
         legacy_result["deleted"] = True
         legacy_result["runtime_cleanup"] = runtime_cleanup
         return legacy_result, receipt
@@ -8154,7 +8156,9 @@ class KnoweServer:
             if transaction is None:
                 # Group commit may have completed before the Task Runtime final marker.
                 self.task_runtime.complete_group_deletion(group_id)
-                self._prune_task_runtime_bridge_group(group_id)
+                self._prune_task_runtime_bridge_group(
+                    group_id, confirmed_group_delete=True,
+                )
                 continue
             await self._run_confirmed_group_delete(
                 group_id, str(transaction["runtime_project_id"]),

@@ -1544,10 +1544,17 @@ class TaskRuntimeStore:
     def clear_live_recovery(
         self, group_id: str, recovery_token: str, generation: int,
     ) -> bool:
+        """Clear one exact, debt-free marker and its dirty suffix atomically.
+
+        Disconnect debt/claims belong to an authenticated replacement and cannot
+        be bypassed by an exact token. Intentional Group deletion uses the separate
+        deletion-fenced ``delete_group``/``clear_group_live_recovery`` path.
+        """
         with self.db.transaction() as conn:
             cursor = conn.execute(
                 """DELETE FROM studycrew_live_recovery
-                   WHERE group_id=? AND recovery_token=? AND generation=?""",
+                   WHERE group_id=? AND recovery_token=? AND generation=?
+                     AND disconnect_retry=0 AND disconnect_claim_id=''""",
                 (group_id, recovery_token, generation),
             )
             if cursor.rowcount == 1:
@@ -1895,7 +1902,17 @@ class TaskRuntimeStore:
         return consumed.rowcount == 1
 
     def clear_group_live_recovery(self, group_id: str) -> int:
+        """Force-clear recovery only behind a durable Group deletion fence."""
         with self.db.transaction() as conn:
+            deletion = conn.execute(
+                """SELECT 1 FROM studycrew_group_deletions
+                   WHERE group_id=? LIMIT 1""",
+                (group_id,),
+            ).fetchone()
+            if deletion is None:
+                raise RuntimeStoreError(
+                    "Group deletion intent is required to force-clear recovery",
+                )
             conn.execute(
                 "DELETE FROM studycrew_live_recovery_dirty WHERE group_id=?", (group_id,),
             )
@@ -2054,6 +2071,15 @@ class TaskRuntimeStore:
     def delete_group(self, group_id: str) -> dict[str, int]:
         """Cascade runtime content while retaining no title/event/PII receipt."""
         with self.db.transaction() as conn:
+            deletion = conn.execute(
+                """SELECT 1 FROM studycrew_group_deletions
+                   WHERE group_id=? LIMIT 1""",
+                (group_id,),
+            ).fetchone()
+            if deletion is None:
+                raise RuntimeStoreError(
+                    "Group deletion intent is required to cascade runtime content",
+                )
             counts = {
                 "runs": int(conn.execute(
                     "SELECT COUNT(*) FROM studycrew_task_runs WHERE group_id=?", (group_id,),
