@@ -67,12 +67,14 @@ class Client:
         # authenticated live connection.  Reconnect intentionally starts empty.
         self.task_runtime_recovery_notified: set[tuple[str, str, int]] = set()
         self.task_runtime_recovery_snapshots: dict[tuple[str, str, int], str] = {}
+        self.task_runtime_recovery_applied: set[tuple[str, str, int]] = set()
         # Recovery intents stay durable in SQLite.  A connection holds only a small
         # fair-scanning window and one opaque paging cursor, never a mirror of the
         # complete recovery table.
         self.task_runtime_recovery_after_group_id = ""
         self.task_runtime_recovery_page_exhausted = False
         self.task_runtime_recovery_seen_revision = 0
+        self.task_runtime_recovery_fill_lock = asyncio.Lock()
 
     @property
     def alive(self) -> bool:

@@ -322,3 +322,75 @@ hide a second recovering Group. This round closes those production boundaries.
   `src/transport/socket.ts`, and `git diff --check` passed. The broad repository
   `npm run typecheck` continues to report its documented unrelated legacy fixture,
   component and store errors; it reported no new error in `src/transport/socket.ts`.
+
+## Independent re-review fix round 5/5 — final
+
+The fourth re-review found two remaining interleavings: an ACK for a newer Group
+generation ignored another window's older notice, and overlapping fill coroutines
+could exceed the four-slot cap while a single latest-Group hint lost earlier late
+inserts. This final round closes both without changing the public transport envelope.
+
+### Cross-generation multi-client obligations
+
+- Recovery ownership is now compared by canonical Group plus its stable token across
+  every generation. A valid old notice remains requestable while the durable row
+  advances; snapshot capture upgrades that connection to the current generation.
+- A successfully applied snapshot becomes a bounded connection-local applied handoff
+  while another window still owns an unresolved notice or issued cursor. Same-current
+  applied handoffs do not block final retirement; older applied handoffs do block and
+  are upgraded/resend when a newer generation appears. Final retirement removes the
+  settled handoff from every live connection.
+- Disconnect retention resolves an old notice/cursor against the row's current
+  generation and records durable fresh-connection retry debt. A current applied
+  handoff does not create false debt, while an applied older generation does.
+- ACK completion refills every live connection, not only the sender, so a generation
+  that advances during another client's snapshot immediately upgrades any older
+  applied handoff. Cursor/token/project/Group validation remains connection-bound;
+  stale or forged ACKs cannot mutate the durable row.
+- Real A/B WebSockets now start with generation 1, advance to generation 2 before A's
+  request, retain the row after A applies/ACKs generation 2, allow B's original
+  generation-1 notice to receive generation 2, and retire only after B's ACK. A
+  three-client regression injects generation 3 before B's generation-2 ACK and proves
+  all older obligations upgrade before retirement. Cross-generation disconnect and
+  replacement-connection retry are also covered.
+
+### Serialized bounded pager and lossless revision rescan
+
+- Every Client owns an explicit asyncio fill lock. All slot reservations repeat the
+  capacity check under the bridge ingress lock before an await, and failed sends roll
+  back their reservation. Ten arbitrary concurrent fill calls therefore retain and
+  emit at most four unresolved frames.
+- The lossy single latest-Group hint was removed. The production recovery recorder
+  advances a monotonic process revision under the bridge lock. A client observing any
+  unseen revision resets only its opaque SQLite cursor/exhausted flag; ACKed rows are
+  absent from SQLite, while its current unresolved/applied handoffs are the only
+  bounded exclusion. Multiple changes between fills are rediscovered by ordinary
+  fixed-size pages.
+- Different clients fill concurrently, each behind its own lock. A slow/unresponsive
+  window keeps its four obligations without blocking a fast window from applying all
+  later Groups. Applied rows retained solely for the slow cohort do not consume the
+  fast client's unresolved window.
+- Regressions cover 513 durable Groups, 100 production-recorded inserts after cursor
+  exhaustion, restart in the middle of a page, two independent clients, a slow cohort,
+  and ten simultaneous notifier tasks. Every durable Group is eventually observed,
+  the oldest survives, and unresolved notified/snapshot state never exceeds four.
+
+### Final-round acceptance evidence
+
+- Focused live bridge and recovery protocol suites: `21 passed in 18.91s`.
+- Task 1–3 Group/Task Runtime regressions: `129 passed in 29.63s`.
+- Legacy Engine regressions: `26 passed, 10 subtests passed in 1.41s`.
+- Frontend real transport/store and Task Runtime/Group suites:
+  `5 files / 45 tests passed in 12.86s`.
+- Targeted Python compilation, changed-file ESLint, strict compilation of
+  `src/transport/socket.ts`, and `git diff --check` passed. No frontend envelope or
+  schema changed in this round. The previously documented broad TypeScript baseline
+  remains outside Task 3A and has no new error from this final fix.
+
+### Final audit
+
+Exact-once event identity/publication, stable marker/snapshot capture, durable Group
+recovery, atomic Group deletion, replay/epoch reconstruction, real Timer expiry order,
+shutdown loop fencing, canonical Group isolation and public redaction retain their
+combined passing coverage. No residual Task 3A correctness issue is known. Task 4 and
+later status-bar/RAG work remain untouched.

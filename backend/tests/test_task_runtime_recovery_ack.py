@@ -13,7 +13,7 @@ from websockets.protocol import State
 
 from backend.hub import Client
 from backend.server import KnoweServer
-from backend.task_runtime.contracts import opaque_id
+from backend.task_runtime.contracts import RunEvent, opaque_id
 from backend.task_runtime.store import TaskRuntimeStore
 
 
@@ -298,16 +298,101 @@ async def test_two_clients_must_ack_and_disconnect_retries_on_fresh_connection(
     with server._task_runtime_event_bridge_lock:  # noqa: SLF001
         server._record_task_runtime_recovery_locked(event, reason="disconnect", attempts=4)  # noqa: SLF001
     responses = [await issue(client) for client in clients]
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(  # noqa: SLF001
+            event, reason="disconnect-generation-two", attempts=4,
+        )
     server._retain_client_recovery_on_disconnect(clients[0])  # noqa: SLF001
     server.hub.remove_client(clients[0])
     await acknowledge(clients[1], responses[1])
     marker = server.task_runtime.store.live_recovery(group.group_id)
-    assert marker is not None and marker["disconnect_retry"] == 1
+    assert marker is not None and marker["generation"] == 2 and marker["disconnect_retry"] == 1
+    current_response = await issue(clients[1])
+    assert current_response["recovery_generation"] == 2
+    await acknowledge(clients[1], current_response)
+    assert server.task_runtime.store.live_recovery(group.group_id) is not None
     replacement = Client(_OpenSocket())
     server.hub.add_client(replacement)
     await replacement.release_live_replay_fence()
     replacement_response = await issue(replacement)
     await acknowledge(replacement, replacement_response)
+    assert server.task_runtime.store.live_recovery(group.group_id) is None
+    await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_three_clients_upgrade_old_notices_across_gen2_and_gen3(
+    tmp_path: Path,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    project_id = "project_three_generation"
+    group = server.groups.create_group("Three generations", legacy_project_id=project_id)
+    run = server.task_runtime.submit(group.group_id, title="Three", request_key="three")
+    event = server.task_runtime.store.events_after(run.run_id, 0)[0]
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(event, reason="gen1", attempts=4)  # noqa: SLF001
+    clients = [Client(_OpenSocket()) for _ in range(3)]
+    for client in clients:
+        server.hub.add_client(client)
+        await client.release_live_replay_fence()
+        await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+    notices = [
+        next(item for item in client.ws.messages if item.get("type") == "resync_required")
+        for client in clients
+    ]
+
+    async def request(client: Client, notice: dict[str, Any]) -> dict[str, Any]:
+        await server._cmd_request_snapshot(client, {  # noqa: SLF001
+            "project_id": project_id, "recovery_token": notice["recovery_token"],
+            "recovery_generation": notice["recovery_generation"],
+        })
+        return next(
+            item for item in reversed(client.ws.messages)
+            if item.get("type") == "task_runtime_result"
+        )
+
+    async def ack(client: Client, response: dict[str, Any]) -> None:
+        await server._cmd_task_runtime_recovery_ack(client, {  # noqa: SLF001
+            "type": "task_runtime_recovery_ack", "project_id": project_id,
+            "group_id": group.group_id, "recovery_token": response["recovery_token"],
+            "recovery_generation": response["recovery_generation"],
+            "snapshot_cursor": response["snapshot_cursor"],
+        })
+
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(event, reason="gen2", attempts=4)  # noqa: SLF001
+    first = await request(clients[0], notices[0])
+    assert first["recovery_generation"] == 2
+    await ack(clients[0], first)
+    assert server.task_runtime.store.live_recovery(group.group_id) is not None
+    # A cursor issued to A cannot be forged onto B's connection.
+    await ack(clients[1], first)
+    assert server.task_runtime.store.live_recovery(group.group_id) is not None
+
+    second = await request(clients[1], notices[1])
+    assert second["recovery_generation"] == 2
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(event, reason="gen3", attempts=4)  # noqa: SLF001
+    await ack(clients[1], second)
+    marker = server.task_runtime.store.live_recovery(group.group_id)
+    assert marker is not None and marker["generation"] == 3
+    third = await request(clients[2], notices[2])
+    assert third["recovery_generation"] == 3
+    await ack(clients[2], third)
+    assert server.task_runtime.store.live_recovery(group.group_id) is not None
+
+    final_responses = []
+    for client in clients[:2]:
+        notice = next(
+            item for item in reversed(client.ws.messages)
+            if item.get("type") == "resync_required"
+            and item.get("recovery_generation") == 3
+        )
+        final_responses.append(await request(client, notice))
+    await ack(clients[0], final_responses[0])
+    assert server.task_runtime.store.live_recovery(group.group_id) is not None
+    await ack(clients[1], final_responses[1])
     assert server.task_runtime.store.live_recovery(group.group_id) is None
     await _close(server)
 
@@ -508,31 +593,219 @@ async def test_real_websocket_two_clients_keep_independent_recovery_obligations(
                 await _receive_until(first, "resync_required"),
                 await _receive_until(second, "resync_required"),
             ]
-            for ws, notice in zip((first, second), notices, strict=True):
-                await ws.send(json.dumps({
-                    "type": "request_snapshot", "project_id": project_id,
-                    "recovery_token": notice["recovery_token"],
-                    "recovery_generation": notice["recovery_generation"],
-                }))
-            responses = [
-                await _receive_until(first, "task_runtime_result"),
-                await _receive_until(second, "task_runtime_result"),
-            ]
+            with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+                server._record_task_runtime_recovery_locked(  # noqa: SLF001
+                    event, reason="generation-two", attempts=4,
+                )
+            await first.send(json.dumps({
+                "type": "request_snapshot", "project_id": project_id,
+                "recovery_token": notices[0]["recovery_token"],
+                "recovery_generation": notices[0]["recovery_generation"],
+            }))
+            first_response = await _receive_until(first, "task_runtime_result")
+            assert first_response["recovery_generation"] == 2
             await first.send(json.dumps({
                 "type": "task_runtime_recovery_ack", "project_id": project_id,
                 "group_id": group.group_id,
-                "recovery_token": responses[0]["recovery_token"],
-                "recovery_generation": responses[0]["recovery_generation"],
-                "snapshot_cursor": responses[0]["snapshot_cursor"],
+                "recovery_token": first_response["recovery_token"],
+                "recovery_generation": first_response["recovery_generation"],
+                "snapshot_cursor": first_response["snapshot_cursor"],
             }))
             await asyncio.sleep(0.05)
             assert server.task_runtime.store.live_recovery(group.group_id) is not None
             await second.send(json.dumps({
+                "type": "request_snapshot", "project_id": project_id,
+                "recovery_token": notices[1]["recovery_token"],
+                "recovery_generation": notices[1]["recovery_generation"],
+            }))
+            second_response = await _receive_until(second, "task_runtime_result")
+            assert second_response["recovery_generation"] == 2
+            await second.send(json.dumps({
                 "type": "task_runtime_recovery_ack", "project_id": project_id,
                 "group_id": group.group_id,
-                "recovery_token": responses[1]["recovery_token"],
-                "recovery_generation": responses[1]["recovery_generation"],
-                "snapshot_cursor": responses[1]["snapshot_cursor"],
+                "recovery_token": second_response["recovery_token"],
+                "recovery_generation": second_response["recovery_generation"],
+                "snapshot_cursor": second_response["snapshot_cursor"],
             }))
             await _wait_for(lambda: server.task_runtime.store.live_recovery(group.group_id) is None)
     await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_fills_never_exceed_window_and_revision_rescans_all_late_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.task_runtime is not None
+    monkeypatch.setattr(
+        server, "_runtime_project_id_for_group", lambda group_id: f"project_{group_id[4:]}",
+    )
+    for index in range(20):
+        server.task_runtime.store.record_live_recovery(
+            run_id=f"run_{index:032x}", group_id=f"grp_{index:032x}", through_seq=1,
+            reason="concurrent", attempts=4, recovery_token=f"recovery_{index:032x}",
+        )
+    socket = _OpenSocket()
+    client = Client(socket)
+    server.hub.add_client(client)
+    await client.release_live_replay_fence()
+    original_send = server.hub.send_to
+    release = asyncio.Event()
+    entered = 0
+
+    async def blocked_send(target: Client, payload: dict[str, Any]) -> bool:
+        nonlocal entered
+        entered += 1
+        await release.wait()
+        return await original_send(target, payload)
+
+    monkeypatch.setattr(server.hub, "send_to", blocked_send)
+    fills = [asyncio.create_task(server._notify_task_runtime_recoveries(client)) for _ in range(10)]  # noqa: SLF001
+    await asyncio.sleep(0.05)
+    assert len(client.task_runtime_recovery_notified) <= client.TASK_RUNTIME_RECOVERY_WINDOW_MAX
+    release.set()
+    await asyncio.gather(*fills)
+    assert entered <= client.TASK_RUNTIME_RECOVERY_WINDOW_MAX
+    assert len(client.task_runtime_recovery_notified) <= client.TASK_RUNTIME_RECOVERY_WINDOW_MAX
+
+    # Drain the original table until this connection records an exhausted cursor.
+    monkeypatch.setattr(server.hub, "send_to", original_send)
+    while client.task_runtime_recovery_notified:
+        group_id, token, generation = min(client.task_runtime_recovery_notified)
+        assert server.task_runtime.store.clear_live_recovery(group_id, token, generation)
+        client.task_runtime_recovery_notified.discard((group_id, token, generation))
+        await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+    assert client.task_runtime_recovery_page_exhausted
+    before = len(socket.messages)
+    late_groups = [f"grp_{index:032x}" for index in range(100, 200)]
+    for index, group_id in enumerate(late_groups, start=100):
+        event = RunEvent(
+            event_id=f"evt_{index:032x}", run_id=f"run_{index:032x}",
+            group_id=group_id, seq=1, version=1, event_type="checkpoint_created",
+            public_payload={"label": "Late"},
+        )
+        with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+            server._record_task_runtime_recovery_locked(event, reason="late", attempts=4)  # noqa: SLF001
+    await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+    while client.task_runtime_recovery_notified:
+        group_id, token, generation = min(client.task_runtime_recovery_notified)
+        assert server.task_runtime.store.clear_live_recovery(group_id, token, generation)
+        client.task_runtime_recovery_notified.discard((group_id, token, generation))
+        await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+    late_notices = {
+        item["group_id"] for item in socket.messages[before:]
+        if item.get("type") == "resync_required"
+    }
+    assert late_notices == set(late_groups)
+    await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_slow_client_does_not_starve_fast_clients_bounded_window(
+    tmp_path: Path,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    project_by_group: dict[str, str] = {}
+    for index in range(8):
+        project_id = f"project_20260819{index:06d}"
+        group = server.groups.create_group(f"Group {index}", legacy_project_id=project_id)
+        run = server.task_runtime.submit(
+            group.group_id, title=f"Run {index}", request_key=f"slow-{index}",
+        )
+        project_by_group[group.group_id] = project_id
+        event = server.task_runtime.store.events_after(run.run_id, 0)[0]
+        with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+            server._record_task_runtime_recovery_locked(event, reason="slow", attempts=4)  # noqa: SLF001
+    fast, slow = Client(_OpenSocket()), Client(_OpenSocket())
+    for client in (fast, slow):
+        server.hub.add_client(client)
+        await client.release_live_replay_fence()
+        await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+        assert len(client.task_runtime_recovery_notified) == client.TASK_RUNTIME_RECOVERY_WINDOW_MAX
+
+    async def apply_notice(client: Client, notice: dict[str, Any]) -> None:
+        await server._cmd_request_snapshot(client, {  # noqa: SLF001
+            "project_id": notice["project_id"],
+            "recovery_token": notice["recovery_token"],
+            "recovery_generation": notice["recovery_generation"],
+        })
+        response = next(
+            item for item in reversed(client.ws.messages)
+            if item.get("type") == "task_runtime_result"
+            and item.get("recovery_token") == notice["recovery_token"]
+        )
+        await server._cmd_task_runtime_recovery_ack(client, {  # noqa: SLF001
+            "type": "task_runtime_recovery_ack", "project_id": notice["project_id"],
+            "group_id": notice["group_id"], "recovery_token": response["recovery_token"],
+            "recovery_generation": response["recovery_generation"],
+            "snapshot_cursor": response["snapshot_cursor"],
+        })
+
+    processed: set[str] = set()
+    while len(processed) < len(project_by_group):
+        notice = next(
+            item for item in fast.ws.messages
+            if item.get("type") == "resync_required" and item["group_id"] not in processed
+        )
+        await apply_notice(fast, notice)
+        processed.add(notice["group_id"])
+        assert len(fast.task_runtime_recovery_notified) <= fast.TASK_RUNTIME_RECOVERY_WINDOW_MAX
+        assert len(fast.task_runtime_recovery_snapshots) <= fast.TASK_RUNTIME_RECOVERY_WINDOW_MAX
+        assert len(fast.task_runtime_recovery_applied) <= fast.TASK_RUNTIME_RECOVERY_WINDOW_MAX
+    assert processed == set(project_by_group)
+    assert len(slow.task_runtime_recovery_notified) == slow.TASK_RUNTIME_RECOVERY_WINDOW_MAX
+
+    slow_notices = [
+        item for item in slow.ws.messages if item.get("type") == "resync_required"
+    ]
+    for notice in slow_notices:
+        await apply_notice(slow, notice)
+    assert server.task_runtime.store.live_recoveries() == ()
+    await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_restart_mid_page_keeps_every_unacknowledged_durable_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        KnoweServer, "_runtime_project_id_for_group",
+        lambda _self, group_id: f"project_{group_id[4:]}",
+    )
+    server = KnoweServer(str(tmp_path))
+    assert server.task_runtime is not None
+    for index in range(20):
+        server.task_runtime.store.record_live_recovery(
+            run_id=f"run_{index:032x}", group_id=f"grp_{index:032x}", through_seq=1,
+            reason="restart-page", attempts=4, recovery_token=f"recovery_{index:032x}",
+        )
+    first = Client(_OpenSocket())
+    server.hub.add_client(first)
+    await first.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(first)  # noqa: SLF001
+    first_page = sorted(first.task_runtime_recovery_notified)
+    assert len(first_page) == first.TASK_RUNTIME_RECOVERY_WINDOW_MAX
+    acknowledged = set(first_page[:2])
+    for group_id, token, generation in acknowledged:
+        assert server.task_runtime.store.clear_live_recovery(group_id, token, generation)
+    await _close(server)
+
+    resumed = KnoweServer(str(tmp_path))
+    assert resumed.task_runtime is not None
+    assert len(resumed.task_runtime.store.live_recoveries()) == 18
+    second = Client(_OpenSocket())
+    resumed.hub.add_client(second)
+    await second.release_live_replay_fence()
+    await resumed._notify_task_runtime_recoveries(second)  # noqa: SLF001
+    delivered = {item[0] for item in acknowledged}
+    while second.task_runtime_recovery_notified:
+        group_id, token, generation = min(second.task_runtime_recovery_notified)
+        delivered.add(group_id)
+        assert resumed.task_runtime.store.clear_live_recovery(group_id, token, generation)
+        second.task_runtime_recovery_notified.discard((group_id, token, generation))
+        await resumed._notify_task_runtime_recoveries(second)  # noqa: SLF001
+        assert len(second.task_runtime_recovery_notified) <= second.TASK_RUNTIME_RECOVERY_WINDOW_MAX
+    assert len(delivered) == 20
+    assert resumed.task_runtime.store.live_recoveries() == ()
+    await _close(resumed)
