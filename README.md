@@ -1,12 +1,14 @@
 <div align="center">
-  <img src="./assets/images/Knowe-banner.png" alt="Knowe" width="100%" />
+  <img src="./assets/images/Knowe-banner.png" alt="StudyCrew 学伴团" width="100%" />
 </div>
 
-# Knowe — Command your Agent team through group chat
+# StudyCrew 学伴团 — Study with your AI crew through focused group chat
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Knowe turns agents into a team — inside the chat interface you already know. Create a dedicated group chat for each project, and build a team of agents customized to it.
+StudyCrew turns agents into a focused study crew — inside the chat interface you already know. Create a dedicated group chat for each course, and build a team of agents customized to it.
+
+StudyCrew is an independent fork of [Knowe](https://github.com/HirezmingD/Knowe-agent-groupchat) by Hezhou Jiang. It retains the upstream MIT license and attribution.
 
 ---
 
@@ -43,8 +45,8 @@ No prompt engineering, no task breakdowns to write. The Coordinator automaticall
 
 ## Quick start
 
-1. Download the latest installer from [Releases](https://github.com/HirezmingD/Knowe-agent-groupchat/releases)
-2. Install and open Knowe, then configure your model service (API Key)
+1. Download the latest StudyCrew installer from your approved release channel
+2. Install and open StudyCrew, then configure your model service (API Key)
 3. Create a project group chat and start building your Agent team
 
 ## Learn more
@@ -58,4 +60,4 @@ Licensed under the [MIT](./LICENSE) license.
 
 ---
 
-*Knowe is an AI-assisted tool. Users are responsible for the data and results produced while using it.*
+*StudyCrew is an AI-assisted tool. Users are responsible for the data and results produced while using it.*

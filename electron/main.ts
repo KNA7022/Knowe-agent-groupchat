@@ -93,7 +93,7 @@ const DATA_ROOT = app.isPackaged && process.platform === 'darwin'
 const ELECTRON_DATA_ROOT = join(DATA_ROOT, 'electron');
 const BACKEND_DATA_ROOT = join(DATA_ROOT, 'backend');
 
-// [v1.0.28 R2] 更新缓存指路：electron-updater 缓存根 = %LOCALAPPDATA%\knowe-updater
+// 更新缓存根（仅在未来签名更新启用时使用）。
 //   （源码实锤：AppAdapter.getAppCacheDir 在 win32 读 process.env.LOCALAPPDATA，懒计算）。
 //   启动早期（模块顶层）指到安装目录，让差分样本/索引/下载包全部落在
 //   <安装目录>\cache\knowe-updater，不碰系统盘。仅打包版生效，开发态不污染系统变量。
@@ -137,7 +137,7 @@ const FIXED_PYTHON = process.platform === 'win32'
   : join(BUNDLED_RUNTIME_ROOT, 'bin', 'python3');
 const DEV_PYTHON_OVERRIDE = app.isPackaged
   ? ''
-  : (process.env.KNOWE_DEV_PYTHON ?? '').trim();
+  : (process.env.STUDYCREW_DEV_PYTHON ?? process.env.KNOWE_DEV_PYTHON ?? '').trim();
 const PYTHON = DEV_PYTHON_OVERRIDE || FIXED_PYTHON;
 
 // [阶段1.5] 统一启动入口：打包版直接执行 PyInstaller 产物（无 -m 参数）；
@@ -187,14 +187,16 @@ function moveLegacyEntry(source: string, target: string): void {
  * 把已知旧根一次性并入新的唯一数据根。迁移前先做全量冲突检查；任何冲突或 I/O
  * 错误都向上抛，绝不在运行期继续双读或悄悄回退。
  */
-function migrateLegacyDataRoots(legacyElectronRoot: string): void {
+function migrateLegacyDataRoots(legacyElectronRoots: readonly string[]): void {
   const moves = [
-    ...legacyRootMoves(
-      legacyElectronRoot,
-      ELECTRON_DATA_ROOT,
-      new Set(['knowe-data']),
-    ),
-    ...legacyRootMoves(join(legacyElectronRoot, 'knowe-data'), BACKEND_DATA_ROOT),
+    ...legacyElectronRoots.flatMap((legacyElectronRoot) => [
+      ...legacyRootMoves(
+        legacyElectronRoot,
+        ELECTRON_DATA_ROOT,
+        new Set(['knowe-data']),
+      ),
+      ...legacyRootMoves(join(legacyElectronRoot, 'knowe-data'), BACKEND_DATA_ROOT),
+    ]),
     // 旧版后端以 BACKEND_DIR 为 cwd，默认 ./data 因而落在这里。
     ...legacyRootMoves(join(BACKEND_DIR, 'data'), BACKEND_DATA_ROOT),
   ];
@@ -214,18 +216,38 @@ function migrateLegacyDataRoots(legacyElectronRoot: string): void {
     const priorSource = targetSources.get(targetKey);
     if (priorSource && pathIdentity(priorSource) !== sourceKey) {
       throw new Error(
-        '检测到两份 Knowe 数据，未自动合并。\n'
+        '检测到两份旧版数据，未自动合并。\n'
         + `来源：${priorSource}\n来源：${move.source}\n目标：${move.target}`,
       );
     }
     targetSources.set(targetKey, move.source);
     if (existsSync(move.target)) {
       throw new Error(
-        '检测到两份 Knowe 数据，未自动合并。\n'
+        '检测到两份旧版数据，未自动合并。\n'
         + `来源：${move.source}\n目标：${move.target}`,
       );
     }
     unique.push(move);
+  }
+
+  // Every legacy entry is copied to a durable backup before the move. A failed backup
+  // stops migration, so the original remains recoverable even after a successful move.
+  if (unique.length) {
+    const backupRoot = join(DATA_ROOT, 'migration-backups', `knowe-${Date.now()}`);
+    unique.forEach(({ source }, index) => {
+      const backup = join(backupRoot, `${String(index + 1).padStart(2, '0')}-${basename(source)}`);
+      cpSync(source, backup, {
+        recursive: true,
+        errorOnExist: true,
+        force: false,
+        preserveTimestamps: true,
+      });
+    });
+    writeFileSync(
+      join(backupRoot, 'README.txt'),
+      'StudyCrew migration backup. Keep this folder until you have verified your migrated data.\n',
+      'utf8',
+    );
   }
 
   // 上次跨盘复制被中断时，只清理尚未发布的临时目标；正式目标存在时绝不碰它。
@@ -238,14 +260,18 @@ function migrateLegacyDataRoots(legacyElectronRoot: string): void {
   for (const { source, target } of unique) moveLegacyEntry(source, target);
 }
 
-const LEGACY_ELECTRON_DATA_ROOT = app.getPath('userData');
+const LEGACY_ELECTRON_DATA_ROOTS = [...new Set([
+  app.getPath('userData'),
+  join(app.getPath('appData'), 'knowe'),
+  join(app.getPath('appData'), 'Knowe'),
+])];
 let dataRootInitError: Error | null = null;
 let electronDataRootBound = false;
 try {
   // [macOS R2] darwin 打包态无 legacy 数据（mac 首次发布），且 DATA_ROOT 即 userData，
   //   迁移会把 userData 自身搬进 userData/electron 造成灾难，直接跳过迁移。
   if (!(app.isPackaged && process.platform === 'darwin')) {
-    migrateLegacyDataRoots(LEGACY_ELECTRON_DATA_ROOT);
+    migrateLegacyDataRoots(LEGACY_ELECTRON_DATA_ROOTS);
   }
   mkdirSync(ELECTRON_DATA_ROOT, { recursive: true });
   mkdirSync(BACKEND_DATA_ROOT, { recursive: true });
@@ -736,7 +762,7 @@ function spawnBackend(): void {
       return;
     }
   } else if (!existsSync(PYTHON)) {
-    setStatus('failed', `随包 Python runtime 缺失：${PYTHON}。请重新安装 Knowe。`);
+    setStatus('failed', `随包 Python runtime 缺失：${PYTHON}。请重新安装 StudyCrew。`);
     if (relaunching) recordRelaunchFailure('Python runtime 缺失'); // [1.3]
     return;
   }
@@ -1062,13 +1088,13 @@ function createTray(): void {
 
   const icon = nativeImage.createFromPath(APP_ICON);
   tray = new Tray(icon);
-  tray.setToolTip('Knowe');
+  tray.setToolTip('StudyCrew 学伴团');
 
   const menu = Menu.buildFromTemplate([
-    { label: '显示 Knowe', click: () => showMainWindow() },
+    { label: '显示 StudyCrew', click: () => showMainWindow() },
     { type: 'separator' },
     {
-      label: '退出 Knowe',
+      label: '退出 StudyCrew',
       click: () => {
         isQuitting = true; // 让 close 事件放行，别再拦成 hide
         app.quit();
@@ -1313,7 +1339,7 @@ function createPreviewWindow(): BrowserWindow {
     minHeight: 500,
     show: false,
     frame: true,
-    title: 'Knowe 预览',
+    title: 'StudyCrew 预览',
     icon: APP_ICON,
     backgroundColor: '#f5f5f5',
     webPreferences: {
@@ -1348,20 +1374,20 @@ function createPreviewWindow(): BrowserWindow {
   win.webContents.on('will-navigate', (event, url) => {
     if (!isPreviewTopLevelUrl(url)) event.preventDefault();
   });
-  win.webContents.on('will-frame-navigate', (event, details: unknown) => {
+  win.webContents.on('will-frame-navigate', (details) => {
     try {
       const decision = parsePreviewNavigationDetails(details);
       if (!decision) {
-        event.preventDefault();
+        details.preventDefault();
         return;
       }
       if (decision.mainFrame) {
-        if (!isPreviewTopLevelUrl(decision.url)) event.preventDefault();
+        if (!isPreviewTopLevelUrl(decision.url)) details.preventDefault();
         return;
       }
       const action = previewFrameNavigationAction(decision.url, decision.currentFrameUrl);
       if (action === 'allow') return;
-      event.preventDefault();
+      details.preventDefault();
       if (action === 'open-external' && typeof decision.url === 'string') {
         void shell.openExternal(decision.url).catch((error: unknown) => {
           const detail = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
@@ -1371,7 +1397,7 @@ function createPreviewWindow(): BrowserWindow {
     } catch (error: unknown) {
       // External Electron payloads are untrusted at runtime.  Any parser/policy failure
       // fails closed and only emits a bounded diagnostic; it must never crash main.
-      event.preventDefault();
+      details.preventDefault();
       const detail = error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300);
       console.error(`[main] preview frame navigation rejected after boundary error: ${detail}`);
     }
@@ -1738,7 +1764,7 @@ function createWindow(): void {
     //   渲染端据此不再自绘右侧 .traffic（见 App.tsx 的 IS_MAC 分支）。
     frame: false,
     ...(process.platform === 'darwin' ? { titleBarStyle: 'hidden' as const } : {}),
-    title: 'Knowe',
+    title: 'StudyCrew 学伴团',
     // APP 窗口/任务栏图标：public/brand/app-icon.png（由 fix-assets 脚本从 Knowe图标2.png 复制而来）
     icon: join(PROJECT_ROOT, 'public', 'brand', 'app-icon.png'),
     webPreferences: {
@@ -1830,7 +1856,7 @@ if (!gotLock) {
 
   void app.whenReady().then(async () => {
     if (!electronDataRootBound) {
-      dialog.showErrorBox('Knowe 无法启动', dataRootInitError?.message ?? '无法绑定内部数据目录。');
+      dialog.showErrorBox('StudyCrew 无法启动', dataRootInitError?.message ?? '无法绑定内部数据目录。');
       app.quit();
       return;
     }

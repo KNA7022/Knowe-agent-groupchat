@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "Knowe"
+title: "StudyCrew 学伴团"
 abstract: "A desktop application that turns AI agents into a team — command your agents through group chat, with a Coordinator splitting tasks and Workers executing them collaboratively."
 authors:
   - family-names: "Jiang"

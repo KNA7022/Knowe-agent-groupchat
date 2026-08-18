@@ -1,10 +1,12 @@
-/** Startup/build preflight: dependencies, required runtime sources, and Python import smoke. */
+/** Startup/build preflight: pinned runtimes, dependencies, required sources, and Python import smoke. */
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { delimiter, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const requiredNodeMajor = 24;
+const requiredPython = [3, 12];
 const required = [
   ['package.json', resolve(projectRoot, 'package.json')],
   ['node_modules', resolve(projectRoot, 'node_modules')],
@@ -20,15 +22,34 @@ if (missing.length) {
   process.exit(1);
 }
 
-const candidates = [process.env.KNOWE_DEV_PYTHON, process.platform === 'win32' ? 'python' : 'python3', 'python']
+const nodeMajor = Number.parseInt(process.versions.node.split('.')[0] ?? '', 10);
+if (nodeMajor !== requiredNodeMajor) {
+  console.error(`❌ preflight: 需要 Node.js ${requiredNodeMajor}.x，当前为 ${process.versions.node}。`);
+  process.exit(1);
+}
+
+const candidates = [
+  process.env.STUDYCREW_DEV_PYTHON,
+  process.env.KNOWE_DEV_PYTHON,
+  process.platform === 'win32' ? 'py -3.12' : 'python3.12',
+  process.platform === 'win32' ? 'python' : 'python3',
+]
   .filter((value, index, all) => value && all.indexOf(value) === index);
 let smoke = null;
 for (const executable of candidates) {
-  const result = spawnSync(executable, ['-c', 'import backend.server; import backend.engine'], {
-    cwd: resolve(projectRoot, 'backend'),
+  const [command, ...commandArgs] = executable.split(' ');
+  const version = spawnSync(command, [...commandArgs, '-c', 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+  });
+  if (version.error?.code === 'ENOENT') continue;
+  if (version.status !== 0 || version.stdout.trim() !== requiredPython.join('.')) continue;
+
+  const result = spawnSync(command, [...commandArgs, '-c', 'import backend.server; import backend.engine'], {
+    cwd: projectRoot,
     env: {
       ...process.env,
-      PYTHONPATH: [resolve(projectRoot, 'backend'), process.env.PYTHONPATH].filter(Boolean).join(delimiter),
+      PYTHONPATH: [projectRoot, resolve(projectRoot, 'backend'), process.env.PYTHONPATH].filter(Boolean).join(delimiter),
       KNOWE_RUNTIME_TOKEN: process.env.KNOWE_RUNTIME_TOKEN || '0'.repeat(64),
     },
     encoding: 'utf8',
@@ -38,7 +59,7 @@ for (const executable of candidates) {
   break;
 }
 if (!smoke) {
-  console.error('❌ preflight: 找不到 Python；请用 KNOWE_DEV_PYTHON 指向 Python 3.11。');
+  console.error('❌ preflight: 找不到 Python 3.12；请用 STUDYCREW_DEV_PYTHON 指向 Python 3.12。');
   process.exit(1);
 }
 if (smoke.result.status !== 0) {

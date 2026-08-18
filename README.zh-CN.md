@@ -1,12 +1,14 @@
 <div align="center">
-  <img src="./assets/images/Knowe-banner.png" alt="Knowe" width="100%" />
+  <img src="./assets/images/Knowe-banner.png" alt="StudyCrew 学伴团" width="100%" />
 </div>
 
-# Knowe — 用群聊的方式，指挥你的 Agent 团队
+# StudyCrew 学伴团 — 用群聊的方式组织你的学习伙伴
 
 [简体中文](README.zh-CN.md) | [English](README.md)
 
-Knowe 用你最熟悉的聊天软件界面，把 Agent 变成一支团队。你可以给每个项目建立自己的专属群聊、定制专属 Agent 团队。
+StudyCrew 用你最熟悉的聊天软件界面，把 Agent 变成一支学习伙伴团队。你可以给每门课程建立专属群聊、定制专属 Agent 团队。
+
+StudyCrew 是由 Hezhou Jiang 的 [Knowe](https://github.com/HirezmingD/Knowe-agent-groupchat) 独立分叉而来，保留上游 MIT 许可证与署名。
 
 ---
 
@@ -43,8 +45,8 @@ Knowe 用你最熟悉的聊天软件界面，把 Agent 变成一支团队。你�
 
 ## 快速上手
 
-1. 前往 [Releases](https://github.com/HirezmingD/Knowe-agent-groupchat/releases) 下载最新安装包
-2. 安装并打开 Knowe，配置你的模型服务（API Key）
+1. 从已批准的发布渠道下载最新版 StudyCrew 安装包
+2. 安装并打开 StudyCrew，配置你的模型服务（API Key）
 3. 创建项目群聊，开始组建你的 Agent 团队
 
 ## 了解更多
@@ -58,4 +60,4 @@ Knowe 用你最熟悉的聊天软件界面，把 Agent 变成一支团队。你�
 
 ---
 
-*Knowe 是 AI 辅助工具，使用过程中产生的数据与结果由使用者自行负责。*
+*StudyCrew 是 AI 辅助工具，使用过程中产生的数据与结果由使用者自行负责。*

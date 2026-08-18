@@ -621,7 +621,7 @@ const AboutPane: React.FC = () => {
       <SetItem t={t('settings.view.12')} d={t('settings.view.19')}>
         <a
           className="set-link"
-          href="https://www.knowe-agent.online"
+          href="https://github.com/StudyCrew/studycrew-desktop"
           target="_blank"
           rel="noreferrer"
         >
@@ -631,11 +631,11 @@ const AboutPane: React.FC = () => {
       <SetItem t={t('settings.view.githubTitle')} d={t('settings.view.13')}>
         <a
           className="set-link"
-          href="https://github.com/HirezmingD/Knowe-agent-groupchat"
+          href="https://github.com/StudyCrew/studycrew-desktop"
           target="_blank"
           rel="noreferrer"
         >
-          github.com/HirezmingD/Knowe-agent-groupchat
+          github.com/StudyCrew/studycrew-desktop
         </a>
       </SetItem>
       {/* [v1.0.25.4] 自动更新（PRD）：手动检查 + 有新版下载完成时出现「重启安装更新」 */}

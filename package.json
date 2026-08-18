@@ -1,14 +1,17 @@
 {
-  "x-knowe-implementation": "[v1.0.13][R5]",
-  "name": "knowe",
+  "x-studycrew-implementation": "[task-1][foundation]",
+  "name": "studycrew-desktop",
   "version": "1.0.36",
   "private": true,
   "license": "MIT",
-  "description": "Command your Agent team through group chat",
+  "description": "Study with your AI crew through focused group chat",
   "main": "out/main/index.js",
   "type": "module",
   "scripts": {
     "verify": "npm run typecheck && npm run lint && npm run test",
+    "verify:runtime": "node scripts/verify-runtime.mjs",
+    "test:backend": "py -3.12 -m pytest backend/tests",
+    "verify:all": "npm run preflight && npm run verify:runtime && npm run verify && npm run test:backend && npm run electron:build",
     "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json",
     "lint": "eslint src/ electron/ --ext .ts,.tsx --max-warnings 0",
     "test": "vitest run",
@@ -25,8 +28,7 @@
     "icon:ico": "node scripts/make-icon-ico.mjs",
     "icon:icns": "node scripts/make-icon-icns.mjs",
     "copy:chromium": "node scripts/copy-chromium.mjs",
-    "dist:win": "node scripts/clean-electron-build.mjs && npm run icon:ico && npm run electron:build && npm run copy:chromium && electron-builder --win nsis",
-    "dist:mac": "node scripts/clean-electron-build.mjs && npm run icon:icns && npm run electron:build && npm run copy:chromium && electron-builder --mac"
+    "dist:win": "node scripts/clean-electron-build.mjs && npm run icon:ico && npm run electron:build && npm run copy:chromium && electron-builder --win nsis"
   },
   "dependencies": {
     "i18next": "^26.3.6",
@@ -55,14 +57,14 @@
     "@testing-library/jest-dom": "^6.4.6",
     "@testing-library/react": "^16.0.0",
     "@testing-library/user-event": "^14.6.1",
-    "@types/node": "^20.14.0",
+    "@types/node": "24.13.3",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@types/ws": "^8.5.10",
     "@typescript-eslint/eslint-plugin": "^7.16.0",
     "@typescript-eslint/parser": "^7.16.0",
     "@vitejs/plugin-react": "^4.3.1",
-    "electron": "^31.2.0",
+    "electron": "43.4.0",
     "electron-builder": "^26.15.3",
     "electron-vite": "^2.3.0",
     "eslint": "^8.57.0",
@@ -76,9 +78,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/HirezmingD/Knowe-agent-groupchat.git"
+    "url": "https://github.com/StudyCrew/studycrew-desktop.git"
   },
-  "author": "Hezhou Jiang",
+  "author": "StudyCrew contributors (forked from Knowe by Hezhou Jiang)",
+  "engines": {
+    "node": ">=24 <25",
+    "npm": ">=11"
+  },
   "keywords": [
     "electron",
     "react",

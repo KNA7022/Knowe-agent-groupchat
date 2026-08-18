@@ -131,7 +131,7 @@ export const ConvList: React.FC<ConvListProps> = ({
         <div className="wordmark">
           <img
             src={appearance === 'dark' ? './brand/knowe-logo-v4-dark.png' : './brand/knowe-logo-v4.png'}
-            alt="Knowe"
+            alt="StudyCrew 学伴团"
           />
         </div>
         <button

@@ -1,4 +1,4 @@
-# electron-builder.yml — Knowe Windows 安装包配置（阶段二 2.2）
+# electron-builder.yml — StudyCrew Windows x64 installer configuration
 #
 # 设计要点（对应 00-审计与架构报告 v2）：
 #   1. files 白名单最小集：out/** + package.json + public/brand/app-icon.png
@@ -11,9 +11,9 @@
 #   4. NSIS：per-user 安装（不请求管理员）、允许改目录、卸载保留数据（installer.nsh）
 #   5. 输出到 release/（dist/ 是 PyInstaller 产物目录，不能混）
 
-appId: com.knowe.app
-productName: Knowe
-copyright: Copyright © 2026 Knowe
+appId: io.studycrew.desktop
+productName: StudyCrew 学伴团
+copyright: Copyright © 2026 StudyCrew contributors
 
 # [v1.0.28] 版本号统一：内部轨 = 显示轨 = 1.0.28（package.json version 三段 semver，单一来源）。
 #   历史教训：electron-builder 26 用 semver.loose 解析 version，四段 1.0.26.2 会被拆成 1.0.2-6.2
@@ -52,28 +52,6 @@ win:
       arch:
         - x64
 
-mac:
-  icon: build/icon.icns
-  category: public.app-category.productivity
-  # [v1.0.36 签名升级] Developer ID 签名 + 公证（凭据走环境变量：
-  #   APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID）。
-  #   有证书时 electron-builder 用 identity 签名并自动公证；无证书时
-  #   after-pack-sign.cjs 回退 ad-hoc 签名（走「仍要打开」）。
-  identity: "hezhou jiang (SVT5CWKYR9)"
-  notarize: true
-  target:
-    - target: dmg
-      arch:
-        - arm64
-    - target: zip
-      arch:
-        - arm64
-
-# [macOS R9] 打包后对 mac app 做 ad-hoc 签名（生成 CMS blob），否则 linker-signed
-#   产物在 macOS 14 被判「将对你的电脑造成伤害」、连「仍要打开」都不给。
-#   见 scripts/after-pack-sign.cjs。
-afterPack: scripts/after-pack-sign.cjs
-
 nsis:
   # 向导式安装（非一键）：允许用户选安装目录
   oneClick: false
@@ -83,7 +61,7 @@ nsis:
   # 快捷方式
   createDesktopShortcut: true
   createStartMenuShortcut: true
-  shortcutName: Knowe
+  shortcutName: StudyCrew 学伴团
   # 图标：安装器/卸载器/快捷方式共用多帧 icon.ico（和洲拍板：四类共用）
   installerIcon: build/icon.ico
   uninstallerIcon: build/icon.ico
@@ -92,20 +70,17 @@ nsis:
   # electron-builder 的 appData 清理开关（默认 false）——我们的数据在安装目录 data/，
   # 由 installer.nsh 的 customRemoveFiles 控制，这里保持默认
   deleteAppDataOnUninstall: false
-  # 产物命名：Knowe-Setup-${version}.exe（连字符，无空格）。
+  # 产物命名：StudyCrew-Setup-${version}.exe（连字符，无空格）。
   #   [v1.0.33] GitHub provider 下 latest.yml 的 url 用 safeArtifactName（空格→连字符），
   #   磁盘产物必须与之一致，否则客户端下载 404（实测：Knowe Setup 1.0.33.exe 生成
   #   latest.yml 引用 Knowe-Setup-1.0.33.exe，名字失配）。连字符命名三者统一，直接上传。
-  artifactName: Knowe-Setup-${version}.${ext}
-# [v1.0.33] 自动更新发布源：GitHub Releases（公开仓库）。
-#   · 显式写 owner/repo —— 本地 git remote 仍指向私有仓库 known_v1.0_React，
-#     不显式写会被 electron-builder 推断成私有仓库名，导致 latest.yml 404。
-#   · 发布流程：本地构建产物（安装包 + latest.yml + blockmap）手动上传 GitHub Releases。
-#   · 旧方案（自建 Caddy 服务器 /knowe-update/）退役。
+  artifactName: StudyCrew-Setup-${version}.${ext}
+# Update coordinates are retained for release metadata only. Runtime updates remain
+# disabled until a Windows signing certificate and a signed-update policy are supplied.
 publish:
   provider: github
-  owner: HirezmingD
-  repo: Knowe-agent-groupchat
+  owner: StudyCrew
+  repo: studycrew-desktop
 
 # 不签名（无证书）：跳过 SmartScreen 的代码签名校验阶段，后续如有证书再补
 # win.signAndEditExecutable: false

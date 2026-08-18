@@ -21,8 +21,11 @@ const { autoUpdater } = updaterPkg;
 
 import { IPC, type UpdateStatus } from '../src/shared/bridge';
 
-/** updaterCacheDirName（app-update.yml 已定，与 electron-builder 生成一致）。 */
-const UPDATER_CACHE_DIR_NAME = 'knowe-updater';
+/**
+ * v1 deliberately ships without unsigned auto-update. This remains false until a
+ * signed-update implementation and Windows signing certificate are reviewed together.
+ */
+const signedAutoUpdateEnabled = false;
 
 /** 当前状态单例（渲染层 getUpdateStatus 直接拿它）。 */
 let status: UpdateStatus = { state: 'idle', progress: 0 };
@@ -54,6 +57,10 @@ export function initAutoUpdater(hooks: { log: UpdaterLogger; onInstall: () => Pr
   if (initialized) return;
   initialized = true;
   const log = hooks.log;
+  if (!signedAutoUpdateEnabled) {
+    log('[updater] 自动更新已禁用：StudyCrew v1 不接受未签名更新。');
+    return;
+  }
 
   autoUpdater.autoDownload = true;           // PRD 3.2：发现新版立即后台下载
   autoUpdater.autoInstallOnAppQuit = false;  // PRD 3.4：用户手动触发安装
@@ -107,6 +114,7 @@ export function getUpdateStatus(): UpdateStatus {
  * @param silent true = 启动静默检查（失败不推送 error，保持 idle）；false = 手动检查（失败推送 error）。
  */
 export async function checkForUpdates(silent: boolean): Promise<void> {
+  if (!signedAutoUpdateEnabled) return;
   lastCheckWasManual = !silent;
   try {
     await autoUpdater.checkForUpdates();
@@ -127,6 +135,7 @@ export async function checkForUpdates(silent: boolean): Promise<void> {
  * 再 quitAndInstall（安装器静默升级、保留数据，完成后以 --updated 拉起新版）。
  */
 export async function installUpdate(hooks: { onInstall: () => Promise<void> }): Promise<void> {
+  if (!signedAutoUpdateEnabled) return;
   if (status.state !== 'ready') return;
   try {
     await hooks.onInstall();
