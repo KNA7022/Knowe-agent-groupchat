@@ -277,6 +277,12 @@ async def test_shutdown_fences_racing_callback_and_restart_reconciles_gap(
     socket.messages.clear()
     monkeypatch.setattr(server.hub, "emit", original_emit)
     server._start_task_runtime_event_bridge()  # noqa: SLF001
+    # Bridge shutdown durably transfers recovery debt and retires the old
+    # transport. A fresh lifecycle therefore admits a fresh connection.
+    socket = OpenCaptureSocket()
+    client = Client(socket)
+    server._admit_task_runtime_client(client)  # noqa: SLF001
+    await client.release_live_replay_fence()
     await asyncio.sleep(0.05)
     assert socket.messages == []
     await asyncio.to_thread(

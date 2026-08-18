@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from websockets.protocol import State
 
 from backend.hub import Client
 from backend.server import KnoweServer
@@ -43,6 +44,19 @@ def _seed(server: KnoweServer, count: int) -> list[str]:
             recovery_token=f"recovery_{index:032x}",
         )
     return groups
+
+
+class _ClosingHandlerSocket(_OpenSocket):
+    """Production-shaped socket whose receive loop closes immediately."""
+
+    def __aiter__(self) -> "_ClosingHandlerSocket":
+        return self
+
+    async def __anext__(self) -> object:
+        raise StopAsyncIteration
+
+    async def close(self, **_kwargs: object) -> None:
+        self.state = State.CLOSED
 
 
 def test_dirty_global_budget_rolls_back_producer_generation(tmp_path: Path) -> None:
@@ -890,7 +904,10 @@ async def test_stalled_client_is_fenced_before_dirty_log_exceeds_budget(
     assert server.groups is not None and server.task_runtime is not None
     monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_DIRTY_GLOBAL_MAX", 8)
     monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_DIRTY_GROUP_MAX", 8)
-    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_ACK_LEASE_SECONDS", 60.0)
+    # These clients are intentionally stalled. Budget pressure may fence them only
+    # after this no-progress lease expires (healthy-progress behavior is covered
+    # separately below).
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_ACK_LEASE_SECONDS", 0.02)
     monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS", 0.001)
     monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS", 0.01)
     project_id = f"project_budget_{update_count}"
@@ -1177,6 +1194,263 @@ async def test_persistence_flush_isolates_poison_group_and_cancels_on_shutdown(
     assert server._task_runtime_recovery_flush_task is not None  # noqa: SLF001
     await _close(server)
     assert server._task_runtime_recovery_flush_task is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_dirty_budget_preserves_recent_progress_until_lease_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.task_runtime is not None
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_ACK_LEASE_SECONDS", 60.0)
+    group_id = _seed(server, 1)[0]
+    monkeypatch.setattr(
+        server, "_runtime_project_id_for_group", lambda _group_id: "project_pressure",
+    )
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    client = Client(_OpenSocket())
+    server._admit_task_runtime_client(client)  # noqa: SLF001
+    await client.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
+    assert client.task_runtime_recovery_notified
+
+    for generation in range(2, 6):
+        marker = server.task_runtime.store.record_live_recovery(
+            run_id="run_00000000000000000000000000000000",
+            group_id=group_id, through_seq=generation,
+            reason="healthy-pressure", attempts=4,
+            recovery_token="recovery_00000000000000000000000000000000",
+            dirty_global_limit=8, dirty_group_limit=8,
+        )
+        dirty = server.task_runtime.store.live_recovery_dirty_marker(group_id)
+        assert dirty is not None
+        assert server.task_runtime.store.freeze_live_recovery_dirty(
+            int(dirty["dirty_queue_revision"]), group_id=group_id,
+            recovery_token=str(marker["recovery_token"]),
+            generation=int(marker["generation"]),
+        ) is not None
+
+    # Proven contiguous progress 15ms ago with almost the full lease remaining is
+    # never an eviction candidate, even under repeated hard-cap relief attempts.
+    now = asyncio.get_running_loop().time()
+    client.task_runtime_recovery_last_progress_at = now - 0.015
+    client.task_runtime_recovery_progress_deadline = now + 59.985
+    for _ in range(5):
+        assert not await server._relieve_task_runtime_recovery_budget()  # noqa: SLF001
+        assert not client.task_runtime_recovery_fenced
+        assert client in server.hub.clients
+    assert server.task_runtime.store.live_recovery_dirty_count() == 4
+
+    client.task_runtime_recovery_last_progress_at = now - 60.001
+    client.task_runtime_recovery_progress_deadline = now - 0.001
+    assert await server._relieve_task_runtime_recovery_budget()  # noqa: SLF001
+    assert client.task_runtime_recovery_fenced
+    assert client not in server.hub.clients
+    await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_handler_finally_keeps_debt_blocker_until_store_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS", 0.01)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS", 0.02)
+    group = server.groups.create_group(
+        "Handler debt", legacy_project_id="project_handler_debt",
+    )
+    run = server.task_runtime.submit(
+        group.group_id, title="Handler", request_key="handler-debt",
+    )
+    event = server.task_runtime.store.events_after(run.run_id, 0)[0]
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(  # noqa: SLF001
+            event, reason="handler-finally", attempts=4,
+        )
+
+    async def no_handshake(_client: Client) -> None:
+        return None
+
+    monkeypatch.setattr(server, "_handshake", no_handshake)
+    original_transfer = server.task_runtime.store.mark_live_recoveries_disconnect_after
+    unavailable = True
+
+    def failing_transfer(*args: object, **kwargs: object) -> int:
+        if unavailable:
+            raise OSError("debt store unavailable")
+        return original_transfer(*args, **kwargs)
+
+    monkeypatch.setattr(
+        server.task_runtime.store,
+        "mark_live_recoveries_disconnect_after",
+        failing_transfer,
+    )
+    await server.handle(_ClosingHandlerSocket())
+    blockers = tuple(server.hub.clients)
+    assert len(blockers) == 1
+    blocker = blockers[0]
+    assert blocker.task_runtime_recovery_fenced
+    assert not blocker.task_runtime_recovery_disconnect_debt_transferred
+    # Failed cleanup cannot make a replacement observe a falsely clean store.
+    assert server.task_runtime.store.live_recovery(group.group_id) is not None
+    server.hub.prune()
+    assert blocker in server.hub.clients
+
+    unavailable = False
+    await _wait_for(lambda: blocker.task_runtime_recovery_retirement_complete)
+    assert blocker not in server.hub.clients
+    debt = server.task_runtime.store.live_recovery(group.group_id)
+    assert debt is not None and int(debt["disconnect_retry"]) == 1
+    await _close(server)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_debt_failure_preserves_restart_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    group = server.groups.create_group(
+        "Restart debt", legacy_project_id="project_restart_debt",
+    )
+    run = server.task_runtime.submit(
+        group.group_id, title="Restart", request_key="restart-debt",
+    )
+    event = server.task_runtime.store.events_after(run.run_id, 0)[0]
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    with server._task_runtime_event_bridge_lock:  # noqa: SLF001
+        server._record_task_runtime_recovery_locked(  # noqa: SLF001
+            event, reason="restart-debt", attempts=4,
+        )
+    old_client = Client(_OpenSocket())
+    server._admit_task_runtime_client(old_client)  # noqa: SLF001
+    await old_client.release_live_replay_fence()
+    await server._notify_task_runtime_recoveries(old_client)  # noqa: SLF001
+
+    def permanently_failed_transfer(*_args: object, **_kwargs: object) -> int:
+        raise OSError("permanent debt failure during shutdown")
+
+    monkeypatch.setattr(
+        server.task_runtime.store,
+        "mark_live_recoveries_disconnect_after",
+        permanently_failed_transfer,
+    )
+    await server._stop_task_runtime_event_bridge()  # noqa: SLF001
+    assert old_client in server.hub.clients
+    assert old_client.task_runtime_recovery_fenced
+    assert not old_client.task_runtime_recovery_disconnect_debt_transferred
+    assert server.task_runtime.store.live_recovery(group.group_id) is not None
+    server.task_runtime.close()
+    if server.store is not None:
+        server.store.close(timeout=5)
+
+    restarted = KnoweServer(str(tmp_path))
+    assert restarted.task_runtime is not None
+    restarted._start_task_runtime_event_bridge()  # noqa: SLF001
+    replacement = Client(_OpenSocket())
+    restarted._admit_task_runtime_client(replacement)  # noqa: SLF001
+    await replacement.release_live_replay_fence()
+    await restarted._notify_task_runtime_recoveries(replacement)  # noqa: SLF001
+    assert replacement.task_runtime_recovery_notified
+    assert await _ack_next_notified(restarted, replacement) == 1
+    assert restarted.task_runtime.store.live_recoveries() == ()
+    await _close(restarted)
+
+
+@pytest.mark.asyncio
+async def test_full_hot_backlog_keeps_drain_alive_and_rescans_after_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_BACKLOG_MAX", 2)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_MARKER_MAX", 2)
+    monkeypatch.setattr(server, "TASK_RUNTIME_DELIVERY_RETRIES", 0)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS", 0.005)
+    monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS", 0.02)
+    groups = [
+        server.groups.create_group(
+            f"Backlog {index}", legacy_project_id=f"project_backlog_{index}",
+        )
+        for index in range(4)
+    ]
+    runs = [
+        server.task_runtime.submit(
+            group.group_id, title=group.name, request_key=f"backlog-{index}",
+        )
+        for index, group in enumerate(groups)
+    ]
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
+    original_record = server.task_runtime.store.record_live_recovery
+    unavailable = True
+
+    def failed_record(**kwargs: object) -> dict[str, object]:
+        if unavailable:
+            raise OSError("permanent recovery-store outage")
+        return original_record(**kwargs)
+
+    async def failed_broadcast(_event: object, *, recovering: bool = False) -> bool:
+        del recovering
+        return False
+
+    monkeypatch.setattr(server.task_runtime.store, "record_live_recovery", failed_record)
+    monkeypatch.setattr(server, "_broadcast_task_runtime_event", failed_broadcast)
+    loop = asyncio.get_running_loop()
+    leaked: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: leaked.append(dict(context)))
+    try:
+        for index, (group, run) in enumerate(zip(groups, runs)):
+            server.task_runtime.checkpoint(
+                group.group_id, run.run_id, label=f"outage-{index}",
+                request_key=f"outage-checkpoint-{index}",
+            )
+        await _wait_for(
+            lambda: server._task_runtime_recovery_bridge_degraded,  # noqa: SLF001
+        )
+        await _wait_for(
+            lambda: server._task_runtime_event_drain_task is None,  # noqa: SLF001
+        )
+        assert len(server._task_runtime_event_bridge_recovery) == 2  # noqa: SLF001
+        assert len(server._task_runtime_event_bridge_pending) == 0  # noqa: SLF001
+        assert not server._task_runtime_event_bridge_scheduled  # noqa: SLF001
+        assert not leaked
+
+        unavailable = False
+        await _wait_for(
+            lambda: all(
+                server.task_runtime.store.live_recovery(group.group_id) is not None
+                for group in groups
+            ),
+            timeout=5,
+        )
+        await _wait_for(
+            lambda: not server._task_runtime_recovery_bridge_degraded,  # noqa: SLF001
+        )
+
+        delivered: list[object] = []
+
+        async def healthy_broadcast(event: object, *, recovering: bool = False) -> bool:
+            del recovering
+            delivered.append(event)
+            return True
+
+        monkeypatch.setattr(server, "_broadcast_task_runtime_event", healthy_broadcast)
+        server.task_runtime.checkpoint(
+            groups[-1].group_id, runs[-1].run_id, label="after-recovery",
+            request_key="backlog-after-recovery",
+        )
+        await _wait_for(lambda: bool(delivered))
+        await _wait_for(
+            lambda: server._task_runtime_event_drain_task is None,  # noqa: SLF001
+        )
+        assert not server._task_runtime_event_bridge_scheduled  # noqa: SLF001
+        assert not leaked
+    finally:
+        loop.set_exception_handler(previous_handler)
+        await _close(server)
 
 
 def test_recovery_revision_never_reuses_after_full_table_retirement(tmp_path: Path) -> None:

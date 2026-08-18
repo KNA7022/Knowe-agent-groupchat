@@ -60,6 +60,12 @@ class Client:
         self.task_runtime_recovery_session_id = secrets.token_urlsafe(24)
         self.task_runtime_recovery_disconnect_debt_transferred = False
         self.task_runtime_recovery_debt_retry_count = 0
+        # Socket teardown is a two-phase retirement.  A fenced session is hidden
+        # from live delivery, but remains in ``Hub.clients`` until its uncovered
+        # recovery suffix has been transferred durably.  The server owns the one
+        # reconciler and completes removal exactly once.
+        self.task_runtime_recovery_retirement_complete = False
+        self.task_runtime_recovery_debt_reconcile_task: asyncio.Task[Any] | None = None
         # ``-1`` means this Client bypassed the server admission boundary (tests or
         # legacy callers) and therefore cannot claim any disconnect debt.
         self.task_runtime_recovery_disconnect_epoch_baseline = -1
@@ -273,7 +279,13 @@ class Hub:
         self.clients.discard(client)
 
     def prune(self) -> None:
-        dead = {c for c in self.clients if not c.alive}
+        # WebSocket handler teardown owns recovery-debt transfer.  Health checks
+        # must never erase a dead/fenced session from the minimum retirement
+        # frontier before that handoff is durable.
+        dead = {
+            c for c in self.clients
+            if not c.alive and c.task_runtime_recovery_retirement_complete
+        }
         for c in dead:
             self.clients.discard(c)
         if dead:
@@ -566,7 +578,11 @@ class Hub:
         )
         for client, ok in zip(clients, results):
             if ok is not True:
-                self.clients.discard(client)
+                # The connection handler's ``finally`` block performs the durable
+                # recovery-debt transfer.  Removing here would create a window in
+                # which retirement can delete state the disconnected renderer has
+                # not acknowledged.
+                log.debug("client %s live send failed; awaiting owned teardown", client.id)
 
         # project_created 广播后，记账到每个活着的客户端（避免握手时重复补发）
         if event.get("type") == "project_created":

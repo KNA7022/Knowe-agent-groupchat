@@ -450,12 +450,19 @@ class KnoweServer:
         self._task_runtime_event_bridge_last_seq: OrderedDict[str, tuple[int, str]] = OrderedDict()
         self._task_runtime_event_bridge_terminal_seq: OrderedDict[str, tuple[int, str]] = OrderedDict()
         self._task_runtime_event_bridge_recovery: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # A saturated volatile recovery backlog cannot retain another Group marker.
+        # The authoritative journal remains intact; this circuit breaker causes the
+        # lifecycle flush owner to rescan journal/publication gaps after storage
+        # recovers, without retaining an unbounded list of affected Groups.
+        self._task_runtime_recovery_bridge_degraded = False
+        self._task_runtime_recovery_bridge_degraded_count = 0
         self._task_runtime_recovery_revision = 0
         self._task_runtime_recovery_update_revision = 0
         self._task_runtime_recovery_reconcile_tasks: set[asyncio.Task[Any]] = set()
         self._task_runtime_recovery_write_tasks: set[asyncio.Task[Any]] = set()
         self._task_runtime_recovery_flush_task: asyncio.Task[Any] | None = None
         self._task_runtime_recovery_watchdog_task: asyncio.Task[Any] | None = None
+        self._task_runtime_recovery_degraded_fence_task: asyncio.Task[Any] | None = None
         self._task_runtime_event_drain_task: asyncio.Task[None] | None = None
         self._task_runtime_listener_service: TaskRuntimeService | None = self.task_runtime
         if self.task_runtime is not None:
@@ -1116,7 +1123,7 @@ class KnoweServer:
 
     def _record_task_runtime_recovery_locked(
         self, event: RunEvent, *, reason: str, attempts: int,
-    ) -> None:
+    ) -> bool:
         previous = self._task_runtime_event_bridge_recovery.get(event.group_id) or {}
         marker = {
             "group_id": event.group_id,
@@ -1177,7 +1184,18 @@ class KnoweServer:
                 for item in self._task_runtime_event_bridge_recovery.values()
             )
             if pending >= self.TASK_RUNTIME_RECOVERY_FLUSH_BACKLOG_MAX:
-                raise RuntimeError("Task Runtime recovery persistence backlog is full")
+                # Fail closed without throwing through the loop-owned drain.  The
+                # committed Task Runtime journal is still authoritative.  A single
+                # bounded circuit-breaker bit asks the flush worker to reconstruct
+                # every publication gap once the recovery store becomes writable.
+                self._task_runtime_recovery_bridge_degraded = True
+                self._task_runtime_recovery_bridge_degraded_count += 1
+                self._schedule_task_runtime_recovery_flush_locked()
+                log.error(
+                    "Task Runtime recovery backlog is full; journal rescan required for %s",
+                    event.group_id,
+                )
+                return False
         # Unpersisted state is one coalesced latest marker per Group and is never
         # client-visible. The lifecycle flush owner makes it durable before notice.
         self._task_runtime_event_bridge_recovery[event.group_id] = marker
@@ -1192,6 +1210,7 @@ class KnoweServer:
             self._task_runtime_event_bridge_recovery.pop(evictable, None)
         if marker.get("persisted") is False:
             self._schedule_task_runtime_recovery_flush_locked()
+        return True
 
     def _enqueue_task_runtime_event_locked(self, event: RunEvent, attempts: int = 0) -> bool:
         key = (event.run_id, event.seq)
@@ -1304,6 +1323,14 @@ class KnoweServer:
                 or generation != self._task_runtime_event_bridge_generation
             ):
                 return
+            if self._task_runtime_recovery_bridge_degraded:
+                fence_task = self._task_runtime_recovery_degraded_fence_task
+                if fence_task is None or fence_task.done():
+                    fence_task = self._spawn_task_runtime_reconciler(
+                        self._fence_task_runtime_clients_for_degraded_bridge(generation),
+                        name="task-runtime-recovery-degraded-fence",
+                    )
+                    self._task_runtime_recovery_degraded_fence_task = fence_task
             task = self._task_runtime_recovery_flush_task
             if task is not None and not task.done():
                 return
@@ -1316,12 +1343,103 @@ class KnoweServer:
             )
             self._task_runtime_recovery_flush_task = task
 
+    async def _fence_task_runtime_clients_for_degraded_bridge(self, generation: int) -> None:
+        """Force authoritative reconnect when recovery persistence is saturated."""
+        current = asyncio.current_task()
+        try:
+            with self._task_runtime_event_bridge_lock:
+                if (
+                    not self._task_runtime_event_bridge_active
+                    or generation != self._task_runtime_event_bridge_generation
+                    or not self._task_runtime_recovery_bridge_degraded
+                ):
+                    return
+                clients = tuple(client for client in self.hub.clients if client.alive)
+            for client in clients:
+                await self._retire_task_runtime_recovery_client(
+                    client, close_socket=True,
+                    close_reason="Task Runtime recovery storage is degraded; reconnect required",
+                )
+        finally:
+            with self._task_runtime_event_bridge_lock:
+                if self._task_runtime_recovery_degraded_fence_task is current:
+                    self._task_runtime_recovery_degraded_fence_task = None
+
+    def _task_runtime_publication_gap_events(self) -> tuple[RunEvent, ...]:
+        """Reconstruct one authoritative journal event per uncovered Group.
+
+        This scan is used only while the bounded volatile backlog circuit breaker
+        is open.  It deliberately stores no growing list of Group IDs: journal run
+        state plus durable publication cursors are the authority after an outage.
+        """
+        service = self.task_runtime
+        if service is None:
+            return ()
+        uncovered: dict[str, RunEvent] = {}
+        for run in service.store.list_runs(limit=100_000):
+            published = service.store.live_publication_cursor(run.run_id) or 0
+            if run.last_seq <= published:
+                continue
+            events = service.store.events_after(run.run_id, published)
+            if not events:
+                continue
+            # A Group snapshot covers all of its runs, so one latest known gap is
+            # sufficient to create the coalesced recovery intent.
+            uncovered[run.group_id] = events[-1]
+        return tuple(uncovered.values())
+
+    def _reconcile_task_runtime_recovery_gaps(self) -> tuple[bool, bool]:
+        """Persist circuit-breaker gaps; return ``(progressed, complete)``."""
+        service = self.task_runtime
+        if service is None:
+            return False, True
+        try:
+            gaps = self._task_runtime_publication_gap_events()
+        except Exception:  # noqa: BLE001 -- lifecycle retry owns store recovery
+            return False, False
+        progressed = False
+        complete = True
+        for event in gaps:
+            group_id = event.group_id
+            with self._task_runtime_event_bridge_lock:
+                hot = self._task_runtime_event_bridge_recovery.get(group_id)
+            try:
+                durable = service.store.live_recovery(group_id)
+            except Exception:  # noqa: BLE001 -- retry on the next bounded pass
+                complete = False
+                continue
+            if hot is not None or durable is not None:
+                continue
+            with self._task_runtime_event_bridge_lock:
+                retained = self._record_task_runtime_recovery_locked(
+                    event, reason="bridge_degraded_rescan", attempts=0,
+                )
+            progressed = retained or progressed
+            complete = retained and complete
+        if complete:
+            with self._task_runtime_event_bridge_lock:
+                self._task_runtime_recovery_bridge_degraded = False
+        return progressed, complete
+
     async def _relieve_task_runtime_recovery_budget(self) -> bool:
-        """Fence minimum-frontier blockers before retrying a bounded dirty append."""
+        """Relieve dirty pressure without evicting a renderer that is progressing.
+
+        The durable cap is a hard boundary, not an eviction trigger.  We first
+        retire any newly acknowledged prefix, then fence only minimum-frontier
+        sessions whose no-progress lease has actually expired.  If every blocker
+        is healthy the one coalesced hot marker remains bounded and the flush owner
+        applies backpressure until a later ACK frees space.
+        """
         service = self.task_runtime
         if service is None:
             return False
         with self._task_runtime_event_bridge_lock:
+            before = service.store.live_recovery_dirty_count()
+            # First compact anything all live clients have already covered. This
+            # closes the race between the latest contiguous ACK and producer write.
+            self._retire_task_runtime_recoveries_locked()
+            after = service.store.live_recovery_dirty_count()
+            progressed = after < before
             alive = tuple(client for client in self.hub.clients if client.alive)
             high_water = service.store.live_recovery_dirty_revision_high_water()
             if not alive:
@@ -1330,16 +1448,15 @@ class KnoweServer:
             minimum = min(
                 client.task_runtime_recovery_update_ack_revision for client in alive
             )
-            # First compact anything all live clients have already covered. This often
-            # resolves a race between the latest ACK and the producer transaction.
-            self._retire_task_runtime_recoveries_locked()
+            now = time.monotonic()
             victims = tuple(
                 client for client in alive
                 if client.task_runtime_recovery_update_ack_revision == minimum
                 and minimum < high_water
+                and self._client_recovery_progress_lease_expired_locked(client, now)
             )
         if not victims:
-            return False
+            return progressed
         for victim in victims:
             await self._fence_task_runtime_recovery_client(victim)
         return True
@@ -1360,7 +1477,8 @@ class KnoweServer:
                         for marker in self._task_runtime_event_bridge_recovery.values()
                         if marker.get("persisted") is False
                     )
-                if not pending:
+                    degraded = self._task_runtime_recovery_bridge_degraded
+                if not pending and not degraded:
                     return
                 service = self.task_runtime
                 if service is None:
@@ -1413,6 +1531,9 @@ class KnoweServer:
                     progressed = True
                 if budget_blocked:
                     progressed = await self._relieve_task_runtime_recovery_budget() or progressed
+                if degraded:
+                    gap_progress, _complete = self._reconcile_task_runtime_recovery_gaps()
+                    progressed = gap_progress or progressed
                 if progressed:
                     delay = max(0.001, self.TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS)
                     await self._notify_task_runtime_recoveries()
@@ -1444,51 +1565,90 @@ class KnoweServer:
                 expired = tuple(
                     client for client in self.hub.clients
                     if client.alive
-                    and client.task_runtime_recovery_progress_deadline is not None
-                    and client.task_runtime_recovery_progress_deadline <= now
-                    and bool(self._client_recovery_keys(client))
+                    and self._client_recovery_progress_lease_expired_locked(client, now)
                 )
             for client in expired:
                 await self._fence_task_runtime_recovery_client(client)
 
     async def _fence_task_runtime_recovery_client(self, client: Client) -> None:
         """Discharge an ambiguous socket by fencing it before freeing owned slots."""
-        if client.task_runtime_recovery_fenced:
-            return
+        await self._retire_task_runtime_recovery_client(
+            client, close_socket=True,
+            close_reason="Task Runtime recovery handoff timed out",
+        )
+
+    async def _retire_task_runtime_recovery_client(
+        self, client: Client, *, close_socket: bool = False,
+        close_reason: str = "Task Runtime connection closed",
+        schedule_reconcile: bool = True,
+    ) -> bool:
+        """Own the one fence -> durable debt -> Hub removal state machine.
+
+        Every timeout, explicit close, handler ``finally`` and shutdown enters here.
+        A failed store write leaves a fenced, non-visible Client in Hub so its ACK
+        frontiers remain authoritative retirement minima.  Exactly one lifecycle
+        reconciler retries; removal happens only after the suffix transfer commits.
+        """
+        if client.task_runtime_recovery_retirement_complete:
+            return True
         client.task_runtime_recovery_fenced = True
         transferred = self._retain_client_recovery_on_disconnect(client)
         if transferred:
-            self.hub.remove_client(client)
+            self._complete_task_runtime_recovery_client_retirement(client)
+        elif schedule_reconcile:
             with self._task_runtime_event_bridge_lock:
-                self._retire_task_runtime_recoveries_locked()
-        else:
-            self._spawn_task_runtime_reconciler(
-                self._reconcile_fenced_task_runtime_recovery_debt(client),
-                name=f"task-runtime-recovery-debt-reconcile-{client.id}",
-            )
+                owner = client.task_runtime_recovery_debt_reconcile_task
+                if (
+                    self._task_runtime_event_bridge_active
+                    and (owner is None or owner.done())
+                ):
+                    owner = self._spawn_task_runtime_reconciler(
+                        self._reconcile_fenced_task_runtime_recovery_debt(client),
+                        name=f"task-runtime-recovery-debt-reconcile-{client.id}",
+                    )
+                    client.task_runtime_recovery_debt_reconcile_task = owner
         close = getattr(client.ws, "close", None)
-        if callable(close):
+        if close_socket and callable(close):
             try:
-                result = close(code=1011, reason="Task Runtime recovery handoff timed out")
+                result = close(code=1011, reason=close_reason)
                 if inspect.isawaitable(result):
                     await asyncio.wait_for(result, timeout=1.0)
             except BaseException:  # the connection is already fenced from authority
                 pass
+        return transferred
+
+    def _complete_task_runtime_recovery_client_retirement(self, client: Client) -> None:
+        """Remove one Client exactly once, after its disconnect debt is durable."""
+        with self._task_runtime_event_bridge_lock:
+            if client.task_runtime_recovery_retirement_complete:
+                return
+            if not client.task_runtime_recovery_disconnect_debt_transferred:
+                return
+            client.task_runtime_recovery_retirement_complete = True
+            self.hub.remove_client(client)
+            self._retire_task_runtime_recoveries_locked()
 
     async def _reconcile_fenced_task_runtime_recovery_debt(self, client: Client) -> None:
         """Keep a failed fence in retirement minima until its debt is durable."""
         delay = max(0.01, self.TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS)
-        while client.task_runtime_recovery_fenced:
-            await asyncio.sleep(delay)
-            if self._retain_client_recovery_on_disconnect(client):
-                self.hub.remove_client(client)
-                with self._task_runtime_event_bridge_lock:
-                    self._retire_task_runtime_recoveries_locked()
-                return
-            delay = min(
-                self.TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS,
-                max(delay * 2, self.TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS),
-            )
+        current = asyncio.current_task()
+        try:
+            while (
+                client.task_runtime_recovery_fenced
+                and not client.task_runtime_recovery_retirement_complete
+            ):
+                await asyncio.sleep(delay)
+                if self._retain_client_recovery_on_disconnect(client):
+                    self._complete_task_runtime_recovery_client_retirement(client)
+                    return
+                delay = min(
+                    self.TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS,
+                    max(delay * 2, self.TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS),
+                )
+        finally:
+            with self._task_runtime_event_bridge_lock:
+                if client.task_runtime_recovery_debt_reconcile_task is current:
+                    client.task_runtime_recovery_debt_reconcile_task = None
 
     def _admit_task_runtime_client(self, client: Client) -> None:
         """Atomically bind the durable debt epoch before publishing a live session."""
@@ -1542,6 +1702,21 @@ class KnoweServer:
         client.task_runtime_recovery_progress_deadline = (
             now + max(0.01, self.TASK_RUNTIME_RECOVERY_ACK_LEASE_SECONDS)
         )
+
+    def _client_recovery_progress_lease_expired_locked(
+        self, client: Client, now: float,
+    ) -> bool:
+        """Use both contiguous-progress evidence and its assigned lease deadline."""
+        deadline = client.task_runtime_recovery_progress_deadline
+        if deadline is None or not self._client_recovery_keys(client):
+            return False
+        progress_deadline = (
+            client.task_runtime_recovery_last_progress_at
+            + max(0.01, self.TASK_RUNTIME_RECOVERY_ACK_LEASE_SECONDS)
+        )
+        # A just-compacted ACK may update progress evidence immediately before the
+        # budget worker samples an older deadline.  The later value wins.
+        return max(deadline, progress_deadline) <= now
 
     def _drop_client_recovery_key_locked(
         self, client: Client, key: tuple[str, str, int],
@@ -2176,7 +2351,8 @@ class KnoweServer:
         """Persist a retry fence for recovery obligations lost with this socket."""
         service = self.task_runtime
         if service is None:
-            return False
+            client.task_runtime_recovery_disconnect_debt_transferred = True
+            return True
         disconnected_at_ns = time.time_ns()
         with self._task_runtime_event_bridge_lock:
             if client.task_runtime_recovery_disconnect_debt_transferred:
@@ -2193,7 +2369,7 @@ class KnoweServer:
                     fence_id=client.task_runtime_recovery_session_id,
                     disconnected_at_ns=disconnected_at_ns,
                 )
-            except Exception:  # noqa: BLE001 -- Hub cleanup must still complete
+            except Exception:  # noqa: BLE001 -- fenced blocker remains authoritative
                 if client.task_runtime_recovery_debt_retry_count == 0:
                     log.exception("Could not retain Task Runtime disconnect retry suffix")
                 client.task_runtime_recovery_debt_retry_count += 1
@@ -2313,6 +2489,7 @@ class KnoweServer:
             self._task_runtime_event_bridge_pending.clear()
             self._task_runtime_event_bridge_pending_keys.clear()
             self._task_runtime_event_bridge_recovery.clear()
+            self._task_runtime_recovery_bridge_degraded = False
             self._task_runtime_recovery_revision = 0
             self._task_runtime_recovery_update_revision = (
                 service.store.live_recovery_dirty_revision_high_water()
@@ -2346,8 +2523,6 @@ class KnoweServer:
 
     async def _stop_task_runtime_event_bridge(self) -> None:
         """Atomically fence callbacks and cancel queued live publication."""
-        for client in tuple(self.hub.clients):
-            self._retain_client_recovery_on_disconnect(client)
         recovery_sends: list[asyncio.Task[bool]] = []
         owned_tasks: set[asyncio.Task[Any]] = set()
         with self._task_runtime_event_bridge_lock:
@@ -2375,9 +2550,19 @@ class KnoweServer:
             )
             self._task_runtime_recovery_flush_task = None
             self._task_runtime_recovery_watchdog_task = None
+            self._task_runtime_recovery_degraded_fence_task = None
             for task in owned_tasks:
                 if not task.done():
                     task.cancel()
+        # Shutdown uses the same durable debt state machine, but does not start a
+        # new retry owner after lifecycle cancellation.  A permanent failure keeps
+        # the Client as an in-memory retirement blocker until this instance dies;
+        # durable base/dirty rows remain intact for authoritative restart recovery.
+        for client in tuple(self.hub.clients):
+            await self._retire_task_runtime_recovery_client(
+                client, schedule_reconcile=False,
+                close_reason="Task Runtime server shutdown",
+            )
         if drain is not None and drain is not asyncio.current_task() and not drain.done():
             drain.cancel()
             await asyncio.gather(drain, return_exceptions=True)
@@ -2412,6 +2597,8 @@ class KnoweServer:
 
     async def _drain_task_runtime_events(self, generation: int) -> None:
         """Publish committed events serially on the owning loop in journal order."""
+        notification: RunEvent | None = None
+        attempts = 0
         try:
             while True:
                 with self._task_runtime_event_bridge_lock:
@@ -2520,11 +2707,50 @@ class KnoweServer:
                             notification.run_id,
                         )
                         await self._notify_task_runtime_recoveries()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 -- drain must fail closed and self-heal
+            log.exception("Task Runtime live drain failed; preserving journal recovery")
+            if notification is not None:
+                with self._task_runtime_event_bridge_lock:
+                    key = (notification.run_id, notification.seq)
+                    if (
+                        self._task_runtime_event_bridge_active
+                        and key not in self._task_runtime_event_bridge_pending_keys
+                        and len(self._task_runtime_event_bridge_pending)
+                        < self.TASK_RUNTIME_LIVE_QUEUE_MAX
+                    ):
+                        self._task_runtime_event_bridge_pending.appendleft(
+                            (notification, attempts + 1),
+                        )
+                        self._task_runtime_event_bridge_pending_keys.add(key)
+                    else:
+                        self._task_runtime_recovery_bridge_degraded = True
+                        self._task_runtime_recovery_bridge_degraded_count += 1
+                        self._schedule_task_runtime_recovery_flush_locked()
         finally:
             current = asyncio.current_task()
+            reschedule = False
+            loop: asyncio.AbstractEventLoop | None = None
             with self._task_runtime_event_bridge_lock:
                 if self._task_runtime_event_drain_task is current:
                     self._task_runtime_event_drain_task = None
+                self._task_runtime_event_bridge_scheduled = False
+                if (
+                    self._task_runtime_event_bridge_active
+                    and generation == self._task_runtime_event_bridge_generation
+                    and bool(self._task_runtime_event_bridge_pending)
+                ):
+                    loop = self._task_runtime_event_bridge_loop
+                    if loop is not None and not loop.is_closed():
+                        self._task_runtime_event_bridge_scheduled = True
+                        reschedule = True
+            if reschedule and loop is not None:
+                try:
+                    loop.call_soon(self._schedule_task_runtime_event_drain, generation)
+                except RuntimeError:
+                    with self._task_runtime_event_bridge_lock:
+                        self._task_runtime_event_bridge_scheduled = False
 
     async def _broadcast_task_runtime_event(
         self, event: RunEvent, *, recovering: bool = False,
@@ -4217,10 +4443,9 @@ class KnoweServer:
         except Exception:
             log.exception("client %s crashed", client.id)
         finally:
-            self._retain_client_recovery_on_disconnect(client)
-            self.hub.remove_client(client)
-            with self._task_runtime_event_bridge_lock:
-                self._retire_task_runtime_recoveries_locked()
+            # Never drop the retirement blocker before the atomic suffix transfer.
+            # A failed write is handed to the one lifecycle-owned reconciler.
+            await self._retire_task_runtime_recovery_client(client)
             log.info("client %s gone (total=%d)", client.id, self.hub.client_count)
 
     async def _authenticate_ws(self, connection: Any, request: Any) -> Any:
