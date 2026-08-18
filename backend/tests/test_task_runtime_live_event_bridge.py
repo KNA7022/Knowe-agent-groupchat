@@ -90,7 +90,7 @@ async def test_real_server_loop_receives_timer_expiry_and_follow_on_schedule_onc
     server.hub.get_or_create("project_live_expiry", "Live expiry")
     socket = OpenCaptureSocket()
     client = Client(socket)
-    server.hub.add_client(client)
+    server._admit_task_runtime_client(client)  # noqa: SLF001
     await client.release_live_replay_fence()
     loop_thread = threading.get_ident()
     server._start_task_runtime_event_bridge()  # noqa: SLF001
@@ -176,7 +176,7 @@ async def test_foreign_thread_burst_is_ordered_and_duplicate_notifications_publi
     server.task_runtime.schedule()
     socket = OpenCaptureSocket()
     client = Client(socket)
-    server.hub.add_client(client)
+    server._admit_task_runtime_client(client)  # noqa: SLF001
     await client.release_live_replay_fence()
     server._start_task_runtime_event_bridge()  # noqa: SLF001
 
@@ -226,7 +226,7 @@ async def test_shutdown_fences_racing_callback_and_restart_reconciles_gap(
     server.task_runtime.schedule()
     socket = OpenCaptureSocket()
     client = Client(socket)
-    server.hub.add_client(client)
+    server._admit_task_runtime_client(client)  # noqa: SLF001
     await client.release_live_replay_fence()
     server._start_task_runtime_event_bridge()  # noqa: SLF001
 
@@ -315,7 +315,7 @@ async def test_replay_fence_sends_all_group_snapshots_before_racing_live_delta(
 
     socket = BlockingReplaySocket()
     client = Client(socket)
-    server.hub.add_client(client)
+    server._admit_task_runtime_client(client)  # noqa: SLF001
     replay_task = asyncio.create_task(server._do_replay(client, {  # noqa: SLF001
         "project_id": first_pid, "since_seq": 0,
     }))
@@ -629,7 +629,7 @@ async def test_cursor_capacity_uses_durable_publication_and_stable_hub_event_ide
     assert retained.run_id not in server._task_runtime_event_bridge_last_seq  # noqa: SLF001
     socket = OpenCaptureSocket()
     client = Client(socket)
-    server.hub.add_client(client)
+    server._admit_task_runtime_client(client)  # noqa: SLF001
     await server._do_replay(client, {  # noqa: SLF001
         "project_id": project_id, "since_seq": 0,
     })
@@ -718,7 +718,7 @@ async def test_exhausted_delivery_directly_resyncs_affected_group_and_survives_r
     )
     socket = OpenCaptureSocket()
     client = Client(socket)
-    server.hub.add_client(client)
+    server._admit_task_runtime_client(client)  # noqa: SLF001
     await client.release_live_replay_fence()
     server._start_task_runtime_event_bridge()  # noqa: SLF001
     socket.messages.clear()
@@ -805,7 +805,7 @@ async def test_exhausted_delivery_directly_resyncs_affected_group_and_survives_r
     restarted._start_task_runtime_event_bridge()  # noqa: SLF001
     restarted_socket = OpenCaptureSocket()
     restarted_client = Client(restarted_socket)
-    restarted.hub.add_client(restarted_client)
+    restarted._admit_task_runtime_client(restarted_client)  # noqa: SLF001
     await restarted_client.release_live_replay_fence()
     await restarted._notify_task_runtime_recoveries(restarted_client)  # noqa: SLF001
     replayed_marker = next(

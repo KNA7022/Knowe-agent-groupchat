@@ -206,6 +206,16 @@ class TaskRuntimeStore:
             );
             CREATE INDEX IF NOT EXISTS idx_studycrew_live_recovery_group
               ON studycrew_live_recovery(group_id, updated_at);
+            CREATE TABLE IF NOT EXISTS studycrew_live_recovery_dirty (
+                group_id TEXT PRIMARY KEY,
+                recovery_token TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                queue_revision INTEGER NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_studycrew_live_recovery_dirty_queue
+              ON studycrew_live_recovery_dirty(queue_revision, group_id);
             CREATE TABLE IF NOT EXISTS studycrew_runtime_counters (
                 name TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
@@ -352,6 +362,17 @@ class TaskRuntimeStore:
                    ON CONFLICT(name) DO UPDATE SET
                      value=MAX(studycrew_runtime_counters.value, excluded.value)""",
                 (current,),
+            )
+            dirty_current = int(conn.execute(
+                "SELECT COALESCE(MAX(queue_revision), 0) "
+                "FROM studycrew_live_recovery_dirty",
+            ).fetchone()[0])
+            conn.execute(
+                """INSERT INTO studycrew_runtime_counters(name, value)
+                   VALUES ('live_recovery_dirty_revision', ?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     value=MAX(studycrew_runtime_counters.value, excluded.value)""",
+                (dirty_current,),
             )
             conn.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS idx_studycrew_live_recovery_revision
@@ -1282,6 +1303,7 @@ class TaskRuntimeStore:
     def record_live_recovery(
         self, *, run_id: str, group_id: str, through_seq: int, reason: str,
         attempts: int, recovery_token: str, run_version: int | None = None,
+        dirty_revision_floor: int = 0,
     ) -> dict[str, Any]:
         """Upsert a mutable generation without moving its immutable queue position."""
         now = utc_now()
@@ -1339,6 +1361,36 @@ class TaskRuntimeStore:
             row = conn.execute(
                 "SELECT * FROM studycrew_live_recovery WHERE group_id=?", (group_id,),
             ).fetchone()
+            if previous is not None and row is not None:
+                conn.execute(
+                    """UPDATE studycrew_runtime_counters SET value=MAX(value, ?)
+                       WHERE name='live_recovery_dirty_revision'""",
+                    (max(0, int(dirty_revision_floor)),),
+                )
+                conn.execute(
+                    """UPDATE studycrew_runtime_counters SET value=value+1
+                       WHERE name='live_recovery_dirty_revision'""",
+                )
+                dirty_revision = int(conn.execute(
+                    """SELECT value FROM studycrew_runtime_counters
+                       WHERE name='live_recovery_dirty_revision'""",
+                ).fetchone()[0])
+                conn.execute(
+                    """INSERT INTO studycrew_live_recovery_dirty(
+                           group_id, recovery_token, generation, queue_revision,
+                           created_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(group_id) DO UPDATE SET
+                          recovery_token=excluded.recovery_token,
+                          generation=excluded.generation,
+                          queue_revision=excluded.queue_revision,
+                          updated_at=excluded.updated_at""",
+                    (
+                        group_id, str(row["recovery_token"]), int(row["generation"]),
+                        dirty_revision,
+                        str(previous["created_at"]), now,
+                    ),
+                )
         return {} if row is None else {key: row[key] for key in row.keys()}
 
     def live_recoveries(
@@ -1388,7 +1440,76 @@ class TaskRuntimeStore:
                    WHERE group_id=? AND recovery_token=? AND generation=?""",
                 (group_id, recovery_token, generation),
             )
+            if cursor.rowcount == 1:
+                conn.execute(
+                    "DELETE FROM studycrew_live_recovery_dirty WHERE group_id=?",
+                    (group_id,),
+                )
         return cursor.rowcount == 1
+
+    def live_recovery_dirty(
+        self, *, limit: int | None = None, after_queue_revision: int = 0,
+    ) -> tuple[dict[str, Any], ...]:
+        """Page the coalesced latest generation for changed recovery Groups."""
+        sql = """SELECT r.*, d.queue_revision AS dirty_queue_revision
+                 FROM studycrew_live_recovery_dirty AS d
+                 JOIN studycrew_live_recovery AS r ON r.group_id=d.group_id
+                 WHERE d.queue_revision > ?
+                 ORDER BY d.queue_revision, d.group_id"""
+        params: tuple[Any, ...]
+        if limit is None:
+            params = (max(0, int(after_queue_revision)),)
+        else:
+            sql += " LIMIT ?"
+            params = (
+                max(0, int(after_queue_revision)), max(1, int(limit)),
+            )
+        with self.db.transaction(immediate=False) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return tuple({key: row[key] for key in row.keys()} for row in rows)
+
+    def live_recovery_dirty_marker(self, group_id: str) -> dict[str, Any] | None:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                """SELECT r.*, d.queue_revision AS dirty_queue_revision
+                   FROM studycrew_live_recovery_dirty AS d
+                   JOIN studycrew_live_recovery AS r ON r.group_id=d.group_id
+                   WHERE d.group_id=?""",
+                (group_id,),
+            ).fetchone()
+        return None if row is None else {key: row[key] for key in row.keys()}
+
+    def live_recovery_dirty_revision_high_water(self) -> int:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                """SELECT value FROM studycrew_runtime_counters
+                   WHERE name='live_recovery_dirty_revision'""",
+            ).fetchone()
+        return 0 if row is None else max(0, int(row[0]))
+
+    def retire_live_recovery_dirty_through(
+        self, queue_revision: int,
+    ) -> tuple[dict[str, Any], ...]:
+        """Retire coalesced dirty rows covered by every current live session."""
+        frontier = max(0, int(queue_revision))
+        if frontier <= 0:
+            return ()
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """SELECT r.*, d.queue_revision AS dirty_queue_revision
+                   FROM studycrew_live_recovery_dirty AS d
+                   JOIN studycrew_live_recovery AS r ON r.group_id=d.group_id
+                   WHERE d.queue_revision <= ?
+                   ORDER BY d.queue_revision, d.group_id""",
+                (frontier,),
+            ).fetchall()
+            if rows:
+                conn.execute(
+                    """DELETE FROM studycrew_live_recovery_dirty
+                       WHERE queue_revision <= ?""",
+                    (frontier,),
+                )
+        return tuple({key: row[key] for key in row.keys()} for row in rows)
 
     def retire_live_recoveries_through(
         self, recovery_revision: int,
@@ -1401,13 +1522,21 @@ class TaskRuntimeStore:
             rows = conn.execute(
                 """SELECT * FROM studycrew_live_recovery
                    WHERE recovery_revision <= ? AND disconnect_retry=0
+                     AND NOT EXISTS (
+                       SELECT 1 FROM studycrew_live_recovery_dirty AS dirty
+                       WHERE dirty.group_id=studycrew_live_recovery.group_id
+                     )
                    ORDER BY recovery_revision, group_id""",
                 (frontier,),
             ).fetchall()
             if rows:
                 conn.execute(
                     """DELETE FROM studycrew_live_recovery
-                       WHERE recovery_revision <= ? AND disconnect_retry=0""",
+                       WHERE recovery_revision <= ? AND disconnect_retry=0
+                         AND NOT EXISTS (
+                           SELECT 1 FROM studycrew_live_recovery_dirty AS dirty
+                           WHERE dirty.group_id=studycrew_live_recovery.group_id
+                         )""",
                     (frontier,),
                 )
         return tuple({key: row[key] for key in row.keys()} for row in rows)
@@ -1454,16 +1583,26 @@ class TaskRuntimeStore:
         return cursor.rowcount == 1
 
     def mark_live_recoveries_disconnect_after(
-        self, recovery_revision: int, *, fence_id: str, disconnected_at_ns: int,
+        self, recovery_revision: int, *, update_revision: int = 0,
+        fence_id: str, disconnected_at_ns: int,
     ) -> int:
-        """Atomically transfer one connection's immutable queue suffix to debt."""
+        """Atomically transfer uncovered base or dirty obligations to debt."""
         if not fence_id:
             raise ValueError("fence_id is required")
         with self.db.transaction() as conn:
             exists = conn.execute(
                 """SELECT 1 FROM studycrew_live_recovery
-                   WHERE recovery_revision > ? LIMIT 1""",
-                (max(0, int(recovery_revision)),),
+                   WHERE recovery_revision > ?
+                      OR EXISTS (
+                        SELECT 1 FROM studycrew_live_recovery_dirty AS dirty
+                        WHERE dirty.group_id=studycrew_live_recovery.group_id
+                          AND dirty.queue_revision > ?
+                      )
+                   LIMIT 1""",
+                (
+                    max(0, int(recovery_revision)),
+                    max(0, int(update_revision)),
+                ),
             ).fetchone()
             if exists is None:
                 return 0
@@ -1482,15 +1621,21 @@ class TaskRuntimeStore:
             ).fetchone()[0])
             cursor = conn.execute(
                 """UPDATE studycrew_live_recovery
-                   SET disconnect_retry=1,
+                    SET disconnect_retry=1,
                        disconnected_at_ns=?,
                        disconnect_debt_generation=?,
                        disconnect_fence_id=?, disconnect_claim_id='',
                        updated_at=?
-                   WHERE recovery_revision > ?""",
+                    WHERE recovery_revision > ?
+                       OR EXISTS (
+                         SELECT 1 FROM studycrew_live_recovery_dirty AS dirty
+                         WHERE dirty.group_id=studycrew_live_recovery.group_id
+                           AND dirty.queue_revision > ?
+                       )""",
                 (
                     int(disconnected_at_ns), debt_generation, fence_id, utc_now(),
                     max(0, int(recovery_revision)),
+                    max(0, int(update_revision)),
                 ),
             )
         return max(0, int(cursor.rowcount))
@@ -1537,6 +1682,9 @@ class TaskRuntimeStore:
 
     def clear_group_live_recovery(self, group_id: str) -> int:
         with self.db.transaction() as conn:
+            conn.execute(
+                "DELETE FROM studycrew_live_recovery_dirty WHERE group_id=?", (group_id,),
+            )
             cursor = conn.execute(
                 "DELETE FROM studycrew_live_recovery WHERE group_id=?", (group_id,),
             )
@@ -1728,7 +1876,8 @@ class TaskRuntimeStore:
                 "studycrew_checkpoints", "studycrew_tool_invocations",
                 "studycrew_permission_grants", "studycrew_approvals",
                 "studycrew_verifier_decisions", "studycrew_executor_continuations",
-                "studycrew_live_recovery", "studycrew_live_publication",
+                "studycrew_live_recovery_dirty", "studycrew_live_recovery",
+                "studycrew_live_publication",
                 "studycrew_run_events", "studycrew_task_runs",
             ):
                 conn.execute(f"DELETE FROM {table} WHERE group_id=?", (group_id,))

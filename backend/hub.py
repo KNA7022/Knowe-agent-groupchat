@@ -59,7 +59,9 @@ class Client:
         self.task_runtime_recovery_fenced = False
         self.task_runtime_recovery_session_id = secrets.token_urlsafe(24)
         self.task_runtime_recovery_disconnect_debt_transferred = False
-        self.task_runtime_recovery_disconnect_epoch_baseline: int | None = None
+        # ``-1`` means this Client bypassed the server admission boundary (tests or
+        # legacy callers) and therefore cannot claim any disconnect debt.
+        self.task_runtime_recovery_disconnect_epoch_baseline = -1
         # ★ 每客户端独立的「已发过 project_created 的项目集合」——握手时按此补发
         self.sent_projects: set[str] = set()
         self.handshake_done = False
@@ -78,8 +80,12 @@ class Client:
         self.task_runtime_recovery_snapshots: dict[tuple[str, str, int], str] = {}
         self.task_runtime_recovery_applied: set[tuple[str, str, int]] = set()
         self.task_runtime_recovery_revisions: dict[tuple[str, str, int], int] = {}
+        self.task_runtime_recovery_kinds: dict[tuple[str, str, int], str] = {}
         self.task_runtime_recovery_order: deque[tuple[str, str, int]] = deque()
         self.task_runtime_recovery_ack_revision = 0
+        self.task_runtime_recovery_update_order: deque[tuple[str, str, int]] = deque()
+        self.task_runtime_recovery_update_ack_revision = 0
+        self.task_runtime_recovery_update_after_revision = 0
         self.task_runtime_recovery_send_tasks: dict[
             tuple[str, str, int], asyncio.Task[bool]
         ] = {}

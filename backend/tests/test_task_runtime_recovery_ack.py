@@ -73,7 +73,7 @@ async def test_two_failed_runs_share_one_group_recovery_and_scoped_ack(tmp_path:
 
     socket = _OpenSocket()
     client = Client(socket)
-    server.hub.add_client(client)
+    server._admit_task_runtime_client(client)  # noqa: SLF001
     await client.release_live_replay_fence()
     await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
     with server._task_runtime_event_bridge_lock:  # noqa: SLF001
@@ -177,12 +177,12 @@ async def test_more_than_dispatch_batch_remains_durable_and_eventually_notified(
     )
     socket = _OpenSocket()
     client = Client(socket)
-    restarted.hub.add_client(client)
+    restarted._admit_task_runtime_client(client)  # noqa: SLF001
     await client.release_live_replay_fence()
     await restarted._notify_task_runtime_recoveries(client)  # noqa: SLF001
     other_socket = _OpenSocket()
     other_client = Client(other_socket)
-    restarted.hub.add_client(other_client)
+    restarted._admit_task_runtime_client(other_client)  # noqa: SLF001
     await other_client.release_live_replay_fence()
     await restarted._notify_task_runtime_recoveries(other_client)  # noqa: SLF001
     assert len(other_client.task_runtime_recovery_notified) == other_client.TASK_RUNTIME_RECOVERY_WINDOW_MAX
@@ -226,7 +226,7 @@ async def test_snapshot_generation_is_rebuilt_when_recovery_advances_mid_capture
         server._record_task_runtime_recovery_locked(first_event, reason="first", attempts=4)  # noqa: SLF001
     socket = _OpenSocket()
     client = Client(socket)
-    server.hub.add_client(client)
+    server._admit_task_runtime_client(client)  # noqa: SLF001
     await client.release_live_replay_fence()
     await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
     notice = next(item for item in socket.messages if item.get("type") == "resync_required")
@@ -310,7 +310,7 @@ async def test_two_clients_must_ack_and_disconnect_retries_on_fresh_connection(
         server._record_task_runtime_recovery_locked(event, reason="both", attempts=4)  # noqa: SLF001
     clients = [Client(_OpenSocket()), Client(_OpenSocket())]
     for client in clients:
-        server.hub.add_client(client)
+        server._admit_task_runtime_client(client)  # noqa: SLF001
         await client.release_live_replay_fence()
     responses = [await issue(client) for client in clients]
     await acknowledge(clients[0], responses[0])
@@ -335,7 +335,7 @@ async def test_two_clients_must_ack_and_disconnect_retries_on_fresh_connection(
     await acknowledge(clients[1], current_response)
     assert server.task_runtime.store.live_recovery(group.group_id) is not None
     replacement = Client(_OpenSocket())
-    server.hub.add_client(replacement)
+    server._admit_task_runtime_client(replacement)  # noqa: SLF001
     await replacement.release_live_replay_fence()
     replacement_response = await issue(replacement)
     await acknowledge(replacement, replacement_response)
@@ -362,7 +362,7 @@ async def test_three_clients_upgrade_old_notices_across_gen2_and_gen3(
         server._record_task_runtime_recovery_locked(event, reason="gen1", attempts=4)  # noqa: SLF001
     clients = [Client(_OpenSocket()) for _ in range(3)]
     for client in clients:
-        server.hub.add_client(client)
+        server._admit_task_runtime_client(client)  # noqa: SLF001
         await client.release_live_replay_fence()
         await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
     notices = [
@@ -675,7 +675,7 @@ async def test_concurrent_fills_never_exceed_window_and_revision_rescans_all_lat
         )
     socket = _OpenSocket()
     client = Client(socket)
-    server.hub.add_client(client)
+    server._admit_task_runtime_client(client)  # noqa: SLF001
     await client.release_live_replay_fence()
     original_send = server.hub.send_to
     release = asyncio.Event()
@@ -747,7 +747,7 @@ async def test_slow_client_does_not_starve_fast_clients_bounded_window(
             server._record_task_runtime_recovery_locked(event, reason="slow", attempts=4)  # noqa: SLF001
     fast, slow = Client(_OpenSocket()), Client(_OpenSocket())
     for client in (fast, slow):
-        server.hub.add_client(client)
+        server._admit_task_runtime_client(client)  # noqa: SLF001
         await client.release_live_replay_fence()
         await server._notify_task_runtime_recoveries(client)  # noqa: SLF001
         assert len(client.task_runtime_recovery_notified) == client.TASK_RUNTIME_RECOVERY_WINDOW_MAX
@@ -814,7 +814,7 @@ async def test_restart_mid_page_keeps_every_unacknowledged_durable_group(
             reason="restart-page", attempts=4, recovery_token=f"recovery_{index:032x}",
         )
     first = Client(_OpenSocket())
-    server.hub.add_client(first)
+    server._admit_task_runtime_client(first)  # noqa: SLF001
     await first.release_live_replay_fence()
     await server._notify_task_runtime_recoveries(first)  # noqa: SLF001
     first_page = sorted(first.task_runtime_recovery_notified)
@@ -828,7 +828,7 @@ async def test_restart_mid_page_keeps_every_unacknowledged_durable_group(
     assert resumed.task_runtime is not None
     assert len(resumed.task_runtime.store.live_recoveries()) == 18
     second = Client(_OpenSocket())
-    resumed.hub.add_client(second)
+    resumed._admit_task_runtime_client(second)  # noqa: SLF001
     await second.release_live_replay_fence()
     await resumed._notify_task_runtime_recoveries(second)  # noqa: SLF001
     delivered = {item[0] for item in acknowledged}

@@ -444,6 +444,7 @@ class KnoweServer:
         self._task_runtime_event_bridge_terminal_seq: OrderedDict[str, tuple[int, str]] = OrderedDict()
         self._task_runtime_event_bridge_recovery: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._task_runtime_recovery_revision = 0
+        self._task_runtime_recovery_update_revision = 0
         self._task_runtime_recovery_reconcile_tasks: set[asyncio.Task[Any]] = set()
         self._task_runtime_recovery_write_tasks: set[asyncio.Task[Any]] = set()
         self._task_runtime_event_drain_task: asyncio.Task[None] | None = None
@@ -1127,6 +1128,7 @@ class KnoweServer:
                     through_seq=event.seq, reason=reason, attempts=attempts,
                     recovery_token=marker["recovery_token"],
                     run_version=event.version,
+                    dirty_revision_floor=self._task_runtime_recovery_update_revision,
                 )
                 if stored:
                     marker = dict(stored)
@@ -1141,23 +1143,30 @@ class KnoweServer:
         else:
             self._task_runtime_recovery_revision += 1
             marker["recovery_revision"] = self._task_runtime_recovery_revision
-        queue_revision = int(marker["recovery_revision"])
-        # A newer mutable generation at an existing queue position invalidates
-        # coverage of that position for every live pager that already passed it.
-        # Rewind only scalar cursors; no per-Group history is retained.
-        for client in tuple(self.hub.clients):
-            owns_group = any(
-                key[0] == event.group_id and key[1] == marker["recovery_token"]
-                for key in self._client_recovery_keys(client)
-            )
-            if owns_group:
-                continue
-            rewind = max(0, queue_revision - 1)
-            if client.task_runtime_recovery_ack_revision >= queue_revision:
-                client.task_runtime_recovery_ack_revision = rewind
-            if client.task_runtime_recovery_after_revision >= queue_revision:
-                client.task_runtime_recovery_after_revision = rewind
-                client.task_runtime_recovery_page_exhausted = False
+        dirty = None
+        if service is not None and marker.get("persisted") is not False:
+            dirty = service.store.live_recovery_dirty_marker(event.group_id)
+            if dirty is not None:
+                self._task_runtime_recovery_update_revision = max(
+                    self._task_runtime_recovery_update_revision,
+                    int(dirty.get("dirty_queue_revision") or 0),
+                )
+        elif int(previous.get("generation") or 0) > 0:
+            self._task_runtime_recovery_update_revision += 1
+            marker["dirty_queue_revision"] = self._task_runtime_recovery_update_revision
+            dirty = marker
+        if dirty is not None:
+            # The dirty stream has its own append-only revision. A notice/snapshot can
+            # upgrade to the latest generation at capture time. Only an out-of-order
+            # old ACK waiting for prefix compaction must be discarded; neither cursor
+            # nor any unrelated obligation is rewound.
+            for client in tuple(self.hub.clients):
+                for key in tuple(self._client_recovery_keys(client)):
+                    if (
+                        key[0] == event.group_id
+                        and key in client.task_runtime_recovery_applied
+                    ):
+                        self._drop_client_recovery_key_locked(client, key)
         self._task_runtime_event_bridge_recovery[event.group_id] = marker
         self._task_runtime_event_bridge_recovery.move_to_end(event.group_id)
         while len(self._task_runtime_event_bridge_recovery) > self.TASK_RUNTIME_RECOVERY_MARKER_MAX:
@@ -1275,6 +1284,15 @@ class KnoweServer:
             except BaseException:  # the connection is already fenced from authority
                 pass
 
+    def _admit_task_runtime_client(self, client: Client) -> None:
+        """Atomically bind the durable debt epoch before publishing a live session."""
+        with self._task_runtime_event_bridge_lock:
+            service = self.task_runtime
+            client.task_runtime_recovery_disconnect_epoch_baseline = (
+                0 if service is None else service.store.live_recovery_disconnect_epoch()
+            )
+            self.hub.add_client(client)
+
     def _normalize_client_recovery_slots_locked(self, client: Client) -> None:
         """Prune auxiliary ownership metadata after a phase transition or test hook."""
         keys = self._client_recovery_keys(client)
@@ -1282,13 +1300,26 @@ class KnoweServer:
             key: revision for key, revision in client.task_runtime_recovery_revisions.items()
             if key in keys
         }
+        client.task_runtime_recovery_kinds = {
+            key: kind for key, kind in client.task_runtime_recovery_kinds.items()
+            if key in keys
+        }
         client.task_runtime_recovery_send_deadlines = {
             key: deadline
             for key, deadline in client.task_runtime_recovery_send_deadlines.items()
             if key in keys
         }
+        base_keys = {
+            key for key in keys
+            if client.task_runtime_recovery_kinds.get(key, "base") == "base"
+        }
+        update_keys = keys - base_keys
         client.task_runtime_recovery_order = deque(sorted(
-            keys,
+            base_keys,
+            key=lambda key: (client.task_runtime_recovery_revisions.get(key, 0), key),
+        ))
+        client.task_runtime_recovery_update_order = deque(sorted(
+            update_keys,
             key=lambda key: (client.task_runtime_recovery_revisions.get(key, 0), key),
         ))
         for key, task in tuple(client.task_runtime_recovery_send_tasks.items()):
@@ -1309,24 +1340,55 @@ class KnoweServer:
         client.task_runtime_recovery_snapshots.pop(key, None)
         client.task_runtime_recovery_applied.discard(key)
         client.task_runtime_recovery_revisions.pop(key, None)
+        client.task_runtime_recovery_kinds.pop(key, None)
         client.task_runtime_recovery_order = deque(
             item for item in client.task_runtime_recovery_order if item != key
         )
+        client.task_runtime_recovery_update_order = deque(
+            item for item in client.task_runtime_recovery_update_order if item != key
+        )
 
-    def _compact_client_recovery_acks_locked(self, client: Client) -> None:
-        """Advance the scalar watermark only across the bounded applied prefix."""
+    def _compact_client_recovery_acks_locked(
+        self, client: Client,
+    ) -> tuple[
+        list[tuple[tuple[str, str, int], int]],
+        list[tuple[tuple[str, str, int], int]],
+    ]:
+        """Advance base and dirty scalar watermarks across their applied prefixes."""
         self._normalize_client_recovery_slots_locked(client)
-        while client.task_runtime_recovery_order:
-            key = client.task_runtime_recovery_order[0]
-            if key not in client.task_runtime_recovery_applied:
-                break
-            client.task_runtime_recovery_order.popleft()
-            revision = client.task_runtime_recovery_revisions.pop(key, 0)
-            client.task_runtime_recovery_applied.discard(key)
-            client.task_runtime_recovery_ack_revision = max(
-                client.task_runtime_recovery_ack_revision, revision,
-            )
+        compacted: dict[str, list[tuple[tuple[str, str, int], int]]] = {
+            "base": [], "update": [],
+        }
+        for kind, order, frontier_name in (
+            (
+                "base", client.task_runtime_recovery_order,
+                "task_runtime_recovery_ack_revision",
+            ),
+            (
+                "update", client.task_runtime_recovery_update_order,
+                "task_runtime_recovery_update_ack_revision",
+            ),
+        ):
+            while order:
+                key = order[0]
+                if key not in client.task_runtime_recovery_applied:
+                    break
+                order.popleft()
+                revision = client.task_runtime_recovery_revisions.pop(key, 0)
+                client.task_runtime_recovery_kinds.pop(key, None)
+                client.task_runtime_recovery_applied.discard(key)
+                setattr(client, frontier_name, max(getattr(client, frontier_name), revision))
+                if kind == "update":
+                    client.task_runtime_recovery_update_after_revision = max(
+                        client.task_runtime_recovery_update_after_revision, revision,
+                    )
+                else:
+                    client.task_runtime_recovery_after_revision = max(
+                        client.task_runtime_recovery_after_revision, revision,
+                    )
+                compacted[kind].append((key, revision))
         self._normalize_client_recovery_slots_locked(client)
+        return compacted["base"], compacted["update"]
 
     def _retire_task_runtime_recoveries_locked(self) -> None:
         """Retire only through the minimum contiguous live-client ACK watermark."""
@@ -1336,6 +1398,10 @@ class KnoweServer:
         alive = tuple(client for client in self.hub.clients if client.alive)
         if not alive:
             return
+        update_frontier = min(
+            client.task_runtime_recovery_update_ack_revision for client in alive
+        )
+        service.store.retire_live_recovery_dirty_through(update_frontier)
         frontier = min(client.task_runtime_recovery_ack_revision for client in alive)
         for marker in service.store.retire_live_recoveries_through(frontier):
             group_id = str(marker["group_id"])
@@ -1397,11 +1463,15 @@ class KnoweServer:
                 )
             return sent
 
-        async def send_marker(target: Client, marker: dict[str, Any]) -> str:
+        async def send_marker(
+            target: Client, marker: dict[str, Any], *, kind: str = "base",
+        ) -> str:
             group_id = str(marker["group_id"])
             token = str(marker["recovery_token"])
             generation = int(marker["generation"])
-            revision = int(marker.get("recovery_revision") or 0)
+            revision = int(marker.get(
+                "dirty_queue_revision" if kind == "update" else "recovery_revision",
+            ) or 0)
             notice_key = (group_id, token, generation)
             try:
                 project_id = self._runtime_project_id_for_group(group_id)
@@ -1423,7 +1493,11 @@ class KnoweServer:
                     return "full"
                 target.task_runtime_recovery_reserved.add(notice_key)
                 target.task_runtime_recovery_revisions[notice_key] = revision
-                target.task_runtime_recovery_order.append(notice_key)
+                target.task_runtime_recovery_kinds[notice_key] = kind
+                if kind == "update":
+                    target.task_runtime_recovery_update_order.append(notice_key)
+                else:
+                    target.task_runtime_recovery_order.append(notice_key)
             payload = {
                 "type": "resync_required",
                 "project_id": project_id,
@@ -1482,10 +1556,6 @@ class KnoweServer:
                     self._normalize_client_recovery_slots_locked(target)
                     if not target.alive:
                         return
-                    if target.task_runtime_recovery_disconnect_epoch_baseline is None:
-                        target.task_runtime_recovery_disconnect_epoch_baseline = (
-                            service.store.live_recovery_disconnect_epoch()
-                        )
                     available = max(
                         0, target.TASK_RUNTIME_RECOVERY_WINDOW_MAX
                         - len(self._client_recovery_keys(target)),
@@ -1508,7 +1578,7 @@ class KnoweServer:
                     stop_fill = False
                     for marker in page:
                         revision = int(marker.get("recovery_revision") or 0)
-                        outcome = await send_marker(target, marker)
+                        outcome = await send_marker(target, marker, kind="base")
                         if outcome == "full":
                             page_complete = False
                             break
@@ -1532,6 +1602,41 @@ class KnoweServer:
                         break
                     await asyncio.sleep(0)
 
+                while available > 0:
+                    page = service.store.live_recovery_dirty(
+                        limit=target.TASK_RUNTIME_RECOVERY_WINDOW_MAX,
+                        after_queue_revision=(
+                            target.task_runtime_recovery_update_after_revision
+                        ),
+                    )
+                    if not page:
+                        break
+                    page_complete = True
+                    stop_fill = False
+                    for marker in page:
+                        revision = int(marker["dirty_queue_revision"])
+                        outcome = await send_marker(target, marker, kind="update")
+                        if outcome == "full":
+                            page_complete = False
+                            break
+                        if outcome == "failed":
+                            page_complete = False
+                            stop_fill = True
+                            break
+                        target.task_runtime_recovery_update_after_revision = max(
+                            target.task_runtime_recovery_update_after_revision, revision,
+                        )
+                        if outcome == "sent":
+                            available -= 1
+                            if available == 0:
+                                page_complete = False
+                                break
+                    if stop_fill:
+                        break
+                    if page_complete and len(page) < target.TASK_RUNTIME_RECOVERY_WINDOW_MAX:
+                        break
+                    await asyncio.sleep(0)
+
                 # A recovery-table write failure is represented by the bounded hot
                 # cache and can only reserve remaining slots through the same cap check.
                 with self._task_runtime_event_bridge_lock:
@@ -1540,12 +1645,23 @@ class KnoweServer:
                         if marker.get("persisted") is False
                     )
                 for marker in hot_markers:
-                    if int(marker.get("recovery_revision") or 0) <= target.task_runtime_recovery_after_revision:
+                    base_revision = int(marker.get("recovery_revision") or 0)
+                    update_revision = int(marker.get("dirty_queue_revision") or 0)
+                    if base_revision > target.task_runtime_recovery_after_revision:
+                        kind = "base"
+                        revision = base_revision
+                    elif update_revision > target.task_runtime_recovery_update_after_revision:
+                        kind = "update"
+                        revision = update_revision
+                    else:
                         continue
-                    outcome = await send_marker(target, marker)
+                    outcome = await send_marker(target, marker, kind=kind)
                     if outcome != "sent":
                         continue
-                    target.task_runtime_recovery_after_revision = int(marker["recovery_revision"])
+                    if kind == "update":
+                        target.task_runtime_recovery_update_after_revision = revision
+                    else:
+                        target.task_runtime_recovery_after_revision = revision
                     available -= 1
                     if available == 0:
                         break
@@ -1644,16 +1760,39 @@ class KnoweServer:
                 ), None)
                 if prior is None:
                     return None
-                order = tuple(client.task_runtime_recovery_order)
+                kind = client.task_runtime_recovery_kinds.get(prior, "base")
+                revision = client.task_runtime_recovery_revisions.get(prior, 0)
+                if kind == "update":
+                    dirty = service.store.live_recovery_dirty_marker(group_id)
+                    if dirty is None and final.get("persisted") is False:
+                        hot = self._task_runtime_event_bridge_recovery.get(group_id)
+                        dirty = dict(hot) if hot is not None else None
+                    if (
+                        dirty is None
+                        or self._task_runtime_marker_identity(dirty)[:2]
+                        != self._task_runtime_marker_identity(final)[:2]
+                    ):
+                        return None
+                    revision = int(dirty.get("dirty_queue_revision") or 0)
+                else:
+                    revision = int(final.get("recovery_revision") or 0)
+                order = tuple(
+                    client.task_runtime_recovery_update_order
+                    if kind == "update"
+                    else client.task_runtime_recovery_order
+                )
                 self._drop_client_recovery_key_locked(client, prior)
                 client.task_runtime_recovery_snapshots[key] = cursor
-                client.task_runtime_recovery_revisions[key] = int(
-                    after.get("recovery_revision") or 0,
-                )
-                client.task_runtime_recovery_after_revision = max(
-                    client.task_runtime_recovery_after_revision,
-                    int(after.get("recovery_revision") or 0),
-                )
+                client.task_runtime_recovery_revisions[key] = revision
+                client.task_runtime_recovery_kinds[key] = kind
+                if kind == "update":
+                    client.task_runtime_recovery_update_after_revision = max(
+                        client.task_runtime_recovery_update_after_revision, revision,
+                    )
+                else:
+                    client.task_runtime_recovery_after_revision = max(
+                        client.task_runtime_recovery_after_revision, revision,
+                    )
                 rebuilt: deque[tuple[str, str, int]] = deque()
                 for item in order:
                     candidate = key if item == prior else item
@@ -1661,7 +1800,10 @@ class KnoweServer:
                         rebuilt.append(candidate)
                 if key not in rebuilt:
                     rebuilt.append(key)
-                client.task_runtime_recovery_order = rebuilt
+                if kind == "update":
+                    client.task_runtime_recovery_update_order = rebuilt
+                else:
+                    client.task_runtime_recovery_order = rebuilt
                 self._normalize_client_recovery_slots_locked(client)
             return snapshot, dict(after), cursor
         return None
@@ -1739,6 +1881,8 @@ class KnoweServer:
         if client.task_runtime_recovery_snapshots.get(key) != snapshot_cursor:
             return False
         with self._task_runtime_event_bridge_lock:
+            kind = client.task_runtime_recovery_kinds.get(key, "base")
+            revision = client.task_runtime_recovery_revisions.get(key, 0)
             marker = self.task_runtime.store.live_recovery(group_id)
             fallback = self._task_runtime_event_bridge_recovery.get(group_id)
             if marker is None and fallback is not None and fallback.get("persisted") is False:
@@ -1755,8 +1899,6 @@ class KnoweServer:
                             claim_id=client.task_runtime_recovery_session_id,
                             claim_after_epoch=(
                                 client.task_runtime_recovery_disconnect_epoch_baseline
-                                if client.task_runtime_recovery_disconnect_epoch_baseline is not None
-                                else -1
                             ),
                         )
                     except Exception:  # noqa: BLE001 -- durable intent must remain retryable
@@ -1768,10 +1910,38 @@ class KnoweServer:
                         return False
             client.task_runtime_recovery_snapshots.pop(key, None)
             client.task_runtime_recovery_applied.add(key)
-            client.task_runtime_recovery_revisions[key] = int(
-                marker.get("recovery_revision") or 0,
-            )
-            self._compact_client_recovery_acks_locked(client)
+            client.task_runtime_recovery_revisions[key] = revision
+            client.task_runtime_recovery_kinds[key] = kind
+            base_compacted, _updates = self._compact_client_recovery_acks_locked(client)
+            # A latest-generation base snapshot also covers the coalesced dirty
+            # obligation for that Group. Reuse the slot just compacted, then advance
+            # the independent update watermark without emitting a duplicate frame.
+            for compacted_key, _base_revision in base_compacted:
+                dirty = self.task_runtime.store.live_recovery_dirty_marker(
+                    compacted_key[0],
+                )
+                if dirty is None:
+                    hot = self._task_runtime_event_bridge_recovery.get(
+                        compacted_key[0],
+                    )
+                    if (
+                        hot is not None
+                        and hot.get("persisted") is False
+                        and int(hot.get("dirty_queue_revision") or 0) > 0
+                    ):
+                        dirty = hot
+                if dirty is None or self._task_runtime_marker_identity(dirty)[:2] != (
+                    compacted_key[1], compacted_key[2],
+                ):
+                    continue
+                client.task_runtime_recovery_applied.add(compacted_key)
+                client.task_runtime_recovery_revisions[compacted_key] = int(
+                    dirty.get("dirty_queue_revision") or 0,
+                )
+                client.task_runtime_recovery_kinds[compacted_key] = "update"
+                client.task_runtime_recovery_update_order.append(compacted_key)
+            if base_compacted:
+                self._compact_client_recovery_acks_locked(client)
             self._retire_task_runtime_recoveries_locked()
         return True
 
@@ -1790,6 +1960,9 @@ class KnoweServer:
             try:
                 service.store.mark_live_recoveries_disconnect_after(
                     client.task_runtime_recovery_ack_revision,
+                    update_revision=(
+                        client.task_runtime_recovery_update_ack_revision
+                    ),
                     fence_id=client.task_runtime_recovery_session_id,
                     disconnected_at_ns=disconnected_at_ns,
                 )
@@ -1807,7 +1980,9 @@ class KnoweServer:
             client.task_runtime_recovery_snapshots.clear()
             client.task_runtime_recovery_applied.clear()
             client.task_runtime_recovery_revisions.clear()
+            client.task_runtime_recovery_kinds.clear()
             client.task_runtime_recovery_order.clear()
+            client.task_runtime_recovery_update_order.clear()
 
     def _record_task_runtime_snapshot_publication(self, snapshot: dict[str, Any]) -> None:
         if self.task_runtime is None:
@@ -1907,6 +2082,9 @@ class KnoweServer:
             self._task_runtime_event_bridge_pending_keys.clear()
             self._task_runtime_event_bridge_recovery.clear()
             self._task_runtime_recovery_revision = 0
+            self._task_runtime_recovery_update_revision = (
+                service.store.live_recovery_dirty_revision_high_water()
+            )
             # Only a bounded hot page lives in memory; notification scans every
             # durable Group in fair pages and never drops older correctness work.
             for marker in service.store.live_recoveries(
@@ -3773,7 +3951,7 @@ class KnoweServer:
     # ═══════════════════════════════════════════════════════════
     async def handle(self, ws: ServerConnection) -> None:
         client = Client(ws)
-        self.hub.add_client(client)     # ★ 立刻进广播集合（§b）
+        self._admit_task_runtime_client(client)  # ★ 绑定恢复纪元后立刻进广播集合（§b）
         log.info("client %s connected (total=%d)", client.id, self.hub.client_count)
 
         try:
@@ -5493,6 +5671,7 @@ class KnoweServer:
         key = (group_id, token, generation)
         if client.task_runtime_recovery_snapshots.get(key) != cursor:
             return
+        failed_kind = client.task_runtime_recovery_kinds.get(key, "base")
         acknowledged = self._ack_task_runtime_recovery(
             client, group_id=group_id, recovery_token=token,
             generation=generation, snapshot_cursor=cursor,
@@ -5508,9 +5687,14 @@ class KnoweServer:
                             self._drop_client_recovery_key_locked(client, item)
                     # A stale debt claim or generation CAS must not leave the pager
                     # beyond the still-durable row it failed to apply.
-                    client.task_runtime_recovery_after_revision = (
-                        client.task_runtime_recovery_ack_revision
-                    )
+                    if failed_kind == "update":
+                        client.task_runtime_recovery_update_after_revision = (
+                            client.task_runtime_recovery_update_ack_revision
+                        )
+                    else:
+                        client.task_runtime_recovery_after_revision = (
+                            client.task_runtime_recovery_ack_revision
+                        )
                     client.task_runtime_recovery_page_exhausted = False
         # A newer durable revision may now be visible to another independent pager;
         # filling only the ACKing client can strand that generation.
