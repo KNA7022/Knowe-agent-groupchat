@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 from pathlib import Path
 
@@ -136,6 +137,9 @@ async def test_duplicate_http_provisions_distinct_runtime_and_returns_duplicate_
     async def provision(project_id, project_name, project_dir=None, **kwargs):
         provisioned.append((project_id, project_dir, kwargs.get("register_group_metadata")))
         group_server.hub.get_or_create(project_id, project_name)
+        group_server.project_dirs[project_id] = project_dir
+        group_server.store.upsert_project(project_id, project_name)
+        group_server._persisted_project_ids.add(project_id)  # noqa: SLF001
         return project_id
 
     monkeypatch.setattr(group_server, "create_project", provision)
@@ -187,6 +191,9 @@ async def test_duplicate_runtime_stays_fenced_until_retry_commits_canonical_grou
         assert kwargs["register_group_metadata"] is False
         assert kwargs["publish_events"] is False
         group_server.hub.get_or_create(project_id, project_name)
+        group_server.project_dirs[project_id] = project_dir
+        group_server.store.upsert_project(project_id, project_name)
+        group_server._persisted_project_ids.add(project_id)  # noqa: SLF001
         return project_id
 
     async def capture_event(event):
@@ -197,12 +204,12 @@ async def test_duplicate_runtime_stays_fenced_until_retry_commits_canonical_grou
     original_commit = group_server.groups.commit_duplicate
     commit_calls = 0
 
-    def fail_once(transaction_id):
+    def fail_once(transaction_id, **kwargs):
         nonlocal commit_calls
         commit_calls += 1
         if commit_calls == 1:
             raise OSError("canonical duplicate commit interrupted")
-        return original_commit(transaction_id)
+        return original_commit(transaction_id, **kwargs)
 
     monkeypatch.setattr(group_server.groups, "commit_duplicate", fail_once)
     body = {
@@ -252,6 +259,90 @@ async def test_duplicate_runtime_stays_fenced_until_retry_commits_canonical_grou
     assert group_server.groups.get(duplicate_id).legacy_project_id == runtime_id
     assert [event["type"] for event in emitted] == ["project_created"]
     assert emitted[0]["group_id"] == duplicate_id
+
+
+async def test_duplicate_retries_after_store_failure_following_hub_insertion(
+    group_server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = group_server.groups.create_group("Durable source", legacy_project_id="project_durable")
+    workspace = tmp_path / "durable-copy"
+    workspace.mkdir()
+    emitted: list[dict] = []
+    original_defer = group_server.store.defer
+    defer_calls = 0
+
+    def fail_first_store_upsert(callback):
+        nonlocal defer_calls
+        defer_calls += 1
+        if defer_calls == 1:
+            failed: concurrent.futures.Future = concurrent.futures.Future()
+            failed.set_exception(OSError("store upsert interrupted after Hub insertion"))
+            return failed
+        return original_defer(callback)
+
+    async def capture_event(event):
+        emitted.append(dict(event))
+
+    monkeypatch.setattr(group_server.store, "defer", fail_first_store_upsert)
+    monkeypatch.setattr(group_server.hub, "emit_no_seq", capture_event)
+    body = {
+        "group_id": source.group_id,
+        "project_id": source.legacy_project_id,
+        "name": "Durable copy",
+        "project_dir": str(workspace),
+        "request_id": "gdup_store_upsert_fault_001",
+    }
+
+    first_writer = CaptureWriter()
+    await group_server._serve_group_operation(  # noqa: SLF001
+        first_writer, "/groups/duplicate", json.dumps(body).encode(),
+    )
+    first_status, _ = first_writer.payload()
+    assert first_status == 500
+    transaction = group_server.groups.duplicate_transaction(source.group_id, body["request_id"])
+    assert transaction is not None and transaction["stage"] == "prepared"
+    runtime_id = str(transaction["runtime_project_id"])
+    duplicate_id = str(transaction["group_id"])
+    assert runtime_id in group_server.hub.projects
+    assert runtime_id not in group_server._persisted_project_ids  # noqa: SLF001
+    assert runtime_id in group_server._provisional_project_ids  # noqa: SLF001
+    assert not group_server._duplicate_runtime_provisioning_complete(runtime_id)  # noqa: SLF001
+    assert runtime_id not in {
+        row["project_id"] for row in group_server._conversation_state_rows()  # noqa: SLF001
+    }
+    assert emitted == []
+    with pytest.raises(GroupNotFoundError):
+        group_server.groups.get(duplicate_id)
+    with pytest.raises(ProjectIdResolutionError, match="not canonically published"):
+        group_server._canonical_project_id_from_request(runtime_id)  # noqa: SLF001
+
+    retry_writer = CaptureWriter()
+    await group_server._serve_group_operation(  # noqa: SLF001
+        retry_writer, "/groups/duplicate", json.dumps(body).encode(),
+    )
+    retry_status, retried = retry_writer.payload()
+    assert retry_status == 200
+    assert defer_calls == 2
+    assert retried["group_id"] == duplicate_id
+    assert retried["project_id"] == runtime_id
+    assert group_server._duplicate_runtime_provisioning_complete(runtime_id)  # noqa: SLF001
+    assert runtime_id in group_server._persisted_project_ids  # noqa: SLF001
+    assert any(
+        row.get("project_id") == runtime_id for row in group_server.store.load_projects()
+    )
+    assert group_server.groups.get(duplicate_id).legacy_project_id == runtime_id
+    assert runtime_id not in group_server._provisional_project_ids  # noqa: SLF001
+    assert [event["type"] for event in emitted] == ["project_created"]
+    assert emitted[0]["group_id"] == duplicate_id
+
+    restarted = KnoweServer(data_dir=str(group_server.data_root))
+    try:
+        restarted.load_from_disk()
+        assert runtime_id in restarted._persisted_project_ids  # noqa: SLF001
+        assert runtime_id in restarted.hub.projects
+        assert restarted.groups.runtime_project_id(duplicate_id) == runtime_id
+    finally:
+        restarted.store.close()
 
 
 async def test_real_runtime_provisioning_emits_nothing_while_provisional(

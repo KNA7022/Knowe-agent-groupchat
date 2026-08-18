@@ -377,6 +377,7 @@ class GroupRepository:
         self.registry_path = self.root / "registry.json"
         self.receipts_path = self.root / "deletion_receipts.json"
         self.root.mkdir(parents=True, exist_ok=True)
+        self._normalize_duplicate_journal()
 
     def _load_payload(self) -> dict[str, Any]:
         if not self.registry_path.is_file():
@@ -404,6 +405,33 @@ class GroupRepository:
         payload["schema_version"] = GROUP_SCHEMA_VERSION
         payload["revision"] = int(payload.get("revision") or 0) + 1
         _atomic_write_json(self.registry_path, payload)
+
+    def _normalize_duplicate_journal(self) -> None:
+        """Atomically scrub full snapshots retained by the pre-fence duplicate format."""
+        if not self.registry_path.is_file():
+            return
+        payload = self._load_payload()
+        allowed = {
+            "transaction_id", "source_group_id", "group_id", "runtime_project_id",
+            "request_id", "created_at", "stage", "updated_at",
+        }
+        changed = False
+        normalized: list[dict[str, Any]] = []
+        for row in payload["duplicate_transactions"]:
+            if (
+                isinstance(row, Mapping)
+                and row.get("stage") in {"committed", "deleted"}
+                and ("group" in row or set(row) - allowed)
+            ):
+                normalized.append(self._minimal_duplicate_transaction(
+                    row, stage=str(row["stage"]),
+                ))
+                changed = True
+            else:
+                normalized.append(dict(row))
+        if changed:
+            payload["duplicate_transactions"] = normalized
+            self._save_payload(payload)
 
     def list_groups(self, *, include_archived: bool = True) -> list[Group]:
         groups = [Group.from_dict(row) for row in self._load_payload()["groups"]]
@@ -634,7 +662,9 @@ class GroupRepository:
         self._save_payload(payload)
         return dict(transaction)
 
-    def commit_duplicate(self, transaction_id: str) -> Group:
+    def commit_duplicate(
+        self, transaction_id: str, *, require_runtime_provisioned: bool = False,
+    ) -> Group:
         payload = self._load_payload()
         for index, row in enumerate(payload["duplicate_transactions"]):
             if row.get("transaction_id") != transaction_id:
@@ -651,6 +681,8 @@ class GroupRepository:
                         f"committed duplicate group not found: {row.get('group_id')}"
                     )
                 return Group.from_dict(committed)
+            if require_runtime_provisioned and row.get("stage") != "runtime_provisioned":
+                raise GroupDomainError("duplicate runtime provisioning is not durable")
             group_raw = row.get("group")
             if not isinstance(group_raw, Mapping):
                 raise GroupDomainError("duplicate transaction is missing Group configuration")
@@ -662,6 +694,21 @@ class GroupRepository:
             )
             self._save_payload(payload)
             return duplicate
+        raise GroupNotFoundError(f"duplicate transaction not found: {transaction_id}")
+
+    def mark_duplicate_runtime_provisioned(self, transaction_id: str) -> dict[str, Any]:
+        payload = self._load_payload()
+        for index, row in enumerate(payload["duplicate_transactions"]):
+            if row.get("transaction_id") != transaction_id:
+                continue
+            if row.get("stage") in {"runtime_provisioned", "committed"}:
+                return dict(row)
+            if row.get("stage") != "prepared":
+                raise GroupDomainError("duplicate transaction cannot be provisioned")
+            updated = {**row, "stage": "runtime_provisioned", "updated_at": utc_now()}
+            payload["duplicate_transactions"][index] = updated
+            self._save_payload(payload)
+            return dict(updated)
         raise GroupNotFoundError(f"duplicate transaction not found: {transaction_id}")
 
     @staticmethod
@@ -687,9 +734,16 @@ class GroupRepository:
         available = set(runtime_project_ids)
         recovered: list[str] = []
         for row in list(self._load_payload()["duplicate_transactions"]):
-            if row.get("stage") != "prepared" or row.get("runtime_project_id") not in available:
+            if (
+                row.get("stage") not in {"prepared", "runtime_provisioned"}
+                or row.get("runtime_project_id") not in available
+            ):
                 continue
-            group = self.commit_duplicate(str(row["transaction_id"]))
+            if row.get("stage") == "prepared":
+                row = self.mark_duplicate_runtime_provisioned(str(row["transaction_id"]))
+            group = self.commit_duplicate(
+                str(row["transaction_id"]), require_runtime_provisioned=True,
+            )
             recovered.append(group.group_id)
         return recovered
 
@@ -954,14 +1008,15 @@ class GroupRepository:
 def migrate_legacy_projects(data_root: str | os.PathLike[str]) -> dict[str, Any]:
     """Run the Group migration with an outer rollback/report fence."""
     root = Path(data_root)
-    repo = GroupRepository(root)
-    registry_existed = repo.registry_path.is_file()
+    registry_path = root / "groups" / f"v{GROUP_SCHEMA_VERSION}" / "registry.json"
+    registry_existed = registry_path.is_file()
     registry_before: bytes | None = None
     source_before: dict[str, str | None] = {}
     before_errors: dict[str, str] = {}
     try:
         if registry_existed:
-            registry_before = repo.registry_path.read_bytes()
+            registry_before = registry_path.read_bytes()
+        GroupRepository(root)  # applies idempotent schema/journal normalization inside the fence
         source_before, before_errors = _safe_legacy_source_inventory(root)
         if before_errors:
             details = "; ".join(f"{path}: {error}" for path, error in sorted(before_errors.items()))
@@ -969,9 +1024,9 @@ def migrate_legacy_projects(data_root: str | os.PathLike[str]) -> dict[str, Any]
         return _migrate_legacy_projects_impl(root)
     except Exception as exc:
         if registry_before is not None:
-            _atomic_write_bytes(repo.registry_path, registry_before)
+            _atomic_write_bytes(registry_path, registry_before)
         elif not registry_existed:
-            repo.registry_path.unlink(missing_ok=True)
+            registry_path.unlink(missing_ok=True)
         report_path = root / "migration_reports" / "groups-v1.json"
         source_after, after_errors = _safe_legacy_source_inventory(root)
         all_paths = sorted(set(source_before) | set(source_after) | set(before_errors) | set(after_errors))

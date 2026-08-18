@@ -3645,6 +3645,25 @@ class KnoweServer:
             created_event["project_dir"] = known_dir
         await self.hub.emit_no_seq(created_event)
 
+    def _duplicate_runtime_provisioning_complete(self, project_id: str) -> bool:
+        """True only after create_project crossed its durable store-registration boundary."""
+        minimum_ready = (
+            project_id in self.hub.projects
+            and project_id in self._persisted_project_ids
+            and bool(self.project_dirs.get(project_id))
+        )
+        if not minimum_ready:
+            return False
+        if self.store is None:
+            return True
+        try:
+            return any(
+                isinstance(row, dict) and row.get("project_id") == project_id
+                for row in self.store.load_projects()
+            )
+        except OSError:
+            return False
+
     # ── create_project 指令 ──
     async def _cmd_create_project(self, client: Client, data: dict[str, Any]) -> None:
         project_id = data.get("project_id")
@@ -5740,13 +5759,13 @@ class KnoweServer:
                         legacy_project_id=duplicate_runtime_id, request_id=request_id,
                     )
                     needs_publication = (
-                        transaction.get("stage") == "prepared"
+                        transaction.get("stage") in {"prepared", "runtime_provisioned"}
                         or duplicate_runtime_id in self._provisional_project_ids
-                        or duplicate_runtime_id not in self.hub.projects
+                        or not self._duplicate_runtime_provisioning_complete(duplicate_runtime_id)
                     )
-                    if transaction.get("stage") == "prepared":
+                    if transaction.get("stage") in {"prepared", "runtime_provisioned"}:
                         self._provisional_project_ids.add(duplicate_runtime_id)
-                    if duplicate_runtime_id not in self.hub.projects:
+                    if not self._duplicate_runtime_provisioning_complete(duplicate_runtime_id):
                         duplicate_raw = transaction.get("group")
                         duplicate_name = (
                             str(duplicate_raw.get("name"))
@@ -5762,7 +5781,15 @@ class KnoweServer:
                             register_group_metadata=False,
                             publish_events=False,
                         )
-                    group = self.groups.commit_duplicate(str(transaction["transaction_id"]))
+                    if not self._duplicate_runtime_provisioning_complete(duplicate_runtime_id):
+                        raise OSError("duplicate runtime provisioning did not become durable")
+                    if transaction.get("stage") == "prepared":
+                        transaction = self.groups.mark_duplicate_runtime_provisioned(
+                            str(transaction["transaction_id"]),
+                        )
+                    group = self.groups.commit_duplicate(
+                        str(transaction["transaction_id"]), require_runtime_provisioned=True,
+                    )
                     if needs_publication:
                         await self._publish_prepared_duplicate_runtime(duplicate_runtime_id)
                     result = {

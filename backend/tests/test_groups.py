@@ -143,6 +143,10 @@ def test_duplicate_commit_failure_is_hidden_and_resumable(
         source.group_id, name="Private duplicate content", legacy_project_id="project_copy",
         request_id="gdup_retryable_1",
     )
+    with pytest.raises(GroupDomainError, match="not durable"):
+        repo.commit_duplicate(
+            str(transaction["transaction_id"]), require_runtime_provisioned=True,
+        )
     before = [group.group_id for group in repo.list_groups()]
     original = repo._save_payload  # noqa: SLF001
 
@@ -181,6 +185,51 @@ def test_duplicate_commit_failure_is_hidden_and_resumable(
     assert "Private duplicate content" not in repo.registry_path.read_text("utf-8")
     with pytest.raises(GroupDomainError, match="target was deleted"):
         repo.commit_duplicate(str(transaction["transaction_id"]))
+
+
+def test_repository_open_scrubs_legacy_committed_duplicate_snapshot(tmp_path: Path) -> None:
+    repo = GroupRepository(tmp_path)
+    source = repo.create_group("Upgrade source", legacy_project_id="project_upgrade_source")
+    transaction = repo.prepare_duplicate(
+        source.group_id,
+        name="PRIVATE_SENTINEL_OLD_DUPLICATE_NAME",
+        legacy_project_id="project_upgrade_copy",
+        request_id="gdup_upgrade_shape_001",
+    )
+    legacy_snapshot = dict(transaction["group"])
+    copied = repo.commit_duplicate(str(transaction["transaction_id"]))
+    repo.rename(copied.group_id, "Current public duplicate name")
+
+    payload = repo._load_payload()  # noqa: SLF001
+    for index, row in enumerate(payload["duplicate_transactions"]):
+        if row["transaction_id"] == transaction["transaction_id"]:
+            payload["duplicate_transactions"][index] = {
+                **row,
+                "stage": "committed",
+                "group": legacy_snapshot,
+            }
+            break
+    repo._save_payload(payload)  # noqa: SLF001
+    assert "PRIVATE_SENTINEL_OLD_DUPLICATE_NAME" in repo.registry_path.read_text("utf-8")
+
+    upgraded = GroupRepository(tmp_path)
+    disk_after_upgrade = upgraded.registry_path.read_text("utf-8")
+    assert "PRIVATE_SENTINEL_OLD_DUPLICATE_NAME" not in disk_after_upgrade
+    upgraded_tx = upgraded.duplicate_transaction(source.group_id, "gdup_upgrade_shape_001")
+    assert upgraded_tx is not None
+    assert upgraded_tx["stage"] == "committed"
+    assert "group" not in upgraded_tx
+    assert set(upgraded_tx).issubset({
+        "transaction_id", "source_group_id", "group_id", "runtime_project_id",
+        "request_id", "created_at", "stage", "updated_at",
+    })
+    retried = upgraded.commit_duplicate(str(transaction["transaction_id"]))
+    assert retried.group_id == copied.group_id
+    assert retried.name == "Current public duplicate name"
+
+    before_second_open = upgraded.registry_path.read_bytes()
+    GroupRepository(tmp_path)
+    assert upgraded.registry_path.read_bytes() == before_second_open
 
 
 def test_delete_commit_is_atomic_resumable_and_idempotent(
