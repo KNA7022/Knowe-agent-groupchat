@@ -65,13 +65,24 @@ class Client:
         self._live_replay_overflow_projects: set[str] = set()
         # Recovery ACKs are accepted only for a snapshot cursor issued to this
         # authenticated live connection.  Reconnect intentionally starts empty.
+        # One recovery key owns exactly one mutually-exclusive phase.  The union of
+        # these collections is the hard per-connection window; applied entries exist
+        # only for out-of-order ACK compaction and can never grow outside that window.
+        self.task_runtime_recovery_reserved: set[tuple[str, str, int]] = set()
         self.task_runtime_recovery_notified: set[tuple[str, str, int]] = set()
         self.task_runtime_recovery_snapshots: dict[tuple[str, str, int], str] = {}
         self.task_runtime_recovery_applied: set[tuple[str, str, int]] = set()
+        self.task_runtime_recovery_revisions: dict[tuple[str, str, int], int] = {}
+        self.task_runtime_recovery_order: deque[tuple[str, str, int]] = deque()
+        self.task_runtime_recovery_ack_revision = 0
+        self.task_runtime_recovery_send_tasks: dict[
+            tuple[str, str, int], asyncio.Task[bool]
+        ] = {}
         # Recovery intents stay durable in SQLite.  A connection holds only a small
         # fair-scanning window and one opaque paging cursor, never a mirror of the
         # complete recovery table.
-        self.task_runtime_recovery_after_group_id = ""
+        self.task_runtime_recovery_after_group_id = ""  # legacy diagnostics only
+        self.task_runtime_recovery_after_revision = 0
         self.task_runtime_recovery_page_exhausted = False
         self.task_runtime_recovery_seen_revision = 0
         self.task_runtime_recovery_fill_lock = asyncio.Lock()
@@ -79,6 +90,20 @@ class Client:
     @property
     def alive(self) -> bool:
         return _is_alive(self.ws)
+
+    @property
+    def task_runtime_recovery_slot_count(self) -> int:
+        """Hard-window accounting across mutually-exclusive recovery phases."""
+        phases = (
+            self.task_runtime_recovery_reserved,
+            self.task_runtime_recovery_notified,
+            set(self.task_runtime_recovery_snapshots),
+            self.task_runtime_recovery_applied,
+        )
+        flattened = [key for phase in phases for key in phase]
+        if len(flattened) != len(set(flattened)):
+            raise RuntimeError("Task Runtime recovery key owns multiple phases")
+        return len(flattened)
 
     async def send(self, event: dict[str, Any]) -> bool:
         if not self.alive:

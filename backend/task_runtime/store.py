@@ -195,6 +195,7 @@ class TaskRuntimeStore:
                 generation INTEGER NOT NULL,
                 failure_count INTEGER NOT NULL,
                 cause_digest TEXT NOT NULL,
+                recovery_revision INTEGER NOT NULL DEFAULT 0,
                 disconnect_retry INTEGER NOT NULL DEFAULT 0,
                 disconnected_at_ns INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -202,6 +203,10 @@ class TaskRuntimeStore:
             );
             CREATE INDEX IF NOT EXISTS idx_studycrew_live_recovery_group
               ON studycrew_live_recovery(group_id, updated_at);
+            CREATE TABLE IF NOT EXISTS studycrew_runtime_counters (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS studycrew_live_publication (
                 run_id TEXT PRIMARY KEY,
                 group_id TEXT NOT NULL,
@@ -231,9 +236,11 @@ class TaskRuntimeStore:
         self.db.ensure_columns("studycrew_live_recovery", {
             "affected_run_id": "TEXT NOT NULL DEFAULT ''",
             "through_version": "INTEGER NOT NULL DEFAULT 0",
+            "recovery_revision": "INTEGER NOT NULL DEFAULT 0",
             "disconnect_retry": "INTEGER NOT NULL DEFAULT 0",
             "disconnected_at_ns": "INTEGER NOT NULL DEFAULT 0",
         })
+        self._backfill_live_recovery_revisions()
         self._migrate_v1_side_records()
         self.db.initialize(
             """
@@ -276,7 +283,8 @@ class TaskRuntimeStore:
                        generation INTEGER NOT NULL,
                        failure_count INTEGER NOT NULL,
                    cause_digest TEXT NOT NULL,
-                   disconnect_retry INTEGER NOT NULL DEFAULT 0,
+                    recovery_revision INTEGER NOT NULL DEFAULT 0,
+                    disconnect_retry INTEGER NOT NULL DEFAULT 0,
                    disconnected_at_ns INTEGER NOT NULL DEFAULT 0,
                    created_at TEXT NOT NULL,
                        updated_at TEXT NOT NULL
@@ -310,6 +318,35 @@ class TaskRuntimeStore:
             conn.execute(
                 "CREATE INDEX idx_studycrew_live_recovery_group "
                 "ON studycrew_live_recovery(group_id, updated_at)",
+            )
+
+    def _backfill_live_recovery_revisions(self) -> None:
+        """Give legacy rows a stable, strictly increasing durable pager identity."""
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """SELECT group_id FROM studycrew_live_recovery
+                   WHERE recovery_revision <= 0
+                   ORDER BY updated_at, group_id""",
+            ).fetchall()
+            current = int(conn.execute(
+                "SELECT COALESCE(MAX(recovery_revision), 0) FROM studycrew_live_recovery",
+            ).fetchone()[0])
+            for row in rows:
+                current += 1
+                conn.execute(
+                    "UPDATE studycrew_live_recovery SET recovery_revision=? WHERE group_id=?",
+                    (current, str(row["group_id"])),
+                )
+            conn.execute(
+                """INSERT INTO studycrew_runtime_counters(name, value)
+                   VALUES ('live_recovery_revision', ?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     value=MAX(studycrew_runtime_counters.value, excluded.value)""",
+                (current,),
+            )
+            conn.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_studycrew_live_recovery_revision
+                   ON studycrew_live_recovery(recovery_revision)""",
             )
 
     def _migrate_v1_side_records(self) -> None:
@@ -1252,11 +1289,25 @@ class TaskRuntimeStore:
             ).hexdigest()
             created_at = str(previous["created_at"]) if previous is not None else now
             conn.execute(
+                """INSERT INTO studycrew_runtime_counters(name, value)
+                   VALUES ('live_recovery_revision', 0)
+                   ON CONFLICT(name) DO NOTHING""",
+            )
+            conn.execute(
+                """UPDATE studycrew_runtime_counters SET value=value+1
+                   WHERE name='live_recovery_revision'""",
+            )
+            recovery_revision = int(conn.execute(
+                """SELECT value FROM studycrew_runtime_counters
+                   WHERE name='live_recovery_revision'""",
+            ).fetchone()[0])
+            conn.execute(
                 """INSERT INTO studycrew_live_recovery(
                        group_id, affected_run_id, through_seq, through_version,
                        reason, attempts, recovery_token,
-                       generation, failure_count, cause_digest, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       generation, failure_count, cause_digest, recovery_revision,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(group_id) DO UPDATE SET
                      affected_run_id=excluded.affected_run_id,
                      through_seq=excluded.through_seq,
@@ -1266,11 +1317,12 @@ class TaskRuntimeStore:
                      generation=excluded.generation,
                      failure_count=excluded.failure_count,
                      cause_digest=excluded.cause_digest,
+                     recovery_revision=excluded.recovery_revision,
                      updated_at=excluded.updated_at""",
                 (
                     group_id, run_id, through_seq, int(run_version or through_seq),
                     reason, attempts, token, generation,
-                    failure_count, cause_digest, created_at, now,
+                    failure_count, cause_digest, recovery_revision, created_at, now,
                 ),
             )
             row = conn.execute(
@@ -1280,11 +1332,19 @@ class TaskRuntimeStore:
 
     def live_recoveries(
         self, *, limit: int | None = None, after_group_id: str = "",
+        after_revision: int | None = None,
     ) -> tuple[dict[str, Any], ...]:
         with self.db.transaction(immediate=False) as conn:
             if limit is None:
                 rows = conn.execute(
-                    "SELECT * FROM studycrew_live_recovery ORDER BY group_id",
+                    "SELECT * FROM studycrew_live_recovery ORDER BY recovery_revision, group_id",
+                ).fetchall()
+            elif after_revision is not None:
+                rows = conn.execute(
+                    """SELECT * FROM studycrew_live_recovery
+                       WHERE recovery_revision > ?
+                       ORDER BY recovery_revision, group_id LIMIT ?""",
+                    (max(0, int(after_revision)), max(1, int(limit))),
                 ).fetchall()
             else:
                 rows = conn.execute(
