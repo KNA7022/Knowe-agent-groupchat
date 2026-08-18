@@ -38,8 +38,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time                     # [v0.44.8] 置顶「后来者居上」的单调排序戳
 import uuid
+from collections import deque
 from contextvars import ContextVar
 from dataclasses import asdict
 from datetime import datetime            # [v0.38] /history 按日期过滤 & ts 解析
@@ -418,6 +420,19 @@ class KnoweServer:
         )
         self.hub = Hub(store=self.store)
         self.hub.group_id_resolver = self._group_id_for_runtime_project
+        # Initialize the cross-thread ingress before registering the synchronous
+        # journal listener: an already-due recovered approval may fire immediately.
+        self._task_runtime_event_bridge_lock = threading.Lock()
+        self._task_runtime_event_bridge_loop: asyncio.AbstractEventLoop | None = None
+        self._task_runtime_event_bridge_generation = 0
+        self._task_runtime_event_bridge_active = False
+        self._task_runtime_event_bridge_stopped = False
+        self._task_runtime_event_bridge_scheduled = False
+        self._task_runtime_event_bridge_pending: deque[RunEvent] = deque()
+        self._task_runtime_event_bridge_published: set[str] = set()
+        self._task_runtime_event_bridge_last_seq: dict[str, int] = {}
+        self._task_runtime_event_drain_task: asyncio.Task[None] | None = None
+        self._task_runtime_listener_service: TaskRuntimeService | None = self.task_runtime
         if self.task_runtime is not None:
             self.task_runtime.add_event_listener(self._on_task_runtime_event)
         self.engines: dict[str, ProjectEngine] = {}
@@ -1043,15 +1058,195 @@ class KnoweServer:
         return self.groups.runtime_project_id(group_id)
 
     def _on_task_runtime_event(self, event: RunEvent) -> None:
-        """Bridge the durable public event to the existing sequenced group Hub."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # Synchronous maintenance/tests still retain the event for HTTP replay.
-            return
-        loop.create_task(self._broadcast_task_runtime_event(event))
+        """Accept a committed event from any thread without touching async Hub state."""
+        with self._task_runtime_event_bridge_lock:
+            if not self._task_runtime_event_bridge_active:
+                # Before listen ownership exists, durable replay/snapshot is the delivery
+                # authority.  Retaining the notification lets activation establish an
+                # exact durable baseline without ever borrowing a caller's incidental loop.
+                if (
+                    self._task_runtime_event_bridge_loop is None
+                    and not self._task_runtime_event_bridge_stopped
+                ):
+                    self._task_runtime_event_bridge_pending.append(event)
+                return
+            loop = self._task_runtime_event_bridge_loop
+            generation = self._task_runtime_event_bridge_generation
+            if loop is None or loop.is_closed():
+                log.warning(
+                    "Task Runtime live loop closed before event delivery; replay will reconcile %s",
+                    event.event_id,
+                )
+                self._task_runtime_event_bridge_active = False
+                self._task_runtime_event_bridge_stopped = True
+                self._task_runtime_event_bridge_loop = None
+                self._task_runtime_event_bridge_pending.clear()
+                return
+            self._task_runtime_event_bridge_pending.append(event)
+            if self._task_runtime_event_bridge_scheduled:
+                return
+            self._task_runtime_event_bridge_scheduled = True
+            try:
+                loop.call_soon_threadsafe(self._schedule_task_runtime_event_drain, generation)
+            except RuntimeError:
+                # Loop closure raced the listener.  The event remains durable; a later
+                # activation establishes a fresh baseline from the journal.
+                log.warning(
+                    "Task Runtime live scheduling raced loop closure; replay will reconcile %s",
+                    event.event_id,
+                )
+                self._task_runtime_event_bridge_scheduled = False
+                self._task_runtime_event_bridge_active = False
+                self._task_runtime_event_bridge_stopped = True
+                self._task_runtime_event_bridge_loop = None
+                self._task_runtime_event_bridge_pending.clear()
 
-    async def _broadcast_task_runtime_event(self, event: RunEvent) -> None:
+    def _start_task_runtime_event_bridge(self) -> None:
+        """Bind live publication to the actual server/listen event loop."""
+        loop = asyncio.get_running_loop()
+        if loop.is_closed():
+            raise RuntimeError("cannot start Task Runtime bridge on a closed loop")
+        service = self.task_runtime
+        if service is None:
+            return
+
+        with self._task_runtime_event_bridge_lock:
+            if self._task_runtime_event_bridge_active:
+                if self._task_runtime_event_bridge_loop is not loop:
+                    raise RuntimeError("Task Runtime bridge is already owned by another loop")
+                return
+            if self._task_runtime_listener_service is not service:
+                if self._task_runtime_listener_service is not None:
+                    self._task_runtime_listener_service.remove_event_listener(
+                        self._on_task_runtime_event,
+                    )
+                service.add_event_listener(self._on_task_runtime_event)
+                self._task_runtime_listener_service = service
+
+            # No client can be connected before ``serve`` enters this lifecycle.  Events
+            # committed before this point are intentionally reconciled by the authoritative
+            # reconnect snapshot, not replayed as fresh live notifications.  Holding the
+            # ingress lock while reading the durable high-water marks closes the activation
+            # race with a commit's synchronous listener callback.
+            self._task_runtime_event_bridge_last_seq = {
+                run.run_id: run.last_seq for run in service.store.list_runs()
+            }
+            self._task_runtime_event_bridge_pending.clear()
+            self._task_runtime_event_bridge_published.clear()
+            self._task_runtime_event_bridge_generation += 1
+            self._task_runtime_event_bridge_loop = loop
+            self._task_runtime_event_bridge_active = True
+            self._task_runtime_event_bridge_stopped = False
+            self._task_runtime_event_bridge_scheduled = False
+
+    async def _stop_task_runtime_event_bridge(self) -> None:
+        """Atomically fence callbacks and cancel queued live publication."""
+        with self._task_runtime_event_bridge_lock:
+            self._task_runtime_event_bridge_active = False
+            self._task_runtime_event_bridge_stopped = True
+            self._task_runtime_event_bridge_generation += 1
+            self._task_runtime_event_bridge_loop = None
+            self._task_runtime_event_bridge_scheduled = False
+            self._task_runtime_event_bridge_pending.clear()
+            drain = self._task_runtime_event_drain_task
+            self._task_runtime_event_drain_task = None
+            listener_service = self._task_runtime_listener_service
+            if listener_service is not None:
+                listener_service.remove_event_listener(self._on_task_runtime_event)
+                self._task_runtime_listener_service = None
+        if drain is not None and drain is not asyncio.current_task() and not drain.done():
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+
+    def _schedule_task_runtime_event_drain(self, generation: int) -> None:
+        """Loop-thread callback scheduled by the thread-safe ingress path."""
+        with self._task_runtime_event_bridge_lock:
+            if (
+                not self._task_runtime_event_bridge_active
+                or generation != self._task_runtime_event_bridge_generation
+                or self._task_runtime_event_bridge_loop is not asyncio.get_running_loop()
+            ):
+                self._task_runtime_event_bridge_scheduled = False
+                return
+            task = self._task_runtime_event_drain_task
+            if task is not None and not task.done():
+                return
+            task = asyncio.create_task(
+                self._drain_task_runtime_events(generation),
+                name="task-runtime-live-event-drain",
+            )
+            self._task_runtime_event_drain_task = task
+
+    async def _drain_task_runtime_events(self, generation: int) -> None:
+        """Publish committed events serially on the owning loop in journal order."""
+        try:
+            while True:
+                with self._task_runtime_event_bridge_lock:
+                    if (
+                        not self._task_runtime_event_bridge_active
+                        or generation != self._task_runtime_event_bridge_generation
+                    ):
+                        return
+                    if not self._task_runtime_event_bridge_pending:
+                        self._task_runtime_event_bridge_scheduled = False
+                        return
+                    notification = self._task_runtime_event_bridge_pending.popleft()
+
+                service = self.task_runtime
+                if service is None:
+                    return
+                last_seq = self._task_runtime_event_bridge_last_seq.get(notification.run_id, 0)
+                if notification.seq <= last_seq or notification.event_id in self._task_runtime_event_bridge_published:
+                    continue
+                try:
+                    # Backfill only through this notification's sequence.  This repairs a
+                    # same-run cross-thread callback inversion without moving later events
+                    # ahead of causally earlier notifications from another run.
+                    committed = tuple(
+                        event for event in service.store.events_after(notification.run_id, last_seq)
+                        if event.seq <= notification.seq
+                    )
+                except Exception:  # noqa: BLE001 -- retry while the live lifecycle owns delivery
+                    log.exception("Task Runtime live event journal read failed: %s", notification.event_id)
+                    with self._task_runtime_event_bridge_lock:
+                        if self._task_runtime_event_bridge_active:
+                            self._task_runtime_event_bridge_pending.appendleft(notification)
+                    await asyncio.sleep(0.05)
+                    continue
+
+                for event in committed:
+                    with self._task_runtime_event_bridge_lock:
+                        if (
+                            not self._task_runtime_event_bridge_active
+                            or generation != self._task_runtime_event_bridge_generation
+                        ):
+                            return
+                    if event.event_id in self._task_runtime_event_bridge_published:
+                        self._task_runtime_event_bridge_last_seq[event.run_id] = max(
+                            self._task_runtime_event_bridge_last_seq.get(event.run_id, 0), event.seq,
+                        )
+                        continue
+                    if event.group_id != notification.group_id:
+                        log.error(
+                            "Task Runtime live event identity mismatch: %s", event.event_id,
+                        )
+                        continue
+                    delivered = await self._broadcast_task_runtime_event(event)
+                    if not delivered:
+                        with self._task_runtime_event_bridge_lock:
+                            if self._task_runtime_event_bridge_active:
+                                self._task_runtime_event_bridge_pending.appendleft(notification)
+                        await asyncio.sleep(0.05)
+                        break
+                    self._task_runtime_event_bridge_published.add(event.event_id)
+                    self._task_runtime_event_bridge_last_seq[event.run_id] = event.seq
+        finally:
+            current = asyncio.current_task()
+            with self._task_runtime_event_bridge_lock:
+                if self._task_runtime_event_drain_task is current:
+                    self._task_runtime_event_drain_task = None
+
+    async def _broadcast_task_runtime_event(self, event: RunEvent) -> bool:
         try:
             project_id = self._runtime_project_id_for_group(event.group_id)
             await self.hub.emit(project_id, {
@@ -1059,10 +1254,12 @@ class KnoweServer:
                 "group_id": event.group_id,
                 "event": event.to_public_dict(),
             })
+            return True
         except (GroupNotFoundError, ProjectClosingError):
-            return
+            return True
         except Exception:  # noqa: BLE001 -- durable replay remains authoritative
             log.exception("Task Runtime live event broadcast failed: %s", event.event_id)
+            return False
 
     def _track_task_runtime_bridge(self, coroutine: Any, *, run_id: str) -> None:
         task = asyncio.create_task(coroutine, name=f"task-runtime-bridge:{run_id}")
@@ -7565,6 +7762,10 @@ class KnoweServer:
             CONFIG.ws_port,
             process_request=self._authenticate_ws,
         ) as ws_server:
+            # The live Task Runtime bridge is deliberately activated only after the
+            # websocket listener owns this running loop.  Constructor-time tests or
+            # background maintenance threads must never become accidental loop owners.
+            self._start_task_runtime_event_bridge()
             log.info(
                 "knowe  → ws://%s:%d  (agent=%s script=%s strict=%s data=%s)",
                 CONFIG.ws_host,
@@ -7574,7 +7775,13 @@ class KnoweServer:
                 CONFIG.strict_contract,
                 self.store.root if self.store else msg("server.py.310"),
             )
-            await self._shutdown_event.wait()
+            try:
+                await self._shutdown_event.wait()
+            finally:
+                # Fence foreign Timer callbacks before any async Hub/project resource
+                # begins shutting down.  Durable events that win this race remain
+                # available through the next reconnect snapshot.
+                await self._stop_task_runtime_event_bridge()
             # Stop accepting new work before closing project-owned resources.
             health.close()
             ws_server.close()

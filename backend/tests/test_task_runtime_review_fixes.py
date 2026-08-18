@@ -274,6 +274,10 @@ async def test_live_chat_and_http_mutations_broadcast_replayable_public_events(
     server = KnoweServer(str(tmp_path))
     group = server.groups.create_group("Live", legacy_project_id="project_live")  # type: ignore[union-attr]
     server.hub.get_or_create("project_live", "Live")
+    # Unit tests invoke the transport directly without entering KnoweServer.run();
+    # explicitly model the real listener lifecycle instead of letting a constructor
+    # or incidental pytest loop become the event bridge owner.
+    server._start_task_runtime_event_bridge()  # noqa: SLF001
 
     async def directory_required(_project_id: str) -> None:
         return None
@@ -322,6 +326,7 @@ async def test_live_chat_and_http_mutations_broadcast_replayable_public_events(
     })
     assert called == ["dm"]
     assert len(server.task_runtime.store.list_runs(group_id=group.group_id)) == before_dm  # type: ignore[union-attr]
+    await server._stop_task_runtime_event_bridge()  # noqa: SLF001
     close_server(server)
 
 

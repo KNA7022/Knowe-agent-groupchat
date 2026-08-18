@@ -143,6 +143,9 @@ class TaskRuntimeService:
     def add_event_listener(self, listener: Any) -> None:
         self.store.add_event_listener(listener)
 
+    def remove_event_listener(self, listener: Any) -> None:
+        self.store.remove_event_listener(listener)
+
     def close(self) -> None:
         with self._lock:
             if self._closed:

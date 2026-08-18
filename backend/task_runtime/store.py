@@ -9,6 +9,7 @@ ring and therefore can prove whether a client cursor is contiguous.
 
 import json
 import logging
+import threading
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -52,6 +53,7 @@ class TaskRuntimeStore:
     def __init__(self, path: str | Path) -> None:
         self.db = SQLiteDatabase(path)
         self._event_listeners: list[Callable[[RunEvent], None]] = []
+        self._event_listener_lock = threading.Lock()
         self.db.initialize(
             """
             CREATE TABLE IF NOT EXISTS studycrew_task_runs (
@@ -341,10 +343,18 @@ class TaskRuntimeStore:
         self.db.close()
 
     def add_event_listener(self, listener: Callable[[RunEvent], None]) -> None:
-        self._event_listeners.append(listener)
+        with self._event_listener_lock:
+            if listener not in self._event_listeners:
+                self._event_listeners.append(listener)
+
+    def remove_event_listener(self, listener: Callable[[RunEvent], None]) -> None:
+        with self._event_listener_lock:
+            self._event_listeners = [item for item in self._event_listeners if item != listener]
 
     def _publish(self, event: RunEvent) -> None:
-        for listener in tuple(self._event_listeners):
+        with self._event_listener_lock:
+            listeners = tuple(self._event_listeners)
+        for listener in listeners:
             try:
                 listener(event)
             except Exception:  # noqa: BLE001 -- a transport subscriber cannot undo durable state
