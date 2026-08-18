@@ -52,6 +52,7 @@
  */
 
 import { z } from 'zod';
+import { GroupRuntimeSnapshotSchema } from './taskRuntime';
 
 // ═══════════════════════════════════════════════════════════════
 // 一、通用基础类型
@@ -887,6 +888,8 @@ export const ReplayCompleteSchema = z.object({
    * [v1.0.24.4] 该群引擎的权威活动账本（可选）。旧后端不带此字段 → 前端退回现状不校准。
    */
   activity: z.array(ActivityLedgerEntrySchema).optional(),
+  /** StudyCrew authoritative control-plane snapshot; never inferred from chat. */
+  task_runtime: GroupRuntimeSnapshotSchema.optional(),
 });
 export type ReplayComplete = z.infer<typeof ReplayCompleteSchema>;
 
@@ -912,6 +915,18 @@ export const PongSchema = z.object({
   type: z.literal('pong'),
 });
 export type Pong = z.infer<typeof PongSchema>;
+
+export const TaskRuntimeResultSchema = z.object({
+  type: z.literal('task_runtime_result'),
+  action: z.enum([
+    'submit', 'control', 'snapshot', 'replay', 'route', 'approval', 'agent',
+    'budget', 'checkpoint', 'verify', 'complete',
+  ]),
+  request_id: z.union([z.string(), z.number()]).nullish(),
+  schema_version: z.literal(1),
+  group_id: z.string().regex(/^grp_[0-9a-f]{32}$/),
+}).passthrough();
+export type TaskRuntimeResult = z.infer<typeof TaskRuntimeResultSchema>;
 
 /** CompletionEvent 的即时、可重放展示状态。 */
 export const CompletionStatusValueSchema = z.enum([
@@ -1028,6 +1043,7 @@ export const InboundEventSchema = z.discriminatedUnion('type', [
   ReplayCompleteSchema,
   ResyncRequiredSchema,
   PongSchema,
+  TaskRuntimeResultSchema,
 ]);
 export type InboundEvent = z.infer<typeof InboundEventSchema>;
 
@@ -1195,6 +1211,18 @@ export const PingCmdSchema = z.object({
 });
 export type PingCmd = z.infer<typeof PingCmdSchema>;
 
+export const TaskRuntimeCmdSchema = z.object({
+  type: z.literal('task_runtime'),
+  action: z.enum([
+    'submit', 'control', 'snapshot', 'replay', 'route', 'approval', 'agent',
+    'budget', 'checkpoint', 'verify', 'complete',
+  ]),
+  group_id: z.string().regex(/^grp_[0-9a-f]{32}$/).optional(),
+  project_id: z.string().min(1).optional(),
+  request_id: z.union([z.string(), z.number()]).optional(),
+}).passthrough();
+export type TaskRuntimeCmd = z.infer<typeof TaskRuntimeCmdSchema>;
+
 /**
  * 关闭项目引擎
  *
@@ -1222,6 +1250,7 @@ export const OutboundCommandSchema = z.discriminatedUnion('type', [
   SetProjectDirectoryCmdSchema,
   CancelProjectDirectoryCmdSchema,
   PingCmdSchema,
+  TaskRuntimeCmdSchema,
   ShutdownCmdSchema,       // [v2#10] 保留但前端禁用
 ]);
 export type OutboundCommand = z.infer<typeof OutboundCommandSchema>;
@@ -1254,6 +1283,7 @@ export const NO_SEQ_EVENT_TYPES = new Set([
   'project_directory_restored',
   'project_delete_progress',
   'token_usage_res',
+  'task_runtime_result',
 ]);
 
 /**
@@ -1282,6 +1312,7 @@ export const TRANSIENT_EVENT_TYPES = new Set([
   'replay_complete',
   'resync_required',
   'state_snapshot',
+  'task_runtime_result',
   'project_directory_required',
   'project_directory_restored',
   'project_delete_progress',

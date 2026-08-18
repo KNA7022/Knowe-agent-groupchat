@@ -67,6 +67,17 @@ from .groups import (
     GroupTemplate,
     StaleDeletePreviewError,
 )
+from .task_runtime import RuntimeConflictError, RuntimeNotFoundError, TaskRuntimeService
+from .task_runtime.contracts import (
+    AgentPhase,
+    BudgetLimits as ControlBudgetLimits,
+    BudgetUsage as ControlBudgetUsage,
+    QueueClass,
+    RiskLevel,
+    RouteLabel,
+    RunKind,
+    TaskStatus as ControlTaskStatus,
+)
 from .tools_knowe import resolve_in_sandbox            # [v0.36] /preview 复用沙箱路径解析
 from .tools_knowe import KNOWN_ROLES, _next_agent_id   # [主动拉入worker] 职能白名单 + id 生成
 
@@ -399,6 +410,9 @@ class KnoweServer:
         self.store: Store | None = Store(raw_dir) if raw_dir else None
         self.data_root = Path(raw_dir or "./data").expanduser().resolve()
         self.groups: GroupRepository | None = GroupRepository(self.data_root) if raw_dir else None
+        self.task_runtime: TaskRuntimeService | None = (
+            TaskRuntimeService(self.data_root, self.groups) if self.groups is not None else None
+        )
         self.hub = Hub(store=self.store)
         self.hub.group_id_resolver = self._group_id_for_runtime_project
         self.engines: dict[str, ProjectEngine] = {}
@@ -2563,6 +2577,13 @@ class KnoweServer:
         #   断线期间丢多少 busy/idle 瞬时帧都能自愈到引擎现场真实状态；
         #   全量下发治愈「重连只补当前群」——所有群的账本一次到齐，各会话按 channel 自取。
         complete["activity"] = self._open_activity_all()
+        # StudyCrew task state is a separate authoritative projection.  It rides the
+        # existing reconnect response but is never reconstructed from chat text.
+        if self.task_runtime is not None and dm_group_id is None:
+            group_id = self._group_id_for_runtime_project(project_id)
+            if group_id is not None:
+                with contextlib.suppress(RuntimeConflictError, RuntimeNotFoundError):
+                    complete["task_runtime"] = self.task_runtime.group_snapshot(group_id)
         # [v1.0.24.4] 磁盘写失败可见性：写失败不再阻断主循环，这里在握手时
         # 把累计计数暴露到日志，运维不再靠翻异常堆栈才发现磁盘异常。
         if self.store is not None:
@@ -2627,6 +2648,20 @@ class KnoweServer:
     # ── ping ──
     async def _cmd_ping(self, client: Client, _msg: dict[str, Any]) -> None:
         await self.hub.send_to(client, {"type": "pong"})
+
+    async def _cmd_task_runtime(self, client: Client, data: dict[str, Any]) -> None:
+        """Versioned WS control boundary; HTTP and WS share the same dispatcher."""
+        action = data.get("action")
+        if not isinstance(action, str) or not action:
+            raise ValueError("task_runtime action is required")
+        payload = dict(data)
+        payload.pop("type", None)
+        payload.pop("action", None)
+        result = self._task_runtime_dispatch(action, payload)
+        await self.hub.send_to(client, {
+            "type": "task_runtime_result", "action": action,
+            "request_id": data.get("request_id"), **result,
+        })
 
     # ── project token usage ──
     async def _cmd_token_usage_req(self, client: Client, data: dict[str, Any]) -> None:
@@ -4075,6 +4110,17 @@ class KnoweServer:
                 "/groups/source-unlink": {"POST"},
                 "/groups/roster-update": {"POST"},
                 "/groups/runtime-summary": {"POST"},
+                "/task-runtime/submit": {"POST"},
+                "/task-runtime/control": {"POST"},
+                "/task-runtime/snapshot": {"POST"},
+                "/task-runtime/replay": {"POST"},
+                "/task-runtime/route": {"POST"},
+                "/task-runtime/approval": {"POST"},
+                "/task-runtime/agent": {"POST"},
+                "/task-runtime/budget": {"POST"},
+                "/task-runtime/checkpoint": {"POST"},
+                "/task-runtime/verify": {"POST"},
+                "/task-runtime/complete": {"POST"},
                 "/agents/permanent-delete": {"POST"},
                 "/preview/resolve": {"GET"},
                 "/files/reveal": {"POST"},
@@ -4220,6 +4266,11 @@ class KnoweServer:
 
                 if path.startswith("/groups/") and method == "POST":
                     await self._serve_group_operation(writer, path, body_bytes)
+                    await writer.drain()
+                    return
+
+                if path.startswith("/task-runtime/") and method == "POST":
+                    await self._serve_task_runtime_operation(writer, path, body_bytes)
                     await writer.drain()
                     return
 
@@ -5803,6 +5854,10 @@ class KnoweServer:
                         "source_group_id": group_id,
                     }
                 elif path == "/groups/archive":
+                    if self.task_runtime is not None:
+                        self.task_runtime.suspend_group(
+                            group_id, reason="Group archived",
+                        )
                     result = {"group": self.groups.archive(group_id).to_dict()}
                 elif path == "/groups/restore":
                     result = {"group": self.groups.restore(group_id).to_dict()}
@@ -5812,13 +5867,22 @@ class KnoweServer:
                     token = payload.get("confirmation_token")
                     if not isinstance(token, str):
                         raise ValueError("confirmation_token is required")
+                    if self.task_runtime is not None:
+                        self.task_runtime.suspend_group(
+                            group_id, reason="Group deletion requested",
+                        )
                     legacy_result, receipt = await self._run_confirmed_group_delete(
                         group_id, str(runtime_id), token,
                         runtime_already_deleted=str(runtime_id) in self._deleted_project_ids(),
                     )
+                    runtime_cleanup = (
+                        self.task_runtime.delete_group_data(group_id)
+                        if self.task_runtime is not None else {}
+                    )
                     result = {
                         "deleted": True, "receipt": receipt.to_dict(),
                         "legacy_cleanup_pending": bool(legacy_result.get("cleanup_pending")),
+                        "runtime_cleanup": runtime_cleanup,
                     }
                 elif path == "/groups/course-bind":
                     course_id = payload.get("course_id")
@@ -5859,10 +5923,15 @@ class KnoweServer:
                     result = {"group": self.groups.update_roster(group_id, roster).to_dict()}
                 elif path == "/groups/runtime-summary":
                     summary = self.groups.runtime_summary(group_id)
+                    runtime_overlay = (
+                        self.task_runtime.group_summary(group_id)
+                        if self.task_runtime is not None else {}
+                    )
                     result = {
                         "summary": {
                             **asdict(summary),
                             "lifecycle": summary.lifecycle.value,
+                            **runtime_overlay,
                         },
                     }
                 else:
@@ -5880,6 +5949,150 @@ class KnoweServer:
             self._preview_error(writer, b"500 Internal Server Error", "Group operation failed")
             return
 
+        body = json.dumps({"ok": True, **result}, ensure_ascii=False).encode("utf-8")
+        self._write_http(writer, b"200 OK", body, b"application/json; charset=utf-8")
+
+    def _task_runtime_dispatch(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.task_runtime is None:
+            raise RuntimeConflictError("Task Runtime persistence is unavailable")
+        group_id, _runtime_id, requested_project_id = self._canonical_group_from_payload(
+            payload, require_runtime=False,
+        )
+        service = self.task_runtime
+        request_key = payload.get("request_key")
+
+        if action == "submit":
+            if not isinstance(request_key, str) or not request_key:
+                raise ValueError("request_key is required")
+            title = payload.get("title")
+            if not isinstance(title, str) or not title.strip():
+                raise ValueError("title is required")
+            raw_limits = payload.get("budget_limits")
+            run = service.submit(
+                group_id, title=title, request_key=request_key,
+                kind=RunKind(str(payload.get("kind") or RunKind.PRIMARY.value)),
+                queue_class=QueueClass(str(payload.get("queue_class") or QueueClass.FOREGROUND.value)),
+                route_label=RouteLabel(str(payload.get("route_label") or RouteLabel.QUEUE_NEW.value)),
+                read_only=bool(payload.get("read_only")),
+                risk=RiskLevel(str(payload.get("risk") or RiskLevel.LOW.value)),
+                parent_run_id=str(payload["parent_run_id"]) if payload.get("parent_run_id") else None,
+                budget_limits=ControlBudgetLimits.from_dict(raw_limits if isinstance(raw_limits, dict) else None),
+                public_summary=str(payload.get("public_summary") or ""),
+            )
+            service.schedule()
+            run = service.store.get_run(run.run_id) or run
+            result: dict[str, Any] = {"run": run.to_public_dict()}
+        elif action == "control":
+            run_id = str(payload.get("run_id") or "")
+            if not isinstance(request_key, str) or not request_key:
+                raise ValueError("request_key is required")
+            command = str(payload.get("command") or "")
+            commands = {
+                "pause": service.pause, "cancel": service.cancel, "resume": service.resume,
+            }
+            if command not in commands:
+                raise ValueError("command must be pause, cancel, or resume")
+            result = {"run": commands[command](group_id, run_id, request_key=request_key).to_public_dict()}
+        elif action == "snapshot":
+            run_id = payload.get("run_id")
+            result = (
+                service.snapshot(group_id, str(run_id)) if isinstance(run_id, str) and run_id
+                else service.group_snapshot(group_id)
+            )
+        elif action == "replay":
+            result = service.replay(
+                group_id, str(payload.get("run_id") or ""),
+                after_seq=int(payload.get("after_seq") or 0),
+                after_version=int(payload["after_version"]) if payload.get("after_version") is not None else None,
+            )
+        elif action == "route":
+            content = payload.get("content")
+            if not isinstance(content, str) or not isinstance(request_key, str) or not request_key:
+                raise ValueError("content and request_key are required")
+            result = service.route_message(
+                group_id, content=content, request_key=request_key,
+                confidence=float(payload.get("confidence") or 0),
+                read_only=bool(payload.get("read_only")), writes=bool(payload.get("writes")),
+                sensitive_outbound=bool(payload.get("sensitive_outbound")),
+                explicit_new_task=bool(payload.get("explicit_new_task")),
+            )
+        elif action == "approval":
+            if not isinstance(request_key, str) or not request_key:
+                raise ValueError("request_key is required")
+            approval, grant, run = service.resolve_approval(
+                group_id, str(payload.get("approval_id") or ""),
+                approved=bool(payload.get("approved")),
+                capabilities=tuple(str(item) for item in payload.get("capabilities") or ()),
+                request_key=request_key,
+            )
+            result = {"approval": approval.to_dict(), "grant": grant.to_dict() if grant else None,
+                      "run": run.to_public_dict()}
+        elif action == "agent":
+            if not isinstance(request_key, str) or not request_key:
+                raise ValueError("request_key is required")
+            run = service.update_agent(
+                group_id, str(payload.get("run_id") or ""), agent_id=str(payload.get("agent_id") or ""),
+                role=str(payload.get("role") or ""), phase=AgentPhase(str(payload.get("phase") or "")),
+                operation_summary=str(payload.get("operation_summary") or ""),
+                blocking_reason=str(payload.get("blocking_reason") or ""), idempotency_key=request_key,
+            )
+            result = {"run": run.to_public_dict()}
+        elif action == "budget":
+            if not isinstance(request_key, str) or not request_key:
+                raise ValueError("request_key is required")
+            delta = payload.get("delta")
+            if not isinstance(delta, dict):
+                raise ValueError("budget delta is required")
+            run = service.consume_budget(
+                group_id, str(payload.get("run_id") or ""),
+                ControlBudgetUsage.from_dict(delta), request_key=request_key,
+            )
+            result = {"run": run.to_public_dict()}
+        elif action == "checkpoint":
+            if not isinstance(request_key, str) or not request_key:
+                raise ValueError("request_key is required")
+            checkpoint = service.checkpoint(
+                group_id, str(payload.get("run_id") or ""),
+                label=str(payload.get("label") or "Checkpoint"), request_key=request_key,
+            )
+            result = {"checkpoint": checkpoint.to_dict()}
+        elif action == "verify":
+            if not isinstance(request_key, str) or not request_key:
+                raise ValueError("request_key is required")
+            result = {"run": service.begin_verification(
+                group_id, str(payload.get("run_id") or ""), request_key=request_key,
+            ).to_public_dict()}
+        elif action == "complete":
+            if not isinstance(request_key, str) or not request_key:
+                raise ValueError("request_key is required")
+            result = {"run": service.complete(
+                group_id, str(payload.get("run_id") or ""),
+                outcome=ControlTaskStatus(str(payload.get("outcome") or "")),
+                request_key=request_key, summary=str(payload.get("summary") or ""),
+                verifier_approved=bool(payload.get("verifier_approved")),
+            ).to_public_dict()}
+        else:
+            raise ValueError(f"unknown Task Runtime action: {action}")
+
+        result.setdefault("schema_version", 1)
+        result.setdefault("group_id", group_id)
+        if requested_project_id:
+            result.setdefault("project_id", requested_project_id)
+        return result
+
+    async def _serve_task_runtime_operation(
+        self, writer: asyncio.StreamWriter, path: str, body_bytes: bytes,
+    ) -> None:
+        try:
+            payload = self._decode_json_object(body_bytes)
+            result = self._task_runtime_dispatch(path.rsplit("/", 1)[-1], payload)
+        except (ValueError, RuntimeConflictError, RuntimeNotFoundError, GroupDomainError) as exc:
+            self._preview_error(writer, b"400 Bad Request", str(exc))
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("Task Runtime operation failed: %s", path)
+            self._preview_error(writer, b"500 Internal Server Error", "Task Runtime operation failed")
+            return
         body = json.dumps({"ok": True, **result}, ensure_ascii=False).encode("utf-8")
         self._write_http(writer, b"200 OK", body, b"application/json; charset=utf-8")
 
@@ -6947,6 +7160,8 @@ class KnoweServer:
             if self.store is not None:
                 # [v1.0.24.4] 关机收尾：排空持久化队列，停掉写入线程。
                 self.store.close(timeout=10.0)
+            if self.task_runtime is not None:
+                self.task_runtime.close()
             await ProviderClient.aclose_shared_clients()
 
     # ── [v0.15] Harness Memory：事件驱动 + 去抖 + 定时兜底 ──

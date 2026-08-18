@@ -136,6 +136,24 @@ export const GroupRuntimeSummarySchema = z.object({
   source_count: z.number().int().nonnegative(),
   shared_source_count: z.number().int().nonnegative(),
   budget: z.number().int().nonnegative().nullable(),
+  active_primary_run_id: z.string().regex(/^run_[0-9a-f]{32}$/).nullable().default(null),
+  primary_task_status: z.enum([
+    'queued', 'routing', 'running', 'waiting_approval', 'paused', 'verifying',
+    'succeeded', 'partial', 'failed', 'cancelled',
+  ]).nullable().default(null),
+  queued_task_count: z.number().int().nonnegative().default(0),
+  active_side_task_count: z.number().int().nonnegative().default(0),
+  pending_approval_count: z.number().int().nonnegative().default(0),
+  budget_usage: z.object({
+    wall_clock_seconds: z.number().nonnegative(),
+    model_turns: z.number().int().nonnegative(),
+    tool_calls: z.number().int().nonnegative(),
+    tokens: z.number().int().nonnegative(),
+    cost_usd: z.number().nonnegative(),
+  }).default({
+    wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0,
+  }),
+  indexing_state: z.enum(['idle', 'queued', 'running', 'failed']).default('idle'),
   updated_at: z.string(),
 });
 

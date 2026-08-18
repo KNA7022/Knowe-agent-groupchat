@@ -103,6 +103,15 @@ describe('canonical Group store', () => {
       source_count: 0,
       shared_source_count: 0,
       budget: null,
+      active_primary_run_id: null,
+      primary_task_status: null,
+      queued_task_count: 0,
+      active_side_task_count: 0,
+      pending_approval_count: 0,
+      budget_usage: {
+        wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0,
+      },
+      indexing_state: 'idle',
       updated_at: now,
     };
 

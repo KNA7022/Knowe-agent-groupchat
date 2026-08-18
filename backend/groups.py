@@ -321,6 +321,16 @@ class GroupRuntimeSummary:
     shared_source_count: int
     budget: int | None
     updated_at: str
+    active_primary_run_id: str | None = None
+    primary_task_status: str | None = None
+    queued_task_count: int = 0
+    active_side_task_count: int = 0
+    pending_approval_count: int = 0
+    budget_usage: dict[str, float | int] = field(default_factory=lambda: {
+        "wall_clock_seconds": 0.0, "model_turns": 0, "tool_calls": 0,
+        "tokens": 0, "cost_usd": 0.0,
+    })
+    indexing_state: str = "idle"
 
 
 @dataclass(frozen=True)
