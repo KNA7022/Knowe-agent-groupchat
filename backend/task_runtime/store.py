@@ -572,7 +572,10 @@ class TaskRuntimeStore:
             ).fetchone()
         if row is None:
             return None
-        raw = _loads(row["payload_json"])
+        return self._approval_from_raw(_loads(row["payload_json"]))
+
+    @staticmethod
+    def _approval_from_raw(raw: Mapping[str, Any]) -> ApprovalRequest:
         return ApprovalRequest(
             approval_id=str(raw["approval_id"]), run_id=str(raw["run_id"]),
             group_id=str(raw["group_id"]), kind=str(raw["kind"]), summary=str(raw["summary"]),
@@ -592,6 +595,64 @@ class TaskRuntimeStore:
                 (group_id,),
             ).fetchall()
         return tuple(item for row in rows if (item := self.get_approval(str(row["approval_id"]))) is not None)
+
+    def all_pending_approvals(self) -> tuple[ApprovalRequest, ...]:
+        with self.db.transaction(immediate=False) as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM studycrew_approvals WHERE status='pending' ORDER BY created_at"
+            ).fetchall()
+        return tuple(self._approval_from_raw(_loads(row["payload_json"])) for row in rows)
+
+    def reject_pending_approval(
+        self, approval_id: str, *, resolution: str, resolved_at: str,
+    ) -> ApprovalRequest | None:
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT group_id, payload_json FROM studycrew_approvals "
+                "WHERE approval_id=? AND status='pending'",
+                (approval_id,),
+            ).fetchone()
+            if row is not None:
+                self._assert_group_mutable_in_transaction(conn, str(row["group_id"]))
+                raw = _loads(row["payload_json"])
+                raw.update({
+                    "status": "rejected", "resolved_at": resolved_at,
+                    "summary": "Approval is no longer actionable",
+                    "terminal_resolution": resolution,
+                })
+                conn.execute(
+                    "UPDATE studycrew_approvals SET status='rejected', payload_json=?, "
+                    "resolved_at=? WHERE approval_id=? AND status='pending'",
+                    (_dumps(raw), resolved_at, approval_id),
+                )
+        return self.get_approval(approval_id)
+
+    @staticmethod
+    def reject_pending_approvals_in_transaction(
+        conn: Any, *, run_id: str, resolution: str, resolved_at: str,
+    ) -> tuple[str, ...]:
+        """Atomically remove every actionable approval owned by a terminalized run."""
+        rows = conn.execute(
+            "SELECT approval_id, payload_json FROM studycrew_approvals "
+            "WHERE run_id=? AND status='pending' ORDER BY created_at, approval_id",
+            (run_id,),
+        ).fetchall()
+        changed: list[str] = []
+        for row in rows:
+            raw = _loads(row["payload_json"])
+            raw["status"] = "rejected"
+            raw["resolved_at"] = resolved_at
+            # Resolution is an opaque lifecycle classification, never user content.
+            raw["summary"] = "Approval is no longer actionable"
+            raw["terminal_resolution"] = resolution
+            conn.execute(
+                "UPDATE studycrew_approvals SET status='rejected', payload_json=?, "
+                "resolved_at=? WHERE approval_id=? AND status='pending'",
+                (_dumps(raw), resolved_at, str(row["approval_id"])),
+            )
+            if conn.execute("SELECT changes()").fetchone()[0] == 1:
+                changed.append(str(row["approval_id"]))
+        return tuple(changed)
 
     def save_grant(self, grant: PermissionGrant) -> None:
         with self.db.transaction() as conn:
@@ -737,6 +798,8 @@ class TaskRuntimeStore:
         conn: Any, *, continuation_id: str, run: TaskRun, approval_id: str | None,
         execution_key: str, route_request_key: str, risk: RiskLevel,
         status: str, private_request: Mapping[str, Any],
+        recovery_of_continuation_id: str | None = None,
+        private_request_digest: str | None = None,
     ) -> None:
         now = utc_now()
         payload = {
@@ -746,6 +809,8 @@ class TaskRuntimeStore:
             "route_request_key": route_request_key, "route_version": run.version,
             "risk": risk.value, "status": status,
             "private_request": dict(private_request), "created_at": now, "updated_at": now,
+            "recovery_of_continuation_id": recovery_of_continuation_id,
+            "private_request_digest": private_request_digest,
         }
         conn.execute(
             """INSERT OR IGNORE INTO studycrew_executor_continuations(
@@ -800,6 +865,15 @@ class TaskRuntimeStore:
                 + " AND ".join(clauses), tuple(args),
             ).fetchone()
         return None if row is None else _loads(row["payload_json"])
+
+    def executor_continuations_for_run(self, run_id: str) -> tuple[dict[str, Any], ...]:
+        with self.db.transaction(immediate=False) as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM studycrew_executor_continuations "
+                "WHERE run_id=? ORDER BY created_at, continuation_id",
+                (run_id,),
+            ).fetchall()
+        return tuple(_loads(row["payload_json"]) for row in rows)
 
     def claim_executor_continuation(self, continuation_id: str) -> tuple[dict[str, Any], bool]:
         with self.db.transaction() as conn:
@@ -906,6 +980,14 @@ class TaskRuntimeStore:
                            WHERE continuation_id=?""",
                         (_dumps(raw), raw["updated_at"], continuation_id),
                     )
+                    if row["approval_id"]:
+                        # The uncertain execution boundary invalidates the old grant.
+                        # Its ApprovalRequest remains as audit history; only a fresh
+                        # linked approval may authorize another attempt.
+                        conn.execute(
+                            "DELETE FROM studycrew_permission_grants WHERE approval_id=?",
+                            (str(row["approval_id"]),),
+                        )
                     report["recovered_blocked"].append(continuation_id)
                 else:
                     report["ready"].append(continuation_id)

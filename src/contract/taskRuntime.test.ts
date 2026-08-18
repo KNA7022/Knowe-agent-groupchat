@@ -7,7 +7,7 @@ import {
   ToolInvocationSchema,
 } from './taskRuntime';
 import { taskRunFixture } from './taskRuntime.fixture';
-import { validateInbound } from './envelope';
+import { TaskRuntimeCmdSchema, TaskRuntimeResultSchema, validateInbound } from './envelope';
 
 const groupId = `grp_${'1'.repeat(32)}`;
 const runId = `run_${'2'.repeat(32)}`;
@@ -128,5 +128,16 @@ describe('Task Runtime public contracts', () => {
         sensitivity: 'public', created_at: '2026-08-18T00:00:01Z', schema_version: 1,
       },
     })).toBeNull();
+  });
+
+  it('accepts the explicit recovered-continuation reapproval transport action', () => {
+    expect(TaskRuntimeCmdSchema.parse({
+      type: 'task_runtime', action: 'reapprove-recovered', group_id: groupId,
+      continuation_id: `cont_${'a'.repeat(32)}`,
+    }).action).toBe('reapprove-recovered');
+    expect(TaskRuntimeResultSchema.parse({
+      type: 'task_runtime_result', action: 'reapprove-recovered',
+      schema_version: 1, group_id: groupId,
+    }).action).toBe('reapprove-recovered');
   });
 });

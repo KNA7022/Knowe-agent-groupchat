@@ -4504,6 +4504,7 @@ class KnoweServer:
                 "/task-runtime/replay": {"POST"},
                 "/task-runtime/route": {"POST"},
                 "/task-runtime/approval": {"POST"},
+                "/task-runtime/reapprove-recovered": {"POST"},
                 "/task-runtime/agent": {"POST"},
                 "/task-runtime/budget": {"POST"},
                 "/task-runtime/checkpoint": {"POST"},
@@ -6464,6 +6465,20 @@ class KnoweServer:
                 self._start_approved_executor_continuation(
                     group_id=group_id, approval_id=approval.approval_id,
                 )
+        elif action == "reapprove-recovered":
+            if not isinstance(request_key, str) or not request_key:
+                raise ValueError("request_key is required")
+            raw_scope = payload.get("operation_scope")
+            if not isinstance(raw_scope, dict):
+                raise ValueError("operation_scope is required")
+            approval, run = service.reapprove_recovered_continuation(
+                group_id, str(payload.get("continuation_id") or ""),
+                purpose=str(payload.get("purpose") or ""),
+                operation_scope={str(key): str(value) for key, value in raw_scope.items()},
+                request_key=request_key,
+                expires_at=str(payload["expires_at"]) if payload.get("expires_at") else None,
+            )
+            result = {"approval": approval.to_dict(), "run": run.to_public_dict()}
         elif action == "agent":
             if not isinstance(request_key, str) or not request_key:
                 raise ValueError("request_key is required")

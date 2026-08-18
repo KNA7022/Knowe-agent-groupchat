@@ -365,3 +365,92 @@ changing the Task 4 UI or implementing the Task 5 Tool Gateway.
   the unified Tool Gateway, MCP transports, DLP gateway, and shell/network policy.
 - Task 4 remains responsible for rendering the authoritative run/Agent state in the
   visual status bar and event drawer. No visual UI was added in this round.
+
+## Independent re-review fix round 4/5
+
+The third re-review left one lifecycle finding with three boundaries. This round
+closes root Coordinator cancellation, truthful approval cancellation/expiry, and the
+explicit recovery path for uncertain high-risk executor requests.
+
+### N2.1 — cancellable whole-turn ProjectEngine ownership
+
+- A governed scope now owns both `turn_tasks` and `worker_tasks`. The long-lived Engine
+  inbox task creates a distinct cancellable child for each root Coordinator or scoped
+  aggregation turn, so cancelling the trusted Future cannot kill the inbox loop or let
+  the root model/tool coroutine continue invisibly.
+- The cancellation callback cancels the root/aggregation task and every scoped Worker.
+  It also removes a committed-but-not-started Worker envelope owned by that scope;
+  `_harness_turn` cannot dispatch a new Worker after cancellation has already swept the
+  scope. Scope settlement waits for root turns, Workers, pending owned envelopes, and
+  aggregation turns, then clears automatically.
+- Cancel-before-start and cancel-while-held real-Engine probes assert that the root
+  receives `CancelledError`, a held Worker is cancelled, an unstarted Worker never
+  crosses into another turn, no post-cancel business effect runs, duplicate completion
+  is harmless, and the Engine accepts the next governed turn.
+- A real Server + ProjectEngine probe cancels a live TaskRun bridge, observes root
+  cancellation and scope drainage, and proves that the next queued primary TaskRun is
+  dispatched after capacity is released.
+
+### N2.2 — approval cancellation and expiry truth
+
+- TaskRun cancellation now rejects every pending approval and terminalizes every
+  actionable executor continuation in the same SQLite run/event CAS transaction. A
+  duplicate cancel returns the durable cancelled owner; late approval resolution sees
+  the terminal rejected approval and cannot invoke an executor.
+- Expired approvals are swept at startup, scheduler entry, and authoritative snapshot
+  reads. A waiting owner atomically becomes `failed/permission_denied`, its approval and
+  continuation become non-actionable, an `approval_resolved` public event reports the
+  opaque `expired` classification, and the scheduler releases the lane for queued work.
+- The sweep tolerates concurrent resolution/cancellation and Group deletion fences.
+  Tests cover cancellation, duplicate cancellation, late resolution, immediate pending
+  snapshot removal, read-triggered short expiry with queue release, and startup expiry
+  reconciliation without a user resolution action.
+
+### N2.3 — explicit crash-blocked high-risk reapproval
+
+- Normal `resume` now rejects a paused run that owns any `recovered_blocked`
+  continuation, so it cannot consume scheduler capacity or accidentally cross the
+  executor boundary. Recovery also revokes the uncertain old permission grant while
+  retaining the old ApprovalRequest and continuation as auditable history.
+- `reapprove_recovered_continuation` creates a fresh high-risk ApprovalRequest and
+  fresh continuation/execution identity in one run CAS transaction. It requires the
+  exact normalized prior operation scope, a new normalized purpose and expiry, binds
+  group/task/run, links `recovery_of_continuation_id`, and stores a digest of the
+  immutable private request. The old record remains tombstoned as
+  `recovered_blocked`; raw content never enters public events or responses.
+- The shared HTTP/WS dispatcher exposes `reapprove-recovered`; the HTTP route and
+  frontend command/result enums are versioned accordingly. Resolution claims only the
+  fresh continuation once through the existing server CAS and governed completion
+  bridge.
+- The restart probe covers: initial high-risk approval before claim; restart to
+  blocked/paused; rejected normal resume; idempotent fresh reapproval; restart while
+  pending; approval followed by another crash before claim; a second blocked attempt;
+  another explicit reapproval; exactly one Engine call with the original private
+  content; terminal Verifier completion; duplicate approval; and a final restart with
+  no replay.
+
+### Round-4 exact regression evidence
+
+- `python -m pytest -q backend/tests/test_task_runtime_rereview_round4.py` ->
+  `7 passed in 2.06s`.
+- `python -m pytest -q backend/tests/test_groups.py backend/tests/test_group_http.py backend/tests/test_task_runtime.py backend/tests/test_task_runtime_review_fixes.py backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_rereview_round3.py backend/tests/test_task_runtime_rereview_round4.py`
+  -> `98 passed in 12.44s`.
+- `python -m pytest -q backend/tests/test_worker_completion_v1.py backend/tests/test_runtime_impl_v10184.py backend/tests/test_coordinator_no_reply.py`
+  -> `26 passed, 10 subtests passed in 1.32s`.
+- `npx vitest run src/contract/taskRuntime.test.ts src/store/taskRuntime.test.ts src/contract/group.test.ts src/store/groups.test.ts --pool=forks --poolOptions.forks.singleFork=true`
+  -> `4 files / 25 tests passed`.
+- ESLint passed for the changed frontend contract/test. Targeted strict TypeScript
+  compilation passed for `src/contract/envelope.ts` and
+  `src/contract/taskRuntime.ts`. Python compilation passed for Engine, Server, Task
+  Runtime contracts/store/service, and the round-4 test module. `git diff --check`
+  passed with only the repository's existing Windows LF-to-CRLF notices.
+
+### Broad baseline note
+
+- `npm run typecheck` still reports the same documented unrelated baseline failures in
+  legacy fixtures/components/store/transport/PDF worker code. None references the
+  changed Task Runtime command/result enum or contract test; targeted strict compilation
+  and ESLint are clean.
+- Python Ruff is not installed in the selected Python environment, so no Ruff result is
+  claimed. Python compilation and all focused/combined regressions above are clean.
+- Task 4 visual UI and Task 5 full Tool Gateway/DLP/MCP remain outside this patch.

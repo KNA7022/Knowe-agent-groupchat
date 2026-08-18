@@ -919,7 +919,7 @@ export type Pong = z.infer<typeof PongSchema>;
 export const TaskRuntimeResultSchema = z.object({
   type: z.literal('task_runtime_result'),
   action: z.enum([
-    'submit', 'control', 'snapshot', 'replay', 'route', 'approval', 'agent',
+    'submit', 'control', 'snapshot', 'replay', 'route', 'approval', 'reapprove-recovered', 'agent',
     'budget', 'checkpoint', 'verify', 'complete',
   ]),
   request_id: z.union([z.string(), z.number()]).nullish(),
@@ -1226,7 +1226,7 @@ export type PingCmd = z.infer<typeof PingCmdSchema>;
 export const TaskRuntimeCmdSchema = z.object({
   type: z.literal('task_runtime'),
   action: z.enum([
-    'submit', 'control', 'snapshot', 'replay', 'route', 'approval', 'agent',
+    'submit', 'control', 'snapshot', 'replay', 'route', 'approval', 'reapprove-recovered', 'agent',
     'budget', 'checkpoint', 'verify', 'complete',
   ]),
   group_id: z.string().regex(/^grp_[0-9a-f]{32}$/).optional(),

@@ -2551,6 +2551,7 @@ class ProjectEngine:
         scope_id = "governed_" + uuid.uuid4().hex
         self._governed_task_scopes[scope_id] = {
             "future": future, "pending_turns": 1, "worker_tasks": set(),
+            "turn_tasks": set(), "pending_worker_ids": set(),
             "outcome": "succeeded", "error_type": "",
         }
         await self.submit(
@@ -2561,7 +2562,15 @@ class ProjectEngine:
             if not done.cancelled():
                 return
             state = self._governed_task_scopes.get(scope_id)
-            for task in tuple((state or {}).get("worker_tasks") or ()):
+            for worker_id in tuple((state or {}).get("pending_worker_ids") or ()):
+                self._close_task_envelope(str(worker_id))
+            if state is not None:
+                state["pending_worker_ids"] = set()
+            owned_tasks = {
+                *tuple((state or {}).get("turn_tasks") or ()),
+                *tuple((state or {}).get("worker_tasks") or ()),
+            }
+            for task in owned_tasks:
                 if not task.done():
                     task.cancel()
 
@@ -2595,7 +2604,9 @@ class ProjectEngine:
             return
         workers = {task for task in state.get("worker_tasks") or set() if not task.done()}
         state["worker_tasks"] = workers
-        if workers:
+        turns = {task for task in state.get("turn_tasks") or set() if not task.done()}
+        state["turn_tasks"] = turns
+        if workers or turns or state.get("pending_worker_ids"):
             return
         future = state.get("future")
         if isinstance(future, asyncio.Future) and not future.done():
@@ -4884,25 +4895,37 @@ class ProjectEngine:
             idempotency_token = _TURN_IDEMPOTENCY_VAR.set(turn_idempotency_key)
             attachments_token = _TURN_ATTACHMENTS_VAR.set(turn_attachments)
 
-            # [v1.0.13][R1] Automatic turns are not allowed to race an un-applied
-            # model binding.  Wait before mutating history or emitting thinking state,
-            # so replaying the inbox item after apply is behaviorally identical.
-            if envelope.get("internal") and feature_enabled(FeatureFlag.MODEL_READINESS_GATE_V1):
-                ready_actor = self._single_agent_id() if self.agent is not None else COORDINATOR
-                await runtime_settings.wait_for_model_ready(self.project_id, ready_actor)
-
-            # [v0.8a A-2] internal = 引擎自己塞的话（报告通知 / 提案被拒的 followup）。
-            #   作废审批那一步在 `submit()` 里，**内部消息根本不经过 submit()**——
-            #   所以这里什么都不用做，挂着的卡安然无恙。这行日志只是让它在日志里看得见。
-            if envelope.get("internal"):
-                log.info("[%s] 内部通知入队（不作废挂起审批）", self.project_id)
-
-            turn = Turn(self.project_id, proj.name, content, list(self.history), attachments=turn_attachments)
-            self.history.append({"role": "user", "content": content})
-
             self._turns_active += 1        # ★ 从取出消息到链式调度跑完，全程算「忙」
             turn_actor_id = COORDINATOR
-            try:
+            governed_turn_task: asyncio.Task[None] | None = None
+
+            async def execute_turn() -> None:
+                nonlocal notification_ok, turn_actor_id, turn_outcome, turn_error
+                # [v1.0.13][R1] Automatic turns are not allowed to race an un-applied
+                # model binding.  This wait belongs to the governed root task so a
+                # TaskRun cancellation cannot leave a hidden Coordinator coroutine
+                # blocked here and later let it resume into model/tool work.
+                if envelope.get("internal") and feature_enabled(FeatureFlag.MODEL_READINESS_GATE_V1):
+                    ready_actor = self._single_agent_id() if self.agent is not None else COORDINATOR
+                    await runtime_settings.wait_for_model_ready(self.project_id, ready_actor)
+
+                state = self._governed_task_scopes.get(governed_scope_id) if governed_scope_id else None
+                governed_future = (state or {}).get("future")
+                if isinstance(governed_future, asyncio.Future) and governed_future.cancelled():
+                    raise asyncio.CancelledError
+
+                # [v0.8a A-2] internal = 引擎自己塞的话（报告通知 / 提案被拒的 followup）。
+                #   作废审批那一步在 `submit()` 里，**内部消息根本不经过 submit()**——
+                #   所以这里什么都不用做，挂着的卡安然无恙。这行日志只是让它在日志里看得见。
+                if envelope.get("internal"):
+                    log.info("[%s] 内部通知入队（不作废挂起审批）", self.project_id)
+
+                turn = Turn(
+                    self.project_id, proj.name, content, list(self.history),
+                    attachments=turn_attachments,
+                )
+                self.history.append({"role": "user", "content": content})
+
                 if self.agent is not None:
                     turn_actor_id = self._single_agent_id()
                     channel = self.project_id
@@ -4940,7 +4963,7 @@ class ProjectEngine:
                                     "phase": "thinking",
                                     "stage": "plan",
                                     "stage_detail": msg("engine.131"),
-                                     "stage_state": "active",
+                                    "stage_state": "active",
                                 },
                                 channel=channel,
                             )
@@ -4956,12 +4979,25 @@ class ProjectEngine:
                 else:
                     harness_ok = await self._harness_turn(
                         content, envelope.get("target"),
-                        internal=bool(envelope.get("internal")),   # [v0.31 Bug2] 永不静默策略要认「这话是不是用户说的」
+                        internal=bool(envelope.get("internal")),
                     )
                     if not harness_ok:
                         notification_ok = False
                         turn_outcome = "failed"
                         turn_error = "executor_precondition_failed"
+
+            try:
+                if governed_scope_id:
+                    governed_turn_task = asyncio.create_task(
+                        execute_turn(),
+                        name=f"governed-root:{self.project_id}:{governed_scope_id}",
+                    )
+                    state = self._governed_task_scopes.get(governed_scope_id)
+                    if state is not None:
+                        state.setdefault("turn_tasks", set()).add(governed_turn_task)
+                    await governed_turn_task
+                else:
+                    await execute_turn()
             except ApprovalCancelled:
                 turn_outcome = "cancelled"
                 turn_error = "approval_cancelled"
@@ -4970,7 +5006,12 @@ class ProjectEngine:
                 notification_ok = False
                 turn_outcome = "cancelled"
                 turn_error = "engine_cancelled"
-                raise
+                # Cancelling a governed child turn is an operation-level outcome,
+                # not permission to kill the long-lived inbox loop.  Engine shutdown
+                # still cancels this parent task and must propagate normally.
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    raise
             except Exception as exc:              # ★ 引擎不许因为一个回合倒下
                 notification_ok = False
                 turn_outcome = "failed"
@@ -5008,6 +5049,9 @@ class ProjectEngine:
                         "project_id": self.project_id,
                     })
                 if governed_scope_id:
+                    state = self._governed_task_scopes.get(governed_scope_id)
+                    if state is not None and governed_turn_task is not None:
+                        state.setdefault("turn_tasks", set()).discard(governed_turn_task)
                     self._governed_scope_settle_turn(
                         governed_scope_id, outcome=turn_outcome, error_type=turn_error,
                     )
@@ -5029,12 +5073,19 @@ class ProjectEngine:
         try:
             return await self._harness_turn_impl(content, target, internal=internal)
         finally:
-            try:
-                self._spawn_pending_workers()
-            except Exception:
-                # The TaskEnvelope remains queued if create_task fails, so a
-                # later turn/recovery can retry instead of silently losing the task.
-                log.exception("[%s] 拉起已提交 Worker 队列失败；任务保留待重试", self.project_id)
+            governed_scope_id = _GOVERNED_TASK_SCOPE_VAR.get()
+            governed_state = (
+                self._governed_task_scopes.get(governed_scope_id)
+                if governed_scope_id else None
+            )
+            governed_future = (governed_state or {}).get("future")
+            if not (isinstance(governed_future, asyncio.Future) and governed_future.cancelled()):
+                try:
+                    self._spawn_pending_workers()
+                except Exception:
+                    # The TaskEnvelope remains queued if create_task fails, so a
+                    # later turn/recovery can retry instead of silently losing the task.
+                    log.exception("[%s] 拉起已提交 Worker 队列失败；任务保留待重试", self.project_id)
 
     async def _harness_turn_impl(self, content: str, target: str | None,
                                  *, internal: bool = False) -> bool:
@@ -5152,6 +5203,16 @@ class ProjectEngine:
         if envelope is None:
             return
         governed_scope_id = _GOVERNED_TASK_SCOPE_VAR.get()
+        governed_state = (
+            self._governed_task_scopes.get(governed_scope_id)
+            if governed_scope_id else None
+        )
+        governed_future = (governed_state or {}).get("future")
+        if isinstance(governed_future, asyncio.Future) and governed_future.cancelled():
+            self._close_task_envelope(agent_id)
+            if governed_state is not None:
+                governed_state.setdefault("pending_worker_ids", set()).discard(agent_id)
+            return
         async def run() -> None:
             try:
                 await self._process_turn(envelope.goal, agent_id, internal=True)
@@ -5190,6 +5251,7 @@ class ProjectEngine:
         if governed_scope_id:
             state = self._governed_task_scopes.get(governed_scope_id)
             if state is not None:
+                state.setdefault("pending_worker_ids", set()).discard(agent_id)
                 state.setdefault("worker_tasks", set()).add(task)
         task.add_done_callback(
             lambda done, aid=agent_id, scope_id=governed_scope_id:
@@ -9053,6 +9115,13 @@ class ProjectEngine:
         self._get_or_create_worker(target_id, self._roster.get(target_id, msg("engine.106")))
         committed, _ref = self._task_envelope_store().commit(envelope)
         self._task_envelopes[target_id] = committed
+        governed_scope_id = _GOVERNED_TASK_SCOPE_VAR.get()
+        governed_state = (
+            self._governed_task_scopes.get(governed_scope_id)
+            if governed_scope_id else None
+        )
+        if governed_state is not None:
+            governed_state.setdefault("pending_worker_ids", set()).add(target_id)
         self._workers_with_open_activity.add(target_id)
         return committed
 

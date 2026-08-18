@@ -2,6 +2,8 @@ from __future__ import annotations
 
 """Authoritative state machine, recovery policy, and fair local scheduler."""
 
+import hashlib
+import json
 import threading
 import sqlite3
 import math
@@ -124,6 +126,9 @@ class TaskRuntimeService:
         self._closed = False
         self.recovery_report = {"deletions": self.reconcile_group_deletions()}
         self.recovery_report.update(self.recover_after_restart())
+        self.recovery_report["expired_approvals"] = list(
+            self.expire_pending_approvals(reschedule=False)
+        )
         self.recovery_report["scheduled_runs"] = [run.run_id for run in self.schedule()]
 
     def add_event_listener(self, listener: Any) -> None:
@@ -290,14 +295,23 @@ class TaskRuntimeService:
         current = self._owned_run(run_id, group_id)
         if self.store.event_by_key(run_id, request_key) is not None:
             return current
+        if current.status is TaskStatus.CANCELLED:
+            return current
         if current.status.terminal:
             raise RuntimeConflictError("terminal runs cannot be cancelled")
+
+        def terminalize_owned_state(conn: Any, _run: TaskRun, _event: Any) -> None:
+            now = utc_now()
+            self.store.reject_pending_approvals_in_transaction(
+                conn, run_id=run_id, resolution="run_cancelled", resolved_at=now,
+            )
+            self.store.terminalize_executor_continuations_in_transaction(
+                conn, run_id=run_id, status="cancelled",
+            )
+
         cancelled = self.transition(group_id, run_id, TaskStatus.CANCELLED,
                                     idempotency_key=request_key, summary="Task cancelled",
-                                    _transaction_hook=lambda conn, _run, _event:
-                                    self.store.terminalize_executor_continuations_in_transaction(
-                                        conn, run_id=run_id, status="cancelled",
-                                    ))
+                                    _transaction_hook=terminalize_owned_state)
         self.schedule()
         return cancelled
 
@@ -308,6 +322,13 @@ class TaskRuntimeService:
             return current
         if current.status is not TaskStatus.PAUSED:
             raise RuntimeConflictError("only paused runs can resume")
+        if any(
+            item.get("status") == "recovered_blocked"
+            for item in self.store.executor_continuations_for_run(run_id)
+        ):
+            raise RuntimeConflictError(
+                "recovered high-risk execution requires explicit reapproval"
+            )
         run = self.transition(group_id, run_id, TaskStatus.QUEUED,
                               idempotency_key=request_key, summary="Task queued for resume")
         self.schedule()
@@ -658,6 +679,198 @@ class TaskRuntimeService:
         durable_grant = self.store.grant_for_approval(approval_id) if approved else None
         return durable_approval, durable_grant, self.store.get_run(run.run_id) or run
 
+    def expire_pending_approvals(self, *, reschedule: bool = True) -> tuple[str, ...]:
+        """Durably remove expired approval actions without waiting for a user click."""
+        expired_ids: list[str] = []
+        now = utc_now()
+        with self._lock:
+            for approval in self.store.all_pending_approvals():
+                if not approval.expires_at or not self._is_expired(approval.expires_at):
+                    continue
+                run = self.store.get_run(approval.run_id)
+                if run is None:
+                    continue
+                if run.status is not TaskStatus.WAITING_APPROVAL:
+                    try:
+                        durable = self.store.reject_pending_approval(
+                            approval.approval_id, resolution="expired", resolved_at=now,
+                        )
+                    except RuntimeStoreError:
+                        # Deletion reconciliation owns fenced Group content.
+                        continue
+                    if durable is not None and durable.status != "pending":
+                        expired_ids.append(approval.approval_id)
+                    continue
+                resolved = replace(
+                    approval, status="rejected", resolved_at=now,
+                    summary="Approval is no longer actionable",
+                )
+
+                def mutate(item: TaskRun, *, expected_group: str = approval.group_id) -> None:
+                    if item.group_id != expected_group or item.status is not TaskStatus.WAITING_APPROVAL:
+                        raise RuntimeConflictError("approval owner is not waiting for approval")
+                    item.status = TaskStatus.FAILED
+                    item.public_summary = "Approval expired"
+                    item.blocking_reason = ""
+                    item.failure_type = FailureType.PERMISSION_DENIED
+                    item.finished_at = now
+
+                def persist_expiry(
+                    conn: Any, updated: TaskRun, _event: Any,
+                    *, current_approval: ApprovalRequest = resolved,
+                ) -> None:
+                    self.store.resolve_pending_approval_in_transaction(conn, current_approval)
+                    self.store.update_executor_continuation_in_transaction(
+                        conn, approval_id=current_approval.approval_id,
+                        status="rejected", run=updated,
+                    )
+
+                try:
+                    self.store.change_run(
+                        run.run_id, event_type="approval_resolved",
+                        public_payload={
+                            "status": TaskStatus.FAILED.value,
+                            "approval_id": approval.approval_id,
+                            "resolution": "expired",
+                            "failure_type": FailureType.PERMISSION_DENIED.value,
+                        },
+                        idempotency_key=f"approval-expired:{approval.approval_id}",
+                        mutate=mutate, transaction_hook=persist_expiry,
+                    )
+                except (RuntimeConflictError, RuntimeStoreError):
+                    # A concurrent cancel/resolution has already made the approval
+                    # non-actionable; report only the durable winner below.
+                    pass
+                durable = self.store.get_approval(approval.approval_id)
+                if durable is not None and durable.status != "pending":
+                    expired_ids.append(approval.approval_id)
+        if expired_ids and reschedule:
+            self.schedule(sweep_expired=False)
+        return tuple(expired_ids)
+
+    def reapprove_recovered_continuation(
+        self, group_id: str, continuation_id: str, *, purpose: str,
+        operation_scope: Mapping[str, str], request_key: str,
+        expires_at: str | None = None,
+    ) -> tuple[ApprovalRequest, TaskRun]:
+        """Create a fresh governed attempt for an uncertain high-risk request.
+
+        The old continuation remains ``recovered_blocked`` forever.  This operation
+        copies its private payload only into a new, separately approved identity.
+        """
+        canonical = self._canonical_group(group_id, require_active=True)
+        self._assert_group_mutable(canonical)
+        if not request_key.strip():
+            raise ValueError("request_key is required")
+        normalized_purpose = str(purpose).strip()
+        if (
+            not normalized_purpose or len(normalized_purpose) > 120
+            or not all(char.isalnum() or char in "_.:/-" for char in normalized_purpose)
+        ):
+            raise ValueError("reapproval purpose must be a normalized identifier")
+        normalized_scope = self._normalize_operation_scope(operation_scope)
+        if not normalized_scope:
+            raise ValueError("reapproval operation_scope is required")
+
+        with self._lock:
+            blocked = self.store.executor_continuation(continuation_id=continuation_id)
+            if blocked is None or blocked.get("group_id") != canonical:
+                raise RuntimeNotFoundError("recovered continuation not found in group")
+            if blocked.get("status") != "recovered_blocked" or blocked.get("risk") != RiskLevel.HIGH.value:
+                raise RuntimeConflictError("continuation is not a crash-blocked high-risk request")
+            run = self._owned_run(str(blocked.get("run_id") or ""), canonical)
+            if run.task_id != blocked.get("task_id"):
+                raise RuntimeConflictError("executor continuation task binding mismatch")
+
+            existing = self.store.approval_by_request_key(request_key)
+            if existing is not None:
+                linked = self.store.executor_continuation(approval_id=existing.approval_id)
+                if (
+                    existing.run_id != run.run_id or existing.group_id != canonical
+                    or linked is None
+                    or linked.get("recovery_of_continuation_id") != continuation_id
+                ):
+                    raise RuntimeConflictError("reapproval request_key is bound to another operation")
+                return existing, self.store.get_run(run.run_id) or run
+            if run.status is not TaskStatus.PAUSED:
+                raise RuntimeConflictError("recovered continuation owner must remain paused")
+
+            old_approval_id = str(blocked.get("approval_id") or "")
+            old_approval = self.store.get_approval(old_approval_id) if old_approval_id else None
+            if old_approval is None:
+                raise RuntimeConflictError("recovered continuation has no auditable approval")
+            if normalized_scope != old_approval.operation_scope:
+                # The private message is immutable.  Changing its operation binding
+                # would approve a different action while replaying the old content.
+                raise RuntimeConflictError("reapproval scope must match the blocked operation")
+
+            private_request = blocked.get("private_request")
+            if not isinstance(private_request, dict):
+                raise RuntimeConflictError("recovered continuation private request is unavailable")
+            private_digest = hashlib.sha256(
+                json.dumps(
+                    private_request, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            request_digest = hashlib.sha256(request_key.encode("utf-8")).hexdigest()
+            approval = ApprovalRequest(
+                approval_id=opaque_id("apr"), run_id=run.run_id, group_id=canonical,
+                kind="recovered_message_route", summary="Confirm recovered high-risk request",
+                risk=RiskLevel.HIGH,
+                requested_capabilities=old_approval.requested_capabilities,
+                tool_name=old_approval.tool_name,
+                operation_scope=normalized_scope,
+                purpose=normalized_purpose,
+                expires_at=expires_at or (
+                    datetime.now(timezone.utc) + timedelta(minutes=10)
+                ).isoformat().replace("+00:00", "Z"),
+            )
+            new_continuation_id = opaque_id("cont")
+            new_execution_key = (
+                f"{blocked.get('execution_key')}:recovery:{request_digest[:24]}"
+            )
+
+            def mutate(item: TaskRun) -> None:
+                if item.status is not TaskStatus.PAUSED or item.group_id != canonical:
+                    raise RuntimeConflictError("recovered continuation owner must remain paused")
+                item.status = TaskStatus.WAITING_APPROVAL
+                item.public_summary = "Recovered request awaits fresh approval"
+                item.blocking_reason = "User reapproval required after restart"
+
+            def persist_reapproval(conn: Any, updated: TaskRun, _event: Any) -> None:
+                self.store.upsert_approval_in_transaction(
+                    conn, approval, request_key=request_key,
+                )
+                self.store.insert_executor_continuation_in_transaction(
+                    conn, continuation_id=new_continuation_id, run=updated,
+                    approval_id=approval.approval_id,
+                    execution_key=new_execution_key,
+                    route_request_key=f"recovery:{request_digest[:32]}",
+                    risk=RiskLevel.HIGH, status="waiting_approval",
+                    private_request=private_request,
+                    recovery_of_continuation_id=continuation_id,
+                    private_request_digest=private_digest,
+                )
+
+            try:
+                self.store.change_run(
+                    run.run_id, event_type="approval_requested",
+                    public_payload={
+                        "status": TaskStatus.WAITING_APPROVAL.value,
+                        "approval": approval.to_dict(),
+                    },
+                    idempotency_key=request_key, mutate=mutate,
+                    transaction_hook=persist_reapproval,
+                )
+            except sqlite3.IntegrityError as exc:
+                raise RuntimeConflictError("a pending approval already gates this task") from exc
+            winner = self.store.approval_by_request_key(request_key)
+            durable_run = self.store.get_run(run.run_id)
+            if winner is None or durable_run is None:
+                raise RuntimeConflictError("reapproval durability winner is unavailable")
+            return winner, durable_run
+
     def prepare_tool(
         self, group_id: str, run_id: str, *, tool_name: str,
         idempotency_key: str, risk: RiskLevel, public_summary: str,
@@ -780,6 +993,7 @@ class TaskRuntimeService:
         return winner
 
     def snapshot(self, group_id: str, run_id: str) -> dict[str, Any]:
+        self.expire_pending_approvals()
         run = self._owned_run(run_id, group_id, allow_deleting=True)
         return {"schema_version": 1, "run": run.to_public_dict(),
                 "last_seq": run.last_seq, "version": run.version}
@@ -802,6 +1016,7 @@ class TaskRuntimeService:
         }
 
     def group_snapshot(self, group_id: str) -> dict[str, Any]:
+        self.expire_pending_approvals()
         canonical = self._canonical_group(group_id)
         runs = self.store.list_runs(group_id=canonical)
         return {
@@ -812,6 +1027,7 @@ class TaskRuntimeService:
         }
 
     def group_summary(self, group_id: str) -> dict[str, Any]:
+        self.expire_pending_approvals()
         canonical = self._canonical_group(group_id)
         runs = self.store.list_runs(group_id=canonical)
         primary = next((run for run in reversed(runs) if run.kind is RunKind.PRIMARY and run.status in _NONTERMINAL), None)
@@ -934,9 +1150,11 @@ class TaskRuntimeService:
         except GroupNotFoundError:
             return False
 
-    def schedule(self) -> tuple[TaskRun, ...]:
+    def schedule(self, *, sweep_expired: bool = True) -> tuple[TaskRun, ...]:
         if self._closed:
             return ()
+        if sweep_expired:
+            self.expire_pending_approvals(reschedule=False)
         now = datetime.now(timezone.utc)
         expires = now + timedelta(seconds=self.SCHEDULER_LEASE_SECONDS)
         if not self.store.acquire_scheduler_lease(
