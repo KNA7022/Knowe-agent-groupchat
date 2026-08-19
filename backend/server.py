@@ -425,6 +425,9 @@ class KnoweServer:
     TASK_RUNTIME_RECOVERY_FLUSH_INITIAL_SECONDS = 0.02
     TASK_RUNTIME_RECOVERY_FLUSH_MAX_SECONDS = 2.0
     TASK_RUNTIME_DELIVERY_RETRIES = 3
+    TASK_RUNTIME_DELETION_RECONCILE_ACTIVE_SECONDS = 0.01
+    TASK_RUNTIME_DELETION_RECONCILE_IDLE_SECONDS = 0.05
+    TASK_RUNTIME_DELETION_RECONCILE_IDLE_MAX_SECONDS = 1.0
 
     def __init__(self, data_dir: str | None = None) -> None:
         # [v0.4] 落盘。data_dir 为空串 → 纯内存（测试和「我就试试」模式用）
@@ -542,6 +545,7 @@ class KnoweServer:
         self._task_runtime_bridges_by_run: dict[str, set[asyncio.Task[Any]]] = {}
         self._task_runtime_group_deletion_task: asyncio.Task[Any] | None = None
         self._task_runtime_group_deletion_lock = asyncio.Lock()
+        self._task_runtime_group_deletion_idle_attempt = 0
         self._shutdown_event = asyncio.Event()
         self._last_pinned_at = 0
 
@@ -8156,17 +8160,89 @@ class KnoweServer:
             return
         batch = self.task_runtime.DELETION_RECONCILE_BATCH_SIZE
         async with self._task_runtime_group_deletion_lock:
-            try:
-                report = self.task_runtime.reconcile_group_deletions(limit=batch)
-            except Exception as exc:  # noqa: BLE001 - startup availability boundary
-                report = {
-                    "processed_count": 0, "sample": [], "cursor": "",
-                    "has_more": False, "view_unavailable": True,
-                    "last_error": type(exc).__name__, "limit": batch,
-                }
-            self.task_runtime.recovery_report["deletions"] = report
             diagnostics: list[dict[str, str]] = []
             candidates: dict[str, dict[str, Any]] = {}
+            candidate_sources: dict[str, set[str]] = {}
+            store = self.task_runtime.store
+
+            # Runtime intents and canonical Group transactions are independent durable
+            # sources.  Persist their sweep state and the next source turn so a restart
+            # cannot repeatedly hand the whole batch to whichever source happens to be
+            # queried first.  A failure-free completed sweep is reopened only by a
+            # later foreground call; a failed sweep durably rotates into a retry sweep,
+            # and the owned continuation stops only when both sources are done.
+            try:
+                runtime_state = store.deletion_reconcile_cursor(
+                    "server_task_runtime_source_state",
+                )
+                group_state = store.deletion_reconcile_cursor(
+                    "server_group_repository_source_state",
+                )
+                source_turn = store.deletion_reconcile_cursor(
+                    "server_deletion_source_turn",
+                )
+            except Exception as exc:  # noqa: BLE001 - bounded availability boundary
+                runtime_state = group_state = ""
+                source_turn = "task_runtime_service"
+                diagnostics.append({
+                    "group_id": "", "status": "deferred_global",
+                    "reason": type(exc).__name__,
+                })
+            runtime_pending = runtime_state != "done"
+            group_pending = group_state != "done"
+            runtime_had_failure = runtime_state == "failed"
+            group_had_failure = group_state == "failed"
+            if not runtime_pending and not group_pending:
+                runtime_pending = group_pending = True
+            if source_turn not in {"task_runtime_service", "group_repository"}:
+                source_turn = "task_runtime_service"
+
+            runtime_quota = group_quota = 0
+            if runtime_pending and group_pending:
+                if batch == 1:
+                    if source_turn == "task_runtime_service":
+                        runtime_quota = 1
+                    else:
+                        group_quota = 1
+                else:
+                    first_quota = (batch + 1) // 2
+                    second_quota = batch - first_quota
+                    if source_turn == "task_runtime_service":
+                        runtime_quota, group_quota = first_quota, second_quota
+                    else:
+                        group_quota, runtime_quota = first_quota, second_quota
+            elif runtime_pending:
+                runtime_quota = batch
+            elif group_pending:
+                group_quota = batch
+
+            if runtime_quota:
+                try:
+                    report = self.task_runtime.reconcile_group_deletions(
+                        limit=runtime_quota,
+                        cursor_owner="server_task_runtime_source",
+                    )
+                except Exception as exc:  # noqa: BLE001 - startup availability boundary
+                    report = {
+                        "processed_count": 0, "sample": [], "cursor": "",
+                        "has_more": False, "view_unavailable": True,
+                        "last_error": type(exc).__name__, "limit": runtime_quota,
+                    }
+                self.task_runtime.recovery_report["deletions"] = report
+                runtime_pending = bool(report.get("has_more"))
+                runtime_had_failure = (
+                    runtime_had_failure or bool(report.get("view_unavailable"))
+                )
+            else:
+                report = {
+                    "processed_count": 0, "sample": [],
+                    "cursor": store.deletion_reconcile_cursor(
+                        "server_task_runtime_source",
+                    ),
+                    "has_more": runtime_pending, "view_unavailable": False,
+                    "last_error": "", "limit": 0,
+                }
+
             for item in report.get("sample") or ():
                 group_id = str(item.get("group_id") or "")
                 status = str(item.get("status") or "")
@@ -8175,39 +8251,59 @@ class KnoweServer:
                         "Quarantined Task Runtime deletion intent for %s (%s)",
                         group_id, item.get("reason", "invalid proof"),
                     )
-                if status not in {"awaiting_group_commit", "complete"} or not group_id:
+                if not group_id:
+                    continue
+                if status == "complete":
+                    # Terminal receipts are permanent write fences.  Pruning their
+                    # bounded hot state does not consume actionable candidate quota.
+                    self._prune_task_runtime_bridge_group(
+                        group_id, confirmed_group_delete=True,
+                    )
+                    continue
+                if status != "awaiting_group_commit":
                     continue
                 transaction = self.groups.delete_transaction(group_id)
                 if transaction is not None and len(candidates) < batch:
                     candidates[group_id] = transaction
+                    candidate_sources.setdefault(group_id, set()).add(
+                        "task_runtime_service",
+                    )
 
-            group_cursor = self.task_runtime.store.deletion_reconcile_cursor(
+            group_cursor = store.deletion_reconcile_cursor(
                 "group_repository",
             )
-            remaining = batch - len(candidates)
-            if remaining <= 0:
-                group_page = {"items": (), "cursor": group_cursor, "has_more": True}
+            if group_quota <= 0:
+                group_page = {
+                    "items": (), "cursor": group_cursor,
+                    "has_more": group_pending, "limit": 0,
+                }
             else:
+                group_page_failed = False
                 try:
                     group_page = self.groups.pending_delete_transactions_page(
-                        cursor=group_cursor, limit=remaining,
+                        cursor=group_cursor, limit=group_quota,
                     )
                 except Exception as exc:  # noqa: BLE001 - bounded global diagnostic
+                    group_page_failed = True
                     group_page = {
                         "items": (), "cursor": group_cursor, "has_more": False,
+                        "limit": group_quota,
                     }
                     diagnostics.append({
                         "group_id": "", "status": "deferred_global",
                         "reason": type(exc).__name__,
                     })
+                group_pending = bool(group_page.get("has_more"))
+                group_had_failure = group_had_failure or group_page_failed
             next_group_cursor = str(
                 group_page["cursor"] if group_page.get("has_more") else ""
             )
             try:
-                self.task_runtime.store.set_deletion_reconcile_cursor(
+                store.set_deletion_reconcile_cursor(
                     "group_repository", next_group_cursor,
                 )
             except Exception as exc:  # noqa: BLE001 - repeat the page after restart
+                group_had_failure = True
                 if len(diagnostics) < batch:
                     diagnostics.append({
                         "group_id": "", "status": "deferred_global",
@@ -8227,26 +8323,28 @@ class KnoweServer:
                             "reason": "RuntimeStoreError",
                         })
                     continue
-                candidates.setdefault(group_id, transaction)
+                if group_id in candidates or len(candidates) < batch:
+                    candidates.setdefault(group_id, transaction)
+                    candidate_sources.setdefault(group_id, set()).add(
+                        "group_repository",
+                    )
 
+            next_source_turn = (
+                "group_repository"
+                if source_turn == "task_runtime_service"
+                else "task_runtime_service"
+            )
+            successful_count = 0
+            failed_sources: set[str] = set()
             for group_id, transaction in tuple(candidates.items())[:batch]:
                 try:
-                    status = next((
-                        str(item.get("status") or "")
-                        for item in report.get("sample") or ()
-                        if item.get("group_id") == group_id
-                    ), "")
-                    if status == "complete":
-                        self._prune_task_runtime_bridge_group(
-                            group_id, confirmed_group_delete=True,
-                        )
-                        continue
                     await self._run_confirmed_group_delete(
                         group_id, str(transaction["runtime_project_id"]),
                         str(transaction["confirmation_token"]),
                         runtime_already_deleted=str(transaction.get("stage"))
                         in {"runtime_deleted", "committed"},
                     )
+                    successful_count += 1
                 except Exception as exc:  # noqa: BLE001 - isolate startup per Group
                     log.error(
                         "Task Runtime deletion reconciliation deferred for %s (%s)",
@@ -8257,14 +8355,74 @@ class KnoweServer:
                             "group_id": group_id, "status": "deferred",
                             "reason": type(exc).__name__,
                         })
+                    failed_sources.update(candidate_sources.get(group_id, ()))
+            runtime_had_failure = runtime_had_failure or (
+                "task_runtime_service" in failed_sources
+            )
+            group_had_failure = group_had_failure or (
+                "group_repository" in failed_sources
+            )
+
+            # ``failed`` carries a retry requirement through later pages in the same
+            # sweep.  At the end it becomes ``retry``; the next pass starts from the
+            # now-empty cursor with a clean failure accumulator.  Only a complete
+            # failure-free sweep reaches ``done``.
+            runtime_source_state = (
+                "failed" if runtime_pending and runtime_had_failure
+                else "pending" if runtime_pending
+                else "retry" if runtime_had_failure
+                else "done"
+            )
+            group_source_state = (
+                "failed" if group_pending and group_had_failure
+                else "pending" if group_pending
+                else "retry" if group_had_failure
+                else "done"
+            )
+            runtime_pending = runtime_source_state != "done"
+            group_pending = group_source_state != "done"
+            try:
+                store.set_deletion_reconcile_cursor(
+                    "server_task_runtime_source_state", runtime_source_state,
+                )
+                store.set_deletion_reconcile_cursor(
+                    "server_group_repository_source_state", group_source_state,
+                )
+                store.set_deletion_reconcile_cursor(
+                    "server_deletion_source_turn", next_source_turn,
+                )
+            except Exception as exc:  # noqa: BLE001 - repeat safely after restart
+                if len(diagnostics) < batch:
+                    diagnostics.append({
+                        "group_id": "", "status": "deferred_global",
+                        "reason": type(exc).__name__,
+                    })
+            has_more = bool(runtime_pending or group_pending)
+            if has_more and successful_count == 0:
+                self._task_runtime_group_deletion_idle_attempt += 1
+                continuation_delay = min(
+                    self.TASK_RUNTIME_DELETION_RECONCILE_IDLE_MAX_SECONDS,
+                    self.TASK_RUNTIME_DELETION_RECONCILE_IDLE_SECONDS
+                    * (2 ** min(
+                        self._task_runtime_group_deletion_idle_attempt - 1, 6,
+                    )),
+                )
+            else:
+                self._task_runtime_group_deletion_idle_attempt = 0
+                continuation_delay = (
+                    self.TASK_RUNTIME_DELETION_RECONCILE_ACTIVE_SECONDS
+                    if has_more else 0.0
+                )
             self.task_runtime.recovery_report["server_deletion_reconciliation"] = {
                 "processed_count": len(candidates),
                 "sample": diagnostics[:batch],
-                "has_more": bool(
-                    report.get("has_more") or group_page.get("has_more")
-                ),
+                "has_more": has_more,
                 "runtime_cursor": str(report.get("cursor") or ""),
                 "group_cursor": next_group_cursor,
+                "runtime_quota": runtime_quota,
+                "group_quota": group_quota,
+                "next_source": next_source_turn,
+                "continuation_delay_seconds": continuation_delay,
                 "limit": batch,
             }
         if self.task_runtime.recovery_report[
@@ -8302,7 +8460,18 @@ class KnoweServer:
 
     async def _task_runtime_group_deletion_reconcile_loop(self) -> None:
         while not self._shutdown_event.is_set():
-            await asyncio.sleep(0.01)
+            if self.task_runtime is None:
+                return
+            state = self.task_runtime.recovery_report.get(
+                "server_deletion_reconciliation",
+            ) or {}
+            delay = float(state.get(
+                "continuation_delay_seconds",
+                self.TASK_RUNTIME_DELETION_RECONCILE_ACTIVE_SECONDS,
+            ))
+            await asyncio.sleep(max(
+                self.TASK_RUNTIME_DELETION_RECONCILE_ACTIVE_SECONDS, delay,
+            ))
             await self._reconcile_task_runtime_group_deletions()
             if self.task_runtime is None:
                 return

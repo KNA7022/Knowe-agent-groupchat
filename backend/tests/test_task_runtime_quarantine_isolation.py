@@ -60,6 +60,28 @@ def _wait_for(predicate, *, timeout: float = 2.0) -> None:
     raise AssertionError("condition was not satisfied before timeout")
 
 
+async def _complete_runtime_delete(
+    server: KnoweServer, group_id: str, runtime_project_id: str,
+) -> None:
+    assert server.groups is not None and server.task_runtime is not None
+    _run_id, _transaction_id = _prepare_runtime_delete(
+        server.task_runtime, server.groups, group_id, runtime_project_id,
+    )
+    transaction = server.groups.delete_transaction(group_id)
+    assert transaction is not None
+    await server._run_confirmed_group_delete(  # noqa: SLF001
+        group_id, runtime_project_id, str(transaction["confirmation_token"]),
+    )
+
+
+async def _cancel_deletion_reconcile_task(server: KnoweServer) -> None:
+    task = server._task_runtime_group_deletion_task  # noqa: SLF001
+    if task is None:
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_full_server_excludes_quarantined_pending_group_and_recovers_other(
     tmp_path: Path,
@@ -345,6 +367,319 @@ async def test_limit_two_overflow_never_starves_valid_confirmed_deletion(
         _close_server(restarted)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch", (1, 2))
+async def test_complete_runtime_page_cannot_starve_canonical_only_prepared_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, batch: int,
+) -> None:
+    """A durable terminal runtime page must not own the shared candidate budget."""
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", batch)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    completed = [server.groups.create_group(f"Completed {index}") for index in range(2)]
+    pending = server.groups.create_group("Canonical crash boundary")
+    for index, group in enumerate(completed):
+        await _complete_runtime_delete(
+            server, group.group_id, f"project_complete_receipt_{index}",
+        )
+
+    preview = server.groups.delete_preview(pending.group_id)
+    pending_transaction = server.groups.prepare_delete(
+        pending.group_id, preview.confirmation_token,
+        runtime_project_id="project_canonical_only_pending",
+    )
+    assert pending_transaction["stage"] == "prepared"
+    server.task_runtime.store.set_deletion_reconcile_cursor(
+        "task_runtime_service", "",
+    )
+    server.task_runtime.store.set_deletion_reconcile_cursor(
+        "server_task_runtime_source", "",
+    )
+    server.task_runtime.store.set_deletion_reconcile_cursor(
+        "group_repository", "",
+    )
+    server.task_runtime._deletion_reconcile_cursor = None  # noqa: SLF001
+
+    try:
+        for _ in range(6):
+            await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+            transaction = server.groups.delete_transaction(pending.group_id)
+            if transaction is not None and transaction["stage"] == "committed":
+                break
+        else:
+            raise AssertionError("canonical-only prepared deletion was starved")
+
+        with pytest.raises(GroupNotFoundError):
+            server.groups.get(pending.group_id)
+        state = server.task_runtime.recovery_report[
+            "server_deletion_reconciliation"
+        ]
+        assert state["processed_count"] <= batch
+        assert len(state["sample"]) <= batch
+        assert state["runtime_quota"] + state["group_quota"] <= batch
+        deadline = time.monotonic() + 2
+        while (
+            server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert server._task_runtime_group_deletion_task is None, (  # noqa: SLF001
+            server.task_runtime.recovery_report["server_deletion_reconciliation"]
+        )
+        assert not server.task_runtime.recovery_report[
+            "server_deletion_reconciliation"
+        ]["has_more"]
+    finally:
+        task = server._task_runtime_group_deletion_task  # noqa: SLF001
+        if task is not None:
+            task.cancel()
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_blocked_canonical_page_cannot_starve_runtime_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    blocked = [server.groups.create_group(f"Blocked canonical {index}") for index in range(3)]
+    for group in blocked:
+        preview = server.groups.delete_preview(group.group_id)
+        server.groups.prepare_delete(
+            group.group_id, preview.confirmation_token,
+            runtime_project_id=f"project_blocked_{group.group_id}",
+        )
+    actionable = server.groups.create_group("Runtime actionable")
+    actionable_run, _transaction_id = _prepare_runtime_delete(
+        server.task_runtime, server.groups, actionable.group_id,
+        "project_runtime_actionable",
+    )
+    blocked_ids = {group.group_id for group in blocked}
+    original_blocked = server.task_runtime.group_deletion_recovery_blocked
+
+    def permanent_block(group_id: str) -> tuple[bool, bool]:
+        if group_id in blocked_ids:
+            return True, False
+        return original_blocked(group_id)
+
+    monkeypatch.setattr(
+        server.task_runtime, "group_deletion_recovery_blocked", permanent_block,
+    )
+    server.task_runtime.store.set_deletion_reconcile_cursor(
+        "task_runtime_service", "",
+    )
+    server.task_runtime.store.set_deletion_reconcile_cursor(
+        "server_task_runtime_source", "",
+    )
+    server.task_runtime.store.set_deletion_reconcile_cursor(
+        "group_repository", "",
+    )
+    server.task_runtime._deletion_reconcile_cursor = None  # noqa: SLF001
+
+    try:
+        await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+        assert server.task_runtime.store.get_run(actionable_run) is None
+        with pytest.raises(GroupNotFoundError):
+            server.groups.get(actionable.group_id)
+        assert all(
+            server.groups.delete_transaction(group_id)["stage"] == "prepared"
+            for group_id in blocked_ids
+        )
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_dual_source_cursors_resume_after_restart_and_process_each_delete_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    complete_groups = [
+        server.groups.create_group(f"Durable complete {index}") for index in range(4)
+    ]
+    for index, group in enumerate(complete_groups):
+        await _complete_runtime_delete(
+            server, group.group_id, f"project_durable_complete_{index}",
+        )
+    pending_groups = [
+        server.groups.create_group(f"Paged canonical {index}") for index in range(4)
+    ]
+    for index, group in enumerate(pending_groups):
+        preview = server.groups.delete_preview(group.group_id)
+        server.groups.prepare_delete(
+            group.group_id, preview.confirmation_token,
+            runtime_project_id=f"project_paged_canonical_{index}",
+        )
+    for owner in (
+        "task_runtime_service", "server_task_runtime_source", "group_repository",
+        "server_task_runtime_source_state", "server_group_repository_source_state",
+        "server_deletion_source_turn",
+    ):
+        server.task_runtime.store.set_deletion_reconcile_cursor(owner, "")
+    server.task_runtime._deletion_reconcile_cursor = None  # noqa: SLF001
+
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    await _cancel_deletion_reconcile_task(server)
+    runtime_cursor = server.task_runtime.store.deletion_reconcile_cursor(
+        "server_task_runtime_source",
+    )
+    group_cursor = server.task_runtime.store.deletion_reconcile_cursor(
+        "group_repository",
+    )
+    assert runtime_cursor and group_cursor
+    _close_server(server)
+
+    restarted = KnoweServer(str(tmp_path))
+    assert restarted.groups is not None and restarted.task_runtime is not None
+    assert restarted.task_runtime.store.deletion_reconcile_cursor(
+        "server_task_runtime_source",
+    ) == runtime_cursor
+    calls: dict[str, int] = {}
+    original_run = restarted._run_confirmed_group_delete  # noqa: SLF001
+
+    async def count_delete(group_id: str, *args, **kwargs):
+        calls[group_id] = calls.get(group_id, 0) + 1
+        return await original_run(group_id, *args, **kwargs)
+
+    monkeypatch.setattr(restarted, "_run_confirmed_group_delete", count_delete)
+    resumed_after_persisted_cursor = False
+    try:
+        for _ in range(40):
+            await restarted._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+            runtime_sample = restarted.task_runtime.recovery_report["deletions"][
+                "sample"
+            ]
+            if runtime_sample:
+                resumed_after_persisted_cursor = (
+                    str(runtime_sample[0]["group_id"]) > runtime_cursor
+                )
+            await _cancel_deletion_reconcile_task(restarted)
+            if all(
+                restarted.groups.delete_transaction(group.group_id)["stage"] == "committed"
+                for group in pending_groups
+            ):
+                break
+        else:
+            raise AssertionError("paged canonical deletions did not converge after restart")
+
+        assert all(count == 1 for count in calls.values())
+        assert set(calls).issubset({group.group_id for group in pending_groups})
+        assert resumed_after_persisted_cursor
+    finally:
+        await _cancel_deletion_reconcile_task(restarted)
+        _close_server(restarted)
+
+
+@pytest.mark.asyncio
+async def test_terminal_only_continuation_uses_idle_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    groups = [server.groups.create_group(f"Idle receipt {index}") for index in range(4)]
+    for index, group in enumerate(groups):
+        await _complete_runtime_delete(
+            server, group.group_id, f"project_idle_receipt_{index}",
+        )
+    for owner in (
+        "task_runtime_service", "server_task_runtime_source", "group_repository",
+        "server_task_runtime_source_state", "server_group_repository_source_state",
+        "server_deletion_source_turn",
+    ):
+        server.task_runtime.store.set_deletion_reconcile_cursor(owner, "")
+    server.task_runtime._deletion_reconcile_cursor = None  # noqa: SLF001
+
+    try:
+        await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+        state = server.task_runtime.recovery_report[
+            "server_deletion_reconciliation"
+        ]
+        assert state["has_more"]
+        assert state["processed_count"] == 0
+        assert state["continuation_delay_seconds"] >= (
+            server.TASK_RUNTIME_DELETION_RECONCILE_IDLE_SECONDS
+        )
+        assert state["continuation_delay_seconds"] > (
+            server.TASK_RUNTIME_DELETION_RECONCILE_ACTIVE_SECONDS
+        )
+        assert state["runtime_quota"] + state["group_quota"] <= 2
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_permanent_candidate_failure_does_not_pin_later_pages_or_spin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    groups = [server.groups.create_group(f"Fair failure {index}") for index in range(4)]
+    for index, group in enumerate(groups):
+        preview = server.groups.delete_preview(group.group_id)
+        server.groups.prepare_delete(
+            group.group_id, preview.confirmation_token,
+            runtime_project_id=f"project_fair_failure_{index}",
+        )
+    poison_id = min(group.group_id for group in groups)
+    healthy_ids = {group.group_id for group in groups} - {poison_id}
+    original_run = server._run_confirmed_group_delete  # noqa: SLF001
+
+    async def fail_one(group_id: str, *args, **kwargs):
+        if group_id == poison_id:
+            raise PermissionError("permanent synthetic candidate failure")
+        return await original_run(group_id, *args, **kwargs)
+
+    monkeypatch.setattr(server, "_run_confirmed_group_delete", fail_one)
+    for owner in (
+        "task_runtime_service", "server_task_runtime_source", "group_repository",
+        "server_task_runtime_source_state", "server_group_repository_source_state",
+        "server_deletion_source_turn",
+    ):
+        server.task_runtime.store.set_deletion_reconcile_cursor(owner, "")
+    server.task_runtime._deletion_reconcile_cursor = None  # noqa: SLF001
+
+    try:
+        for _ in range(12):
+            await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+            await _cancel_deletion_reconcile_task(server)
+            if all(
+                server.groups.delete_transaction(group_id)["stage"] == "committed"
+                for group_id in healthy_ids
+            ):
+                break
+        else:
+            raise AssertionError("poison candidate pinned a later canonical page")
+
+        assert server.groups.delete_transaction(poison_id)["stage"] == "prepared"
+        for _ in range(12):
+            await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+            await _cancel_deletion_reconcile_task(server)
+            state = server.task_runtime.recovery_report[
+                "server_deletion_reconciliation"
+            ]
+            if (
+                state["sample"]
+                and state["sample"][0].get("group_id") == poison_id
+                and state["continuation_delay_seconds"]
+                >= server.TASK_RUNTIME_DELETION_RECONCILE_IDLE_SECONDS
+            ):
+                break
+        else:
+            raise AssertionError("permanent candidate did not enter idle backoff")
+        assert state["has_more"]
+        assert state["processed_count"] <= 2
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
 def test_ten_thousand_intent_page_and_restart_cursor_stay_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -404,3 +739,31 @@ def test_ten_thousand_intent_page_and_restart_cursor_stay_bounded(
         assert len(second_service._deferred_quarantines) <= 2  # noqa: SLF001
     finally:
         second_service.close()
+
+
+def test_ten_thousand_canonical_transactions_keep_page_materialization_bounded(
+    tmp_path: Path,
+) -> None:
+    groups = GroupRepository(tmp_path)
+    groups.create_group("Registry initializer")
+    registry = json.loads(groups.registry_path.read_text(encoding="utf-8"))
+    registry["deletion_transactions"] = [
+        {
+            "group_id": f"grp_{index:032x}",
+            "stage": "prepared",
+        }
+        for index in range(10_000)
+    ]
+    groups.registry_path.write_text(
+        json.dumps(registry, ensure_ascii=False, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    first = groups.pending_delete_transactions_page(limit=2)
+    second = groups.pending_delete_transactions_page(
+        cursor=str(first["cursor"]), limit=2,
+    )
+    assert len(first["items"]) == len(second["items"]) == 2
+    assert first["limit"] == second["limit"] == 2
+    assert first["has_more"] and second["has_more"]
+    assert first["cursor"] < second["cursor"]

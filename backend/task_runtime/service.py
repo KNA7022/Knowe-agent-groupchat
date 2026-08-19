@@ -1432,22 +1432,29 @@ class TaskRuntimeService:
 
     def reconcile_group_deletions(
         self, *, limit: int | None = None,
+        cursor_owner: str = "task_runtime_service",
     ) -> dict[str, Any]:
         with self._lock:
-            return self._reconcile_group_deletions_locked(limit=limit)
+            return self._reconcile_group_deletions_locked(
+                limit=limit, cursor_owner=cursor_owner,
+            )
 
     def _reconcile_group_deletions_locked(
         self, *, limit: int | None = None,
+        cursor_owner: str = "task_runtime_service",
     ) -> dict[str, Any]:
         bounded = max(1, min(
             int(limit or self.DELETION_RECONCILE_BATCH_SIZE),
             self.DELETION_RECONCILE_BATCH_SIZE,
         ))
-        if self._deletion_reconcile_cursor is None:
+        owner = str(cursor_owner or "task_runtime_service")
+        service_owned_cursor = owner == "task_runtime_service"
+        cursor = self._deletion_reconcile_cursor if service_owned_cursor else None
+        if cursor is None:
             try:
-                self._deletion_reconcile_cursor = self.store.deletion_reconcile_cursor(
-                    "task_runtime_service",
-                )
+                cursor = self.store.deletion_reconcile_cursor(owner)
+                if service_owned_cursor:
+                    self._deletion_reconcile_cursor = cursor
             except Exception as exc:  # noqa: BLE001 - constructor availability
                 return {
                     "processed_count": 0, "quarantined_count": 0,
@@ -1459,14 +1466,14 @@ class TaskRuntimeService:
                 }
         try:
             page = self.store.group_deletion_intents_page(
-                cursor=self._deletion_reconcile_cursor, limit=bounded,
+                cursor=cursor, limit=bounded,
             )
         except Exception as exc:  # noqa: BLE001 - constructor must remain available
             return {
                 "processed_count": 0, "quarantined_count": 0,
                 "deferred_count": 0, "complete_count": 0,
                 "awaiting_count": 0,
-                "sample": [], "cursor": self._deletion_reconcile_cursor,
+                "sample": [], "cursor": cursor,
                 "has_more": False, "view_unavailable": True,
                 "last_error": type(exc).__name__, "limit": bounded,
             }
@@ -1544,12 +1551,13 @@ class TaskRuntimeService:
             if len(sample) < bounded:
                 sample.append(row)
         next_cursor = str(page["cursor"] if page["has_more"] else "")
-        self._deletion_reconcile_cursor = next_cursor
-        self._deletion_reconcile_has_more = bool(page["has_more"])
+        if service_owned_cursor:
+            self._deletion_reconcile_cursor = next_cursor
+            self._deletion_reconcile_has_more = bool(page["has_more"])
         cursor_error = ""
         try:
             self.store.set_deletion_reconcile_cursor(
-                "task_runtime_service", next_cursor,
+                owner, next_cursor,
             )
         except Exception as exc:  # noqa: BLE001 - repeat page safely after restart
             cursor_error = type(exc).__name__
@@ -1563,7 +1571,8 @@ class TaskRuntimeService:
             "has_more": bool(page["has_more"]), "view_unavailable": False,
             "last_error": cursor_error, "limit": bounded,
         }
-        self._arm_deferred_quarantine_retry()
+        if service_owned_cursor:
+            self._arm_deferred_quarantine_retry()
         return report
 
     def _round_robin(self, candidates: list[TaskRun], lane: str) -> list[TaskRun]:
