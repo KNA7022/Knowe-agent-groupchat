@@ -8153,9 +8153,17 @@ class KnoweServer:
     async def _reconcile_task_runtime_group_deletions(self) -> None:
         if self.task_runtime is None or self.groups is None:
             return
+        try:
+            report_rows = self.task_runtime.reconcile_group_deletions()
+        except Exception as exc:  # noqa: BLE001 - startup availability boundary
+            report_rows = [{
+                "group_id": "", "status": "deferred_global",
+                "reason": type(exc).__name__,
+            }]
+        self.task_runtime.recovery_report["deletions"] = report_rows
         reports = {
             item["group_id"]: item
-            for item in self.task_runtime.reconcile_group_deletions()
+            for item in report_rows if item.get("group_id")
         }
         for item in reports.values():
             if item.get("status") == "quarantined":
@@ -8163,34 +8171,85 @@ class KnoweServer:
                     "Quarantined orphan Task Runtime deletion intent for %s (%s)",
                     item["group_id"], item.get("reason", "invalid proof"),
                 )
-        group_transactions = {
-            str(transaction["group_id"]): transaction
-            for transaction in self.groups.pending_delete_transactions()
+        try:
+            group_transactions = {
+                str(transaction["group_id"]): transaction
+                for transaction in self.groups.pending_delete_transactions()
+            }
+        except Exception as exc:  # noqa: BLE001 - fail this global view closed
+            log.error(
+                "Canonical Group deletion reconciliation deferred (%s)",
+                type(exc).__name__,
+            )
+            self.task_runtime.recovery_report["server_deletion_reconciliation"] = [{
+                "group_id": "", "status": "deferred_global",
+                "reason": type(exc).__name__,
+            }]
+            return
+        deferred_ids = {
+            group_id for group_id, item in reports.items()
+            if str(item.get("status") or "").startswith("deferred")
         }
+        quarantined_ids, store_view_unavailable = (
+            self.task_runtime.deletion_recovery_exclusions()
+        )
+        quarantined_ids.update(
+            group_id for group_id, item in reports.items()
+            if item.get("status") == "quarantined"
+        )
         candidates = set(group_transactions) | {
             group_id for group_id, item in reports.items()
-            if item.get("status") != "quarantined"
+            if item.get("status") not in {"quarantined", "deferred_quarantine"}
         }
-        for group_id in sorted(candidates):
-            transaction = self.groups.delete_transaction(group_id)
-            if transaction is None:
-                # Absence is never evidence of a commit. The service has already
-                # quarantined any orphan runtime intent and preserved its content.
-                log.error(
-                    "Canonical Group deletion proof missing for runtime intent %s",
-                    group_id,
-                )
-                continue
-            if reports.get(group_id, {}).get("status") == "complete":
-                self._prune_task_runtime_bridge_group(
-                    group_id, confirmed_group_delete=True,
-                )
-                continue
-            await self._run_confirmed_group_delete(
-                group_id, str(transaction["runtime_project_id"]),
-                str(transaction["confirmation_token"]),
-                runtime_already_deleted=str(transaction.get("stage")) in {"runtime_deleted", "committed"},
+        # Quarantine/deferred status dominates every candidate source.  This
+        # subtraction intentionally happens after the complete union so a pending
+        # canonical transaction can never re-add a quarantined Group.
+        candidates -= quarantined_ids | deferred_ids
+        if store_view_unavailable or any(
+            item.get("status") == "deferred_global" for item in report_rows
+        ):
+            log.error(
+                "Task Runtime deletion reconciliation deferred: "
+                "quarantine view unavailable or overflowed",
             )
+            self.task_runtime.recovery_report["server_deletion_reconciliation"] = [{
+                "group_id": "", "status": "deferred_global",
+                "reason": "quarantine_view_unavailable",
+            }]
+            return
+        diagnostics: list[dict[str, str]] = []
+        for group_id in sorted(candidates):
+            try:
+                transaction = self.groups.delete_transaction(group_id)
+                if transaction is None:
+                    # Absence is never evidence of a commit. The service has already
+                    # quarantined any orphan runtime intent and preserved its content.
+                    log.error(
+                        "Canonical Group deletion proof missing for runtime intent %s",
+                        group_id,
+                    )
+                    continue
+                if reports.get(group_id, {}).get("status") == "complete":
+                    self._prune_task_runtime_bridge_group(
+                        group_id, confirmed_group_delete=True,
+                    )
+                    continue
+                await self._run_confirmed_group_delete(
+                    group_id, str(transaction["runtime_project_id"]),
+                    str(transaction["confirmation_token"]),
+                    runtime_already_deleted=str(transaction.get("stage")) in {"runtime_deleted", "committed"},
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate startup per Group
+                log.error(
+                    "Task Runtime deletion reconciliation deferred for %s (%s)",
+                    group_id, type(exc).__name__,
+                )
+                if len(diagnostics) < self.task_runtime.DEFERRED_QUARANTINE_LIMIT:
+                    diagnostics.append({
+                        "group_id": group_id, "status": "deferred",
+                        "reason": type(exc).__name__,
+                    })
+        self.task_runtime.recovery_report["server_deletion_reconciliation"] = diagnostics
 
     async def _serve_groups_list(self, writer: asyncio.StreamWriter) -> None:
         if self.groups is None:

@@ -120,6 +120,9 @@ class TaskRuntimeService:
     SCHEDULER_LEASE_SECONDS = 30.0
     APPROVAL_DEFAULT_TTL_SECONDS = 600.0
     APPROVAL_MAX_TTL_SECONDS = 86_400.0
+    DEFERRED_QUARANTINE_LIMIT = 64
+    DEFERRED_QUARANTINE_RETRY_BASE_SECONDS = 0.1
+    DEFERRED_QUARANTINE_RETRY_MAX_SECONDS = 5.0
     _AWARE_ISO8601 = re.compile(
         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
     )
@@ -131,6 +134,13 @@ class TaskRuntimeService:
         self._scheduler_owner = opaque_id("lease")
         self._scheduler_retry: threading.Timer | None = None
         self._approval_expiry_timer: threading.Timer | None = None
+        self._quarantine_retry_timer: threading.Timer | None = None
+        self._deferred_quarantines: dict[str, str] = {}
+        self._deferred_quarantine_overflow = False
+        self._quarantine_retry_attempt = 0
+        self._quarantine_retry_enabled = False
+        self._quarantine_retry_running = False
+        self._quarantine_retry_thread_id: int | None = None
         self._closed = False
         self.recovery_report = {"deletions": self.reconcile_group_deletions()}
         self.recovery_report.update(self.recover_after_restart())
@@ -139,6 +149,8 @@ class TaskRuntimeService:
         )
         self.recovery_report["scheduled_runs"] = [run.run_id for run in self.schedule()]
         self._arm_approval_expiry_watcher()
+        self._quarantine_retry_enabled = True
+        self._arm_deferred_quarantine_retry()
 
     def add_event_listener(self, listener: Any) -> None:
         self.store.add_event_listener(listener)
@@ -159,6 +171,10 @@ class TaskRuntimeService:
             self._approval_expiry_timer = None
             if approval_timer is not None:
                 approval_timer.cancel()
+            quarantine_timer = self._quarantine_retry_timer
+            self._quarantine_retry_timer = None
+            if quarantine_timer is not None:
+                quarantine_timer.cancel()
             self.store.release_scheduler_lease(self._scheduler_owner)
             self.store.close()
 
@@ -166,6 +182,20 @@ class TaskRuntimeService:
         transaction = self.groups.delete_transaction(group_id)
         if transaction is not None or self.store.group_is_deleting(group_id):
             raise RuntimeConflictError("Task Runtime group is fenced for deletion")
+
+    def _assert_not_deferred_quarantine(self, group_id: str) -> None:
+        with self._lock:
+            if (
+                group_id in self._deferred_quarantines
+                or self._deferred_quarantine_overflow
+                or (
+                    self._quarantine_retry_running
+                    and self._quarantine_retry_thread_id != threading.get_ident()
+                )
+            ):
+                raise RuntimeConflictError(
+                    "Task Runtime deletion intent is quarantined pending audit",
+                )
 
     def _canonical_group(self, group_id: str, *, require_active: bool = False) -> str:
         """Internal calls require the canonical opaque ID, never the legacy alias."""
@@ -1156,6 +1186,7 @@ class TaskRuntimeService:
     ) -> tuple[str, ...]:
         """Fence work only for the exact user-confirmed canonical delete intent."""
         canonical = self._canonical_group(group_id)
+        self._assert_not_deferred_quarantine(canonical)
         _transaction, proof = self._canonical_group_deletion_transaction(
             canonical, group_transaction_id,
             allowed_stages={"prepared", "runtime_deleted"},
@@ -1185,6 +1216,7 @@ class TaskRuntimeService:
 
     def prepare_group_deletion(self, group_id: str, group_transaction_id: str) -> dict[str, str]:
         canonical = self._canonical_group(group_id)
+        self._assert_not_deferred_quarantine(canonical)
         transaction, proof = self._canonical_group_deletion_transaction(
             canonical, group_transaction_id,
             allowed_stages={"prepared", "runtime_deleted"},
@@ -1242,6 +1274,7 @@ class TaskRuntimeService:
         self, group_id: str, *, canonical_stages: set[str],
         runtime_stages: set[str], allow_legacy_proof_bind: bool = False,
     ) -> tuple[dict[str, str], dict[str, Any]]:
+        self._assert_not_deferred_quarantine(group_id)
         intent = next((
             item for item in self.store.group_deletion_intents()
             if item["group_id"] == group_id
@@ -1305,11 +1338,119 @@ class TaskRuntimeService:
                 )
             self.store.set_group_deletion_stage(group_id, "complete")
 
+    def _defer_quarantine(self, group_id: str, audit_code: str) -> None:
+        """Retain one bounded fail-closed retry marker per affected Group."""
+        with self._lock:
+            if group_id in self._deferred_quarantines:
+                self._deferred_quarantines[group_id] = str(audit_code)[:120]
+            elif len(self._deferred_quarantines) < self.DEFERRED_QUARANTINE_LIMIT:
+                self._deferred_quarantines[group_id] = str(audit_code)[:120]
+            else:
+                # The durable invalid proof remains the primary fence.  Overflow is
+                # one coalesced rescan bit rather than an unbounded in-memory queue.
+                self._deferred_quarantine_overflow = True
+            if self._quarantine_retry_enabled:
+                self._arm_deferred_quarantine_retry_locked()
+
+    def _clear_deferred_quarantine(self, group_id: str) -> None:
+        with self._lock:
+            self._deferred_quarantines.pop(group_id, None)
+
+    def _arm_deferred_quarantine_retry(self) -> None:
+        with self._lock:
+            self._arm_deferred_quarantine_retry_locked()
+
+    def _arm_deferred_quarantine_retry_locked(self) -> None:
+        if (
+            self._closed
+            or not self._quarantine_retry_enabled
+            or self._quarantine_retry_running
+            or self._quarantine_retry_timer is not None
+            or not (self._deferred_quarantines or self._deferred_quarantine_overflow)
+        ):
+            return
+        delay = min(
+            self.DEFERRED_QUARANTINE_RETRY_MAX_SECONDS,
+            self.DEFERRED_QUARANTINE_RETRY_BASE_SECONDS
+            * (2 ** min(self._quarantine_retry_attempt, 6)),
+        )
+        timer = threading.Timer(delay, self._retry_deferred_quarantines)
+        timer.daemon = True
+        self._quarantine_retry_timer = timer
+        timer.start()
+
+    def _retry_deferred_quarantines(self) -> None:
+        """Lifecycle-owned retry; all faults are observed and re-armed with backoff."""
+        with self._lock:
+            self._quarantine_retry_timer = None
+            if self._closed:
+                return
+            self._quarantine_retry_running = True
+            self._quarantine_retry_thread_id = threading.get_ident()
+            pending = tuple(self._deferred_quarantines.items())
+            had_overflow = self._deferred_quarantine_overflow
+            self._deferred_quarantine_overflow = False
+        made_progress = False
+        try:
+            for group_id, audit_code in pending:
+                try:
+                    self.store.quarantine_group_deletion(group_id, audit_code)
+                except Exception:  # noqa: BLE001 - lifecycle containment boundary
+                    continue
+                with self._lock:
+                    if self._deferred_quarantines.get(group_id) == audit_code:
+                        self._deferred_quarantines.pop(group_id, None)
+                        made_progress = True
+            if had_overflow:
+                # Rediscover overflowed invalid proofs after slots become available.
+                # This scan is bounded by the durable intent table and stores only
+                # the fixed-size retry cohort above.
+                reports = self.reconcile_group_deletions()
+                if hasattr(self, "recovery_report"):
+                    self.recovery_report["deletions"] = reports
+        except Exception:  # noqa: BLE001 - Timer callbacks never leak exceptions
+            pass
+        finally:
+            with self._lock:
+                self._quarantine_retry_running = False
+                self._quarantine_retry_thread_id = None
+                if made_progress:
+                    self._quarantine_retry_attempt = 0
+                elif self._deferred_quarantines or self._deferred_quarantine_overflow:
+                    self._quarantine_retry_attempt += 1
+                self._arm_deferred_quarantine_retry_locked()
+
+    def deletion_recovery_exclusions(self) -> tuple[set[str], bool]:
+        """Return automatic-delete exclusions and whether the Store view is unavailable."""
+        with self._lock:
+            excluded = set(self._deferred_quarantines)
+            overflowed = (
+                self._deferred_quarantine_overflow
+                or self._quarantine_retry_running
+            )
+        try:
+            intents = self.store.group_deletion_intents()
+        except Exception:  # noqa: BLE001 - fail all candidates closed for this pass
+            return excluded, True
+        excluded.update(
+            item["group_id"] for item in intents
+            if item.get("stage") == "quarantined"
+        )
+        return excluded, overflowed
+
     def reconcile_group_deletions(self) -> list[dict[str, str]]:
         report: list[dict[str, str]] = []
-        for intent in self.store.group_deletion_intents():
+        try:
+            intents = self.store.group_deletion_intents()
+        except Exception as exc:  # noqa: BLE001 - constructor must remain available
+            return [{
+                "group_id": "", "status": "deferred_global",
+                "reason": type(exc).__name__,
+            }]
+        for intent in intents:
             group_id = intent["group_id"]
             if intent.get("stage") == "quarantined":
+                self._clear_deferred_quarantine(group_id)
                 report.append({
                     "group_id": group_id, "status": "quarantined",
                     "reason": str(intent.get("audit_code") or "invalid_canonical_proof"),
@@ -1335,14 +1476,29 @@ class TaskRuntimeService:
                     self.clean_prepared_group_deletion(group_id)
                     report.append({"group_id": group_id, "status": "awaiting_group_commit"})
             except RuntimeConflictError as exc:
-                self.store.quarantine_group_deletion(group_id, type(exc).__name__)
-                report.append({
-                    "group_id": group_id, "status": "quarantined",
-                    "reason": type(exc).__name__,
-                })
+                reason = type(exc).__name__
+                try:
+                    self.store.quarantine_group_deletion(group_id, reason)
+                except Exception as audit_exc:  # noqa: BLE001 - quarantine must not brick startup
+                    self._defer_quarantine(group_id, reason)
+                    report.append({
+                        "group_id": group_id, "status": "deferred_quarantine",
+                        "reason": type(audit_exc).__name__,
+                    })
+                else:
+                    self._clear_deferred_quarantine(group_id)
+                    report.append({
+                        "group_id": group_id, "status": "quarantined",
+                        "reason": reason,
+                    })
             except RuntimeStoreError as exc:
                 # A storage outage is retryable and must not rewrite a valid
                 # canonical authorization into a permanent quarantine.
+                report.append({
+                    "group_id": group_id, "status": "deferred",
+                    "reason": type(exc).__name__,
+                })
+            except Exception as exc:  # noqa: BLE001 - isolate validator/repository faults
                 report.append({
                     "group_id": group_id, "status": "deferred",
                     "reason": type(exc).__name__,
