@@ -1622,6 +1622,252 @@ async def test_shutdown_fences_queued_foreign_thread_wake(
     _close_server(server)
 
 
+@pytest.mark.asyncio
+async def test_transient_owner_exception_retries_durable_wake_with_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    original_reconcile = server._reconcile_task_runtime_group_deletions  # noqa: SLF001
+    calls = {"count": 0}
+
+    async def fail_first_owner() -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("synthetic transient deletion owner failure")
+        await original_reconcile()
+
+    monkeypatch.setattr(
+        server, "_reconcile_task_runtime_group_deletions", fail_first_owner,
+    )
+    group = server.groups.create_group("Transient owner failure")
+    preview = server.groups.delete_preview(group.group_id)
+    server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id="project_transient_owner_failure",
+    )
+
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            transaction = server.groups.delete_transaction(group.group_id)
+            if transaction is not None and transaction["stage"] == "committed":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("transient owner exception consumed durable wake")
+        assert calls["count"] >= 2
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_owner_exception_before_later_prepare_keeps_one_backoff_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        KnoweServer, "TASK_RUNTIME_DELETION_ERROR_RETRY_BASE_SECONDS", 0.05,
+    )
+    monkeypatch.setattr(
+        KnoweServer, "TASK_RUNTIME_DELETION_ERROR_RETRY_MAX_SECONDS", 0.1,
+    )
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    original_reconcile = server._reconcile_task_runtime_group_deletions  # noqa: SLF001
+    calls = {"count": 0}
+
+    async def fail_before_work_once() -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise RuntimeError("synthetic owner failure before durable work")
+        await original_reconcile()
+
+    monkeypatch.setattr(
+        server, "_reconcile_task_runtime_group_deletions", fail_before_work_once,
+    )
+    listener = server.groups.deletion_prepare_listener
+    assert listener is not None
+    listener()
+    deadline = time.monotonic() + 2
+    while (
+        server._task_runtime_group_deletion_error_retry_handle is None  # noqa: SLF001
+        and time.monotonic() < deadline
+    ):
+        await asyncio.sleep(0.005)
+    handle = server._task_runtime_group_deletion_error_retry_handle  # noqa: SLF001
+    assert handle is not None and calls["count"] == 1
+    assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+    loop = asyncio.get_running_loop()
+    original_call_soon_threadsafe = loop.call_soon_threadsafe
+    wake_calls = {"count": 0}
+
+    def count_wake(callback, *args, **kwargs):
+        wake_calls["count"] += 1
+        return original_call_soon_threadsafe(callback, *args, **kwargs)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", count_wake)
+
+    def produce_settle_burst() -> None:
+        for _ in range(10_000):
+            listener()
+
+    producer = threading.Thread(target=produce_settle_burst, daemon=True)
+    producer.start()
+    producer.join(timeout=5)
+    assert not producer.is_alive()
+    assert wake_calls["count"] == 0
+    assert server._task_runtime_group_deletion_error_retry_handle is handle  # noqa: SLF001
+
+    group = server.groups.create_group("Work inserted during owner backoff")
+    preview = server.groups.delete_preview(group.group_id)
+    server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id="project_inserted_during_owner_backoff",
+    )
+    assert server._task_runtime_group_deletion_error_retry_handle is handle  # noqa: SLF001
+    assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+
+    try:
+        while time.monotonic() < deadline:
+            transaction = server.groups.delete_transaction(group.group_id)
+            if transaction is not None and transaction["stage"] == "committed":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("later prepare was lost behind error retry handle")
+        assert calls["count"] >= 2
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_foreign_prepare_during_failing_owner_survives_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        KnoweServer, "TASK_RUNTIME_DELETION_ERROR_RETRY_BASE_SECONDS", 0.01,
+    )
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    first = server.groups.create_group("Wake before failing owner")
+    second = server.groups.create_group("Wake during failing owner")
+    first_preview = server.groups.delete_preview(first.group_id)
+    second_preview = server.groups.delete_preview(second.group_id)
+    original_reconcile = server._reconcile_task_runtime_group_deletions  # noqa: SLF001
+    calls = {"count": 0}
+
+    async def insert_foreign_then_fail() -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            await asyncio.to_thread(
+                server.groups.prepare_delete,
+                second.group_id,
+                second_preview.confirmation_token,
+                runtime_project_id="project_wake_during_failing_owner",
+            )
+            raise RuntimeError("synthetic settle-race owner failure")
+        await original_reconcile()
+
+    monkeypatch.setattr(
+        server, "_reconcile_task_runtime_group_deletions", insert_foreign_then_fail,
+    )
+    server.groups.prepare_delete(
+        first.group_id, first_preview.confirmation_token,
+        runtime_project_id="project_wake_before_failing_owner",
+    )
+
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            transactions = (
+                server.groups.delete_transaction(first.group_id),
+                server.groups.delete_transaction(second.group_id),
+            )
+            if all(item is not None and item["stage"] == "committed" for item in transactions):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("wake during failing owner settlement was lost")
+        assert calls["count"] >= 2
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_permanent_owner_exception_backs_off_and_shutdown_drains_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        KnoweServer, "TASK_RUNTIME_DELETION_ERROR_RETRY_BASE_SECONDS", 0.01,
+    )
+    monkeypatch.setattr(
+        KnoweServer, "TASK_RUNTIME_DELETION_ERROR_RETRY_MAX_SECONDS", 0.04,
+    )
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    loop = asyncio.get_running_loop()
+    previous_exception_handler = loop.get_exception_handler()
+    unhandled_contexts: list[dict[str, object]] = []
+    loop.set_exception_handler(
+        lambda _loop, context: unhandled_contexts.append(dict(context)),
+    )
+    calls: list[float] = []
+
+    async def fail_permanently() -> None:
+        calls.append(time.monotonic())
+        raise RuntimeError("synthetic permanent deletion owner failure")
+
+    monkeypatch.setattr(
+        server, "_reconcile_task_runtime_group_deletions", fail_permanently,
+    )
+    group = server.groups.create_group("Permanent owner failure")
+    preview = server.groups.delete_preview(group.group_id)
+    server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id="project_permanent_owner_failure",
+    )
+
+    try:
+        await asyncio.sleep(0.22)
+        assert 3 <= len(calls) <= 7
+        assert calls[-1] - calls[-2] >= 0.035
+        task = server._task_runtime_group_deletion_task  # noqa: SLF001
+        handle = server._task_runtime_group_deletion_error_retry_handle  # noqa: SLF001
+        assert not (
+            task is not None and not task.done()
+            and handle is not None and not handle.cancelled()
+        )
+        state = server.task_runtime.recovery_report[
+            "server_deletion_reconciliation"
+        ]
+        assert state["owner_error"] == "RuntimeError"
+        assert state["owner_error_retry_delay_seconds"] == pytest.approx(0.04)
+        assert state["has_more"]
+        assert not unhandled_contexts
+        assert server.task_runtime._quarantine_retry_timer is None  # noqa: SLF001
+        server._shutdown_event.set()  # noqa: SLF001
+        await server._stop_task_runtime_group_deletion_reconcile()  # noqa: SLF001
+        stopped_count = len(calls)
+        await asyncio.sleep(0.08)
+        assert len(calls) == stopped_count
+        assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+        assert server._task_runtime_group_deletion_error_retry_handle is None  # noqa: SLF001
+        assert server.groups.deletion_prepare_listener is None
+        assert server.task_runtime.store.group_deletion_prepare_listener is None
+    finally:
+        loop.set_exception_handler(previous_exception_handler)
+        await server._stop_task_runtime_group_deletion_reconcile()  # noqa: SLF001
+        _close_server(server)
+
+
 def test_ten_thousand_intent_page_and_restart_cursor_stay_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

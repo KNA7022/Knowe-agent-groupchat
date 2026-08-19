@@ -337,3 +337,84 @@ DONE
   before the thread-safe callback executes.
 - The listener burst retains only counters and one scheduled callback. Durable source
   storage and per-pass page/candidate/report bounds remain unchanged.
+
+## Independent review fix round 4/5
+
+### Status
+
+DONE
+
+### Exception-safe lifecycle retry
+
+- A loop-owned reconciliation task that terminates with an observed exception now
+  preserves generation invalidation and arms one asyncio `TimerHandle` for retry. The
+  completed task's exception is always retrieved before settlement, so no
+  `Task exception was never retrieved` path remains.
+- Error retry uses a separate capped exponential policy (`50ms` to `1s` in production),
+  rather than the normal `10ms` active cadence. Consecutive owner failures increase the
+  attempt; a successful owner settlement resets it.
+- The delayed handle carries the same loop/lifecycle generation fence as insertion
+  wakeups. While it is pending, `wake_scheduled` stays true, so canonical/runtime
+  listeners, foreign-thread bursts, and the existing Task Runtime Timer cannot create
+  a second owner or bypass the error backoff.
+- When the handle fires it clears itself before creating the sole reconciliation task.
+  Task and retry handle are therefore never simultaneously active. A permanent error
+  retains only one handle, one counter, opaque error class metadata, and bounded retry
+  delay.
+- Shutdown invalidates the lifecycle generation, detaches both insertion listeners,
+  cancels the delayed handle, cancels/drains the owner task, and prevents all late
+  callbacks from recreating either resource.
+
+### Exact red/green and boundary coverage
+
+- The independent reviewer probe was admitted first: the first wake-owned pass raised
+  `RuntimeError`, the second would be healthy, and a canonical transaction remained
+  `prepared`. It failed before the change and now converges automatically after one
+  delayed retry without a foreground call.
+- An exception before durable work followed by a later prepare proves listener wake is
+  retained behind the already-armed handle. A 10,000-callback foreign-thread burst
+  during that delay queues zero additional loop callbacks and keeps the same handle.
+- A second canonical prepare executed through `asyncio.to_thread` inside the failing
+  owner proves invalidation during exception/settlement survives; both authenticated
+  transactions commit on the healthy retry.
+- A permanent-error probe records retry timestamps and proves the delay reaches its
+  configured cap, call count remains bounded, error state remains observable, the Task
+  exception is retrieved, and only one of owner/handle is active.
+- The permanent-error shutdown probe proves the handle and task are both absent after
+  stop, call count no longer changes, listeners are detached, and no Task Runtime
+  quarantine Timer leaks.
+- All prior generation/checkpoint, restart, fairness, authority outage, burst wake,
+  proof/quarantine, recovery-debt, and bounded 10,000-row probes remain green.
+
+### Verification evidence
+
+- Final Task 3D fairness/crash/generation/wake/error suite:
+  `54 passed in 15.06s`.
+- Exception-focused tests were additionally repeated three times:
+  `4 passed` on every run.
+- Complete Task 1-3 Group/HTTP/Task Runtime/live bridge/recovery/deletion suites:
+  `222 passed in 59.24s`.
+- Legacy Engine suites: `26 passed, 10 subtests passed in 1.62s`.
+- Frontend Group/Task Runtime contracts, stores, and real socket transport:
+  `5 files / 45 tests passed in 12.98s`.
+- Node `v24.19.0`, Python `3.12.10`; foundation/runtime verification and ESLint
+  passed. Targeted Python compilation and `git diff --check` also passed; Git emitted
+  only the repository's existing Windows LF-to-CRLF notices.
+- The existing Windows quarantine-Timer overflow test timed out during three initial
+  focused attempts, then passed in isolation and in the clean 54-test focused rerun.
+  It does not share the asyncio error handle; the clean 222-test combined run also
+  passed.
+
+### Changed files in this round
+
+- `backend/server.py`
+- `backend/tests/test_task_runtime_quarantine_isolation.py`
+- `.superpowers/sdd/studycrew-implementation/task-3d-report.md`
+
+### Residual risks
+
+- A permanent internal exception intentionally retries for the lifetime of the Server
+  at the capped one-second interval so authenticated durable work is not abandoned.
+  The retry is observable and is fully fenced at shutdown.
+- Error retry state is process-local. Durable source revisions, prepared transactions,
+  and startup generation remain the crash/restart authority.
