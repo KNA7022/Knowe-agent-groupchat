@@ -1,15 +1,15 @@
 /**
  * FileCard.fold.test.tsx — v1.0.17 · 变更集 E · AC-FC-1 / AC-FC-2
  *
- * Bounded file-card folding: dedupe order/identity unchanged; ≤6 render in full with no
- * control; >6 render the first 6 with a single keyboard-accessible toggle that reports
+ * Bounded file-card folding: dedupe order/identity unchanged; ≤3 render in full with no
+ * control; >3 render the first 3 with a single keyboard-accessible toggle that reports
  * the total; folding state is local to the component instance (messages fold
  * independently); when collapsed only the visible cards are mounted (fixed DOM upper
  * bound). Preview/reveal side effects are mocked — this test is about the fold contract.
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach, cleanup } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { cleanup, render, screen, fireEvent } from '@testing-library/react';
 import React from 'react';
 
 vi.mock('../store/filePreview', () => ({
@@ -17,7 +17,7 @@ vi.mock('../store/filePreview', () => ({
   revealFileInFolder: vi.fn(() => Promise.resolve()),
 }));
 
-import { FileCardList, FILE_CARD_COLLAPSE_LIMIT } from './FileCard';
+import { FileCardList } from './FileCard';
 import type { ProducedFile } from '../store/state';
 
 beforeEach(() => { cleanup(); });
@@ -35,7 +35,7 @@ function cardCount(): number {
 }
 
 function toggle(): HTMLElement | null {
-  return document.querySelector('.fc-fold-toggle');
+  return document.querySelector('.file-card-fold-toggle');
 }
 
 describe('FileCardList bounded folding (AC-FC-1)', () => {
@@ -50,42 +50,42 @@ describe('FileCardList bounded folding (AC-FC-1)', () => {
     expect(toggle()).toBeNull();
   });
 
-  it('6 files → full, no control', () => {
-    render(<FileCardList files={files(6)} projectId="p1" />);
-    expect(cardCount()).toBe(FILE_CARD_COLLAPSE_LIMIT);
+  it('3 files → full, no control', () => {
+    render(<FileCardList files={files(3)} projectId="p1" />);
+    expect(cardCount()).toBe(3);
     expect(toggle()).toBeNull();
   });
 
-  it('7 files → first 6 + a control', () => {
+  it('7 files → first 3 + a control', () => {
     render(<FileCardList files={files(7)} projectId="p1" />);
-    expect(cardCount()).toBe(6);
+    expect(cardCount()).toBe(3);
     expect(toggle()).not.toBeNull();
   });
 
-  it('20 files → collapsed shows 6; expand shows all; collapse returns to 6', () => {
+  it('20 files → collapsed shows 3; expand shows all; collapse returns to 3', () => {
     render(<FileCardList files={files(20)} projectId="p1" />);
-    expect(cardCount()).toBe(6);
+    expect(cardCount()).toBe(3);
     const btn = toggle()!;
     expect(btn.getAttribute('aria-expanded')).toBe('false');
     fireEvent.click(btn);
     expect(cardCount()).toBe(20);
     expect(toggle()!.getAttribute('aria-expanded')).toBe('true');
     fireEvent.click(toggle()!);
-    expect(cardCount()).toBe(6);
+    expect(cardCount()).toBe(3);
   });
 
-  it('200 files → collapsed mounts only 6 (fixed DOM upper bound)', () => {
+  it('200 files → collapsed mounts only 3 (fixed DOM upper bound)', () => {
     render(<FileCardList files={files(200)} projectId="p1" />);
-    expect(cardCount()).toBe(6);
+    expect(cardCount()).toBe(3);
     fireEvent.click(toggle()!);
     expect(cardCount()).toBe(200);
   });
 
   it('duplicate paths do not count toward the total', () => {
-    const dupes = [...files(6), ...files(6)]; // same 6 paths twice
+    const dupes = [...files(3), ...files(3)]; // same 3 paths twice
     render(<FileCardList files={dupes} projectId="p1" />);
-    // 6 unique → no overflow control.
-    expect(cardCount()).toBe(6);
+    // 3 unique → no overflow control.
+    expect(cardCount()).toBe(3);
     expect(toggle()).toBeNull();
   });
 });
@@ -110,9 +110,9 @@ describe('FileCardList accessibility & isolation (AC-FC-2)', () => {
     const m1 = screen.getByTestId('m1');
     const m2 = screen.getByTestId('m2');
     // Expand only the first message.
-    fireEvent.click(m1.querySelector('.fc-fold-toggle')!);
+    fireEvent.click(m1.querySelector('.file-card-fold-toggle')!);
     expect(m1.querySelectorAll('.file-card').length).toBe(10);
     // The second message stays collapsed.
-    expect(m2.querySelectorAll('.file-card').length).toBe(6);
+    expect(m2.querySelectorAll('.file-card').length).toBe(3);
   });
 });

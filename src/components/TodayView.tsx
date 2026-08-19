@@ -5,6 +5,12 @@ import { useGroupStore } from '../store/groups';
 import { useKnoweStore } from '../store/store';
 import { IconAlert, IconCheck, IconChevR, IconTask } from './icons';
 
+const STATUS_ZH: Record<string, string> = {
+  queued: '排队中', routing: '路由中', running: '执行中', waiting_approval: '等待审批',
+  paused: '已暂停', verifying: '核验中', succeeded: '已完成', partial: '部分完成',
+  failed: '失败', cancelled: '已取消',
+};
+
 export interface TodayRow {
   groupId: Group['group_id'];
   groupName: string;
@@ -64,7 +70,7 @@ export const TodayView: React.FC<TodayViewProps> = ({ groups, summaries, onOpenG
       <div className="today-section-title"><div><span className="study-eyebrow">工作区</span><h2 id="today-groups-title">群组动态</h2></div><span>{rows.length} 个活跃群组</span></div>
       {rows.length ? rows.map((row, index) => <article key={row.groupId} className={index === 0 ? 'today-group primary' : 'today-group'}>
         <div className="today-group-mark" aria-hidden="true">{row.pendingApprovals ? <IconAlert /> : <IconTask />}</div>
-        <div><h3>{row.groupName}</h3><p>{row.status ? `主任务：${row.status}` : '当前没有运行中的主任务'}</p>
+        <div><h3>{row.groupName}</h3><p>{row.status ? `主任务：${STATUS_ZH[row.status] || row.status}` : '当前没有运行中的主任务'}</p>
           <ul>
             {row.pendingApprovals ? <li>{row.pendingApprovals} 个待审批</li> : null}
             {row.queued ? <li>{row.queued} 个任务排队</li> : null}

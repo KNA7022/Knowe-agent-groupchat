@@ -119,7 +119,7 @@ import ToastHost from '../components/ToastHost';
 import DevDrawer from '../components/DevDrawer';
 import ContactsView from '../components/ContactsView';
 import FavoritesView from '../components/FavoritesView';
-import KnowledgeView from '../components/KnowledgeView';
+import KnowledgeScopedView from '../components/KnowledgeScopedView';
 import SettingsView from '../components/SettingsView';
 import TodayShell from '../components/TodayView';
 import ProductShell from '../components/ProductShell';
@@ -686,7 +686,7 @@ export const App: React.FC = () => {
                     onSearchFocusDone={clearSearchFocus}
                   />
                 ) : activeView === 'knowledge' ? (
-                  <KnowledgeView />
+                  <KnowledgeScopedView />
                 ) : activeView === 'review' ? (
                   <ProductShell kind="review" />
                 ) : activeView === 'privacy' ? (

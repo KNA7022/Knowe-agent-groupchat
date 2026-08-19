@@ -72,6 +72,7 @@ import { useRecordsStore } from '../store/records';
 import { useTokenUsageStore } from '../store/tokenUsage';
 import { shouldShowDivider, formatDividerLabel } from '../utils/messageTime';
 import AgentStatusBar from './AgentStatusBar';
+import { useGroupStore } from '../store/groups';
 
 /** [v1.0.35] relay 接力对信息（气泡行 + 卡片行的 ik 与行号）。 */
 type RelayPair = {
@@ -224,6 +225,13 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
   const deferredItems = useDeferredValue(items);
 
   const members = useKnoweStore(useMemo(() => makeSelectMembers(projectId), [projectId]));
+  const canonicalGroup = useGroupStore((state) => {
+    for (const groupId of state.order) {
+      const group = state.groups[groupId];
+      if (group?.legacy_project_id === projectId) return group;
+    }
+    return null;
+  });
   const name = useKnoweStore(useMemo(() => makeSelectConvName(projectId), [projectId]));
   const banner = useKnoweStore(useMemo(() => makeSelectBanner(projectId), [projectId]));
 
@@ -1192,6 +1200,8 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
                     : (dmRole || t('chat.stream.22'))}
                 </span>
               )
+            ) : canonicalGroup ? (
+              <span>{canonicalGroup.roster.length} 个 Agent · Coordinator / Verifier 已锁定</span>
             ) : busyCount > 0 ? (
               <>
                 <span className="live-dot" />
@@ -1226,7 +1236,7 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
             </button>
           )}
           {/* [v1.0.23.4] 群聊中途添加 Agent 员工：仅群聊显示（私聊/知知隐藏） */}
-          {!priv && projectId !== PLATFORM_PROJECT_ID && (
+          {!priv && projectId !== PLATFORM_PROJECT_ID && !canonicalGroup && (
             <button
               className="btn-add-agents effect-btn"
               data-tip={t('chat.head.addAgents')}
@@ -1244,7 +1254,14 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
               </span>
             </button>
           )}
-          {stack.length > 0 && (
+          {canonicalGroup ? (
+            <div className="stack canonical-group-stack" aria-label={`群组 Agent：${canonicalGroup.roster.map((agent) => agent.display_name).join('、')}`}>
+              {canonicalGroup.roster.slice(0, 4).map((agent, index) => <span key={agent.agent_id} className="stack-avatar"
+                title={`${agent.display_name} · ${agent.role}`} style={{ marginLeft: index === 0 ? 0 : -7, zIndex: canonicalGroup.roster.length - index }}>
+                <Avatar glyph={agent.display_name.slice(0, 1)} pal="av-d" size={28} />
+              </span>)}
+            </div>
+          ) : stack.length > 0 && (
             <div
               className="stack"
               title={t('chat.stream.20')}
@@ -1299,7 +1316,7 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
       </header>
 
       {/* [v1.0.23.4] 群聊中途添加 Agent 员工 Popover（卡片左上角跟随鼠标） */}
-      {addAgentsAnchor && projectId && (
+      {addAgentsAnchor && projectId && !canonicalGroup && (
         <AddAgentsPopover
           projectId={projectId}
           anchor={addAgentsAnchor}

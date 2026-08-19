@@ -48,7 +48,7 @@ describe('displayInfo · 回退链', () => {
     ['be_2', '后端'],
     ['pm_1', '产品'],
     ['qa_3', '测试'],
-    ['ux_1', '设计'],
+    ['ux_1', 'UI/UX 设计'],
   ])('③ 前缀匹配：%s → %s', (id, role) => {
     expect(displayInfo(conv(), id, DEFAULT_AGENTS, DEFAULT_ROLE_TYPES).role).toBe(role);
   });
@@ -105,9 +105,9 @@ describe('registerMember · 注册', () => {
     expect(DEFAULT_AGENTS.coordinator!.avatarUrl).toBeUndefined();       // 模板没被写脏
   });
 
-  it('带 role 参数注册 → 成员初始状态跟着走', () => {
+  it('role 参数只描述角色，不污染 idle/busy 运行状态', () => {
     const c = conv();
     registerMember(c, 'fe_1', DEFAULT_AGENTS, DEFAULT_ROLE_TYPES, 'busy');
-    expect(c.members[0]!.state).toBe('busy');
+    expect(c.members[0]!.state).toBe('idle');
   });
 });

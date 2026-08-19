@@ -30,6 +30,11 @@ export const NO_SEQ_TYPES: ReadonlySet<string> = new Set([
   'pong',
   'replay_complete',
   'resync_required',
+  'project_directory_required',
+  'project_directory_restored',
+  'project_delete_progress',
+  'token_usage_res',
+  'task_runtime_result',
 ]);
 
 /** 结构事件（进快照 conversation；与后端 STRUCTURAL_EVENT_TYPES 一致） */
@@ -38,6 +43,7 @@ export const STRUCTURAL_TYPES: ReadonlySet<string> = new Set([
   'approval_card',
   'approval_resolved',
   'agents_created',
+  'agent_removed',
   'instruction_injected',
   'report_submitted',
   'error',

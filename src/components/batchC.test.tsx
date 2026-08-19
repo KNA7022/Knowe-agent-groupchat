@@ -60,7 +60,7 @@ describe('ApprovalCard · 团队卡', () => {
     fireEvent.click(screen.getByText('确认'));
 
     expect(spy.approved).toEqual([{ id: 'ap1', projectId: 'p1' }]);
-    expect(screen.getByText('已提交…').hasAttribute('disabled')).toBe(true);
+    expect(screen.getByText('已提交').hasAttribute('disabled')).toBe(true);
     expect((screen.getByText('拒绝') as HTMLButtonElement).disabled).toBe(true);
     // ★ 首个解决为准：卡片仍是未决态，等服务端 approval_resolved
     expect(container.querySelector('.approval.settled')).toBeNull();

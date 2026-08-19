@@ -34,7 +34,7 @@ export const Rail: React.FC = () => {
 
   const MAIN_ITEMS: RailItem[] = [
     { view: 'today', label: '今日', icon: <IconTask /> },
-    { view: 'chats', label: t('common.14'), icon: <IconChats /> },
+    { view: 'chats', label: '群组', icon: <IconChats /> },
     { view: 'contacts', label: t('contacts.view.29'), icon: <IconContacts /> },
     { view: 'favorites', label: t('common.09'), icon: <IconFavorites /> },
     { view: 'knowledge', label: t('knowledge.view.06'), icon: <IconKnowledge /> },

@@ -38,6 +38,7 @@ import { IconForKind } from '../preview/icons';
 import { kindOf } from '../preview/fileKinds';
 import { PLATFORM_PROJECT_ID } from '../store/avatar';
 import type { Member } from '../store/state';
+import { useGroupStore } from '../store/groups';
 
 /** 输入区最小高度（设计稿的原状） */
 export const COMPOSER_MIN = 96;
@@ -77,7 +78,7 @@ function mentionFragmentAt(value: string, cursor: number): MentionFragment | nul
   const before = value.slice(0, Math.max(0, cursor));
   const start = before.lastIndexOf('@');
   if (start < 0) return null;
-  const prev = start > 0 ? before[start - 1] : '';
+  const prev = start > 0 ? (before[start - 1] ?? '') : '';
   if (/[A-Za-z0-9._%+-]/.test(prev)) return null; // foo@bar.com
 
   const query = before.slice(start + 1);
@@ -99,6 +100,9 @@ export const Composer: React.FC = () => {
   const projectId = useKnoweStore(selectActiveProjectId);
   const conn = useKnoweStore(selectConn);
   const members = useKnoweStore(selectActiveMembers);
+  const canonicalGroup = useGroupStore((state) => state.order.some(
+    (groupId) => state.groups[groupId]?.legacy_project_id === projectId,
+  ));
 
   /*
    * [v0.7 #1] ★ 输入框里的字**不再是 Composer 自己的 state** —— 它归会话所有。
@@ -173,7 +177,8 @@ export const Composer: React.FC = () => {
   const canMention = Boolean(
     projectId
     && projectId !== PLATFORM_PROJECT_ID
-    && !projectId.startsWith('dm:'),
+    && !projectId.startsWith('dm:')
+    && !canonicalGroup
   );
   const mentionMembers = useMemo(
     () => members.filter((member) => member.status !== 'removed' && Boolean(mentionLabel(member))),
@@ -724,9 +729,11 @@ export const Composer: React.FC = () => {
           ref={taRef}
           rows={1}
           value={text}
-          placeholder={conn === 'live'
-            ? t('composer.02', { sendKey: SEND_KEY })
-            : t('composer.03')}
+          placeholder={canonicalGroup
+            ? (conn === 'live'
+              ? `发送消息到群组（${SEND_KEY}+Enter 发送，Enter 换行）`
+              : '发送消息到群组（当前未连接，消息会标记为存疑）')
+            : conn === 'live' ? t('composer.02', { sendKey: SEND_KEY }) : t('composer.03')}
           aria-label={t('composer.15')}
           onChange={(e) => {
             if (projectId) setDraft(projectId, e.target.value);

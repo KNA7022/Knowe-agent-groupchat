@@ -10,13 +10,12 @@
  * 数据：selectProjectList / selectActiveProjectId + switchProject（唯一入口）。
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { shallow } from 'zustand/shallow';
 import { useCachedT } from '../i18n';
 import i18n from '../i18n';
 import { roleLabel } from '../shared/roleLabel';
 import { useKnoweStore } from '../store/store';
-import { useSettingsStore } from '../store/settings';
 import { selectProjectList, selectActiveProjectId, orderRosterMembers, type WorkingAgentSummary } from '../store/selectors';
 import { Avatar, AvatarGrid, palOf, glyphOf, type GridMember } from './Avatar';
 import { PLATFORM_PROJECT_ID, ZINNIA_AVATAR, getZinniaDisplayName } from '../store/avatar';
@@ -26,7 +25,10 @@ import { useDirectoryPending } from '../store/directoryRecovery';
 import { IconPlus, IconSearch, IconChevR } from './icons';
 import { openAgentMenu, openConversationMenu } from './ContextMenu';
 import GroupCreationWizard from './GroupCreationWizard';
+import GroupManagementDialog from './GroupManagementDialog';
 import { useGroupStore } from '../store/groups';
+import { useTaskRuntimeStore } from '../store/taskRuntime';
+import { useSideTaskReadStore } from '../store/sideTaskRead';
 import ResizeHandle from './ResizeHandle';
 import {
   GlobalSearchResults, useGlobalSearchGroups, type GlobalSearchTarget,
@@ -59,11 +61,15 @@ export const ConvList: React.FC<ConvListProps> = ({
   const switchProject = useKnoweStore((s) => s.switchProject);
   const enterDm = useKnoweStore((s) => s.enterDm);
 
-  /* [v1.0.19.2] 左上角 Logo 跟随主题：深色用暗色版，浅色用原版。 */
-  const appearance = useSettingsStore((s) => s.appearance);
-
   const [q, setQ] = useState('');
   const [modalOpen, setModalOpen] = useState(false);
+  const [managedArchivedGroupId, setManagedArchivedGroupId] = useState<string | null>(null);
+  const canonicalGroups = useGroupStore(
+    (state) => state.order.map((id) => state.groups[id]).filter((group): group is NonNullable<typeof group> => group !== undefined), shallow,
+  );
+  const archivedProjectIds = useMemo(() => new Set(canonicalGroups
+    .filter((group) => group.lifecycle === 'archived')
+    .map((group) => group.legacy_project_id).filter((id): id is string => Boolean(id))), [canonicalGroups]);
 
   /*
    * [v0.37] 群内私聊「面板模式」。
@@ -109,9 +115,11 @@ export const ConvList: React.FC<ConvListProps> = ({
   const searchGroups = useGlobalSearchGroups(q);
 
   // [v0.44.8] store 已维护好顺序；渲染层只负责拆成置顶、普通、折叠三段。
-  const pinned = projects.filter((p) => !!pinnedProjects[p.id]);
-  const folded = projects.filter((p) => !!foldedProjects[p.id]);
-  const normal = projects.filter((p) => !pinnedProjects[p.id] && !foldedProjects[p.id]);
+  const activeProjects = projects.filter((project) => !archivedProjectIds.has(project.id));
+  const archivedProjects = projects.filter((project) => archivedProjectIds.has(project.id));
+  const pinned = activeProjects.filter((p) => !!pinnedProjects[p.id]);
+  const folded = activeProjects.filter((p) => !!foldedProjects[p.id]);
+  const normal = activeProjects.filter((p) => !pinnedProjects[p.id] && !foldedProjects[p.id]);
   const pinnedCount = pinned.length;
   const foldedCount = folded.length;
   // [v1.0.24.6-P1a] 精准订阅：只有「置顶项目从未读→有未读（或反向）」才触发重渲染。
@@ -119,6 +127,9 @@ export const ConvList: React.FC<ConvListProps> = ({
   const pinnedHasUnread = useKnoweStore(
     (s) => Object.keys(s.pinnedProjects).some((pid) => (s.convs[pid]?.unread ?? 0) > 0),
   );
+  useEffect(() => {
+    if (activeId && archivedProjectIds.has(activeId)) switchProject(PLATFORM_PROJECT_ID);
+  }, [activeId, archivedProjectIds, switchProject]);
 
   return (
     <aside className="clist">
@@ -129,11 +140,8 @@ export const ConvList: React.FC<ConvListProps> = ({
             擦背景——擦不干净，浅色底上仍能看出一块淡淡的矩形）。
             v4 用 tools/make-logo-v4.py 从 v3 生成：去白、反预乘羽化边缘、裁掉留白。
             现在它在浅色和深色主题下都是干净的，CSS 里的混色也可以撤了。 */}
-        <div className="wordmark">
-          <img
-            src={appearance === 'dark' ? './brand/knowe-logo-v4-dark.png' : './brand/knowe-logo-v4.png'}
-            alt="StudyCrew 学伴团"
-          />
+        <div className="wordmark studycrew-wordmark" aria-label="StudyCrew 学伴团">
+          <strong>StudyCrew</strong><span>学伴团</span>
         </div>
         <button
           className="icon-btn"
@@ -150,8 +158,8 @@ export const ConvList: React.FC<ConvListProps> = ({
           <IconSearch />
           <input
             type="text"
-            placeholder={t('conv.list.06')}
-            aria-label={t('conv.list.01')}
+            placeholder="搜索群组或 Agent"
+            aria-label="搜索群组或 Agent"
             value={q}
             onChange={(e) => setQ(e.target.value)}
           />
@@ -161,8 +169,17 @@ export const ConvList: React.FC<ConvListProps> = ({
       <div
         className={'clist-scroll clist-anim-freeze' + (searching ? ' clist-search-results' : '')}
         data-knowe-native-conversation-list="true"
-        role={searching ? 'listbox' : undefined}
       >
+        {/* 知知是固定私聊入口；搜索只过滤群组/Agent 结果，不能把入口一起替换掉。 */}
+        <ConvListItem
+          id={PLATFORM_PROJECT_ID}
+          name={getZinniaDisplayName()}
+          avatarUrl={ZINNIA_AVATAR}
+          subtitle={t('conv.list.05')}
+          active={activeId === PLATFORM_PROJECT_ID}
+          pinned
+          onOpen={() => switchProject(PLATFORM_PROJECT_ID)}
+        />
         {searching ? (
           <GlobalSearchResults
             query={q}
@@ -174,20 +191,6 @@ export const ConvList: React.FC<ConvListProps> = ({
           />
         ) : (
           <>
-        {/*
-          [v0.4] 知知：**永远在最上面，不可删除、不可归档、搜不掉。**
-          [v0.37] 私聊面板模式下她也雷打不动置顶——只是不再高亮（当前在某个群内私聊里）。
-        */}
-        <ConvListItem
-          id={PLATFORM_PROJECT_ID}
-          name={getZinniaDisplayName()}
-          avatarUrl={ZINNIA_AVATAR}
-          subtitle={t('conv.list.05')}
-          active={activeId === PLATFORM_PROJECT_ID}
-          pinned
-          onOpen={() => switchProject(PLATFORM_PROJECT_ID)}
-        />
-
         {dmMode && dmGroup ? (
           /*
            * [v0.37] 群内私聊面板：知知下方置顶「该群」，其下缩进列出群成员。
@@ -258,7 +261,7 @@ export const ConvList: React.FC<ConvListProps> = ({
             <div className="grp-label">群组</div>
 
             {normal.length === 0 ? (
-              <div className="grp-empty">{t('conv.list.09')}</div>
+              <div className="grp-empty">还没有群组——点击上方加号创建</div>
             ) : normal.map((p) => (
               <ConvListItem
                 key={p.id}
@@ -312,6 +315,17 @@ export const ConvList: React.FC<ConvListProps> = ({
                 </div>
               </>
             )}
+            {archivedProjects.length ? <section className="archived-groups" aria-label="已归档群组">
+              <div className="grp-label">已归档群组</div>
+              {archivedProjects.map((project) => {
+                const group = canonicalGroups.find((candidate) => candidate.legacy_project_id === project.id);
+                if (!group) return null;
+                return <ConvListItem key={project.id} id={project.id} name={project.name}
+                  draft={project.draft} workingAgents={[]} active={false}
+                  menuMuted={!!mutedProjects[project.id]}
+                  onOpen={() => setManagedArchivedGroupId(group.group_id)} />;
+              })}
+            </section> : null}
           </>
         )}
           </>
@@ -325,6 +339,10 @@ export const ConvList: React.FC<ConvListProps> = ({
           if (legacyProjectId) switchProject(legacyProjectId);
         }}
       />
+      {managedArchivedGroupId && canonicalGroups.find((group) => group.group_id === managedArchivedGroupId) ? <GroupManagementDialog
+        group={canonicalGroups.find((group) => group.group_id === managedArchivedGroupId)!}
+        open onClose={() => setManagedArchivedGroupId(null)}
+      /> : null}
 
       {/* [v0.5 #14] 左栏右边缘这条线可以拖——拖窄了自动进紧凑模式（只剩头像） */}
       <ResizeHandle />
@@ -362,6 +380,11 @@ interface ConvListItemProps {
 /** 草稿预览只露前 20 个字——列表是一行的事，不是文章 */
 const DRAFT_PREVIEW_LEN = 20;
 const WORKING_BLUE = 'var(--accent, #4f7cff)';
+const RUNTIME_STATUS_ZH: Record<string, string> = {
+  queued: '排队中', routing: '路由中', running: '执行中', waiting_approval: '等待审批',
+  paused: '已暂停', verifying: '核验中', succeeded: '已完成', partial: '部分完成',
+  failed: '失败', cancelled: '已取消',
+};
 
 function workingPreview(agents: WorkingAgentSummary[]): string {
   const roles = Array.from(new Set(agents.map((a) => roleLabel(a.role) || a.displayName).filter(Boolean)));
@@ -430,6 +453,12 @@ export const ConvListItem: React.FC<ConvListItemProps> = ({
   const runtimeSummary = useGroupStore((state) => mappedGroup
     ? state.runtimeSummaries[mappedGroup.group_id]
     : undefined);
+  const sideRuns = useTaskRuntimeStore((state) => mappedGroup
+    ? (state.byGroup[mappedGroup.group_id] || []).map((runId) => state.byRun[runId]?.run)
+      .filter((run) => run?.kind === 'side')
+    : [], shallow);
+  const sideReadWatermarks = useSideTaskReadStore((state) => state.watermarks);
+  const unreadSideCount = sideRuns.filter((run) => run && run.last_seq > (sideReadWatermarks[run.run_id] || 0)).length;
   /*
    * [v0.23 问题四] 左栏预览：**跳过空文本的条目**。
    *
@@ -470,7 +499,7 @@ export const ConvListItem: React.FC<ConvListItemProps> = ({
   return (
     <div
       className={'citem'
-        + (active ? ' active' : '')
+        + (active && mappedGroup?.lifecycle !== 'archived' ? ' active' : '')
         + (pinned ? ' pinned' : '')          /* [v0.8b #11] */
         + (menuPinned ? ' pinned' : '')
         + (menuMuted ? ' knowe-conv-muted' : '')
@@ -485,7 +514,7 @@ export const ConvListItem: React.FC<ConvListItemProps> = ({
       tabIndex={0}
       role="button"
       aria-label={priv ? `${t('context.menu.05')} ${name}` : `群组 ${name}`}
-      aria-current={active}
+      aria-current={active && mappedGroup?.lifecycle !== 'archived'}
       onClick={onOpen}
       onContextMenu={id === PLATFORM_PROJECT_ID ? undefined : (e) => {
         e.preventDefault();
@@ -568,10 +597,11 @@ export const ConvListItem: React.FC<ConvListItemProps> = ({
         )}
         {mappedGroup ? <div className="group-runtime-badges" aria-label="群组运行摘要">
           {mappedGroup.lifecycle === 'archived' ? <span className="is-muted">已归档</span> : null}
-          {runtimeSummary?.primary_task_status ? <span className="is-primary">主任务 {runtimeSummary.primary_task_status}</span> : null}
+          {runtimeSummary?.primary_task_status ? <span className="is-primary">主任务 {RUNTIME_STATUS_ZH[runtimeSummary.primary_task_status] || runtimeSummary.primary_task_status}</span> : null}
           {runtimeSummary?.queued_task_count ? <span>排队 {runtimeSummary.queued_task_count}</span> : null}
           {runtimeSummary?.pending_approval_count ? <span className="is-warning">待审批 {runtimeSummary.pending_approval_count}</span> : null}
           {runtimeSummary?.active_side_task_count ? <span>旁路 {runtimeSummary.active_side_task_count}</span> : null}
+          {unreadSideCount ? <span className="is-warning">旁路未读 {unreadSideCount}</span> : null}
           {runtimeSummary?.indexing_state === 'failed' ? <span className="is-danger">索引异常</span> : null}
         </div> : null}
       </div>

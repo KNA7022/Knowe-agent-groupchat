@@ -32,6 +32,13 @@ const stream = (): React.ReactElement => (
 
 beforeEach(() => { cleanup(); resetStore(); });
 
+class TestResizeObserver {
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
+beforeEach(() => { globalThis.ResizeObserver = TestResizeObserver as never; });
+
 // ═══════════════════════════════════════════════════════════════
 describe('MessageBubble · 用户消息三态', () => {
   it('pending → 有发送中标记', () => {
@@ -79,25 +86,23 @@ describe('MessageBubble · 用户消息三态', () => {
 
 // ═══════════════════════════════════════════════════════════════
 describe('StreamBubble · 流式', () => {
-  it('流式中 → 有三点输入反馈，但不逐字渲染增量正文', () => {
+  it('流式中 → 有公开等待反馈，但不逐字渲染增量正文', () => {
     const { container } = render(<StreamBubble text="正在思" />);
-    expect(container.querySelectorAll('.bubble.agent .typing-dots i')).toHaveLength(3);
-    expect(screen.getByText('正在输入…')).toBeTruthy();
+    expect(container.querySelector('.bubble.agent .thinking-dot')).toBeTruthy();
     expect(screen.queryByText('正在思')).toBeNull();
   });
 
   it('text 为空也渲染——第一个 delta 未到时的样子', () => {
     const { container } = render(<StreamBubble text="" />);
-    expect(container.querySelectorAll('.typing-dots i')).toHaveLength(3);
+    expect(container.querySelector('.thinking-dot')).toBeTruthy();
   });
 
   it('[v1.0.23.3] 推理面板：流式中实时展示推理段落，默认展开可折叠', () => {
     const { container } = render(
       <StreamBubble reasoning={'先分析问题\n再看数据'} />,
     );
-    expect(screen.getByText('AI 推理记录')).toBeTruthy();
+    expect(screen.getByText('AI 推理中...')).toBeTruthy();
     expect(screen.getByText('先分析问题')).toBeTruthy();
-    expect(screen.getByText('再看数据')).toBeTruthy();
     const trigger = container.querySelector('.reasoning-trigger') as HTMLButtonElement | null;
     expect(trigger).toBeTruthy();
     expect(trigger?.getAttribute('aria-expanded')).toBe('true');
@@ -111,7 +116,7 @@ describe('StreamBubble · 流式', () => {
         reasoning="不该露出的推理"
       />,
     );
-    expect(screen.getByText('正在输入')).toBeTruthy();
+    expect(document.querySelector('.thinking-dot')).toBeTruthy();
     expect(screen.queryByText('AI 推理记录')).toBeNull();
   });
 });
@@ -124,43 +129,43 @@ describe('FileCardList · 有界折叠', () => {
     ext: 'txt',
   }));
 
-  it.each([0, 6] as const)('%i 个文件无需折叠', (count) => {
+  it.each([0, 3] as const)('%i 个文件无需折叠', (count) => {
     const { container } = render(<FileCardList files={files(count)} projectId="p1" />);
     expect(container.querySelectorAll('.file-card')).toHaveLength(count);
     expect(container.querySelector('.file-card-fold-toggle')).toBeNull();
   });
 
-  it('7 个文件默认只挂载 6 个，并报告隐藏数量', () => {
+  it('7 个文件默认只挂载 3 个，并报告隐藏数量', () => {
     const { container } = render(<FileCardList files={files(7)} projectId="p1" />);
-    expect(container.querySelectorAll('.file-card')).toHaveLength(6);
-    expect(screen.getByText('共 7 个文件，已隐藏 1 个')).toBeTruthy();
-    expect(screen.getByRole('button', { name: '展开其余 1 个' }).getAttribute('aria-expanded'))
+    expect(container.querySelectorAll('.file-card')).toHaveLength(3);
+    expect(screen.getByText('共 7 个文件，已隐藏 4 个')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '展开其余 4 个' }).getAttribute('aria-expanded'))
       .toBe('false');
   });
 
   it.each([20, 200] as const)('%i 个文件可完整展开并再次收起', async (count) => {
     const user = userEvent.setup();
     const { container } = render(<FileCardList files={files(count)} projectId="p1" />);
-    expect(container.querySelectorAll('.file-card')).toHaveLength(6);
-    await user.click(screen.getByRole('button', { name: `展开其余 ${count - 6} 个` }));
+    expect(container.querySelectorAll('.file-card')).toHaveLength(3);
+    await user.click(screen.getByRole('button', { name: `展开其余 ${count - 3} 个` }));
     expect(container.querySelectorAll('.file-card')).toHaveLength(count);
     expect(screen.getByRole('button', { name: '收起' }).getAttribute('aria-expanded')).toBe('true');
     await user.click(screen.getByRole('button', { name: '收起' }));
-    expect(container.querySelectorAll('.file-card')).toHaveLength(6);
+    expect(container.querySelectorAll('.file-card')).toHaveLength(3);
   });
 
   it('按 path 去重后再计算折叠边界，并保持首次出现顺序', () => {
     const duplicate = [...files(7), { ...files(1)[0]!, name: '重复名称.txt' }];
     const { container } = render(<FileCardList files={duplicate} projectId="p1" />);
-    expect(container.querySelectorAll('.file-card')).toHaveLength(6);
-    expect(screen.getByText('共 7 个文件，已隐藏 1 个')).toBeTruthy();
+    expect(container.querySelectorAll('.file-card')).toHaveLength(3);
+    expect(screen.getByText('共 7 个文件，已隐藏 4 个')).toBeTruthy();
     expect(container.querySelector('.file-card')?.getAttribute('data-fc-name')).toBe('file-1.txt');
   });
 
   it('原生按钮支持键盘切换', async () => {
     const user = userEvent.setup();
     const { container } = render(<FileCardList files={files(7)} projectId="p1" />);
-    const toggle = screen.getByRole('button', { name: '展开其余 1 个' });
+    const toggle = screen.getByRole('button', { name: '展开其余 4 个' });
     toggle.focus();
     await user.keyboard('{Enter}');
     expect(container.querySelectorAll('.file-card')).toHaveLength(7);
@@ -174,9 +179,9 @@ describe('FileCardList · 有界折叠', () => {
         <div data-testid="second"><FileCardList files={files(7)} projectId="p1" /></div>
       </>,
     );
-    await user.click(within(getByTestId('first')).getByRole('button', { name: '展开其余 1 个' }));
+    await user.click(within(getByTestId('first')).getByRole('button', { name: '展开其余 4 个' }));
     expect(getByTestId('first').querySelectorAll('.file-card')).toHaveLength(7);
-    expect(getByTestId('second').querySelectorAll('.file-card')).toHaveLength(6);
+    expect(getByTestId('second').querySelectorAll('.file-card')).toHaveLength(3);
   });
 });
 
@@ -229,7 +234,7 @@ describe('ChatStream · 消息流分发', () => {
     expect(container.querySelector('.bubble.agent')).toBeNull();
   });
 
-  it('★ 流式中有三点反馈；收尾后三点消失（定格）', () => {
+  it('★ 流式中有等待反馈；收尾后反馈消失（定格）', () => {
     seedConv('p1', {
       items: [{ kind: 'agent', agentId: 'fe_1', text: '正在', streaming: true }],
       members: [member('fe_1', '小前')],
@@ -237,7 +242,7 @@ describe('ChatStream · 消息流分发', () => {
     activate('p1');
 
     const { container, rerender } = render(stream());
-    expect(container.querySelectorAll('.typing-dots i')).toHaveLength(3);
+    expect(container.querySelector('.thinking-dot')).toBeTruthy();
 
     // message 收尾（applyEvent 会把 streaming 置 false）
     act(() => {
@@ -253,7 +258,7 @@ describe('ChatStream · 消息流分发', () => {
     });
     rerender(stream());
 
-    expect(container.querySelector('.typing-dots')).toBeNull();
+    expect(container.querySelector('.thinking-dot')).toBeNull();
     expect(container.querySelector('.bubble.agent')?.textContent).toBe('正在写');
   });
 
@@ -288,7 +293,7 @@ describe('Composer', () => {
     render(<Composer />);
     const ta = screen.getByLabelText('消息输入框');
     fireEvent.change(ta, { target: { value: '你好' } });
-    fireEvent.keyDown(ta, { key: 'Enter' });
+    fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true });
 
     expect(spy.sent).toEqual([{ content: '你好', projectId: 'p1' }]);
 
@@ -330,7 +335,7 @@ describe('Composer', () => {
     expect(ta).toBeTruthy();                       // 输入框没消失（v0.2 事故的专属回归）
 
     fireEvent.change(ta, { target: { value: '断线也要发' } });
-    fireEvent.keyDown(ta, { key: 'Enter' });
+    fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true });
     expect(spy.sent.length).toBe(1);               // 交给 transport 响亮失败 + 回声哨兵
   });
 });

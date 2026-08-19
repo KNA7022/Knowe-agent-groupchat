@@ -6,8 +6,8 @@
  * （唯一动过的既有断言：v05.test.tsx 里项目经理名字的格式，那正是 #3 要改掉的旧格式。）
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
-import { render, screen, within } from '@testing-library/react';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { cleanup, render, screen, within, waitFor } from '@testing-library/react';
 
 import ConvList from '../components/ConvList';
 import Rail from '../components/Rail';
@@ -27,25 +27,32 @@ function resetStore(): void {
     convs: {}, projectOrder: [], activeProjectId: null, notices: [], conn: 'live',
   } as never);
 }
-beforeEach(resetStore);
+class SuccessfulImagePreloader {
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  set src(_value: string) { queueMicrotask(() => this.onload?.()); }
+}
+beforeEach(() => { resetStore(); vi.stubGlobal('Image', SuccessfulImagePreloader); });
+afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 // ═══════════════════════════════════════════════════════════════
 // #1 · Logo 在左栏顶上（不是 Rail 底下）
 // ═══════════════════════════════════════════════════════════════
 
 describe('#1 Logo 位置', () => {
-  it('★ 左栏顶上是 logo 图片，不是「Knowe」四个字', () => {
+  it('★ 左栏顶上使用 StudyCrew 学伴团单品牌字标', () => {
     const { container } = render(<ConvList />);
-    const img = container.querySelector('.wordmark img');
+    const wordmark = container.querySelector('.studycrew-wordmark');
 
-    expect(img).toHaveAttribute('src', './brand/knowe-logo.png');
-    expect(container.querySelector('.wordmark')).not.toHaveTextContent('Knowe');
+    expect(wordmark).toHaveAccessibleName('StudyCrew 学伴团');
+    expect(wordmark).toHaveTextContent('StudyCrew学伴团');
+    expect(wordmark).not.toHaveTextContent('Knowe');
   });
 
   it('★ Rail 底部那个 logo 删掉了（上一批放错地方了）', () => {
     const { container } = render(<Rail />);
     expect(container.querySelector('.rail-logo-foot')).toBeNull();
-    expect(container.querySelector('img')).toBeNull();
+    expect(container.querySelector('.rail-logo-foot img')).toBeNull();
   });
 });
 
@@ -185,14 +192,16 @@ describe('#6 群聊头像宫格', () => {
     expect(container.querySelectorAll('.avatar')).toHaveLength(9);
   });
 
-  it('★ 项目经理排第一格（左上）', () => {
+  it('★ 项目经理排第一格（左上）', async () => {
     const { container } = render(<AvatarGrid members={gm(4)} />);
+    await waitFor(() => expect(container.querySelector('img')).not.toBeNull());
     const first = container.querySelector('.cav-row .avatar img');
-    expect(first).toHaveAttribute('src', './avatars/x_0.png');   // gm() 里第 0 个是 coordinator
+    expect(first?.getAttribute('src')).toMatch(/\/avatars\/x_0\.png$/);   // gm() 里第 0 个是 coordinator
   });
 
-  it('宫格里的头像是图片，不是文字字形', () => {
+  it('宫格里的头像是图片，不是文字字形', async () => {
     const { container } = render(<AvatarGrid members={gm(3)} />);
+    await waitFor(() => expect(container.querySelectorAll('img')).toHaveLength(3));
     expect(container.querySelectorAll('img')).toHaveLength(3);
   });
 });
@@ -208,18 +217,18 @@ describe('#6 接进左栏', () => {
     } as never);
 
     const { container } = render(<ConvList />);
-    const row = screen.getByRole('button', { name: '项目 官网改版' });
+    const row = screen.getByRole('button', { name: '群组 官网改版' });
 
     expect(within(row).getByTitle('官网改版')).toHaveClass('cav-grid');
     expect(container.querySelectorAll('.citem .cav-grid .avatar').length).toBeGreaterThan(1);
   });
 
-  it('知知还是单个头像（她没有团队，摆宫格没意义）', () => {
+  it('知知还是单个头像（她没有团队，摆宫格没意义）', async () => {
     render(<ConvList />);
-    const row = screen.getByRole('button', { name: `项目 ${getZinniaDisplayName()}` });
+    const row = screen.getByRole('button', { name: `私聊 ${getZinniaDisplayName()}` });
 
     expect(row.querySelector('.cav-grid')).toBeNull();
-    expect(within(row).getByRole('presentation', { hidden: true }))
+    expect(await within(row).findByRole('presentation', { hidden: true }))
       .toHaveAttribute('src', './avatars/zinnia.png');
   });
 

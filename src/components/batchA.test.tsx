@@ -107,29 +107,18 @@ describe('ConvList · 项目列表', () => {
     seedConv('p2', { name: '数据看板' });
     render(<ConvList />);
 
-    fireEvent.change(screen.getByLabelText('搜索项目'), { target: { value: '看板' } });
+    fireEvent.change(screen.getByLabelText('搜索群组或 Agent'), { target: { value: '看板' } });
     expect(screen.queryByText('官网改版')).toBeNull();
-    expect(screen.getByText('数据看板')).toBeTruthy();
+    expect(screen.getByRole('option')).toHaveTextContent('数据看板');
   });
 
-  it('＋ → 弹窗 → 创建 → 走 socket.createProject（前端先本地注册再发指令）', async () => {
-    // [v0.7 A0] 弹窗里「项目目录」是必填的
-    window.knowe = { selectDirectory: () => Promise.resolve('/test/dir'), version: 'test', isElectron: true } as never;
-
-    const spy = installSocketSpy();
+  it('＋ → 打开 canonical 群组向导，并锁定 Coordinator/Verifier', () => {
     render(<ConvList />);
 
-    fireEvent.click(screen.getByLabelText('新建项目'));
-    fireEvent.change(screen.getByLabelText('项目名'), { target: { value: '新官网' } });
-    // 点「选择目录」→ resolve → 目录填入输入框
-    fireEvent.click(screen.getByText('选择目录'));
-    await vi.waitFor(() => expect(screen.getByLabelText('项目目录')).toHaveValue('/test/dir'));
-    fireEvent.click(screen.getByText('创建'));
-
-    expect(spy.created.length).toBe(1);
-    expect(spy.created[0]?.name).toBe('新官网');
-    // [v0.7 #5] createProject 现在本地注册 → 本地已有会话
-    expect(useKnoweStore.getState().projectOrder.length).toBe(1);
+    fireEvent.click(screen.getByLabelText('新建群组'));
+    expect(screen.getByRole('dialog', { name: '创建 Agent 群组' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Coordinator')).toBeChecked();
+    expect(screen.getByLabelText('Verifier')).toBeChecked();
   });
 });
 

@@ -174,7 +174,7 @@ describe('v0.23 问题二 · 推理可见性', () => {
     apply(c, { type: 'agent_thinking', agent_id: 'be_1', seq: 2, ...base });
     apply(c, { type: 'tool_gen', agent_id: 'fe_1', tool_name: 'safe_patch', seq: 3, ...base });
 
-    expect((c.items[0] as AgentItem).activities).toEqual([{ tool: 'safe_patch', n: 1 }]);
+    expect((c.items[0] as AgentItem).activities).toEqual([{ tool: 'safe_patch', n: 1, pendingDetail: true }]);
     expect((c.items[1] as AgentItem).activities).toBeUndefined();
   });
 });
@@ -203,7 +203,7 @@ describe('v0.23 问题二 · 工具名翻成人话', () => {
   it('原子工具名与参数只出现在默认折叠的技术详情', () => {
     expect(toolTechnicalDetail(`safe_read_file${TOOL_ACTIVITY_SEPARATOR}src/store/state.ts`))
       .toBe('读取项目文件 · src/store/state.ts');
-    expect(toolTechnicalDetail('quantum_teleport')).toBe('调用 quantum_teleport');
+    expect(toolTechnicalDetail('quantum_teleport')).toBe('调用 quantum_teleport（未知工具兜底）');
   });
 
   it('完成阶段不会残留“✓ 正在……”的矛盾文案', () => {

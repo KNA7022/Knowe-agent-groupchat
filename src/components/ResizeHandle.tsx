@@ -41,8 +41,8 @@ function wordmarkMinWidth(): number {
 }
 
 function clamp(px: number): number {
-  // [v1.0.24.1] 最小宽度 = 至少完整显示 wordmark，且不低于紧凑分界（低于分界 wordmark 会被隐藏）
-  const min = Math.max(CLIST_MIN, CLIST_COMPACT, wordmarkMinWidth());
+  // 紧凑模式必须允许落到分界线以下；字标在该模式中由 CSS 隐藏。
+  const min = Math.max(CLIST_MIN, wordmarkMinWidth());
   return Math.max(min, Math.min(CLIST_MAX, px));
 }
 

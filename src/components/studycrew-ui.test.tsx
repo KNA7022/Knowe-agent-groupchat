@@ -7,11 +7,13 @@ import type { Group } from '../contract/group';
 import { taskRunFixture } from '../contract/taskRuntime.fixture';
 import { useGroupStore } from '../store/groups';
 import { useTaskRuntimeStore } from '../store/taskRuntime';
+import { useSideTaskReadStore } from '../store/sideTaskRead';
 import AgentStatusBar, {
   controlCommandsForStatus,
   groupForLegacyProject,
+  primaryProjectionForSummary,
 } from './AgentStatusBar';
-import GroupCreationWizard from './GroupCreationWizard';
+import GroupCreationWizard, { roleDefaultsForTemplate } from './GroupCreationWizard';
 import GroupManagementDialog from './GroupManagementDialog';
 import { TodayView, buildTodayRows } from './TodayView';
 
@@ -127,12 +129,24 @@ function snapshot(): unknown {
   };
 }
 
+function runtimeSummary(activePrimaryRunId: string | null = runId): never {
+  return {
+    group_id: groupId, lifecycle: 'active', active_agent_count: 2,
+    course_binding_count: 0, source_count: 0, shared_source_count: 0, budget: 5,
+    active_primary_run_id: activePrimaryRunId, primary_task_status: activePrimaryRunId ? 'running' : null,
+    queued_task_count: 0, active_side_task_count: 1, pending_approval_count: 0,
+    budget_usage: { wall_clock_seconds: 12, model_turns: 2, tool_calls: 1, tokens: 500, cost_usd: 0.02 },
+    indexing_state: 'idle', updated_at: '2026-08-18T00:00:00Z',
+  } as never;
+}
+
 beforeEach(() => {
   useGroupStore.setState({
     groups: {}, order: [], runtimeSummaries: {}, sourceReferenceCounts: {},
     loading: false, error: null,
   });
   useTaskRuntimeStore.getState().resetAll();
+  useSideTaskReadStore.getState().reset();
 });
 
 afterEach(() => cleanup());
@@ -147,6 +161,7 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
 
   it('keeps primary and side tasks separate and collapses idle Agents', () => {
     useGroupStore.getState().ingest([makeGroup(), makeGroup(otherGroupId, 'legacy-english')]);
+    useGroupStore.setState({ runtimeSummaries: { [groupId]: runtimeSummary() } });
     useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot());
     render(<AgentStatusBar projectId="legacy-calculus" />);
 
@@ -163,14 +178,35 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
   });
 
   it('exposes only valid controls for each authoritative status', () => {
-    expect(controlCommandsForStatus('running')).toEqual(['pause', 'cancel']);
-    expect(controlCommandsForStatus('paused')).toEqual(['resume', 'cancel']);
-    expect(controlCommandsForStatus('failed')).toEqual(['reconcile']);
-    expect(controlCommandsForStatus('succeeded')).toEqual([]);
+    expect(controlCommandsForStatus('queued', false)).toEqual(['cancel']);
+    expect(controlCommandsForStatus('routing', false)).toEqual(['pause', 'cancel']);
+    expect(controlCommandsForStatus('running', false)).toEqual(['pause', 'cancel']);
+    expect(controlCommandsForStatus('waiting_approval', false)).toEqual(['cancel']);
+    expect(controlCommandsForStatus('paused', false)).toEqual(['resume', 'cancel']);
+    expect(controlCommandsForStatus('verifying', false)).toEqual(['pause', 'cancel']);
+    expect(controlCommandsForStatus('succeeded', false)).toEqual([]);
+    expect(controlCommandsForStatus('partial', false)).toEqual(['reconcile']);
+    expect(controlCommandsForStatus('failed', false)).toEqual(['reconcile']);
+    expect(controlCommandsForStatus('cancelled', false)).toEqual([]);
+    expect(controlCommandsForStatus('running', true)).toEqual(['reconcile']);
+  });
+
+  it('selects the primary projection only from the authoritative summary id', () => {
+    const first = taskRunFixture({ run_id: `run_${'a'.repeat(32)}`, status: 'queued' }) as never;
+    const second = taskRunFixture({ run_id: `run_${'b'.repeat(32)}`, status: 'running' }) as never;
+    const projections = [
+      { run: first, events: [], needsResync: false },
+      { run: second, events: [], needsResync: false },
+    ];
+    expect(primaryProjectionForSummary(projections, `run_${'b'.repeat(32)}`)?.run.run_id)
+      .toBe(`run_${'b'.repeat(32)}`);
+    expect(primaryProjectionForSummary(projections, null)).toBeNull();
+    expect(primaryProjectionForSummary(projections, `run_${'c'.repeat(32)}`)).toBeNull();
   });
 
   it('shows only the public tool projection in the details drawer', () => {
     useGroupStore.getState().ingest([makeGroup()]);
+    useGroupStore.setState({ runtimeSummaries: { [groupId]: runtimeSummary() } });
     useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot());
     useTaskRuntimeStore.getState().applyEvent(groupId, {
       event_id: `evt_${'7'.repeat(32)}`,
@@ -194,10 +230,50 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
     expect(screen.getByText('local_files')).toBeInTheDocument();
     expect(screen.getByText('approval_required')).toBeInTheDocument();
     expect(document.body.textContent).not.toContain('private_payload');
+    const toolTab = screen.getByRole('tab', { name: '工具' });
+    fireEvent.keyDown(toolTab, { key: 'ArrowRight' });
+    expect(screen.getByRole('tab', { name: '证据' })).toHaveFocus();
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', expect.stringContaining('tab-evidence'));
+  });
+
+  it('addresses primary and side approvals with their exact run identities', async () => {
+    const sideRunId = `run_${'5'.repeat(32)}`;
+    const primaryApproval = { approval_id: `apr_${'a'.repeat(32)}`, run_id: runId, group_id: groupId,
+      kind: 'tool', summary: '主任务审批', risk: 'high', requested_capabilities: ['read'], tool_name: 'files',
+      operation_scope: {}, purpose: 'read', expires_at: null, status: 'pending', created_at: '2026-08-18T00:00:00Z', resolved_at: null, schema_version: 1 };
+    const sideApproval = { ...primaryApproval, approval_id: `apr_${'b'.repeat(32)}`, run_id: sideRunId, summary: '旁路审批' };
+    useGroupStore.getState().ingest([makeGroup()]);
+    useGroupStore.setState({ runtimeSummaries: { [groupId]: runtimeSummary() } });
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot());
+    const resolveApproval = vi.fn().mockResolvedValue({});
+    useTaskRuntimeStore.setState({ approvals: {
+      [primaryApproval.approval_id]: primaryApproval as never,
+      [sideApproval.approval_id]: sideApproval as never,
+    }, resolveApproval });
+    render(<AgentStatusBar projectId="legacy-calculus" />);
+    const sideRegion = screen.getByRole('region', { name: '其他任务审批' });
+    fireEvent.click(within(sideRegion).getByRole('button', { name: /批准/ }));
+    await waitFor(() => expect(resolveApproval).toHaveBeenCalledWith(groupId, sideRunId, sideApproval.approval_id, true));
+  });
+
+  it('projects and acknowledges side-task unread watermarks locally', () => {
+    useGroupStore.getState().ingest([makeGroup()]);
+    useGroupStore.setState({ runtimeSummaries: { [groupId]: runtimeSummary() } });
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot());
+    render(<AgentStatusBar projectId="legacy-calculus" />);
+    const unread = screen.getByRole('button', { name: /未读，点击标记已读/ });
+    fireEvent.click(unread);
+    expect(screen.getByRole('button', { name: /已读/ })).toBeInTheDocument();
   });
 });
 
 describe('Group creation wizard', () => {
+  it('uses distinct role defaults for all four templates', () => {
+    expect(roleDefaultsForTemplate('course_study')).toEqual({ knowledge: true, planning: true, coach: true });
+    expect(roleDefaultsForTemplate('exam_sprint')).toEqual({ knowledge: true, planning: true, coach: true });
+    expect(roleDefaultsForTemplate('general_assistant')).toEqual({ knowledge: false, planning: false, coach: false });
+    expect(roleDefaultsForTemplate('custom')).toEqual({ knowledge: false, planning: false, coach: false });
+  });
   it('moves focus into the dialog, closes with Escape, and restores the trigger', () => {
     const onClose = vi.fn();
     const trigger = document.createElement('button');
@@ -213,6 +289,21 @@ describe('Group creation wizard', () => {
     view.rerender(<GroupCreationWizard open={false} onClose={onClose} />);
     expect(trigger).toHaveFocus();
     trigger.remove();
+  });
+
+  it('portals above the app root and makes the background inert while open', () => {
+    const appRoot = document.createElement('div');
+    appRoot.id = 'root';
+    document.body.append(appRoot);
+    const view = render(<GroupCreationWizard open onClose={() => undefined} />);
+    expect(screen.getByRole('dialog')).toHaveProperty('parentElement');
+    expect(screen.getByRole('dialog').closest('#studycrew-overlay-host')).not.toBeNull();
+    expect(appRoot).toHaveAttribute('aria-hidden', 'true');
+    expect((appRoot as HTMLElement & { inert: boolean }).inert).toBe(true);
+    view.unmount();
+    expect(appRoot).not.toHaveAttribute('aria-hidden');
+    expect((appRoot as HTMLElement & { inert: boolean }).inert).toBe(false);
+    appRoot.remove();
   });
 
   it('keeps Coordinator and Verifier mandatory and validates the workspace directory', async () => {
@@ -248,8 +339,8 @@ describe('Group creation wizard', () => {
     fireEvent.change(screen.getByLabelText('首选聊天模型'), { target: { value: 'provider/chat-safe' } });
     fireEvent.change(screen.getByLabelText('群组允许工具'), { target: { value: 'local_files, calculator' } });
     fireEvent.click(screen.getByRole('button', { name: /添加受控专家 Agent/ }));
-    fireEvent.change(screen.getByLabelText('专家名称'), { target: { value: '线代专家' } });
-    fireEvent.change(screen.getByLabelText('专业范围'), { target: { value: '线性代数概念讲解' } });
+    fireEvent.change(screen.getByLabelText('专家 1 名称'), { target: { value: '线代专家' } });
+    fireEvent.change(screen.getByLabelText('专家 1 专业范围'), { target: { value: '线性代数概念讲解' } });
     fireEvent.click(screen.getByRole('button', { name: '创建群组' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('backend unavailable');
     expect(screen.getByRole('button', { name: '创建群组' })).toBeEnabled();
@@ -261,6 +352,24 @@ describe('Group creation wizard', () => {
       tool_overrides: { group: ['local_files', 'calculator'] },
       experts: [expect.objectContaining({ name: '线代专家', specialty: '线性代数概念讲解' })],
     })));
+  });
+
+  it('resumes failed initial bindings without creating a duplicate Group', async () => {
+    const createGroup = vi.fn().mockResolvedValue(makeGroup());
+    const bindCourse = vi.fn().mockRejectedValueOnce(new Error('course offline')).mockResolvedValueOnce({});
+    const onClose = vi.fn();
+    useGroupStore.setState({ createGroup, bindCourse } as never);
+    render(<GroupCreationWizard open onClose={onClose} />);
+    fireEvent.change(screen.getByLabelText('群组名称'), { target: { value: '高数绑定' } });
+    fireEvent.change(screen.getByLabelText('工作目录'), { target: { value: 'D:\\StudyCrew\\Calculus' } });
+    fireEvent.change(screen.getByLabelText('课程 ID'), { target: { value: 'course-calculus' } });
+    fireEvent.click(screen.getByRole('button', { name: '创建群组' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('群组已创建，但初始绑定未完成');
+    expect(createGroup).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: '继续完成绑定' }));
+    await waitFor(() => expect(onClose).toHaveBeenCalledOnce());
+    expect(createGroup).toHaveBeenCalledTimes(1);
+    expect(bindCourse).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -297,6 +406,21 @@ describe('Group lifecycle management', () => {
     fireEvent.change(screen.getByLabelText('确认群组名称'), { target: { value: '高数冲刺' } });
     fireEvent.click(deleteButton);
     await waitFor(() => expect(confirmedDelete).toHaveBeenCalledWith(groupId, confirmationToken));
+  });
+
+  it('invalidates a delete preview when Group identity or version changes', async () => {
+    const previewDelete = vi.fn().mockImplementation(async (id: string) => ({
+      group_id: id, confirmation_token: 'e'.repeat(64), agent_count: 2,
+      course_binding_count: 0, source_link_count: 0, exclusive_source_ids: [], shared_source_ids: [], source_reference_counts: {},
+    }));
+    useGroupStore.setState({ previewDelete } as never);
+    const close = () => undefined;
+    const view = render(<GroupManagementDialog group={makeGroup()} open onClose={close} />);
+    fireEvent.click(screen.getByRole('button', { name: /查看删除影响/ }));
+    expect(await screen.findByTestId('delete-preview')).toBeInTheDocument();
+    view.rerender(<GroupManagementDialog group={makeGroup(otherGroupId, 'legacy-english')} open onClose={close} />);
+    await waitFor(() => expect(screen.queryByTestId('delete-preview')).not.toBeInTheDocument());
+    expect(screen.getByRole('button', { name: /查看删除影响/ })).toBeInTheDocument();
   });
 });
 

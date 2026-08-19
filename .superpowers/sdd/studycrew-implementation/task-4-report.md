@@ -25,6 +25,17 @@ Task 4 已把已有的 Group 与 Task Runtime 权威状态接入 Electron render
 - 增加开发专用 `?studycrew-demo=1` 确定性场景，供作品演示与 UI 验收使用，不影响生产数据路径。
 - 样式保持现有暖色画布、靛蓝与 token；公开事件行使用 `content-visibility:auto`；Task 4 区域在 `prefers-reduced-motion` 下关闭动画和过渡。
 
+## Round 1 独立审查修复
+
+- 所有向导、管理框和运行抽屉均经 `ModalPortal` 进入 body 顶层 overlay host；首个模态打开时 `#root` 同时设置 `inert` 与 `aria-hidden`，最后一个关闭后恢复原值。三个交互面均具备焦点圈闭、Escape 与触发器焦点恢复。
+- 主任务严格由 `GroupRuntimeSummary.active_primary_run_id` 选中 exact projection；无摘要时诚实显示“无权威主任务”，`needsResync` 时只允许对账。控制矩阵与后端状态机一致。
+- 审批按 exact `run_id` 分区并用其自身身份提交；旁路/排队审批不再挂到主任务名下。
+- 删除预览绑定 `(group_id, updated_at)`，关闭、换群或成功 mutation 后清空；渲染和提交均校验身份与 token。
+- 四模板角色默认、最多四个专家、整数预算与“创建成功后仅续跑失败绑定”均已覆盖；成功完成后重置向导，下一次打开不会复用旧 Group。
+- canonical Group 隐藏旧员工入口，聊天头改读 Group roster；管理面支持受控专家增改删，Coordinator/Verifier 与平台策略锁定。
+- 归档群组单独分区且不可激活；知识入口先要求选择 Group/课程范围；旧 Knowe/项目/员工 UI 品牌和心智在 canonical 路径被 StudyCrew/群组/Agent 替换。
+- 完成状态/阶段本地化、Verifier 负向终态诚实措辞、完整 tab/roving keyboard 语义，以及基于 side run `last_seq` 水位的本地未读/确认投影。
+
 ## 自动化验证
 
 最终相关回归命令：
@@ -33,18 +44,27 @@ Task 4 已把已有的 Group 与 Task Runtime 权威状态接入 Electron render
 npm test -- --run src/components/studycrew-ui.test.tsx src/components/studycrew-css.test.ts src/store/taskRuntime.test.ts src/store/groups.test.ts src/components/sessionHost.test.tsx src/transport/socket.wars.test.ts
 ```
 
-覆盖精确 Project→Group 映射/隔离、主旁路分离、空闲折叠、公开工具投影、控制矩阵、伪造审批身份、四模板与受控配置、后端错误恢复、归档/恢复、删除 token、Today summary、键盘/焦点/Escape、reduced motion 及 900px 收拢。最后一次运行：6 个文件、49 个测试通过。
+覆盖精确 Project→Group 映射/隔离、主旁路分离、空闲折叠、公开工具投影、权威主任务与全状态控制矩阵、resync、exact run 审批、四模板默认、绑定失败不重复创建、删除 token 身份/版本、Today summary、modal inert、键盘/焦点/Escape、tabs、side unread 和 reduced motion。
 
-触及文件 ESLint 通过。仓库全量 TypeScript 仍含 Task 4 之前的基线错误；按 Task 4 触及文件过滤为 0。此前全量 Vitest 基线为 21 个文件/364 个测试通过、16 个文件/91 个测试失败，失败集中在旧 parity 白名单、v23 旧断言、历史 UI 测试未 cleanup 造成的 DOM 累积和旧 logo/avatar 假设；本任务 focused suites 全绿，未借 Task 4 扩改这些历史基线。
+直接触达 App/ConvList/ChatStream/Composer/Rail/Group/Runtime 的回归最终为 **8 个文件、162 个测试全绿**。额外迁移旧 accessible-name、异步头像预加载、共享 cleanup、FileCard 新边界、推理收缩动画以及 FakeServer 白名单后，全量从独立审查时的 **91 failed / 370 passed** 降到 **13 failed / 457 passed**。
+
+生产触及文件 ESLint 通过。仓库全量 TypeScript 仍含 Task 4 之前的基线错误；按 Task 4 触及文件过滤为 0。
+
+全量剩余只在两条与 Task 4 无关且可单文件复现的历史路径出现；`git diff 3f32bdd --name-only` 证明本轮没有修改对应生产组件：
+
+- `src/store/v24.test.ts`：6 个脆弱源码字符串断言仍要求旧 `StreamBubble` 八阶段 DOM 和旧 `ApprovalCard` 文本/selector；本轮未修改 `StreamBubble.tsx` 或 `ApprovalCard.tsx`。
+- `src/components/BackendGate.test.tsx`：6 个 bridge 状态/重试断言在现有 jsdom bridge bootstrap 下超时或取不到旧文案；本轮未修改 `BackendGate.tsx`。Vitest 汇总显示 13 failed（输出中具名断言为上述 12 个）/457 passed；未把它们误称为本轮回归。
 
 ## 实际渲染检查
 
-使用应用内 Browser 在真实 Vite 页面 `?studycrew-demo=1` 检查，不使用静态 HTML 替身：
+初始 Task 4 曾使用应用内 Browser 在真实 Vite 页面 `?studycrew-demo=1` 检查，不使用静态 HTML 替身：
 
 - 1440×900：Today 单一主角清晰；进入“高等数学冲刺”后，状态栏位于标题与消息流之间；七个详情分区可交互；Escape 关闭抽屉后焦点返回“详情”。
 - 1024×768：页面 `scrollWidth` 等于 1024，无全局横向溢出或错误 overlay。
 - 900×700：旧会话栏实际折叠为 76px；页面 `scrollWidth` 等于 900；状态栏边界为 left 148/right 886；“暂停/取消/详情/管理群组”保持可读。实测发现并修复了旧 CSS 导入顺序覆盖折叠规则，以及窄屏按钮被压成 `font-size:0` 的问题。
 - 控制台无应用错误；仅有既有 Zustand equality API 弃用提示和未启动本地 backend 时的连接告警。截图已在 Browser 验收步骤中生成，viewport override 已恢复。
+
+Round 1 修复后按 `control-in-app-browser` 的 bootstrap/documentation/troubleshooting 流程重新连接时，既有 binding 返回 unavailable，浏览器列表为空。技能明确禁止改用无关 browser-control surface，因此没有伪造本轮 modal hit-test、dark/light 或截图结论；顶层 portal、`inert`/`aria-hidden`、焦点圈闭/恢复与 Escape 由真实 React DOM 测试覆盖。待应用内 Browser 恢复后仍需补跑 900/1024/1440 的 `elementFromPoint` 验收。
 
 ## 主要文件
 
@@ -66,5 +86,5 @@ npm test -- --run src/components/studycrew-ui.test.tsx src/components/studycrew-
 
 - 工具抽屉只展示 Task Runtime 已发布的 `tool_prepared` 公共投影；完整 ToolInvocation 台账属于后续 Tool Gateway 任务，不能在 UI 猜测。
 - Review 与 Privacy 明确标为后续能力，只展示当前真实 Group/runtime 计数；未伪造 RAG、PII 或评测结果。
-- 既有 Knowledge 视图仍复用原入口，课程/群组范围的完整 RAG 交互由 Task 5 实现。
+- Knowledge 入口已增加 Group/课程范围选择边界；完整 RAG 交互仍由 Task 5 实现。
 - 900px 是计划要求的最低桌面验证宽度；不承诺移动端布局。
