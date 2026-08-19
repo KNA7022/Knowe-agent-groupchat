@@ -8113,14 +8113,25 @@ class KnoweServer:
         *,
         operation_id: str | None = None,
         runtime_already_deleted: bool = False,
+        recovery_lifecycle: tuple[
+            asyncio.AbstractEventLoop, int, asyncio.Lock,
+        ] | None = None,
     ) -> tuple[dict[str, Any], Any]:
         """Resume the durable Group/runtime deletion state machine to completion."""
+        def require_current_recovery_lifecycle() -> None:
+            if recovery_lifecycle is not None:
+                self._require_task_runtime_group_deletion_lifecycle(
+                    recovery_lifecycle,
+                )
+
+        require_current_recovery_lifecycle()
         if self.groups is None:
             raise ValueError("Group persistence is unavailable")
         transaction = self.groups.prepare_delete(
             group_id, confirmation_token, runtime_project_id=runtime_project_id,
         )
         await self._task_runtime_delete_boundary("after_group_prepare", group_id)
+        require_current_recovery_lifecycle()
         stage = str(transaction.get("stage") or "prepared")
         runtime_cleanup: dict[str, int] = {}
         if self.task_runtime is not None and stage != "committed":
@@ -8128,40 +8139,55 @@ class KnoweServer:
                 self.task_runtime.store.group_deletion_intent(group_id) is not None
             )
             if stage == "prepared" and not runtime_intent_exists:
+                require_current_recovery_lifecycle()
                 self.task_runtime.suspend_group_for_deletion(
                     group_id, str(transaction["transaction_id"]),
                     reason="Group deletion confirmed",
                 )
                 await self._task_runtime_delete_boundary("after_runtime_suspend", group_id)
+                require_current_recovery_lifecycle()
+            require_current_recovery_lifecycle()
             self.task_runtime.prepare_group_deletion(
                 group_id, str(transaction["transaction_id"]),
             )
             await self._task_runtime_delete_boundary("after_runtime_intent", group_id)
+            require_current_recovery_lifecycle()
             runtime_cleanup = self.task_runtime.clean_prepared_group_deletion(group_id)
             await self._task_runtime_delete_boundary("after_runtime_cleanup", group_id)
+            require_current_recovery_lifecycle()
         legacy_result: dict[str, Any] = {
             "project_id": runtime_project_id,
             "deleted": stage in {"runtime_deleted", "committed"},
             "cleanup_pending": False,
         }
         if stage == "prepared":
+            require_current_recovery_lifecycle()
             if runtime_already_deleted or runtime_project_id in self._deleted_project_ids():
                 legacy_result = await self._resume_committed_project_delete(
                     runtime_project_id, operation_id,
                 )
+                require_current_recovery_lifecycle()
             elif runtime_project_id in self.hub.projects:
                 legacy_result = await self._delete_project_permanently(
                     runtime_project_id, operation_id,
                 )
+                require_current_recovery_lifecycle()
             elif runtime_project_id in self._persisted_project_ids:
                 raise ValueError("runtime project is persisted but not loaded; deletion cannot be confirmed")
+            require_current_recovery_lifecycle()
             transaction = self.groups.mark_runtime_deleted(str(transaction["transaction_id"]))
             await self._task_runtime_delete_boundary("after_legacy_runtime_deleted", group_id)
+            require_current_recovery_lifecycle()
+        require_current_recovery_lifecycle()
         receipt = self.groups.commit_delete(str(transaction["transaction_id"]))
         await self._task_runtime_delete_boundary("after_group_commit", group_id)
+        require_current_recovery_lifecycle()
         if self.task_runtime is not None:
+            require_current_recovery_lifecycle()
             self.task_runtime.complete_group_deletion(group_id)
             await self._task_runtime_delete_boundary("after_runtime_complete", group_id)
+            require_current_recovery_lifecycle()
+        require_current_recovery_lifecycle()
         self._prune_task_runtime_bridge_group(
             group_id, confirmed_group_delete=True,
         )
@@ -8183,7 +8209,15 @@ class KnoweServer:
         if not self._bind_task_runtime_group_deletion_loop():
             return
         batch = self.task_runtime.DELETION_RECONCILE_BATCH_SIZE
-        async with self._task_runtime_group_deletion_lock:
+        with self._task_runtime_group_deletion_wake_lock:
+            recovery_lifecycle = (
+                asyncio.get_running_loop(),
+                self._task_runtime_group_deletion_lifecycle_generation,
+                self._task_runtime_group_deletion_lock,
+            )
+        reconciliation_lock = recovery_lifecycle[2]
+        async with reconciliation_lock:
+            self._require_task_runtime_group_deletion_lifecycle(recovery_lifecycle)
             diagnostics: list[dict[str, str]] = []
             candidates: dict[str, dict[str, Any]] = {}
             candidate_sources: dict[str, set[str]] = {}
@@ -8401,6 +8435,10 @@ class KnoweServer:
                         str(transaction["confirmation_token"]),
                         runtime_already_deleted=str(transaction.get("stage"))
                         in {"runtime_deleted", "committed"},
+                        recovery_lifecycle=recovery_lifecycle,
+                    )
+                    self._require_task_runtime_group_deletion_lifecycle(
+                        recovery_lifecycle,
                     )
                     successful_count += 1
                 except Exception as exc:  # noqa: BLE001 - isolate startup per Group
@@ -8482,6 +8520,9 @@ class KnoweServer:
             runtime_pending = runtime_source_state != "done"
             group_pending = group_source_state != "done"
             try:
+                self._require_task_runtime_group_deletion_lifecycle(
+                    recovery_lifecycle,
+                )
                 # Candidate effects complete (or durable retry debt is classified)
                 # before this single checkpoint can move either source frontier.
                 # Cancellation before this transaction leaves the old page replayable;
@@ -8497,6 +8538,9 @@ class KnoweServer:
                     "server_observed_runtime_deletion_revision": str(runtime_revision),
                     "server_observed_group_deletion_revision": str(group_revision),
                 })
+                self._require_task_runtime_group_deletion_lifecycle(
+                    recovery_lifecycle,
+                )
                 self._task_runtime_group_deletion_generation_started = True
                 with self._task_runtime_group_deletion_wake_lock:
                     if (
@@ -8550,6 +8594,9 @@ class KnoweServer:
                 "continuation_delay_seconds": continuation_delay,
                 "limit": batch,
             }
+            self._require_task_runtime_group_deletion_lifecycle(
+                recovery_lifecycle,
+            )
         if self.task_runtime.recovery_report[
             "server_deletion_reconciliation"
         ].get("has_more"):
@@ -8567,6 +8614,23 @@ class KnoweServer:
             self.groups.deletion_prepare_listener = listener
         if self.task_runtime is not None:
             self.task_runtime.store.group_deletion_prepare_listener = listener
+
+    def _require_task_runtime_group_deletion_lifecycle(
+        self,
+        lifecycle: tuple[asyncio.AbstractEventLoop, int, asyncio.Lock],
+    ) -> None:
+        """Fence a recovery coroutine before every post-await durable mutation."""
+        loop, generation, reconciliation_lock = lifecycle
+        with self._task_runtime_group_deletion_wake_lock:
+            current = bool(
+                not self._task_runtime_group_deletion_stopped
+                and not self._shutdown_event.is_set()
+                and self._task_runtime_group_deletion_loop is loop
+                and self._task_runtime_group_deletion_lifecycle_generation == generation
+                and self._task_runtime_group_deletion_lock is reconciliation_lock
+            )
+        if not current:
+            raise asyncio.CancelledError("retired deletion recovery lifecycle")
 
     def _invalidate_task_runtime_group_deletion_generation(
         self, lifecycle_generation: int,
@@ -8670,11 +8734,37 @@ class KnoweServer:
                     except RuntimeError:
                         # A concurrent close won after is_closed(); the lifecycle
                         # generation already makes the old callback a strict no-op.
+                        try:
+                            retired_task._log_destroy_pending = False  # type: ignore[attr-defined]  # noqa: SLF001
+                        except Exception:  # noqa: BLE001 - alternate event-loop Task
+                            pass
+                else:
+                    # asyncio cannot safely schedule cancellation on a closed loop.
+                    # The Task is detached from every Server resource and the new
+                    # lifecycle receives a distinct lock. Suppress CPython's generic
+                    # pending-destruction warning in favor of the bounded diagnostic
+                    # below; no Task/content reference is retained.
+                    try:
+                        retired_task._log_destroy_pending = False  # type: ignore[attr-defined]  # noqa: SLF001
+                    except Exception:  # noqa: BLE001 - alternate event-loop Task
                         pass
+            self._task_runtime_group_deletion_lock = asyncio.Lock()
             self._task_runtime_group_deletion_loop = loop
             self._publish_task_runtime_group_deletion_listeners_locked(
                 lifecycle_generation,
             )
+            if retired_task is not None and not retired_task.done() and self.task_runtime is not None:
+                self.task_runtime.recovery_report[
+                    "server_deletion_reconciliation_lifecycle"
+                ] = {
+                    "status": (
+                        "detached_closed_loop"
+                        if owner is None or owner.is_closed()
+                        else "cancel_requested_stopped_loop"
+                    ),
+                    "retired_generation": lifecycle_generation - 1,
+                    "active_generation": lifecycle_generation,
+                }
             return True
 
     def _ensure_task_runtime_group_deletion_reconcile(self, generation: int) -> None:

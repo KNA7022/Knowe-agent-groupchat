@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import sqlite3
 import threading
@@ -2405,6 +2406,132 @@ def test_rebind_clears_cancelled_handle_and_retrieves_done_owner(
         first_loop.close()
         second_loop.close()
         _close_server(server)
+
+
+@pytest.mark.parametrize("boundary", ("after_group_prepare", "after_runtime_intent"))
+@pytest.mark.parametrize("close_first_loop", (False, True), ids=("stopped", "closed"))
+def test_rebind_replaces_lock_held_by_real_stale_reconciliation(
+    tmp_path: Path,
+    boundary: str,
+    close_first_loop: bool,
+) -> None:
+    """Loop 2 must not inherit a lock held inside loop 1's real delete path."""
+    server = KnoweServer(str(tmp_path / f"held-lock-{close_first_loop}-{boundary}"))
+    assert server.groups is not None and server.task_runtime is not None
+    original_reconcile = server._reconcile_task_runtime_group_deletions  # noqa: SLF001
+    first_loop = asyncio.new_event_loop()
+    second_loop = asyncio.new_event_loop()
+    first_contexts: list[dict[str, object]] = []
+    second_contexts: list[dict[str, object]] = []
+    first_loop.set_exception_handler(
+        lambda _loop, context: first_contexts.append(dict(context)),
+    )
+    second_loop.set_exception_handler(
+        lambda _loop, context: second_contexts.append(dict(context)),
+    )
+    entered_boundary: asyncio.Event | None = None
+
+    async def bind_first_loop() -> None:
+        nonlocal entered_boundary
+        await original_reconcile()
+        entered_boundary = asyncio.Event()
+
+    first_loop.run_until_complete(bind_first_loop())
+    assert entered_boundary is not None
+
+    async def suspend_inside_real_reconciliation(
+        current_boundary: str, _group_id: str,
+    ) -> None:
+        if current_boundary == boundary:
+            assert entered_boundary is not None
+            entered_boundary.set()
+            await asyncio.Event().wait()
+
+    server._task_runtime_delete_fault = suspend_inside_real_reconciliation  # noqa: SLF001
+    group = server.groups.create_group(f"Held lock {close_first_loop} {boundary}")
+    _run_id, _transaction_id = _prepare_runtime_delete(
+        server.task_runtime,
+        server.groups,
+        group.group_id,
+        f"project_held_lock_{close_first_loop}_{boundary}",
+    )
+    first_loop.run_until_complete(entered_boundary.wait())
+    old_task = server._task_runtime_group_deletion_task  # noqa: SLF001
+    old_lock = server._task_runtime_group_deletion_lock  # noqa: SLF001
+    old_generation = server._task_runtime_group_deletion_lifecycle_generation  # noqa: SLF001
+    assert old_task is not None and not old_task.done()
+    assert old_lock.locked()
+    assert not first_loop.is_running()
+    if close_first_loop:
+        first_loop.close()
+
+    # Loop 2 must finish through a newly published generation lock without manually
+    # reviving loop 1. The stale fault is generation-scoped by the recovery caller.
+    server._task_runtime_delete_fault = None  # noqa: SLF001
+
+    async def recover_on_second_loop() -> tuple[object, ...]:
+        await asyncio.wait_for(original_reconcile(), timeout=3)
+        transaction = server.groups.delete_transaction(group.group_id)
+        assert transaction is not None and transaction["stage"] == "committed"
+        assert server._task_runtime_group_deletion_loop is second_loop  # noqa: SLF001
+        assert server._task_runtime_group_deletion_lock is not old_lock  # noqa: SLF001
+        assert (  # noqa: SLF001
+            server._task_runtime_group_deletion_lifecycle_generation
+            > old_generation
+        )
+        lifecycle_report = server.task_runtime.recovery_report[
+            "server_deletion_reconciliation_lifecycle"
+        ]
+        assert lifecycle_report["status"] == (
+            "detached_closed_loop"
+            if close_first_loop
+            else "cancel_requested_stopped_loop"
+        )
+        assert lifecycle_report["retired_generation"] == old_generation
+        return (
+            server._task_runtime_group_deletion_lifecycle_generation,  # noqa: SLF001
+            server._task_runtime_group_deletion_task,  # noqa: SLF001
+            server._task_runtime_group_deletion_owner_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_handle,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_attempt,  # noqa: SLF001
+            server._task_runtime_group_deletion_invalidation_epoch,  # noqa: SLF001
+            server.groups.delete_transaction(group.group_id),
+        )
+
+    try:
+        second_state = second_loop.run_until_complete(recover_on_second_loop())
+        if not close_first_loop:
+            # Deliver the already-requested cancellation and late settlement only
+            # after loop 2 has committed. It must release only the retired lock.
+            first_loop.run_until_complete(asyncio.sleep(0))
+            assert old_task.done() and old_task.cancelled()
+            assert not old_lock.locked()
+            assert second_state == (
+                server._task_runtime_group_deletion_lifecycle_generation,  # noqa: SLF001
+                server._task_runtime_group_deletion_task,  # noqa: SLF001
+                server._task_runtime_group_deletion_owner_token,  # noqa: SLF001
+                server._task_runtime_group_deletion_error_retry_handle,  # noqa: SLF001
+                server._task_runtime_group_deletion_error_attempt,  # noqa: SLF001
+                server._task_runtime_group_deletion_invalidation_epoch,  # noqa: SLF001
+                server.groups.delete_transaction(group.group_id),
+            )
+        server._shutdown_event.set()  # noqa: SLF001
+        second_loop.run_until_complete(
+            server._stop_task_runtime_group_deletion_reconcile(),  # noqa: SLF001
+        )
+    finally:
+        if not first_loop.is_closed():
+            first_loop.close()
+        if not second_loop.is_closed():
+            second_loop.close()
+        del old_task
+        gc.collect()
+        _close_server(server)
+    assert not [
+        context for context in first_contexts + second_contexts
+        if "never retrieved" in str(context.get("message", "")).lower()
+        or "destroyed but it is pending" in str(context.get("message", "")).lower()
+    ]
 
 
 def test_ten_thousand_intent_page_and_restart_cursor_stay_bounded(

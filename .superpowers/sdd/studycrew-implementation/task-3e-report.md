@@ -89,10 +89,11 @@ DONE
 ## Residual risks
 
 - A closed event loop cannot safely execute cancellation for a Task that its caller
-  abandoned while pending. Rebind detaches and generation-fences that Task without
-  invoking the closed loop; normal Server shutdown remains the only way to drain it.
-  Durable source revisions and authenticated prepared records remain the recovery
-  authority.
+  abandoned while pending. Rebind now detaches that Task from every Server lifecycle
+  resource, publishes a distinct reconciliation lock, suppresses the generic CPython
+  destruction warning in favor of a bounded opaque diagnostic, and generation-fences
+  every continuation. Durable source revisions and authenticated prepared records
+  remain the recovery authority.
 - The existing Windows filesystem/Timer pressure probes remain timing-sensitive. Their
   failure modes are fail-closed and idempotent, and both passed in the final focused
   and complete suites after isolated reruns.
@@ -101,3 +102,56 @@ DONE
 
 This report is included in the focused Task 3E commit. The immutable commit hash is
 reported in the handoff because a commit cannot embed its own hash.
+
+## Independent review fix round 1/5
+
+### Status
+
+DONE
+
+### Lifecycle-owned reconciliation serialization
+
+- The independent held-lock probe was admitted first. A real recovery owner suspended
+  inside `_run_confirmed_group_delete` while holding the production reconciliation lock.
+  Loop 2 published successfully but timed out on the inherited lock for both stopped
+  and closed loop-1 variants. Red result: `4 failed, 64 deselected`.
+- Every loop lifecycle now owns a distinct `asyncio.Lock`. Rebind increments generation,
+  retires owner/retry identities, then atomically publishes the new lock, loop and
+  generation-scoped listeners under the lifecycle lock. Loop 2 can never wait on a
+  primitive retained by loop 1.
+- Each reconciliation captures an immutable `(loop, lifecycle generation, lock)` fence.
+  It validates that fence after lock acquisition, after every deletion await, before
+  and after durable effects, before and after the atomic source checkpoint, and before
+  publishing process-local recovery state. A late old-generation continuation raises
+  `CancelledError` before it can mutate new-generation state.
+- A stopped-loop Task receives cancellation and may be drained later on its original
+  loop; its settlement is stale and releases only the retired lock. A closed-loop Task
+  is never passed to an unsafe cancellation operation. It is detached without retaining
+  the Task/content, the new generation receives a fresh lock, and an opaque diagnostic
+  records only retired/active generation numbers and lifecycle status.
+
+### Exact acceptance coverage
+
+- Parameterized real-path probes stop or close loop 1 at `after_group_prepare` and
+  `after_runtime_intent`, covering both sides of the idempotent Runtime-intent effect.
+  All four now converge on loop 2 without running loop 1.
+- The stopped variants drain loop 1 only after loop 2 commits and assert that the late
+  cancellation/settlement changes no loop-2 owner, token, handle, backoff, epoch or
+  canonical transaction state.
+- Both loop exception handlers are captured and garbage collection is forced. No
+  pending-Task destruction or un-retrieved exception context is emitted.
+- Prior loop2/loop3 migration, same-loop owner/retry mutual exclusion, 100/1,000 real
+  foreign-thread insertions, durable checkpoint/crash replay and idempotent deletion
+  tests remain green.
+
+### Verification evidence
+
+- Held-lock stopped/closed exact probes: `4 passed, 64 deselected in 1.96s`.
+- Complete quarantine/fairness/crash/generation/wake/error/lifecycle/rebind suite:
+  `68 passed in 31.46s` on the final post-diagnostic rerun.
+- Complete Task 1-3 Group/HTTP/Task Runtime/live bridge/recovery/deletion suites:
+  `236 passed in 74.24s`.
+- Legacy Engine suites: `26 passed, 10 subtests passed in 1.18s`.
+- Frontend Group/Task Runtime contracts, stores and real socket transport:
+  `5 files / 45 tests passed in 12.94s`.
+- Node 24/Python 3.12 foundation and Windows package verification passed.
