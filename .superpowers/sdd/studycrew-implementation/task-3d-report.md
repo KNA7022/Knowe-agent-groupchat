@@ -260,3 +260,80 @@ DONE
 - The existing canonical JSON snapshot remains O(N) to load even though page output,
   candidate maps, diagnostics, and per-turn effects remain bounded. Replacing that
   storage authority is outside Task 3D.
+
+## Independent review fix round 3/5
+
+### Status
+
+DONE
+
+### Lifecycle-owned autonomous wake
+
+- Canonical Group prepare and Task Runtime intent insertion listeners now do two
+  things atomically under a small process-local lock: advance the invalidation epoch
+  and request one coalesced wake of the Server-owned reconciliation loop.
+- The listener may run on the asyncio owner thread, a Task Runtime Timer thread, or any
+  other foreign thread. It never calls `create_task` directly; it crosses into the
+  bound loop through `call_soon_threadsafe`, guarded by a lifecycle generation.
+- The first real Server reconciliation binds the deletion owner to its running loop.
+  Constructor-time insertions remain durable-only and are recovered by the startup
+  sweep, so tests and early maintenance threads cannot accidentally claim loop
+  ownership.
+- `wake_scheduled` remains set for the full lifetime of the single owned task. A burst
+  therefore queues at most one cross-thread callback, while the existing task owner
+  and asyncio reconciliation lock prevent concurrent deletion loops.
+- The owner loop checks invalidation after every apparently terminal pass. Its settled
+  callback closes the narrower post-compare/post-return race: if a prepare commits
+  after the loop's terminal check, the completed owner is replaced exactly once.
+- Shutdown increments the lifecycle generation, detaches both insertion listeners,
+  clears queued-wake ownership, and cancels/drains the sole reconciliation task before
+  Task Runtime storage closes. Late or foreign callbacks cannot create a Task or Timer;
+  their durable revision remains restart recovery evidence.
+
+### Exact red/green and boundary coverage
+
+- The independent reviewer probes were admitted first and failed exactly as reported:
+  ordinary `RuntimeError` immediately after `after_group_prepare` and
+  `after_runtime_intent` left prepared transactions idle with `owner=None`; a canonical
+  prepare after terminal reconciliation return did the same.
+- After the fix, all three cases converge autonomously without a foreground
+  reconciliation call. The two-trigger runtime-intent case proves canonical plus
+  runtime insertion callbacks coalesce into one loop wake.
+- Autonomous probes cover both sources pending, runtime pending/group done, runtime
+  done/group pending, and dual done. Every new durable source identity opens a newer
+  coordinated generation, commits once, and exits with no owner leak.
+- A real Runtime intent inserted from `asyncio.to_thread` proves foreign-thread delivery
+  through the bound loop. Parameterized 100/10,000-callback bursts queue one loop
+  callback and terminate after one clean owned sweep.
+- A queued foreign-thread wake racing shutdown is fenced before task creation; an
+  additional late listener call after stop remains inert, and no quarantine Timer or
+  reconciliation task survives.
+- Existing restart, generation/checkpoint ambiguity, effect-boundary crash, source
+  fairness, authority outage/backoff, and 10,000-row bounded tests remain green.
+
+### Verification evidence
+
+- Final Task 3D fairness/crash/generation/wake suite:
+  `50 passed in 12.19s`.
+- Complete Task 1-3 Group/HTTP/Task Runtime/live bridge/recovery/deletion suites:
+  `218 passed in 56.59s`.
+- Legacy Engine suites: `26 passed, 10 subtests passed in 1.70s`.
+- Frontend Group/Task Runtime contracts, stores, and real socket transport:
+  `5 files / 45 tests passed in 12.90s`.
+- Node `v24.19.0`, Python `3.12.10`; foundation/runtime verification and ESLint
+  passed. Targeted Python compilation and `git diff --check` also passed; Git emitted
+  only the repository's existing Windows LF-to-CRLF notices.
+
+### Changed files in this round
+
+- `backend/server.py`
+- `backend/tests/test_task_runtime_quarantine_isolation.py`
+- `.superpowers/sdd/studycrew-implementation/task-3d-report.md`
+
+### Residual risks
+
+- Wake state is deliberately process-local; the monotonic source revisions and startup
+  generation remain the durable fallback if the process exits after insertion but
+  before the thread-safe callback executes.
+- The listener burst retains only counters and one scheduled callback. Durable source
+  storage and per-pass page/candidate/report bounds remain unchanged.

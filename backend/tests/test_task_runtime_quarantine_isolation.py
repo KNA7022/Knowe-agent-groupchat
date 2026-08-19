@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -1334,6 +1335,291 @@ async def test_prepare_during_checkpoint_opens_followup_generation(
     finally:
         await _cancel_deletion_reconcile_task(server)
         _close_server(server)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault_boundary", (
+    "after_group_prepare",
+    "after_runtime_intent",
+))
+async def test_live_prepare_failure_wakes_idle_reconciliation_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault_boundary: str,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+    initial_generation = int(server.task_runtime.recovery_report[
+        "server_deletion_reconciliation"
+    ]["generation"])
+    loop = asyncio.get_running_loop()
+    original_call_soon_threadsafe = loop.call_soon_threadsafe
+    wake_calls = {"count": 0}
+
+    def count_wake(callback, *args, **kwargs):
+        wake_calls["count"] += 1
+        return original_call_soon_threadsafe(callback, *args, **kwargs)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", count_wake)
+    group = server.groups.create_group(f"Autonomous {fault_boundary}")
+    preview = server.groups.delete_preview(group.group_id)
+
+    def fail_once(boundary: str, _group_id: str) -> None:
+        if boundary == fault_boundary:
+            raise RuntimeError(f"synthetic {fault_boundary} request failure")
+
+    server._task_runtime_delete_fault = fail_once  # noqa: SLF001
+    with pytest.raises(RuntimeError, match=fault_boundary):
+        await server._run_confirmed_group_delete(  # noqa: SLF001
+            group.group_id, f"project_live_{fault_boundary}",
+            preview.confirmation_token,
+        )
+    server._task_runtime_delete_fault = None  # noqa: SLF001
+
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            transaction = server.groups.delete_transaction(group.group_id)
+            if transaction is not None and transaction["stage"] == "committed":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable request failure did not wake reconciliation")
+        while (
+            server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+        assert int(server.task_runtime.recovery_report[
+            "server_deletion_reconciliation"
+        ]["generation"]) > initial_generation
+        assert wake_calls["count"] == 1
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_prepare_after_terminal_reconcile_return_wakes_without_foreground_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    assert not server.task_runtime.recovery_report[
+        "server_deletion_reconciliation"
+    ]["has_more"]
+    assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+    group = server.groups.create_group("Prepare after terminal return")
+    preview = server.groups.delete_preview(group.group_id)
+    server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id="project_after_terminal_return",
+    )
+
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            transaction = server.groups.delete_transaction(group.group_id)
+            if transaction is not None and transaction["stage"] == "committed":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("post-return prepare required foreground reconciliation")
+        while (
+            server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_runtime_intent_from_foreign_thread_wakes_loop_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    group = server.groups.create_group("Foreign-thread runtime intent")
+    preview = server.groups.delete_preview(group.group_id)
+    listener = server.groups.deletion_prepare_listener
+    server.groups.deletion_prepare_listener = None
+    transaction = server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id="project_foreign_thread_intent",
+    )
+    server.groups.deletion_prepare_listener = listener
+
+    try:
+        await asyncio.to_thread(
+            server.task_runtime.prepare_group_deletion,
+            group.group_id,
+            str(transaction["transaction_id"]),
+        )
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            current = server.groups.delete_transaction(group.group_id)
+            if current is not None and current["stage"] == "committed":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("foreign-thread runtime intent did not converge")
+        while (
+            server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("runtime_state", "group_state", "new_source"), (
+    ("pending", "pending", "group"),
+    ("pending", "done", "group"),
+    ("done", "pending", "runtime"),
+))
+async def test_new_source_wake_reopens_pending_and_one_done_states(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    runtime_state: str, group_state: str, new_source: str,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    initial_generation = int(server.task_runtime.recovery_report[
+        "server_deletion_reconciliation"
+    ]["generation"])
+    server.task_runtime.store.set_deletion_reconcile_checkpoints({
+        "server_task_runtime_source": "",
+        "group_repository": "",
+        "server_task_runtime_source_state": runtime_state,
+        "server_group_repository_source_state": group_state,
+        "server_deletion_source_turn": "task_runtime_service",
+        "server_deletion_sweep_generation": str(initial_generation),
+        "server_observed_runtime_deletion_revision": str(
+            server.task_runtime.store.group_deletion_revision()
+        ),
+        "server_observed_group_deletion_revision": str(
+            server.groups.deletion_revision()
+        ),
+    })
+    group = server.groups.create_group(
+        f"Autonomous {runtime_state} {group_state} {new_source}",
+    )
+    preview = server.groups.delete_preview(group.group_id)
+    group_listener = server.groups.deletion_prepare_listener
+    if new_source == "runtime":
+        server.groups.deletion_prepare_listener = None
+    transaction = server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id=f"project_autonomous_{new_source}",
+    )
+    server.groups.deletion_prepare_listener = group_listener
+    if new_source == "runtime":
+        server.task_runtime.prepare_group_deletion(
+            group.group_id, str(transaction["transaction_id"]),
+        )
+
+    try:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            current = server.groups.delete_transaction(group.group_id)
+            if current is not None and current["stage"] == "committed":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("source wake did not reopen coordinated generation")
+        while (
+            server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+        assert int(server.task_runtime.recovery_report[
+            "server_deletion_reconciliation"
+        ]["generation"]) > initial_generation
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("burst_size", (100, 10_000))
+async def test_foreign_thread_wake_burst_is_coalesced_to_one_loop_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, burst_size: int,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    loop = asyncio.get_running_loop()
+    original_call_soon_threadsafe = loop.call_soon_threadsafe
+    wake_calls = {"count": 0}
+
+    def count_wake(callback, *args, **kwargs):
+        wake_calls["count"] += 1
+        return original_call_soon_threadsafe(callback, *args, **kwargs)
+
+    monkeypatch.setattr(loop, "call_soon_threadsafe", count_wake)
+    listener = server.groups.deletion_prepare_listener
+    assert listener is not None
+    def produce_burst() -> None:
+        for _ in range(burst_size):
+            listener()
+
+    producer = threading.Thread(target=produce_burst, daemon=True)
+    producer.start()
+    producer.join(timeout=5)
+    assert not producer.is_alive()
+    assert wake_calls["count"] == 1
+
+    try:
+        await asyncio.sleep(0.05)
+        deadline = time.monotonic() + 2
+        while (
+            server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+        assert not server._task_runtime_group_deletion_wake_scheduled  # noqa: SLF001
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_fences_queued_foreign_thread_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    listener = server.task_runtime.store.group_deletion_prepare_listener
+    assert listener is not None
+    producer = threading.Thread(target=listener, daemon=True)
+    producer.start()
+    producer.join(timeout=2)
+    assert not producer.is_alive()
+    assert server._task_runtime_group_deletion_wake_scheduled  # noqa: SLF001
+    server._shutdown_event.set()  # noqa: SLF001
+    await server._stop_task_runtime_group_deletion_reconcile()  # noqa: SLF001
+    listener()
+    await asyncio.sleep(0.05)
+    assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+    assert not server._task_runtime_group_deletion_wake_scheduled  # noqa: SLF001
+    assert server.task_runtime._quarantine_retry_timer is None  # noqa: SLF001
+    _close_server(server)
 
 
 def test_ten_thousand_intent_page_and_restart_cursor_stay_bounded(

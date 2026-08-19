@@ -545,6 +545,11 @@ class KnoweServer:
         self._task_runtime_bridges_by_run: dict[str, set[asyncio.Task[Any]]] = {}
         self._task_runtime_group_deletion_task: asyncio.Task[Any] | None = None
         self._task_runtime_group_deletion_lock = asyncio.Lock()
+        self._task_runtime_group_deletion_wake_lock = threading.Lock()
+        self._task_runtime_group_deletion_loop: asyncio.AbstractEventLoop | None = None
+        self._task_runtime_group_deletion_lifecycle_generation = 0
+        self._task_runtime_group_deletion_wake_scheduled = False
+        self._task_runtime_group_deletion_stopped = False
         self._task_runtime_group_deletion_idle_attempt = 0
         self._task_runtime_group_deletion_generation_started = False
         self._task_runtime_group_deletion_generation_invalidated = False
@@ -8169,6 +8174,8 @@ class KnoweServer:
     async def _reconcile_task_runtime_group_deletions(self) -> None:
         if self.task_runtime is None or self.groups is None:
             return
+        if not self._bind_task_runtime_group_deletion_loop():
+            return
         batch = self.task_runtime.DELETION_RECONCILE_BATCH_SIZE
         async with self._task_runtime_group_deletion_lock:
             diagnostics: list[dict[str, str]] = []
@@ -8214,9 +8221,13 @@ class KnoweServer:
                     "group_id": "", "status": "deferred_global",
                     "reason": type(exc).__name__,
                 })
+            with self._task_runtime_group_deletion_wake_lock:
+                generation_invalidated = (
+                    self._task_runtime_group_deletion_generation_invalidated
+                )
             start_generation = bool(
                 not self._task_runtime_group_deletion_generation_started
-                or self._task_runtime_group_deletion_generation_invalidated
+                or generation_invalidated
                 or runtime_revision != observed_runtime_revision
                 or group_revision != observed_group_revision
                 or (runtime_state == "done" and group_state == "done")
@@ -8226,10 +8237,11 @@ class KnoweServer:
                 runtime_state = group_state = "pending"
             # A callback arriving after this point represents work not covered by the
             # current generation and will be observed again before checkpoint.
-            reconciliation_invalidation_epoch = (
-                self._task_runtime_group_deletion_invalidation_epoch
-            )
-            self._task_runtime_group_deletion_generation_invalidated = False
+            with self._task_runtime_group_deletion_wake_lock:
+                reconciliation_invalidation_epoch = (
+                    self._task_runtime_group_deletion_invalidation_epoch
+                )
+                self._task_runtime_group_deletion_generation_invalidated = False
             runtime_pending = runtime_state != "done"
             group_pending = group_state != "done"
             runtime_had_failure = runtime_state == "failed" or revision_view_failed
@@ -8430,16 +8442,23 @@ class KnoweServer:
                 latest_runtime_revision = runtime_revision
                 latest_group_revision = group_revision
                 runtime_source_state = group_source_state = "failed"
-                self._task_runtime_group_deletion_generation_invalidated = True
+                with self._task_runtime_group_deletion_wake_lock:
+                    self._task_runtime_group_deletion_generation_invalidated = True
                 if len(diagnostics) < batch:
                     diagnostics.append({
                         "group_id": "", "status": "deferred_global",
                         "reason": type(exc).__name__,
                     })
+            with self._task_runtime_group_deletion_wake_lock:
+                generation_invalidated = (
+                    self._task_runtime_group_deletion_generation_invalidated
+                )
+                latest_invalidation_epoch = (
+                    self._task_runtime_group_deletion_invalidation_epoch
+                )
             generation_changed = bool(
-                self._task_runtime_group_deletion_generation_invalidated
-                or self._task_runtime_group_deletion_invalidation_epoch
-                != reconciliation_invalidation_epoch
+                generation_invalidated
+                or latest_invalidation_epoch != reconciliation_invalidation_epoch
                 or latest_runtime_revision != runtime_revision
                 or latest_group_revision != group_revision
             )
@@ -8473,22 +8492,24 @@ class KnoweServer:
                     "server_observed_group_deletion_revision": str(group_revision),
                 })
                 self._task_runtime_group_deletion_generation_started = True
-                if (
-                    self._task_runtime_group_deletion_invalidation_epoch
-                    == reconciliation_invalidation_epoch
-                ):
-                    self._task_runtime_group_deletion_generation_invalidated = False
-                else:
-                    # A durable prepare may occur inside the checkpoint call itself.
-                    # Keep the owned loop alive even if the just-written values carried
-                    # terminal states from the prior source snapshot.
-                    self._task_runtime_group_deletion_generation_invalidated = True
-                    runtime_pending = group_pending = True
-                    runtime_source_state = group_source_state = "pending"
+                with self._task_runtime_group_deletion_wake_lock:
+                    if (
+                        self._task_runtime_group_deletion_invalidation_epoch
+                        == reconciliation_invalidation_epoch
+                    ):
+                        self._task_runtime_group_deletion_generation_invalidated = False
+                    else:
+                        # A durable prepare may occur inside the checkpoint call itself.
+                        # Keep the owned loop alive even if the just-written values
+                        # carried terminal states from the prior source snapshot.
+                        self._task_runtime_group_deletion_generation_invalidated = True
+                        runtime_pending = group_pending = True
+                        runtime_source_state = group_source_state = "pending"
             except Exception as exc:  # noqa: BLE001 - repeat safely after restart
                 runtime_pending = group_pending = True
                 runtime_source_state = group_source_state = "failed"
-                self._task_runtime_group_deletion_generation_invalidated = True
+                with self._task_runtime_group_deletion_wake_lock:
+                    self._task_runtime_group_deletion_generation_invalidated = True
                 if len(diagnostics) < batch:
                     diagnostics.append({
                         "group_id": "", "status": "deferred_global",
@@ -8529,15 +8550,101 @@ class KnoweServer:
             self._schedule_task_runtime_group_deletion_reconcile()
 
     def _invalidate_task_runtime_group_deletion_generation(self) -> None:
-        """Invalidate old dual-source completion proof after a new durable intent."""
-        self._task_runtime_group_deletion_invalidation_epoch += 1
-        self._task_runtime_group_deletion_generation_invalidated = True
+        """Invalidate and coalesce a wake from either durable insertion thread."""
+        with self._task_runtime_group_deletion_wake_lock:
+            self._task_runtime_group_deletion_invalidation_epoch += 1
+            self._task_runtime_group_deletion_generation_invalidated = True
+            if (
+                self._task_runtime_group_deletion_stopped
+                or self._shutdown_event.is_set()
+                or self._task_runtime_group_deletion_wake_scheduled
+            ):
+                return
+            loop = self._task_runtime_group_deletion_loop
+            generation = self._task_runtime_group_deletion_lifecycle_generation
+            if loop is None or loop.is_closed():
+                return
+            self._task_runtime_group_deletion_wake_scheduled = True
+        try:
+            loop.call_soon_threadsafe(
+                self._ensure_task_runtime_group_deletion_reconcile,
+                generation,
+            )
+        except RuntimeError:
+            # Loop shutdown won the race. Durable source revisions remain the restart
+            # authority; no foreign thread creates an asyncio Task directly.
+            with self._task_runtime_group_deletion_wake_lock:
+                if generation == self._task_runtime_group_deletion_lifecycle_generation:
+                    self._task_runtime_group_deletion_wake_scheduled = False
+
+    def _bind_task_runtime_group_deletion_loop(self) -> bool:
+        """Bind deletion recovery to the loop that owns Server reconciliation."""
+        loop = asyncio.get_running_loop()
+        with self._task_runtime_group_deletion_wake_lock:
+            if self._task_runtime_group_deletion_stopped or self._shutdown_event.is_set():
+                return False
+            owner = self._task_runtime_group_deletion_loop
+            if owner is loop:
+                return True
+            if owner is not None and not owner.is_closed():
+                raise RuntimeError(
+                    "Task Runtime Group deletion recovery is owned by another loop",
+                )
+            self._task_runtime_group_deletion_lifecycle_generation += 1
+            self._task_runtime_group_deletion_loop = loop
+            self._task_runtime_group_deletion_wake_scheduled = False
+            return True
+
+    def _ensure_task_runtime_group_deletion_reconcile(self, generation: int) -> None:
+        """Enter the loop-owned task scheduler after a thread-safe wake."""
+        with self._task_runtime_group_deletion_wake_lock:
+            if (
+                self._task_runtime_group_deletion_stopped
+                or self._shutdown_event.is_set()
+                or generation != self._task_runtime_group_deletion_lifecycle_generation
+                or self._task_runtime_group_deletion_loop is not asyncio.get_running_loop()
+            ):
+                if generation == self._task_runtime_group_deletion_lifecycle_generation:
+                    self._task_runtime_group_deletion_wake_scheduled = False
+                return
+        # Keep wake_scheduled set while an owner exists. A burst therefore queues at
+        # most one cross-thread callback and the owner consumes every newer revision.
+        self._schedule_task_runtime_group_deletion_reconcile()
+
+    async def _stop_task_runtime_group_deletion_reconcile(self) -> None:
+        """Fence insertion wakes and drain the one loop-owned deletion task."""
+        with self._task_runtime_group_deletion_wake_lock:
+            self._task_runtime_group_deletion_stopped = True
+            self._task_runtime_group_deletion_lifecycle_generation += 1
+            self._task_runtime_group_deletion_loop = None
+            self._task_runtime_group_deletion_wake_scheduled = False
+            task = self._task_runtime_group_deletion_task
+        if self.groups is not None:
+            self.groups.deletion_prepare_listener = None
+        if self.task_runtime is not None:
+            self.task_runtime.store.group_deletion_prepare_listener = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        if self._task_runtime_group_deletion_task is task:
+            self._task_runtime_group_deletion_task = None
 
     def _schedule_task_runtime_group_deletion_reconcile(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        with self._task_runtime_group_deletion_wake_lock:
+            if (
+                self._task_runtime_group_deletion_stopped
+                or self._shutdown_event.is_set()
+                or self._task_runtime_group_deletion_loop is not loop
+            ):
+                return
         owner = self._task_runtime_group_deletion_task
         if owner is not None and not owner.done():
             return
-        task = asyncio.create_task(
+        task = loop.create_task(
             self._task_runtime_group_deletion_reconcile_loop(),
             name="task-runtime-group-deletion-reconcile",
         )
@@ -8546,6 +8653,15 @@ class KnoweServer:
         def settled(done: asyncio.Task[Any]) -> None:
             if self._task_runtime_group_deletion_task is done:
                 self._task_runtime_group_deletion_task = None
+            with self._task_runtime_group_deletion_wake_lock:
+                self._task_runtime_group_deletion_wake_scheduled = False
+                wake_again = bool(
+                    not done.cancelled()
+                    and self._task_runtime_group_deletion_generation_invalidated
+                    and not self._task_runtime_group_deletion_stopped
+                    and not self._shutdown_event.is_set()
+                    and self._task_runtime_group_deletion_loop is loop
+                )
             if done.cancelled():
                 return
             try:
@@ -8558,6 +8674,9 @@ class KnoweServer:
                         "Task Runtime Group deletion reconciliation failed (%s)",
                         type(error).__name__,
                     )
+                    return
+            if wake_again:
+                self._schedule_task_runtime_group_deletion_reconcile()
 
         task.add_done_callback(settled)
 
@@ -8575,13 +8694,19 @@ class KnoweServer:
             await asyncio.sleep(max(
                 self.TASK_RUNTIME_DELETION_RECONCILE_ACTIVE_SECONDS, delay,
             ))
+            if self._shutdown_event.is_set():
+                return
             await self._reconcile_task_runtime_group_deletions()
             if self.task_runtime is None:
                 return
             state = self.task_runtime.recovery_report.get(
                 "server_deletion_reconciliation",
             ) or {}
-            if not state.get("has_more"):
+            with self._task_runtime_group_deletion_wake_lock:
+                invalidated = (
+                    self._task_runtime_group_deletion_generation_invalidated
+                )
+            if not state.get("has_more") and not invalidated:
                 return
 
     async def _serve_groups_list(self, writer: asyncio.StreamWriter) -> None:
@@ -9994,6 +10119,7 @@ class KnoweServer:
                 # begins shutting down.  Durable events that win this race remain
                 # available through the next reconnect snapshot.
                 await self._stop_task_runtime_event_bridge()
+                await self._stop_task_runtime_group_deletion_reconcile()
             # Stop accepting new work before closing project-owned resources.
             health.close()
             ws_server.close()
