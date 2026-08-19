@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import sqlite3
 import time
 from pathlib import Path
 
@@ -79,7 +81,7 @@ async def test_full_server_excludes_quarantined_pending_group_and_recovers_other
     assert restarted.task_runtime is not None and restarted.groups is not None
     try:
         report = next(
-            item for item in restarted.task_runtime.recovery_report["deletions"]
+            item for item in restarted.task_runtime.recovery_report["deletions"]["sample"]
             if item.get("group_id") == bad.group_id
         )
         assert report["status"] == "quarantined"
@@ -126,7 +128,7 @@ async def test_server_candidate_failure_isolated_from_later_group(
         diagnostics = restarted.task_runtime.recovery_report[
             "server_deletion_reconciliation"
         ]
-        assert diagnostics == [{
+        assert diagnostics["sample"] == [{
             "group_id": failing_id,
             "status": "deferred",
             "reason": "RuntimeStoreError",
@@ -171,7 +173,7 @@ def test_one_shot_quarantine_write_failure_retries_without_blocking_startup(
     recovered = TaskRuntimeService(tmp_path, groups)
     try:
         initial = next(
-            item for item in recovered.recovery_report["deletions"]
+            item for item in recovered.recovery_report["deletions"]["sample"]
             if item.get("group_id") == bad_group_id
         )
         assert initial["status"] == "deferred_quarantine"
@@ -233,6 +235,7 @@ def test_many_failed_quarantines_coalesce_at_fixed_cap(
     service.close()
 
     monkeypatch.setattr(TaskRuntimeService, "DEFERRED_QUARANTINE_LIMIT", 3)
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 3)
 
     def always_fail(
         _self: TaskRuntimeStore, _group_id: str, _audit_code: str,
@@ -243,13 +246,161 @@ def test_many_failed_quarantines_coalesce_at_fixed_cap(
     recovered = TaskRuntimeService(tmp_path, groups)
     try:
         reports = recovered.recovery_report["deletions"]
-        assert len(reports) == len(bad_group_ids)
-        assert all(item["status"] == "deferred_quarantine" for item in reports)
+        assert reports["processed_count"] == 3
+        assert len(reports["sample"]) == 3
+        assert reports["has_more"]
+        assert all(
+            item["status"] == "deferred_quarantine"
+            for item in reports["sample"]
+        )
         assert len(recovered._deferred_quarantines) == 3  # noqa: SLF001
-        assert recovered._deferred_quarantine_overflow  # noqa: SLF001
-        _excluded, globally_blocked = recovered.deletion_recovery_exclusions()
-        assert globally_blocked
         time.sleep(0.25)
         assert len(recovered._deferred_quarantines) <= 3  # noqa: SLF001
+        assert recovered._deferred_quarantine_overflow  # noqa: SLF001
     finally:
         recovered.close()
+
+
+@pytest.mark.asyncio
+async def test_limit_two_overflow_never_starves_valid_confirmed_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    healthy = server.groups.create_group("Healthy among overflow")
+    unrelated = server.groups.create_group("Unrelated runnable")
+    healthy_run, _transaction_id = _prepare_runtime_delete(
+        server.task_runtime, server.groups, healthy.group_id,
+        "project_healthy_overflow",
+    )
+    unrelated_run = server.task_runtime.submit(
+        unrelated.group_id, title="Unaffected", request_key="unrelated-overflow",
+    ).run_id
+    bad_ids = [
+        "grp_00000000000000000000000000000000",
+        "grp_10000000000000000000000000000000",
+        "grp_e0000000000000000000000000000000",
+        "grp_f0000000000000000000000000000000",
+    ]
+    for index, group_id in enumerate(bad_ids):
+        server.task_runtime.store.prepare_group_deletion(
+            group_id, f"gdt_bad_{index:028x}",
+            group_proof_digest=f"{index + 1:064x}",
+            confirmation_token=f"bad-confirmation-{index}",
+            runtime_project_id=f"bad-project-{index}",
+        )
+    _close_server(server)
+
+    monkeypatch.setattr(TaskRuntimeService, "DEFERRED_QUARANTINE_LIMIT", 2)
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    monkeypatch.setattr(
+        TaskRuntimeService, "DEFERRED_QUARANTINE_RETRY_BASE_SECONDS", 0.01,
+    )
+    original = TaskRuntimeStore.quarantine_group_deletion
+
+    def permanent_failure(
+        _self: TaskRuntimeStore, _group_id: str, _audit_code: str,
+    ) -> None:
+        raise RuntimeStoreError("permanent bad-Group audit failure")
+
+    monkeypatch.setattr(
+        TaskRuntimeStore, "quarantine_group_deletion", permanent_failure,
+    )
+    restarted = KnoweServer(str(tmp_path))
+    assert restarted.groups is not None and restarted.task_runtime is not None
+    try:
+        await restarted._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if restarted.groups.delete_transaction(healthy.group_id)["stage"] == "committed":
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("healthy confirmed deletion was starved")
+
+        assert restarted.task_runtime.store.get_run(healthy_run) is None
+        assert restarted.task_runtime.store.get_run(unrelated_run) is not None
+        runtime_report = restarted.task_runtime.recovery_report["deletions"]
+        server_report = restarted.task_runtime.recovery_report[
+            "server_deletion_reconciliation"
+        ]
+        assert len(runtime_report["sample"]) <= 2
+        assert runtime_report["processed_count"] <= 2
+        assert len(server_report["sample"]) <= 2
+        assert server_report["processed_count"] <= 2
+        assert len(restarted.task_runtime._deferred_quarantines) <= 2  # noqa: SLF001
+
+        monkeypatch.setattr(
+            TaskRuntimeStore, "quarantine_group_deletion", original,
+        )
+        _wait_for(lambda: all(
+            restarted.task_runtime.store.group_deletion_intent(group_id)["stage"]
+            == "quarantined"
+            for group_id in bad_ids
+        ), timeout=4)
+    finally:
+        task = restarted._task_runtime_group_deletion_task  # noqa: SLF001
+        if task is not None:
+            task.cancel()
+        _close_server(restarted)
+
+
+def test_ten_thousand_intent_page_and_restart_cursor_stay_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    groups = GroupRepository(tmp_path)
+    service = TaskRuntimeService(tmp_path, groups)
+    database = Path(service.store.db.path)
+    service.close()
+    rows = [(
+        f"grp_{index:032x}", f"gdt_{index:032x}", f"{index + 1:064x}",
+        f"confirmation-{index}", f"project-{index}",
+        "prepared", "", "2026-08-19T00:00:00Z", "2026-08-19T00:00:00Z",
+    ) for index in range(10_000)]
+    with sqlite3.connect(database) as conn:
+        conn.executemany(
+            """INSERT INTO studycrew_group_deletions(
+                   group_id, group_transaction_id, group_proof_digest,
+                   confirmation_token, runtime_project_id, stage, audit_code,
+                   created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        conn.commit()
+
+    store = TaskRuntimeStore(database)
+    try:
+        first = store.group_deletion_intents_page(limit=2)
+        second = store.group_deletion_intents_page(
+            cursor=str(first["cursor"]), limit=2,
+        )
+        assert len(first["items"]) == len(second["items"]) == 2
+        assert first["has_more"] and second["has_more"]
+        assert first["cursor"] < second["cursor"]
+    finally:
+        store.close()
+
+    monkeypatch.setattr(TaskRuntimeService, "DEFERRED_QUARANTINE_LIMIT", 2)
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+
+    def fail_audit(
+        _self: TaskRuntimeStore, _group_id: str, _audit_code: str,
+    ) -> None:
+        raise RuntimeStoreError("synthetic audit outage")
+
+    monkeypatch.setattr(TaskRuntimeStore, "quarantine_group_deletion", fail_audit)
+    first_service = TaskRuntimeService(tmp_path, groups)
+    first_report = first_service.recovery_report["deletions"]
+    first_cursor = str(first_report["cursor"])
+    assert first_report["processed_count"] == len(first_report["sample"]) == 2
+    assert len(first_service._deferred_quarantines) <= 2  # noqa: SLF001
+    first_service.close()
+
+    second_service = TaskRuntimeService(tmp_path, groups)
+    try:
+        second_report = second_service.recovery_report["deletions"]
+        assert second_report["processed_count"] == len(second_report["sample"]) == 2
+        assert str(second_report["sample"][0]["group_id"]) > first_cursor
+        assert len(second_service._deferred_quarantines) <= 2  # noqa: SLF001
+    finally:
+        second_service.close()

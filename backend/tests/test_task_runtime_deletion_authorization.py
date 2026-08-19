@@ -202,7 +202,7 @@ def test_startup_quarantines_orphan_runtime_intent_without_deleting_content(
     recovered = TaskRuntimeService(tmp_path, groups)
     try:
         report = next(
-            item for item in recovered.recovery_report["deletions"]
+            item for item in recovered.recovery_report["deletions"]["sample"]
             if item["group_id"] == group.group_id
         )
         assert report["status"] == "quarantined"
@@ -254,7 +254,7 @@ def test_startup_quarantines_tampered_canonical_transaction(
     recovered = TaskRuntimeService(tmp_path, reopened_groups)
     try:
         report = next(
-            item for item in recovered.recovery_report["deletions"]
+            item for item in recovered.recovery_report["deletions"]["sample"]
             if item["group_id"] == group.group_id
         )
         assert report["status"] == "quarantined"

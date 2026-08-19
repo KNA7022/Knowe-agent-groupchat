@@ -12,6 +12,7 @@ group name, source path, prompt, or other user content.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import os
@@ -948,6 +949,32 @@ class GroupRepository:
             dict(row) for row in self._load_payload()["deletion_transactions"]
             if row.get("stage") != "committed"
         )
+
+    def pending_delete_transactions_page(
+        self, *, cursor: str = "", limit: int = 64,
+    ) -> dict[str, Any]:
+        """Return one stable opaque-ID page for bounded startup reconciliation."""
+        bounded = max(1, min(int(limit), 256))
+        rows: list[dict[str, Any]] = []
+        keys: list[str] = []
+        after = str(cursor or "")
+        for raw in self._load_payload()["deletion_transactions"]:
+            key = str(raw.get("group_id") or "")
+            if raw.get("stage") == "committed" or key <= after:
+                continue
+            index = bisect.bisect_left(keys, key)
+            keys.insert(index, key)
+            rows.insert(index, dict(raw))
+            if len(rows) > bounded + 1:
+                rows.pop()
+                keys.pop()
+        has_more = len(rows) > bounded
+        visible = rows[:bounded]
+        next_cursor = str(visible[-1]["group_id"]) if has_more and visible else ""
+        return {
+            "items": tuple(visible), "cursor": next_cursor,
+            "has_more": has_more, "limit": bounded,
+        }
 
     def mark_runtime_deleted(self, transaction_id: str) -> dict[str, Any]:
         payload = self._load_payload()

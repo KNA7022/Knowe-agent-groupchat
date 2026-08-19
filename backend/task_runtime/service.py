@@ -121,6 +121,7 @@ class TaskRuntimeService:
     APPROVAL_DEFAULT_TTL_SECONDS = 600.0
     APPROVAL_MAX_TTL_SECONDS = 86_400.0
     DEFERRED_QUARANTINE_LIMIT = 64
+    DELETION_RECONCILE_BATCH_SIZE = 64
     DEFERRED_QUARANTINE_RETRY_BASE_SECONDS = 0.1
     DEFERRED_QUARANTINE_RETRY_MAX_SECONDS = 5.0
     _AWARE_ISO8601 = re.compile(
@@ -141,6 +142,8 @@ class TaskRuntimeService:
         self._quarantine_retry_enabled = False
         self._quarantine_retry_running = False
         self._quarantine_retry_thread_id: int | None = None
+        self._deletion_reconcile_has_more = False
+        self._deletion_reconcile_cursor: str | None = None
         self._closed = False
         self.recovery_report = {"deletions": self.reconcile_group_deletions()}
         self.recovery_report.update(self.recover_after_restart())
@@ -185,14 +188,7 @@ class TaskRuntimeService:
 
     def _assert_not_deferred_quarantine(self, group_id: str) -> None:
         with self._lock:
-            if (
-                group_id in self._deferred_quarantines
-                or self._deferred_quarantine_overflow
-                or (
-                    self._quarantine_retry_running
-                    and self._quarantine_retry_thread_id != threading.get_ident()
-                )
-            ):
+            if group_id in self._deferred_quarantines:
                 raise RuntimeConflictError(
                     "Task Runtime deletion intent is quarantined pending audit",
                 )
@@ -1191,10 +1187,7 @@ class TaskRuntimeService:
             canonical, group_transaction_id,
             allowed_stages={"prepared", "runtime_deleted"},
         )
-        intent = next((
-            item for item in self.store.group_deletion_intents()
-            if item["group_id"] == canonical
-        ), None)
+        intent = self.store.group_deletion_intent(canonical)
         if intent is not None and any((
             intent["group_transaction_id"] != group_transaction_id,
             intent.get("group_proof_digest") != proof,
@@ -1275,10 +1268,7 @@ class TaskRuntimeService:
         runtime_stages: set[str], allow_legacy_proof_bind: bool = False,
     ) -> tuple[dict[str, str], dict[str, Any]]:
         self._assert_not_deferred_quarantine(group_id)
-        intent = next((
-            item for item in self.store.group_deletion_intents()
-            if item["group_id"] == group_id
-        ), None)
+        intent = self.store.group_deletion_intent(group_id)
         if intent is None:
             raise RuntimeConflictError("Task Runtime deletion intent is required")
         if intent.get("stage") not in runtime_stages:
@@ -1366,14 +1356,19 @@ class TaskRuntimeService:
             or not self._quarantine_retry_enabled
             or self._quarantine_retry_running
             or self._quarantine_retry_timer is not None
-            or not (self._deferred_quarantines or self._deferred_quarantine_overflow)
+            or not (
+                self._deferred_quarantines
+                or self._deferred_quarantine_overflow
+                or self._deletion_reconcile_has_more
+            )
         ):
             return
-        delay = min(
-            self.DEFERRED_QUARANTINE_RETRY_MAX_SECONDS,
-            self.DEFERRED_QUARANTINE_RETRY_BASE_SECONDS
-            * (2 ** min(self._quarantine_retry_attempt, 6)),
-        )
+        delay = self.DEFERRED_QUARANTINE_RETRY_BASE_SECONDS
+        if not self._deletion_reconcile_has_more:
+            delay = min(
+                self.DEFERRED_QUARANTINE_RETRY_MAX_SECONDS,
+                delay * (2 ** min(self._quarantine_retry_attempt, 6)),
+            )
         timer = threading.Timer(delay, self._retry_deferred_quarantines)
         timer.daemon = True
         self._quarantine_retry_timer = timer
@@ -1389,6 +1384,7 @@ class TaskRuntimeService:
             self._quarantine_retry_thread_id = threading.get_ident()
             pending = tuple(self._deferred_quarantines.items())
             had_overflow = self._deferred_quarantine_overflow
+            scan_has_more = self._deletion_reconcile_has_more
             self._deferred_quarantine_overflow = False
         made_progress = False
         try:
@@ -1401,7 +1397,10 @@ class TaskRuntimeService:
                     if self._deferred_quarantines.get(group_id) == audit_code:
                         self._deferred_quarantines.pop(group_id, None)
                         made_progress = True
-            if had_overflow:
+            if had_overflow and not made_progress:
+                with self._lock:
+                    self._deferred_quarantine_overflow = True
+            if scan_has_more or (had_overflow and made_progress):
                 # Rediscover overflowed invalid proofs after slots become available.
                 # This scan is bounded by the durable intent table and stores only
                 # the fixed-size retry cohort above.
@@ -1420,89 +1419,151 @@ class TaskRuntimeService:
                     self._quarantine_retry_attempt += 1
                 self._arm_deferred_quarantine_retry_locked()
 
-    def deletion_recovery_exclusions(self) -> tuple[set[str], bool]:
-        """Return automatic-delete exclusions and whether the Store view is unavailable."""
+    def group_deletion_recovery_blocked(self, group_id: str) -> tuple[bool, bool]:
+        """Check one candidate without allocating the complete quarantine view."""
         with self._lock:
-            excluded = set(self._deferred_quarantines)
-            overflowed = (
-                self._deferred_quarantine_overflow
-                or self._quarantine_retry_running
-            )
+            if group_id in self._deferred_quarantines:
+                return True, False
         try:
-            intents = self.store.group_deletion_intents()
-        except Exception:  # noqa: BLE001 - fail all candidates closed for this pass
-            return excluded, True
-        excluded.update(
-            item["group_id"] for item in intents
-            if item.get("stage") == "quarantined"
-        )
-        return excluded, overflowed
+            intent = self.store.group_deletion_intent(group_id)
+        except Exception:  # noqa: BLE001 - authoritative exact view unavailable
+            return True, True
+        return bool(intent is not None and intent.get("stage") == "quarantined"), False
 
-    def reconcile_group_deletions(self) -> list[dict[str, str]]:
-        report: list[dict[str, str]] = []
+    def reconcile_group_deletions(
+        self, *, limit: int | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            return self._reconcile_group_deletions_locked(limit=limit)
+
+    def _reconcile_group_deletions_locked(
+        self, *, limit: int | None = None,
+    ) -> dict[str, Any]:
+        bounded = max(1, min(
+            int(limit or self.DELETION_RECONCILE_BATCH_SIZE),
+            self.DELETION_RECONCILE_BATCH_SIZE,
+        ))
+        if self._deletion_reconcile_cursor is None:
+            try:
+                self._deletion_reconcile_cursor = self.store.deletion_reconcile_cursor(
+                    "task_runtime_service",
+                )
+            except Exception as exc:  # noqa: BLE001 - constructor availability
+                return {
+                    "processed_count": 0, "quarantined_count": 0,
+                    "deferred_count": 0, "complete_count": 0,
+                    "awaiting_count": 0,
+                    "sample": [], "cursor": "", "has_more": False,
+                    "view_unavailable": True, "last_error": type(exc).__name__,
+                    "limit": bounded,
+                }
         try:
-            intents = self.store.group_deletion_intents()
+            page = self.store.group_deletion_intents_page(
+                cursor=self._deletion_reconcile_cursor, limit=bounded,
+            )
         except Exception as exc:  # noqa: BLE001 - constructor must remain available
-            return [{
-                "group_id": "", "status": "deferred_global",
-                "reason": type(exc).__name__,
-            }]
-        for intent in intents:
+            return {
+                "processed_count": 0, "quarantined_count": 0,
+                "deferred_count": 0, "complete_count": 0,
+                "awaiting_count": 0,
+                "sample": [], "cursor": self._deletion_reconcile_cursor,
+                "has_more": False, "view_unavailable": True,
+                "last_error": type(exc).__name__, "limit": bounded,
+            }
+        sample: list[dict[str, str]] = []
+        counts = {
+            "quarantined": 0, "deferred": 0,
+            "complete": 0, "awaiting": 0,
+        }
+        for intent in page["items"]:
             group_id = intent["group_id"]
             if intent.get("stage") == "quarantined":
                 self._clear_deferred_quarantine(group_id)
-                report.append({
+                row = {
                     "group_id": group_id, "status": "quarantined",
                     "reason": str(intent.get("audit_code") or "invalid_canonical_proof"),
-                })
-                continue
-            try:
-                _bound, transaction = self._validated_runtime_group_deletion(
-                    group_id,
-                    canonical_stages={"prepared", "runtime_deleted", "committed"},
-                    runtime_stages={"prepared", "runtime_cleaned", "complete"},
-                    allow_legacy_proof_bind=True,
-                )
-                if transaction.get("stage") == "committed":
-                    if intent.get("stage") != "complete":
-                        self.clean_prepared_group_deletion(group_id)
-                    self.complete_group_deletion(group_id)
-                    report.append({"group_id": group_id, "status": "complete"})
-                elif intent.get("stage") == "complete":
-                    raise RuntimeConflictError(
-                        "Runtime deletion completed before canonical Group commit",
-                    )
-                else:
-                    self.clean_prepared_group_deletion(group_id)
-                    report.append({"group_id": group_id, "status": "awaiting_group_commit"})
-            except RuntimeConflictError as exc:
-                reason = type(exc).__name__
+                }
+            else:
                 try:
-                    self.store.quarantine_group_deletion(group_id, reason)
-                except Exception as audit_exc:  # noqa: BLE001 - quarantine must not brick startup
-                    self._defer_quarantine(group_id, reason)
-                    report.append({
-                        "group_id": group_id, "status": "deferred_quarantine",
-                        "reason": type(audit_exc).__name__,
-                    })
-                else:
-                    self._clear_deferred_quarantine(group_id)
-                    report.append({
-                        "group_id": group_id, "status": "quarantined",
-                        "reason": reason,
-                    })
-            except RuntimeStoreError as exc:
-                # A storage outage is retryable and must not rewrite a valid
-                # canonical authorization into a permanent quarantine.
-                report.append({
-                    "group_id": group_id, "status": "deferred",
-                    "reason": type(exc).__name__,
-                })
-            except Exception as exc:  # noqa: BLE001 - isolate validator/repository faults
-                report.append({
-                    "group_id": group_id, "status": "deferred",
-                    "reason": type(exc).__name__,
-                })
+                    _bound, transaction = self._validated_runtime_group_deletion(
+                        group_id,
+                        canonical_stages={"prepared", "runtime_deleted", "committed"},
+                        runtime_stages={"prepared", "runtime_cleaned", "complete"},
+                        allow_legacy_proof_bind=True,
+                    )
+                    if transaction.get("stage") == "committed":
+                        if intent.get("stage") != "complete":
+                            self.clean_prepared_group_deletion(group_id)
+                        self.complete_group_deletion(group_id)
+                        row = {"group_id": group_id, "status": "complete", "reason": ""}
+                    elif intent.get("stage") == "complete":
+                        raise RuntimeConflictError(
+                            "Runtime deletion completed before canonical Group commit",
+                        )
+                    else:
+                        self.clean_prepared_group_deletion(group_id)
+                        row = {
+                            "group_id": group_id,
+                            "status": "awaiting_group_commit", "reason": "",
+                        }
+                except RuntimeConflictError as exc:
+                    reason = type(exc).__name__
+                    try:
+                        self.store.quarantine_group_deletion(group_id, reason)
+                    except Exception as audit_exc:  # noqa: BLE001
+                        self._defer_quarantine(group_id, reason)
+                        row = {
+                            "group_id": group_id, "status": "deferred_quarantine",
+                            "reason": type(audit_exc).__name__,
+                        }
+                    else:
+                        self._clear_deferred_quarantine(group_id)
+                        row = {
+                            "group_id": group_id, "status": "quarantined",
+                            "reason": reason,
+                        }
+                except RuntimeStoreError as exc:
+                    row = {
+                        "group_id": group_id, "status": "deferred",
+                        "reason": type(exc).__name__,
+                    }
+                except Exception as exc:  # noqa: BLE001 - isolate validator faults
+                    row = {
+                        "group_id": group_id, "status": "deferred",
+                        "reason": type(exc).__name__,
+                    }
+            status = row["status"]
+            if status == "quarantined":
+                counts["quarantined"] += 1
+            elif status.startswith("deferred"):
+                counts["deferred"] += 1
+            elif status == "complete":
+                counts["complete"] += 1
+            elif status == "awaiting_group_commit":
+                counts["awaiting"] += 1
+            if len(sample) < bounded:
+                sample.append(row)
+        next_cursor = str(page["cursor"] if page["has_more"] else "")
+        self._deletion_reconcile_cursor = next_cursor
+        self._deletion_reconcile_has_more = bool(page["has_more"])
+        cursor_error = ""
+        try:
+            self.store.set_deletion_reconcile_cursor(
+                "task_runtime_service", next_cursor,
+            )
+        except Exception as exc:  # noqa: BLE001 - repeat page safely after restart
+            cursor_error = type(exc).__name__
+        report = {
+            "processed_count": len(page["items"]),
+            "quarantined_count": counts["quarantined"],
+            "deferred_count": counts["deferred"],
+            "complete_count": counts["complete"],
+            "awaiting_count": counts["awaiting"],
+            "sample": sample, "cursor": next_cursor,
+            "has_more": bool(page["has_more"]), "view_unavailable": False,
+            "last_error": cursor_error, "limit": bounded,
+        }
+        self._arm_deferred_quarantine_retry()
         return report
 
     def _round_robin(self, candidates: list[TaskRun], lane: str) -> list[TaskRun]:

@@ -1438,6 +1438,53 @@ class TaskRuntimeStore:
             ).fetchall()
         return tuple({key: str(row[key]) for key in row.keys()} for row in rows)
 
+    def group_deletion_intent(self, group_id: str) -> dict[str, str] | None:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT * FROM studycrew_group_deletions WHERE group_id=?",
+                (group_id,),
+            ).fetchone()
+        return None if row is None else {key: str(row[key]) for key in row.keys()}
+
+    def group_deletion_intents_page(
+        self, *, cursor: str = "", limit: int = 64,
+    ) -> dict[str, Any]:
+        bounded = max(1, min(int(limit), 256))
+        with self.db.transaction(immediate=False) as conn:
+            rows = conn.execute(
+                """SELECT * FROM studycrew_group_deletions
+                   WHERE group_id>? ORDER BY group_id LIMIT ?""",
+                (str(cursor or ""), bounded + 1),
+            ).fetchall()
+        has_more = len(rows) > bounded
+        visible = rows[:bounded]
+        next_cursor = str(visible[-1]["group_id"]) if has_more and visible else ""
+        return {
+            "items": tuple(
+                {key: str(row[key]) for key in row.keys()} for row in visible
+            ),
+            "cursor": next_cursor,
+            "has_more": has_more,
+            "limit": bounded,
+        }
+
+    def deletion_reconcile_cursor(self, owner: str) -> str:
+        name = f"deletion_cursor:{owner}"
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT value FROM studycrew_scheduler_state WHERE name=?", (name,),
+            ).fetchone()
+        return "" if row is None else str(row["value"])
+
+    def set_deletion_reconcile_cursor(self, owner: str, cursor: str) -> None:
+        name = f"deletion_cursor:{owner}"
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT INTO studycrew_scheduler_state(name, value) VALUES (?, ?)
+                   ON CONFLICT(name) DO UPDATE SET value=excluded.value""",
+                (name, str(cursor or "")),
+            )
+
     def record_live_recovery(
         self, *, run_id: str, group_id: str, through_seq: int, reason: str,
         attempts: int, recovery_token: str, run_version: int | None = None,
