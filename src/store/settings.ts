@@ -15,6 +15,7 @@ import { runtimeFetch } from '../shared/runtimeFetch';
 import { cheapTierOf, migrateModelName, providerOf, isCustomProvider } from './modelCatalog';
 import i18n, { normalizeLanguage } from '../i18n'; // [v1.0.21.3] 语言校验（i18n 不依赖 settings，无环）
 import { DEFAULT_AVATAR_DATA_URL } from './defaultAvatar'; // [v1.0.23.5] 首次安装默认头像
+import { groupDeletionFenceRevision, isGroupDeletionFenced } from './groupDeletionFence';
 
 
 export interface ModelBinding {
@@ -501,9 +502,22 @@ function postCurrentSettings(
 
 async function reconcileSettings(): Promise<ModelApplyResult> {
   const state = useSettingsStore.getState();
+  const deletionRevision = groupDeletionFenceRevision();
   try {
     const response = await runtimeFetch(`${runtimeHttpBase()}/settings`, { method: 'GET' });
     const body = asObject(await response.json().catch(() => null));
+    if (groupDeletionFenceRevision() !== deletionRevision) {
+      return {
+        ok: false,
+        restartRequired: state.restartRequired,
+        settingsRevision: state.settingsRevision,
+        appliedFingerprint: state.appliedFingerprint,
+        zinniaCompatible: false,
+        zinniaBindingSource: 'unknown',
+        welcomeState: state.welcomeState,
+        message: i18n.t('settings.11'),
+      };
+    }
     if (!response.ok || !body) {
       return {
         ok: false,
@@ -522,6 +536,8 @@ async function reconcileSettings(): Promise<ModelApplyResult> {
     const backendAgentsRaw = asObject(body.agent_models);
     const backendAgents: Record<string, ModelBinding> = {};
     for (const [key, value] of Object.entries(backendAgentsRaw ?? {})) {
+      const identity = key.split('::', 1)[0] || '';
+      if (identity && isGroupDeletionFenced(identity)) continue;
       const binding = bindingFromBackend(value, state.agentModels[key]);
       if (binding) backendAgents[key] = binding;
     }
@@ -544,7 +560,9 @@ async function reconcileSettings(): Promise<ModelApplyResult> {
         approvalTimeoutS: numberValue(body.approval_timeout_s, state.approvalTimeoutS),
         groupApprovalTimeouts: Object.fromEntries(
           Object.entries(asObject(body.group_approval_timeouts) ?? {})
-            .filter((entry): entry is [string, number] => typeof entry[1] === 'number'),
+            .filter((entry): entry is [string, number] => (
+              typeof entry[1] === 'number' && !isGroupDeletionFenced(entry[0])
+            )),
         ),
         settingsConflict: conflict
           ? i18n.t('settings.08')
@@ -777,16 +795,49 @@ export const useSettingsStore = create<SettingsState>()(
           ),
         } as unknown as SettingsState;
       },
+      merge: (persistedState, currentState) => {
+        const raw = asObject(persistedState) ?? {};
+        const rawAgents = asObject(raw.agentModels) ?? {};
+        const rawTimeouts = asObject(raw.groupApprovalTimeouts) ?? {};
+        return {
+          ...currentState,
+          ...raw,
+          agentModels: Object.fromEntries(Object.entries(rawAgents).filter(([key]) => {
+            const identity = key.split('::', 1)[0] || '';
+            return !identity || !isGroupDeletionFenced(identity);
+          })) as Record<string, ModelBinding>,
+          groupApprovalTimeouts: Object.fromEntries(
+            Object.entries(rawTimeouts).filter(([identity, value]) => (
+              typeof value === 'number' && !isGroupDeletionFenced(identity)
+            )),
+          ),
+        } as SettingsState;
+      },
+      onRehydrateStorage: () => (state, error) => {
+        if (error || !state) return;
+        // `merge` prevents display immediately; this follow-up commit also overwrites the old
+        // localStorage blob so a deleted identity cannot survive indefinitely at rest.
+        queueMicrotask(() => useSettingsStore.setState({
+          agentModels: state.agentModels,
+          groupApprovalTimeouts: state.groupApprovalTimeouts,
+        }));
+      },
       partialize: (state) => ({
         userName: state.userName,
         avatarDataUrl: state.avatarDataUrl,
         mainModel: persistedBinding(state.mainModel),
         auxModel: persistedBinding(state.auxModel),
-        agentModels: persistedBindings(state.agentModels),
+        agentModels: persistedBindings(Object.fromEntries(
+          Object.entries(state.agentModels).filter(([key]) => {
+            const identity = key.split('::', 1)[0] || '';
+            return !identity || !isGroupDeletionFenced(identity);
+          }),
+        )),
         notifyDesktop: state.notifyDesktop,
         closeToTray: state.closeToTray,
         approvalTimeoutS: state.approvalTimeoutS,
-        groupApprovalTimeouts: state.groupApprovalTimeouts,
+        groupApprovalTimeouts: Object.fromEntries(Object.entries(state.groupApprovalTimeouts)
+          .filter(([identity]) => !isGroupDeletionFenced(identity))),
         appearance: state.appearance,
         fontScale: state.fontScale,
         language: normalizeLanguage(state.language), // [v1.0.21.3] localStorage 持久化

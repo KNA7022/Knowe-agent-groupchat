@@ -32,6 +32,9 @@ import { create } from 'zustand';
 import { runtimeHttpBase } from '../shared/runtimeEndpoints';
 import { runtimeFetch } from '../shared/runtimeFetch';
 import i18n from '../i18n';
+import {
+  groupCommitAllowed, groupDeletionGeneration, isGroupDeletionFenced,
+} from './groupDeletionFence';
 
 // ═══════════════════════════════════════════════════════════════
 // 视图模型
@@ -391,6 +394,24 @@ export function knowledgeScopeKey(scope?: KnowledgeQueryScope | null): string {
   });
 }
 
+type KnowledgeScopeFence = ReadonlyArray<readonly [string, number]>;
+
+function beginKnowledgeRequest(
+  scope?: KnowledgeQueryScope | null, extraIdentities: string[] = [],
+): KnowledgeScopeFence | null {
+  const identities = [...new Set([
+    ...(scope?.groupIds ?? []), ...(scope?.projectIds ?? []), ...extraIdentities.filter(Boolean),
+  ])];
+  if (identities.some(isGroupDeletionFenced)) return null;
+  return identities.map((identity) => [identity, groupDeletionGeneration(identity)] as const);
+}
+
+function knowledgeCommitAllowed(fence: KnowledgeScopeFence | null): boolean {
+  return fence !== null && fence.every(([identity, generation]) => (
+    groupCommitAllowed(identity, generation)
+  ));
+}
+
 export const KN_PREVIEW_MIN = 320;
 export function knPreviewMax(): number {
   return Math.max(KN_PREVIEW_MIN, Math.floor(window.innerWidth * 0.62));
@@ -411,6 +432,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   previewWidth: 420,
 
   setScope(scope) {
+    if (!knowledgeCommitAllowed(beginKnowledgeRequest(scope))) return;
     const activeScope = scope ? {
       groupIds: [...scope.groupIds], projectIds: [...scope.projectIds],
       sourceIds: [...scope.sourceIds], courseId: scope.courseId,
@@ -426,6 +448,8 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
 
   async load(opts) {
     const requestedScope = opts?.scope ?? get().activeScope ?? undefined;
+    const deletionFence = beginKnowledgeRequest(requestedScope);
+    if (!knowledgeCommitAllowed(deletionFence)) return;
     const requestIdentity = knowledgeScopeKey(requestedScope);
     if (opts?.scope && requestIdentity !== get().activeScopeKey) get().setScope(opts.scope);
     const silent = !!opts?.silent;
@@ -442,12 +466,12 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
         .filter((p) => p.profile_exists)
         .map((p) => String(p.project_id || ''))
         .filter(Boolean);
-      if (get().activeScopeKey !== requestIdentity) return;
+      if (get().activeScopeKey !== requestIdentity || !knowledgeCommitAllowed(deletionFence)) return;
       set({ cards, profileProjects, loading: false, loadedAt: Date.now(), error: null });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // 静默刷新失败：留着旧数据继续用，别把界面打回错误态。
-      if (get().activeScopeKey !== requestIdentity) return;
+      if (get().activeScopeKey !== requestIdentity || !knowledgeCommitAllowed(deletionFence)) return;
       if (silent && get().loadedAt) {
         set({ loading: false });
       } else {
@@ -458,6 +482,8 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
 
   async loadSkillpacks(scope) {
     const requestedScope = scope ?? get().activeScope ?? undefined;
+    const deletionFence = beginKnowledgeRequest(requestedScope);
+    if (!knowledgeCommitAllowed(deletionFence)) return;
     const requestIdentity = knowledgeScopeKey(requestedScope);
     try {
       const data = await apiFetch<{
@@ -465,7 +491,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
         project_experience?: RawSkillPack[];
         third_party?: RawSkillPack[];
       }>(`/skillpacks${knowledgeScopeQuery(requestedScope)}`);
-      if (get().activeScopeKey !== requestIdentity) return;
+      if (get().activeScopeKey !== requestIdentity || !knowledgeCommitAllowed(deletionFence)) return;
       set({
         skillpacks: {
           systemBuiltin: (data.system_builtin || [])
@@ -482,6 +508,8 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async reviewSkillpack(pack, action) {
+    const deletionFence = beginKnowledgeRequest(get().activeScope, [pack.projectId]);
+    if (!knowledgeCommitAllowed(deletionFence)) return false;
     try {
       await apiFetch<{ ok: boolean }>(
         `/skillpacks/${encodeURIComponent(pack.packId)}/review${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
@@ -491,6 +519,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
           body: JSON.stringify({ action }),
         },
       );
+      if (!knowledgeCommitAllowed(deletionFence)) return false;
       await get().loadSkillpacks();
       return true;
     } catch {
@@ -500,6 +529,8 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async setSkillpackStatus(pack, status) {
+    const deletionFence = beginKnowledgeRequest(get().activeScope, [pack.projectId]);
+    if (!knowledgeCommitAllowed(deletionFence)) return false;
     try {
       await apiFetch<{ ok: boolean }>(
         `/skillpacks/${encodeURIComponent(pack.packId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
@@ -509,6 +540,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
           body: JSON.stringify({ status }),
         },
       );
+      if (!knowledgeCommitAllowed(deletionFence)) return false;
       await get().loadSkillpacks();
       return true;
     } catch {
@@ -518,6 +550,8 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async purgeSkillpack(pack) {
+    const deletionFence = beginKnowledgeRequest(get().activeScope, [pack.projectId]);
+    if (!knowledgeCommitAllowed(deletionFence)) return false;
     try {
       await apiFetch<{ ok: boolean }>(
         `/skillpacks/${encodeURIComponent(pack.packId)}/purge${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
@@ -527,6 +561,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
           body: JSON.stringify({}),
         },
       );
+      if (!knowledgeCommitAllowed(deletionFence)) return false;
       set((s) => ({
         skillpacks: {
           systemBuiltin: s.skillpacks.systemBuiltin.filter((p) => p.packId !== pack.packId),
@@ -545,11 +580,13 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async fetchSkillpackDetail(pack) {
+    const deletionFence = beginKnowledgeRequest(get().activeScope, [pack.projectId]);
+    if (!knowledgeCommitAllowed(deletionFence)) return null;
     try {
       const data = await apiFetch<{
         found: boolean; pack?: RawSkillPack; body_md?: string;
       }>(`/skillpacks/${encodeURIComponent(pack.packId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`);
-      if (!data.found || !data.pack) return null;
+      if (!knowledgeCommitAllowed(deletionFence) || !data.found || !data.pack) return null;
       const fresh = toSkillPack(data.pack);
       return { pack: fresh ?? pack, bodyMd: String(data.body_md || '') };
     } catch {
@@ -558,6 +595,8 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async override(card, patch) {
+    const deletionFence = beginKnowledgeRequest(get().activeScope, [card.projectId]);
+    if (!knowledgeCommitAllowed(deletionFence)) return false;
     // 乐观：先把本地卡片改成目标态，POST 失败由 load 重拉回滚。
     const optimistic = get().cards.map((c) => {
       if (c.id !== card.id) return c;
@@ -582,6 +621,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
           body: JSON.stringify(patch),
         },
       );
+      if (!knowledgeCommitAllowed(deletionFence)) return false;
       // 后端是真源（refresh 会重算 utility/category/skill 导出等派生态）→ 静默对齐。
       void get().load({ silent: true });
       return true;
@@ -592,6 +632,8 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async review(card, action) {
+    const deletionFence = beginKnowledgeRequest(get().activeScope, [card.projectId]);
+    if (!knowledgeCommitAllowed(deletionFence)) return false;
     try {
       await apiFetch<{ ok: boolean }>(
         `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}/review${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
@@ -601,6 +643,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
           body: JSON.stringify({ action }),
         },
       );
+      if (!knowledgeCommitAllowed(deletionFence)) return false;
       void get().load({ silent: true });
       return true;
     } catch {
@@ -610,6 +653,8 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async purge(card) {
+    const deletionFence = beginKnowledgeRequest(get().activeScope, [card.projectId]);
+    if (!knowledgeCommitAllowed(deletionFence)) return false;
     try {
       await apiFetch<{ ok: boolean }>(
         `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}/purge${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
@@ -619,6 +664,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
           body: JSON.stringify({}),
         },
       );
+      if (!knowledgeCommitAllowed(deletionFence)) return false;
       // 彻底删除：本地立刻移除；预览开着这张卡就顺手关掉。
       set((s) => ({
         cards: s.cards.filter((c) => c.id !== card.id),
@@ -633,11 +679,13 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async fetchDetail(card) {
+    const deletionFence = beginKnowledgeRequest(get().activeScope, [card.projectId]);
+    if (!knowledgeCommitAllowed(deletionFence)) return null;
     try {
       const data = await apiFetch<{ found: boolean; asset?: RawAsset }>(
         `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
       );
-      if (!data.found || !data.asset) return null;
+      if (!knowledgeCommitAllowed(deletionFence) || !data.found || !data.asset) return null;
       const fresh = toCard({ ...data.asset, project_id: card.projectId });
       return {
         card: fresh ?? card,
@@ -654,17 +702,22 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async fetchProfile(projectId) {
+    const deletionFence = beginKnowledgeRequest(get().activeScope, [projectId]);
+    if (!knowledgeCommitAllowed(deletionFence)) return null;
     try {
       const data = await apiFetch<{ text: string }>(
         `/${encodeURIComponent(projectId)}/profile${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
       );
-      return String(data.text || '');
+      return knowledgeCommitAllowed(deletionFence) ? String(data.text || '') : null;
     } catch {
       return null;
     }
   },
 
-  openPreview(p) { set({ preview: p }); },
+  openPreview(p) {
+    if (!knowledgeCommitAllowed(beginKnowledgeRequest(get().activeScope, [p.projectId]))) return;
+    set({ preview: p });
+  },
   closePreview() { set({ preview: null }); },
   setPreviewWidth(px) { set({ previewWidth: clampW(px) }); },
   teardownGroupScope(groupId, projectId) {

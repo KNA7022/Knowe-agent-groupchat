@@ -24,6 +24,7 @@
  */
 
 import { useEffect, useState } from 'react';
+import { isGroupDeletionFenced } from './groupDeletionFence';
 
 /** 5 分钟倒计时（需求 2）。展开卡片与重开都用它。 */
 export const DIRECTORY_CARD_DURATION_MS = 5 * 60 * 1000;
@@ -94,6 +95,7 @@ export function openRequest(ev: {
   project_id: string; project_name: string;
   previous_dir: string; reason: string; request_id: string;
 }): void {
+  if (isGroupDeletionFenced(ev.project_id)) return;
   const req: DirectoryRequest = {
     projectId: ev.project_id,
     projectName: ev.project_name,
@@ -119,6 +121,10 @@ export function syncFromProjectCreated(ev: {
   directory_required?: { previous_dir: string; reason: string; request_id: string };
 }): void {
   const pid = ev.project_id;
+  if (isGroupDeletionFenced(pid)) {
+    resolve(pid);
+    return;
+  }
   const info = ev.directory_required;
   if (info) {
     const prev = state.entries[pid];
@@ -149,6 +155,7 @@ export function collapse(projectId: string): void {
 
 /** 重新展开卡片（需求 6：点卡片入口重开）。倒计时重新计。 */
 export function reopen(projectId: string): void {
+  if (isGroupDeletionFenced(projectId)) return;
   const e = state.entries[projectId];
   if (!e) return;
   setEntries({
@@ -172,6 +179,7 @@ export function resolve(projectId: string): void {
  *   卡片组件自己在提交期间置「提交中」禁用按钮防抖。
  */
 export function confirm(projectId: string, directory: string, projectName?: string): void {
+  if (isGroupDeletionFenced(projectId)) return;
   const e = state.entries[projectId];
   if (!e || !socket) return;
   socket.setProjectDirectory(projectId, directory, e.request.requestId, projectName);
@@ -182,6 +190,7 @@ export function confirm(projectId: string, directory: string, projectName?: stri
  * 需求 6 的核心：取消 = 暂缓，但留一个随时可点开的入口。
  */
 export function cancel(projectId: string): void {
+  if (isGroupDeletionFenced(projectId)) return;
   const e = state.entries[projectId];
   if (!e) return;
   socket?.cancelProjectDirectory(projectId, e.request.requestId);

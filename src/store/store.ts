@@ -46,6 +46,9 @@ import {
   DEFAULT_ROLE_TYPES,
 } from './state';
 import i18n from '../i18n';
+import {
+  fenceDeletedGroup, groupCommitAllowed, groupDeletionGeneration, isGroupDeletionFenced,
+} from './groupDeletionFence';
 
 const _transientFrameFallbacks = new Map<string, () => void>();
 
@@ -520,7 +523,7 @@ function pumpSnapshots(getSocket: () => SocketAPI | null): void {
 function requestSnapshotOnce(
   projectId: string, getSocket: () => SocketAPI | null, now = false,
 ): void {
-  if (!projectId || _synced.has(projectId)) return;
+  if (!projectId || isGroupDeletionFenced(projectId) || _synced.has(projectId)) return;
   const socket = getSocket();
   if (!socket) return;
   _synced.add(projectId);
@@ -978,7 +981,7 @@ export const useKnoweStore = create<KnoweStore>()(
           const payload = await projectMenuJson<{ projects?: unknown[] }>('/projects/menu-state');
           const rows = Array.isArray(payload?.projects)
             ? payload.projects.map(parseConversationState).filter(
-              (row): row is ProjectConversationState => !!row,
+              (row): row is ProjectConversationState => !!row && !isGroupDeletionFenced(row.project_id),
             )
             : [];
           set((draft) => {
@@ -1008,7 +1011,9 @@ export const useKnoweStore = create<KnoweStore>()(
     },
 
     async setProjectPinned(projectId: string, enabled: boolean): Promise<boolean> {
-      if (!projectId || projectId === PLATFORM_PROJECT_ID || !!parseDmId(projectId)) return false;
+      if (!projectId || projectId === PLATFORM_PROJECT_ID || !!parseDmId(projectId)
+          || isGroupDeletionFenced(projectId)) return false;
+      const generation = groupDeletionGeneration(projectId);
       const previous = snapshotConversationState(get(), projectId);
       const optimistic: ProjectConversationState = {
         ...previous,
@@ -1023,9 +1028,11 @@ export const useKnoweStore = create<KnoweStore>()(
         });
         const row = parseConversationState(raw);
         if (!row) throw new Error(i18n.t('store.14'));
+        if (!groupCommitAllowed(projectId, generation)) return false;
         set((draft) => { applyConversationState(draft, row); });
         return true;
       } catch (error) {
+        if (!groupCommitAllowed(projectId, generation)) return false;
         set((draft) => { applyConversationState(draft, previous); });
         const message = error instanceof Error ? error.message : i18n.t('store.20');
         get().addNotice(message);
@@ -1035,7 +1042,9 @@ export const useKnoweStore = create<KnoweStore>()(
     },
 
     async setProjectMuted(projectId: string, enabled: boolean): Promise<boolean> {
-      if (!projectId || projectId === PLATFORM_PROJECT_ID || !!parseDmId(projectId)) return false;
+      if (!projectId || projectId === PLATFORM_PROJECT_ID || !!parseDmId(projectId)
+          || isGroupDeletionFenced(projectId)) return false;
+      const generation = groupDeletionGeneration(projectId);
       const previous = snapshotConversationState(get(), projectId);
       const optimistic: ProjectConversationState = { ...previous, muted: enabled };
       set((draft) => { applyConversationState(draft, optimistic); });
@@ -1045,9 +1054,11 @@ export const useKnoweStore = create<KnoweStore>()(
         });
         const row = parseConversationState(raw);
         if (!row) throw new Error(i18n.t('store.12'));
+        if (!groupCommitAllowed(projectId, generation)) return false;
         set((draft) => { applyConversationState(draft, row); });
         return true;
       } catch (error) {
+        if (!groupCommitAllowed(projectId, generation)) return false;
         set((draft) => { applyConversationState(draft, previous); });
         const message = error instanceof Error ? error.message : i18n.t('store.04');
         get().addNotice(message);
@@ -1057,7 +1068,9 @@ export const useKnoweStore = create<KnoweStore>()(
     },
 
     async setProjectFolded(projectId: string, enabled: boolean): Promise<boolean> {
-      if (!projectId || projectId === PLATFORM_PROJECT_ID || !!parseDmId(projectId)) return false;
+      if (!projectId || projectId === PLATFORM_PROJECT_ID || !!parseDmId(projectId)
+          || isGroupDeletionFenced(projectId)) return false;
+      const generation = groupDeletionGeneration(projectId);
       const previous = snapshotConversationState(get(), projectId);
       const optimistic: ProjectConversationState = {
         ...previous,
@@ -1072,9 +1085,11 @@ export const useKnoweStore = create<KnoweStore>()(
         });
         const row = parseConversationState(raw);
         if (!row) throw new Error(i18n.t('store.13'));
+        if (!groupCommitAllowed(projectId, generation)) return false;
         set((draft) => { applyConversationState(draft, row); });
         return true;
       } catch (error) {
+        if (!groupCommitAllowed(projectId, generation)) return false;
         set((draft) => { applyConversationState(draft, previous); });
         const message = error instanceof Error ? error.message : i18n.t('store.08');
         get().addNotice(message);
@@ -1084,7 +1099,9 @@ export const useKnoweStore = create<KnoweStore>()(
     },
 
     async renameProject(projectId: string, projectName: string): Promise<boolean> {
-      if (!projectId || projectId === PLATFORM_PROJECT_ID || !!parseDmId(projectId)) return false;
+      if (!projectId || projectId === PLATFORM_PROJECT_ID || !!parseDmId(projectId)
+          || isGroupDeletionFenced(projectId)) return false;
+      const generation = groupDeletionGeneration(projectId);
       const name = projectName.trim();
       if (!name) return false;
       try {
@@ -1095,10 +1112,12 @@ export const useKnoweStore = create<KnoweStore>()(
             || typeof (raw as Record<string, unknown>).project_name !== 'string') {
           throw new Error(i18n.t('store.15'));
         }
+        if (!groupCommitAllowed(projectId, generation)) return false;
         const canonicalName = String((raw as Record<string, unknown>).project_name);
         set((draft) => { applyProjectName(draft, projectId, canonicalName); });
         return true;
       } catch (error) {
+        if (!groupCommitAllowed(projectId, generation)) return false;
         const message = error instanceof Error ? error.message : i18n.t('store.24');
         get().addNotice(message);
         // 网络/广播可能恰好断在后端提交之后；用权威快照对账，避免“其实改成了但本窗还旧名”。
@@ -1138,6 +1157,7 @@ export const useKnoweStore = create<KnoweStore>()(
             || (canonicalProjectId !== projectId && requestProjectId !== projectId)) {
           throw new Error(i18n.t('store.11'));
         }
+        fenceDeletedGroup(projectId, canonicalProjectId);
 
         // The card can still carry an old optimistic/request id while the server has
         // already canonicalised it.  Remove both exact ids; DM ownership is parsed,
@@ -1209,6 +1229,8 @@ export const useKnoweStore = create<KnoweStore>()(
       if (!projectId || projectId === PLATFORM_PROJECT_ID || !!parseDmId(projectId) || !agentId) {
         return false;
       }
+      if (isGroupDeletionFenced(projectId)) return false;
+      const generation = groupDeletionGeneration(projectId);
       try {
         const raw = await projectMenuJson<unknown>('/agents/permanent-delete', {
           method: 'POST', body: JSON.stringify({ project_id: projectId, agent_id: agentId }),
@@ -1219,6 +1241,7 @@ export const useKnoweStore = create<KnoweStore>()(
             || (raw as Record<string, unknown>).agent_id !== agentId) {
           throw new Error(i18n.t('store.10'));
         }
+        if (!groupCommitAllowed(projectId, generation)) return false;
 
         const dmId = dmSessionId(projectId, agentId);
         _synced.delete(dmId);
@@ -1241,6 +1264,7 @@ export const useKnoweStore = create<KnoweStore>()(
         });
         return true;
       } catch (error) {
+        if (!groupCommitAllowed(projectId, generation)) return false;
         const message = error instanceof Error ? error.message : i18n.t('store.02');
         get().addNotice(message);
         return false;
@@ -1285,6 +1309,7 @@ export const useKnoweStore = create<KnoweStore>()(
       const rawEvent = event as unknown as Record<string, unknown>;
       const eventType = String(rawEvent.type || '');
       const pid = rawEvent.project_id as string || DEFAULT_PROJECT_ID;
+      if (pid !== PLATFORM_PROJECT_ID && isGroupDeletionFenced(pid)) return;
       const requestProjectId = eventType === 'project_created'
         ? (event as InboundEvent & { request_project_id?: string }).request_project_id
         : undefined;
@@ -1496,7 +1521,8 @@ export const useKnoweStore = create<KnoweStore>()(
      * 纯数据注入：不 bump 置顶、不算未读、不触发跳转——快照到达后整体重建覆盖。
      */
     applyIncrementalEvents(projectId: string, events: InboundEvent[]): void {
-      if (!projectId || !Array.isArray(events) || events.length === 0) return;
+      if (!projectId || isGroupDeletionFenced(projectId)
+          || !Array.isArray(events) || events.length === 0) return;
       const { agents, roleTypes } = get();
       set((draft) => {
         const conv = ensureConversation(draft.convs, projectId);

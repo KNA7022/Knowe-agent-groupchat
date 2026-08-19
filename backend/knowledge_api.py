@@ -43,6 +43,8 @@ class KnowledgeHttpResponse:
 class _KnowledgeScope:
     group_ids: frozenset[str]
     project_ids: frozenset[str]
+    allowed_source_ids: frozenset[str]
+    allowed_course_ids: frozenset[str]
     source_ids: frozenset[str]
     course_id: str | None
 
@@ -160,6 +162,8 @@ def _resolve_scope(
     return _KnowledgeScope(
         group_ids=requested_groups,
         project_ids=frozenset(requested_projects or project_ids),
+        allowed_source_ids=frozenset(source_ids),
+        allowed_course_ids=frozenset(course_ids),
         source_ids=frozenset(requested_sources),
         course_id=requested_course,
     )
@@ -179,14 +183,61 @@ def _approved_global(row: dict[str, Any]) -> bool:
     )
 
 
+def _ownership_ids(value: Any) -> tuple[frozenset[str], frozenset[str]]:
+    """Collect every structured contributor identity from an indivisible object.
+
+    Knowledge bodies, summaries and skill instructions cannot be projected by contributor.
+    Authorization therefore has to cover the complete object graph, not just the labels on its
+    outer row.  Only explicit ownership keys are interpreted; free text is never treated as an
+    authority signal.
+    """
+    sources: set[str] = set()
+    courses: set[str] = set()
+
+    def walk(item: Any) -> None:
+        if isinstance(item, dict):
+            source = item.get("source_id")
+            if source:
+                sources.add(str(source))
+            course = item.get("course_id")
+            if course:
+                courses.add(str(course))
+            sources.update(_structured_ids(item, "source_ids"))
+            courses.update(_structured_ids(item, "course_ids"))
+            for nested in item.values():
+                if isinstance(nested, (dict, list)):
+                    walk(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                walk(nested)
+
+    walk(value)
+    return frozenset(sources), frozenset(courses)
+
+
+def _contributors_allowed(value: Any, scope: _KnowledgeScope) -> bool:
+    sources, courses = _ownership_ids(value)
+    effective_sources = scope.source_ids or scope.allowed_source_ids
+    effective_courses = frozenset({scope.course_id}) if scope.course_id else scope.allowed_course_ids
+
+    # A narrow request is an exact data boundary: an ownerless or partially matching aggregate
+    # cannot prove that its body belongs to the requested source/course.
+    if scope.source_ids and (not sources or not sources.issubset(effective_sources)):
+        return False
+    if scope.course_id and (not courses or not courses.issubset(effective_courses)):
+        return False
+    # Broad Group access still must reject private contributors from other Groups.
+    if sources and not sources.issubset(effective_sources):
+        return False
+    if courses and not courses.issubset(effective_courses):
+        return False
+    return True
+
+
 def _row_allowed(row: dict[str, Any], project_id: str, scope: _KnowledgeScope) -> bool:
     if project_id not in scope.project_ids and not _approved_global(row):
         return False
-    if scope.source_ids and not (_structured_ids(row, "source_ids") & scope.source_ids):
-        return False
-    if scope.course_id and scope.course_id not in _structured_ids(row, "course_ids"):
-        return False
-    return True
+    return _contributors_allowed(row, scope)
 
 
 def _sanitize_scoped_row(row: dict[str, Any], scope: _KnowledgeScope) -> dict[str, Any]:
@@ -333,20 +384,20 @@ def _merged_skillpacks(only_project: str | None, scope: _KnowledgeScope | None =
             if isinstance(raw, dict) and raw.get("pack_id"):
                 row = dict(raw)
                 row.setdefault("project_id", reg.project_id)
-                if scope is None or reg.project_id in scope.project_ids or _approved_global(row):
-                    system_by_id[str(row["pack_id"])] = row
+                if scope is None or _row_allowed(row, reg.project_id, scope):
+                    system_by_id[str(row["pack_id"])] = _sanitize_scoped_row(row, scope) if scope else row
         for raw in packs.get("project_experience") or []:
             if isinstance(raw, dict) and raw.get("pack_id"):
                 row = dict(raw)
                 row.setdefault("project_id", reg.project_id)
                 if _row_allowed(row, reg.project_id, scope):
-                    experiences.append(row)
+                    experiences.append(_sanitize_scoped_row(row, scope))
         for raw in packs.get("third_party") or []:
             if isinstance(raw, dict) and raw.get("pack_id"):
                 row = dict(raw)
                 row.setdefault("project_id", reg.project_id)
                 if _row_allowed(row, reg.project_id, scope):
-                    third_party_by_id[str(row["pack_id"])] = row
+                    third_party_by_id[str(row["pack_id"])] = _sanitize_scoped_row(row, scope)
     system = sorted(system_by_id.values(), key=lambda row: str(row.get("name") or "").casefold())
     experiences.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
     third_party = sorted(
@@ -378,7 +429,8 @@ def _find_skillpack(
             log.exception("[%s] 技能定位失败（继续找）：%s", reg.project_id, wanted)
             continue
         pack = result.get("pack") if isinstance(result.get("pack"), dict) else result
-        if result.get("found") and _row_allowed(pack, reg.project_id, scope):
+        if (result.get("found") and _row_allowed(pack, reg.project_id, scope)
+                and _contributors_allowed(result, scope)):
             return reg, result
     return None
 

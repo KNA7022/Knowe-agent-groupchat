@@ -9,9 +9,13 @@ import { parseDmId } from './chat';
 import { useSideTaskReadStore } from './sideTaskRead';
 import { teardownLegacyProjectCaches, useKnoweStore } from './store';
 import { useTaskRuntimeStore } from './taskRuntime';
+import { fenceDeletedGroup } from './groupDeletionFence';
 
 /** Purge every renderer projection only after the backend confirms durable deletion. */
 export function teardownGroup(groupId: GroupId, legacyProjectId?: string | null): void {
+  // Fence both public identities before touching any store.  A response resolving during teardown
+  // must observe the new generation and is never allowed to repopulate cleared state.
+  fenceDeletedGroup(groupId, legacyProjectId);
   clearGroupRequestCaches(groupId);
   useGroupStore.setState((state) => {
     const groups = { ...state.groups }; delete groups[groupId];

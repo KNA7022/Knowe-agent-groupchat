@@ -8,6 +8,9 @@ import { runtimeFetch } from '../shared/runtimeFetch';
 import { create } from 'zustand';
 import type { ProducedFile } from './state';   // [v0.38.1 #9] 复用聊天区的文件类型
 import i18n from '../i18n';
+import {
+  groupCommitAllowed, groupDeletionGeneration, isGroupDeletionFenced,
+} from './groupDeletionFence';
 
 /** 一条历史记录（对应后端 /history 响应里的 item）。 */
 export interface HistoryItem {
@@ -209,7 +212,8 @@ export const useRecordsStore = create<RecordsState>((set, get) => ({
   clearJump: () => set({ jumpSeq: null }),
 
   async load(projectId) {
-    if (!projectId) return;
+    if (!projectId || isGroupDeletionFenced(projectId)) return;
+    const generation = groupDeletionGeneration(projectId);
     const { category, pageSize, selectedDate } = get();
     set({ loading: true, error: null, page: 1 });
     try {
@@ -217,14 +221,17 @@ export const useRecordsStore = create<RecordsState>((set, get) => ({
         projectId, category, page: 1, pageSize,
         date: category === 'date' ? selectedDate : null,
       });
+      if (!groupCommitAllowed(projectId, generation)) return;
       set({ items, total, page: 1, loading: false });
     } catch (e) {
+      if (!groupCommitAllowed(projectId, generation)) return;
       set({ loading: false, error: e instanceof Error ? e.message : i18n.t('html.preview.01') });
     }
   },
 
   async loadMore(projectId) {
-    if (!projectId) return;
+    if (!projectId || isGroupDeletionFenced(projectId)) return;
+    const generation = groupDeletionGeneration(projectId);
     const { category, pageSize, selectedDate, page, items, total, loading } = get();
     if (loading || items.length >= total) return;
     const nextPage = page + 1;
@@ -234,25 +241,30 @@ export const useRecordsStore = create<RecordsState>((set, get) => ({
         projectId, category, page: nextPage, pageSize,
         date: category === 'date' ? selectedDate : null,
       });
+      if (!groupCommitAllowed(projectId, generation)) return;
       set({ items: [...items, ...res.items], total: res.total, page: nextPage, loading: false });
     } catch (e) {
+      if (!groupCommitAllowed(projectId, generation)) return;
       set({ loading: false, error: e instanceof Error ? e.message : i18n.t('html.preview.01') });
     }
   },
 
   // [v0.38.3 #4] 拉取报告/交接（一次全量，前端不分页——通常条数不多）。
   async loadHandoffs(projectId) {
-    if (!projectId) return;
+    if (!projectId || isGroupDeletionFenced(projectId)) return;
+    const generation = groupDeletionGeneration(projectId);
     set({ handoffsLoading: true, error: null });
     try {
       const res = await runtimeFetch(`${historyBase()}/history/handoffs?project_id=${encodeURIComponent(projectId)}`);
       if (!res.ok) throw new Error(`handoffs ${res.status}`);
       const data = await res.json();
+      if (!groupCommitAllowed(projectId, generation)) return;
       set({
         handoffs: Array.isArray(data.items) ? (data.items as HandoffItem[]) : [],
         handoffsLoading: false,
       });
     } catch (e) {
+      if (!groupCommitAllowed(projectId, generation)) return;
       set({ handoffsLoading: false, error: e instanceof Error ? e.message : i18n.t('html.preview.01') });
     }
   },

@@ -144,20 +144,22 @@ async def test_every_non_health_route_requires_one_canonical_group_and_filters_e
     source_id = repo.link_source(own.group_id).source_id
     foreign_source = "src_" + "f" * 32
     allowed = {
-        "ref": "node-own", "source_ids": [source_id, foreign_source],
-        "course_ids": ["course-own", "course-x"],
+        "ref": "node-own", "source_ids": [source_id],
+        "course_ids": ["course-own"],
         "evidence": [
             {"evidence_id": "own", "source_id": source_id, "course_id": "course-own"},
-            {"evidence_id": "foreign", "source_id": foreign_source, "course_id": "course-x"},
-            {"evidence_id": "ownerless"},
         ],
         "related": [
             {"ref": "related-own", "source_ids": [source_id], "course_ids": ["course-own"]},
-            {"ref": "related-foreign", "source_ids": [foreign_source], "course_ids": ["course-x"]},
         ],
     }
+    mixed = {
+        "ref": "node-mixed", "source_ids": [source_id, foreign_source],
+        "course_ids": ["course-own", "course-x"], "summary": "OWN + FOREIGN-NODE-SECRET",
+        "evidence": [{"source_id": foreign_source, "course_id": "course-x"}],
+    }
     foreign = {"ref": "node-foreign", "source_ids": ["src_" + "f" * 32], "course_ids": ["course-x"]}
-    manager = _Manager([allowed, foreign])
+    manager = _Manager([allowed, mixed, foreign])
     assets = _Assets("matrix-project", [{
         "asset_id": "asset-foreign", "scope": "project", "status": "validated",
         "source_ids": ["src_" + "f" * 32], "course_ids": ["course-x"],
@@ -221,6 +223,15 @@ async def test_every_non_health_route_requires_one_canonical_group_and_filters_e
         )
         assert allowed_detail.status == 200
         assert [row["evidence_id"] for row in allowed_detail.body["node"]["evidence"]] == ["own"]
+        mixed_detail = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/matrix-project/node", scoped + "&ref=node-mixed", b"", repo,
+        )
+        assert mixed_detail.status == 403
+        mixed_write = await dispatch_knowledge_http(
+            "POST", "/api/knowledge/matrix-project/nodes/node-mixed", scoped,
+            b'{"summary":"changed"}', repo,
+        )
+        assert mixed_write.status == 403
         narrow_profile = await dispatch_knowledge_http(
             "GET", "/api/knowledge/matrix-project/profile", scoped, b"", repo,
         )
@@ -237,3 +248,121 @@ async def test_every_non_health_route_requires_one_canonical_group_and_filters_e
         assert foreign_write.status == 403
     finally:
         unregister_project("matrix-project")
+
+
+@pytest.mark.asyncio
+async def test_mixed_indivisible_objects_fail_closed_across_read_and_write_matrix(tmp_path: Path) -> None:
+    repo = GroupRepository(tmp_path / "data")
+    group = repo.create_group("own", legacy_project_id="mixed-project")
+    repo.bind_course(group.group_id, "course-own")
+    source_id = repo.link_source(group.group_id).source_id
+    foreign_source = "src_" + "e" * 32
+    mixed_asset = {
+        "asset_id": "asset-mixed", "scope": "project", "scope_set_by": "system",
+        "status": "validated", "view_state": "ok",
+        "source_ids": [source_id, foreign_source], "course_ids": ["course-own", "course-x"],
+        "summary": "OWN + FOREIGN-ASSET-SECRET", "body_md": "FOREIGN-ASSET-BODY",
+    }
+    clean_global = {
+        "asset_id": "global-clean", "scope": "global", "scope_set_by": "user",
+        "status": "validated", "view_state": "ok", "source_ids": [], "course_ids": [],
+        "summary": "clean approved global",
+    }
+    foreign_global = {
+        "asset_id": "global-foreign", "scope": "global", "scope_set_by": "user",
+        "status": "core", "view_state": "ok", "source_ids": [foreign_source],
+        "course_ids": ["course-x"], "summary": "FOREIGN-GLOBAL-SECRET",
+    }
+
+    class _MixedAssets(_Assets):
+        def list_skillpacks(self, project_id: str, _workspace: Path) -> dict[str, object]:
+            return {"system_builtin": [], "third_party": [], "project_experience": [{
+                "pack_id": "pack-mixed", "name": "mixed", "kind": "project_experience",
+                "project_id": project_id, "scope": "project", "status": "active",
+                "source_ids": [source_id, foreign_source],
+                "course_ids": ["course-own", "course-x"],
+                "description": "FOREIGN-PACK-SECRET", "instructions": "FOREIGN-PACK-INSTRUCTIONS",
+            }]}
+
+        def read_skillpack(
+            self, project_id: str, _workspace: Path, pack_id: str, *, active_only: bool = False,
+        ) -> dict[str, object]:
+            del active_only
+            if pack_id != "pack-mixed":
+                return {"found": False, "pack_id": pack_id}
+            return {"found": True, "pack": self.list_skillpacks(project_id, _workspace)["project_experience"][0],
+                    "body_md": "FOREIGN-PACK-BODY"}
+
+    manager = _Manager([{
+        "ref": "node-mixed", "source_ids": [source_id, foreign_source],
+        "course_ids": ["course-own", "course-x"], "summary": "FOREIGN-NODE-SECRET",
+    }])
+    assets = _MixedAssets("mixed-project", [mixed_asset, clean_global, foreign_global])
+    try:
+        register_project(
+            "mixed-project", manager=manager, assets=assets, workspace_provider=lambda: tmp_path,
+        )
+        scoped = (f"group_id={group.group_id}&legacy_project_id=mixed-project"
+                  f"&source_id={source_id}&course_id=course-own")
+
+        asset_list = await dispatch_knowledge_http("GET", "/api/knowledge/assets", scoped, b"", repo)
+        assert asset_list.status == 200
+        serialized_assets = str(asset_list.body)
+        assert "asset-mixed" not in serialized_assets
+        assert "FOREIGN" not in serialized_assets
+        asset_detail = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/mixed-project/assets/asset-mixed", scoped, b"", repo,
+        )
+        assert asset_detail.status == 403
+        asset_write = await dispatch_knowledge_http(
+            "POST", "/api/knowledge/mixed-project/assets/asset-mixed", scoped,
+            b'{"title":"changed"}', repo,
+        )
+        assert asset_write.status == 403
+
+        pack_list = await dispatch_knowledge_http("GET", "/api/knowledge/skillpacks", scoped, b"", repo)
+        assert "pack-mixed" not in str(pack_list.body)
+        assert "FOREIGN" not in str(pack_list.body)
+        pack_detail = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/skillpacks/pack-mixed", scoped, b"", repo,
+        )
+        assert pack_detail.status == 404
+        pack_write = await dispatch_knowledge_http(
+            "POST", "/api/knowledge/skillpacks/pack-mixed", scoped,
+            b'{"status":"active"}', repo,
+        )
+        assert pack_write.status == 404
+
+        nodes = await dispatch_knowledge_http("GET", "/api/knowledge/nodes", scoped, b"", repo)
+        search = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/mixed-project/search", scoped + "&q=x", b"", repo,
+        )
+        node_detail = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/mixed-project/node", scoped + "&ref=node-mixed", b"", repo,
+        )
+        node_write = await dispatch_knowledge_http(
+            "POST", "/api/knowledge/mixed-project/nodes/node-mixed", scoped,
+            b'{"summary":"changed"}', repo,
+        )
+        assert nodes.body["nodes"] == []
+        assert search.body["hits"] == []
+        assert node_detail.status == 403
+        assert node_write.status == 403
+        profile = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/mixed-project/profile", scoped, b"", repo,
+        )
+        assert profile.status == 403
+        profile_write = await dispatch_knowledge_http(
+            "POST", "/api/knowledge/mixed-project/profile", scoped,
+            b'{"text":"changed"}', repo,
+        )
+        assert profile_write.status == 403
+
+        broad = f"group_id={group.group_id}&legacy_project_id=mixed-project"
+        globals_result = await dispatch_knowledge_http("GET", "/api/knowledge/assets", broad, b"", repo)
+        global_ids = {row["asset_id"] for row in globals_result.body["assets"]}
+        assert "global-clean" in global_ids
+        assert "global-foreign" not in global_ids
+        assert "FOREIGN-GLOBAL-SECRET" not in str(globals_result.body)
+    finally:
+        unregister_project("mixed-project")
