@@ -418,3 +418,82 @@ DONE
   The retry is observable and is fully fenced at shutdown.
 - Error retry state is process-local. Durable source revisions, prepared transactions,
   and startup generation remain the crash/restart authority.
+
+## Independent review fix round 5/5
+
+### Status
+
+DONE
+
+### Atomic owner/retry lifecycle state machine
+
+- Owner creation, identity publication, exceptional settlement, retry-handle
+  publication, timer firing, healthy replacement, and shutdown now serialize through
+  the same lifecycle lock. A Task remains the published owner until its exact settled
+  callback consumes it; a queued listener wake cannot replace a completed-but-not-yet-
+  settled Task.
+- Each owner has a monotonic identity token and each delayed retry has a separate
+  monotonic token tied to the failed owner. A settled callback may mutate lifecycle
+  state only when Task identity, owner token, event loop, and lifecycle generation all
+  still match. Stale callbacks retrieve their exception but cannot arm or cancel a
+  resource belonging to a replacement.
+- Error retry arming atomically proves that no owner, owner token, or live retry handle
+  exists. Timer firing validates both retry and failed-owner tokens, clears the handle,
+  and publishes the replacement owner while still holding the lock. Consequently an
+  active owner and active retry handle never coexist.
+- A healthy current owner cancels any retry handle before either publishing an
+  invalidation-driven successor or releasing wake ownership. Shutdown fences the
+  lifecycle generation, cancels the sole handle and owner, drains the Task, and leaves
+  late foreign-thread callbacks inert.
+
+### Exact red/green and stress coverage
+
+- The independent reviewer ordering was admitted as a ten-iteration formal test:
+  stable-exit invalidation creates a replacement owner; a real foreign-thread listener
+  callback is queued immediately before that owner raises; the queued ensure races its
+  settled callback; and a third owner is held open while lifecycle state is sampled.
+  Before the fix the test observed an active owner plus active retry handle. After the
+  fix all ten iterations satisfy the hard `active_owner + active_retry_handle <= 1`
+  invariant and the healthy replacement leaves no spurious later owner.
+- Parameterized stress probes exercise 100 healthy-replacement and 1,000 failed-
+  replacement foreign-listener interleavings. Every sample keeps the same hard
+  invariant, the failed path retains capped retry semantics, the healthy path leaves no
+  stale handle, and stable settlement creates no extra owner.
+- Close-race cleanup is asserted in the stress probes: after stop, owner and retry
+  handle counts are both zero and further listener activity cannot recreate them.
+- The preceding transient/permanent exception, generation/checkpoint, restart,
+  fairness, authority-outage, proof/quarantine, recovery-debt, privacy, and bounded
+  10,000-row probes remain green.
+
+### Verification evidence
+
+- Final Task 3D fairness/crash/generation/wake/error/lifecycle suite:
+  `57 passed in 16.20s`.
+- Stale-owner exact plus 100/1,000-interleaving stress subset:
+  `3 passed, 54 deselected in 3.21s`.
+- Complete Task 1-3 Group/HTTP/Task Runtime/live bridge/recovery/deletion suites:
+  `225 passed in 58.30s`.
+- Legacy Engine suites: `26 passed, 10 subtests passed in 1.31s`.
+- Frontend Group/Task Runtime contracts, stores, and real socket transport:
+  `5 files / 45 tests passed in 12.88s`.
+- Node `v24.19.0`, Python `3.12.10`; foundation/runtime verification, ESLint,
+  targeted Python compilation, and `git diff --check` passed. Git emitted only the
+  repository's existing Windows LF-to-CRLF notices.
+- An earlier combined run encountered the existing Windows quarantine-Timer timeout
+  and an idempotent deletion retry after transient `PermissionError`. Both exact tests
+  passed immediately in isolation, followed by the clean 225-test combined run above.
+
+### Changed files in this round
+
+- `backend/server.py`
+- `backend/tests/test_task_runtime_quarantine_isolation.py`
+- `.superpowers/sdd/studycrew-implementation/task-3d-report.md`
+
+### Residual risks
+
+- Error retry ownership remains intentionally process-local. Canonical prepared
+  transactions, Runtime intents, durable source revisions, and startup generation
+  continue to provide crash/restart recovery authority.
+- A permanent internal owner exception intentionally retains one capped delayed retry
+  for the Server lifetime; the invariant guarantees it never overlaps an owner, and
+  shutdown cancels it deterministically.

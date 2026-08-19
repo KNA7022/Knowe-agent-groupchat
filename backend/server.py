@@ -550,11 +550,16 @@ class KnoweServer:
         self._task_runtime_group_deletion_wake_lock = threading.Lock()
         self._task_runtime_group_deletion_loop: asyncio.AbstractEventLoop | None = None
         self._task_runtime_group_deletion_lifecycle_generation = 0
+        self._task_runtime_group_deletion_owner_serial = 0
+        self._task_runtime_group_deletion_owner_token: int | None = None
         self._task_runtime_group_deletion_wake_scheduled = False
         self._task_runtime_group_deletion_stopped = False
         self._task_runtime_group_deletion_error_retry_handle: (
             asyncio.TimerHandle | None
         ) = None
+        self._task_runtime_group_deletion_error_retry_serial = 0
+        self._task_runtime_group_deletion_error_retry_token: int | None = None
+        self._task_runtime_group_deletion_error_retry_owner_token: int | None = None
         self._task_runtime_group_deletion_error_attempt = 0
         self._task_runtime_group_deletion_idle_attempt = 0
         self._task_runtime_group_deletion_generation_started = False
@@ -8617,22 +8622,68 @@ class KnoweServer:
         # most one cross-thread callback and the owner consumes every newer revision.
         self._schedule_task_runtime_group_deletion_reconcile()
 
-    def _arm_task_runtime_group_deletion_error_retry_locked(
+    def _cancel_task_runtime_group_deletion_error_retry_locked(self) -> None:
+        """Cancel and forget the sole retry handle; wake lock must be held."""
+        handle = self._task_runtime_group_deletion_error_retry_handle
+        self._task_runtime_group_deletion_error_retry_handle = None
+        self._task_runtime_group_deletion_error_retry_token = None
+        self._task_runtime_group_deletion_error_retry_owner_token = None
+        if handle is not None:
+            handle.cancel()
+
+    def _create_task_runtime_group_deletion_owner_locked(
         self, loop: asyncio.AbstractEventLoop, generation: int,
-    ) -> float | None:
-        """Arm one loop-owned capped retry handle; wake lock must be held."""
+    ) -> asyncio.Task[Any] | None:
+        """Atomically create and publish the sole owner; wake lock must be held."""
+        handle = self._task_runtime_group_deletion_error_retry_handle
         if (
             self._task_runtime_group_deletion_stopped
             or self._shutdown_event.is_set()
             or generation != self._task_runtime_group_deletion_lifecycle_generation
             or self._task_runtime_group_deletion_loop is not loop
             or loop.is_closed()
+            or self._task_runtime_group_deletion_task is not None
+            or (handle is not None and not handle.cancelled())
         ):
-            self._task_runtime_group_deletion_wake_scheduled = False
             return None
+        if handle is not None:
+            self._cancel_task_runtime_group_deletion_error_retry_locked()
+        self._task_runtime_group_deletion_owner_serial += 1
+        owner_token = self._task_runtime_group_deletion_owner_serial
+        task = loop.create_task(
+            self._task_runtime_group_deletion_reconcile_loop(),
+            name="task-runtime-group-deletion-reconcile",
+        )
+        self._task_runtime_group_deletion_task = task
+        self._task_runtime_group_deletion_owner_token = owner_token
+        self._task_runtime_group_deletion_wake_scheduled = True
+        task.add_done_callback(
+            lambda done: self._settle_task_runtime_group_deletion_owner(
+                done, loop, generation, owner_token,
+            ),
+        )
+        return task
+
+    def _arm_task_runtime_group_deletion_error_retry_locked(
+        self, loop: asyncio.AbstractEventLoop, generation: int,
+        failed_owner_token: int,
+    ) -> float | None:
+        """Arm one capped retry only for the just-settled current owner."""
         handle = self._task_runtime_group_deletion_error_retry_handle
-        if handle is not None and not handle.cancelled():
+        if (
+            self._task_runtime_group_deletion_stopped
+            or self._shutdown_event.is_set()
+            or generation != self._task_runtime_group_deletion_lifecycle_generation
+            or self._task_runtime_group_deletion_loop is not loop
+            or loop.is_closed()
+            or self._task_runtime_group_deletion_task is not None
+            or self._task_runtime_group_deletion_owner_token is not None
+            or self._task_runtime_group_deletion_owner_serial != failed_owner_token
+            or (handle is not None and not handle.cancelled())
+        ):
             return None
+        if handle is not None:
+            self._cancel_task_runtime_group_deletion_error_retry_locked()
         self._task_runtime_group_deletion_error_attempt += 1
         delay = min(
             self.TASK_RUNTIME_DELETION_ERROR_RETRY_MAX_SECONDS,
@@ -8641,28 +8692,49 @@ class KnoweServer:
                 self._task_runtime_group_deletion_error_attempt - 1, 6,
             )),
         )
+        self._task_runtime_group_deletion_error_retry_serial += 1
+        retry_token = self._task_runtime_group_deletion_error_retry_serial
         self._task_runtime_group_deletion_generation_invalidated = True
         self._task_runtime_group_deletion_wake_scheduled = True
+        self._task_runtime_group_deletion_error_retry_token = retry_token
+        self._task_runtime_group_deletion_error_retry_owner_token = failed_owner_token
         self._task_runtime_group_deletion_error_retry_handle = loop.call_later(
             delay,
             self._fire_task_runtime_group_deletion_error_retry,
             generation,
+            failed_owner_token,
+            retry_token,
         )
         return delay
 
-    def _fire_task_runtime_group_deletion_error_retry(self, generation: int) -> None:
-        """Convert the one delayed error handle into the one reconciliation owner."""
+    def _fire_task_runtime_group_deletion_error_retry(
+        self, generation: int, failed_owner_token: int, retry_token: int,
+    ) -> None:
+        """Atomically replace the current retry handle with one new owner."""
+        loop = asyncio.get_running_loop()
         with self._task_runtime_group_deletion_wake_lock:
+            if (
+                self._task_runtime_group_deletion_error_retry_token != retry_token
+                or self._task_runtime_group_deletion_error_retry_owner_token
+                != failed_owner_token
+            ):
+                return
             self._task_runtime_group_deletion_error_retry_handle = None
+            self._task_runtime_group_deletion_error_retry_token = None
+            self._task_runtime_group_deletion_error_retry_owner_token = None
             if (
                 self._task_runtime_group_deletion_stopped
                 or self._shutdown_event.is_set()
                 or generation != self._task_runtime_group_deletion_lifecycle_generation
-                or self._task_runtime_group_deletion_loop is not asyncio.get_running_loop()
+                or self._task_runtime_group_deletion_loop is not loop
+                or self._task_runtime_group_deletion_task is not None
+                or self._task_runtime_group_deletion_owner_token is not None
             ):
-                self._task_runtime_group_deletion_wake_scheduled = False
+                self._task_runtime_group_deletion_wake_scheduled = bool(
+                    self._task_runtime_group_deletion_task is not None
+                )
                 return
-        self._schedule_task_runtime_group_deletion_reconcile()
+            self._create_task_runtime_group_deletion_owner_locked(loop, generation)
 
     async def _stop_task_runtime_group_deletion_reconcile(self) -> None:
         """Fence insertion wakes and drain the one loop-owned deletion task."""
@@ -8673,6 +8745,8 @@ class KnoweServer:
             self._task_runtime_group_deletion_wake_scheduled = False
             retry_handle = self._task_runtime_group_deletion_error_retry_handle
             self._task_runtime_group_deletion_error_retry_handle = None
+            self._task_runtime_group_deletion_error_retry_token = None
+            self._task_runtime_group_deletion_error_retry_owner_token = None
             task = self._task_runtime_group_deletion_task
         if self.groups is not None:
             self.groups.deletion_prepare_listener = None
@@ -8683,8 +8757,10 @@ class KnoweServer:
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        if self._task_runtime_group_deletion_task is task:
-            self._task_runtime_group_deletion_task = None
+        with self._task_runtime_group_deletion_wake_lock:
+            if self._task_runtime_group_deletion_task is task:
+                self._task_runtime_group_deletion_task = None
+                self._task_runtime_group_deletion_owner_token = None
 
     def _schedule_task_runtime_group_deletion_reconcile(self) -> None:
         try:
@@ -8701,72 +8777,75 @@ class KnoweServer:
             lifecycle_generation = (
                 self._task_runtime_group_deletion_lifecycle_generation
             )
-        owner = self._task_runtime_group_deletion_task
-        if owner is not None and not owner.done():
-            return
-        task = loop.create_task(
-            self._task_runtime_group_deletion_reconcile_loop(),
-            name="task-runtime-group-deletion-reconcile",
-        )
-        self._task_runtime_group_deletion_task = task
+            self._create_task_runtime_group_deletion_owner_locked(
+                loop, lifecycle_generation,
+            )
 
-        def settled(done: asyncio.Task[Any]) -> None:
-            if done.cancelled():
-                with self._task_runtime_group_deletion_wake_lock:
-                    if self._task_runtime_group_deletion_task is done:
-                        self._task_runtime_group_deletion_task = None
-                    self._task_runtime_group_deletion_wake_scheduled = False
-                return
+    def _settle_task_runtime_group_deletion_owner(
+        self, done: asyncio.Task[Any], loop: asyncio.AbstractEventLoop,
+        lifecycle_generation: int, owner_token: int,
+    ) -> None:
+        """Settle only the still-current owner and publish its successor atomically."""
+        error: BaseException | None = None
+        if not done.cancelled():
             try:
                 error = done.exception()
             except Exception as exc:  # noqa: BLE001 - lifecycle containment boundary
                 log.exception("Task Runtime Group deletion reconciliation failed")
                 error = exc
-            with self._task_runtime_group_deletion_wake_lock:
-                if self._task_runtime_group_deletion_task is done:
-                    self._task_runtime_group_deletion_task = None
-                if error is not None:
-                    retry_delay = (
-                        self._arm_task_runtime_group_deletion_error_retry_locked(
-                            loop, lifecycle_generation,
-                        )
-                    )
-                    wake_again = False
-                else:
-                    retry_delay = None
-                    self._task_runtime_group_deletion_wake_scheduled = False
-                    self._task_runtime_group_deletion_error_attempt = 0
-                    wake_again = bool(
-                        self._task_runtime_group_deletion_generation_invalidated
-                        and not self._task_runtime_group_deletion_stopped
-                        and not self._shutdown_event.is_set()
-                        and self._task_runtime_group_deletion_loop is loop
-                    )
-            if error is not None:
-                log.error(
-                    "Task Runtime Group deletion reconciliation failed (%s)",
-                    type(error).__name__,
-                )
-                if retry_delay is not None and self.task_runtime is not None:
-                    state = dict(self.task_runtime.recovery_report.get(
-                        "server_deletion_reconciliation",
-                    ) or {})
-                    state.update({
-                        "has_more": True,
-                        "owner_error": type(error).__name__,
-                        "owner_error_retry_attempt": (
-                            self._task_runtime_group_deletion_error_attempt
-                        ),
-                        "owner_error_retry_delay_seconds": retry_delay,
-                    })
-                    self.task_runtime.recovery_report[
-                        "server_deletion_reconciliation"
-                    ] = state
+        retry_delay: float | None = None
+        error_attempt = 0
+        with self._task_runtime_group_deletion_wake_lock:
+            current = bool(
+                lifecycle_generation
+                == self._task_runtime_group_deletion_lifecycle_generation
+                and self._task_runtime_group_deletion_loop is loop
+                and self._task_runtime_group_deletion_task is done
+                and self._task_runtime_group_deletion_owner_token == owner_token
+            )
+            if not current:
                 return
-            if wake_again:
-                self._schedule_task_runtime_group_deletion_reconcile()
-
-        task.add_done_callback(settled)
+            self._task_runtime_group_deletion_task = None
+            self._task_runtime_group_deletion_owner_token = None
+            if done.cancelled():
+                self._cancel_task_runtime_group_deletion_error_retry_locked()
+                self._task_runtime_group_deletion_wake_scheduled = False
+            elif error is not None:
+                retry_delay = self._arm_task_runtime_group_deletion_error_retry_locked(
+                    loop, lifecycle_generation, owner_token,
+                )
+                error_attempt = self._task_runtime_group_deletion_error_attempt
+            else:
+                self._cancel_task_runtime_group_deletion_error_retry_locked()
+                self._task_runtime_group_deletion_error_attempt = 0
+                if (
+                    self._task_runtime_group_deletion_generation_invalidated
+                    and not self._task_runtime_group_deletion_stopped
+                    and not self._shutdown_event.is_set()
+                ):
+                    self._create_task_runtime_group_deletion_owner_locked(
+                        loop, lifecycle_generation,
+                    )
+                else:
+                    self._task_runtime_group_deletion_wake_scheduled = False
+        if error is not None:
+            log.error(
+                "Task Runtime Group deletion reconciliation failed (%s)",
+                type(error).__name__,
+            )
+            if retry_delay is not None and self.task_runtime is not None:
+                state = dict(self.task_runtime.recovery_report.get(
+                    "server_deletion_reconciliation",
+                ) or {})
+                state.update({
+                    "has_more": True,
+                    "owner_error": type(error).__name__,
+                    "owner_error_retry_attempt": error_attempt,
+                    "owner_error_retry_delay_seconds": retry_delay,
+                })
+                self.task_runtime.recovery_report[
+                    "server_deletion_reconciliation"
+                ] = state
 
     async def _task_runtime_group_deletion_reconcile_loop(self) -> None:
         while not self._shutdown_event.is_set():

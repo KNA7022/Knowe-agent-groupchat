@@ -1868,6 +1868,156 @@ async def test_permanent_owner_exception_backs_off_and_shutdown_drains_retry(
         _close_server(server)
 
 
+@pytest.mark.asyncio
+async def test_stale_failed_owner_never_arms_retry_beside_replacement_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        KnoweServer, "TASK_RUNTIME_DELETION_ERROR_RETRY_BASE_SECONDS", 0.05,
+    )
+    simultaneous_count = 0
+    for iteration in range(10):
+        server = KnoweServer(str(tmp_path / f"stale-owner-{iteration}"))
+        assert server.groups is not None and server.task_runtime is not None
+        await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+        listener = server.groups.deletion_prepare_listener
+        assert listener is not None
+        original_reconcile = server._reconcile_task_runtime_group_deletions  # noqa: SLF001
+        release_replacement = asyncio.Event()
+        replacement_started = asyncio.Event()
+        calls = {"count": 0}
+
+        async def controlled_owner() -> None:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                # Stable-exit invalidation requests a replacement owner.
+                listener()
+                return
+            if calls["count"] == 2:
+                # Queue a real foreign-thread wake immediately before this owner
+                # fails; its loop callback may run before this Task's settled callback.
+                producer = threading.Thread(target=listener, daemon=True)
+                producer.start()
+                producer.join(timeout=2)
+                assert not producer.is_alive()
+                raise RuntimeError("synthetic stale owner settlement failure")
+            replacement_started.set()
+            await release_replacement.wait()
+            await original_reconcile()
+
+        monkeypatch.setattr(
+            server, "_task_runtime_group_deletion_reconcile_loop", controlled_owner,
+        )
+        listener()
+        try:
+            await asyncio.wait_for(replacement_started.wait(), timeout=1)
+            await asyncio.sleep(0)
+            task = server._task_runtime_group_deletion_task  # noqa: SLF001
+            handle = server._task_runtime_group_deletion_error_retry_handle  # noqa: SLF001
+            active_owner = task is not None and not task.done()
+            active_handle = handle is not None and not handle.cancelled()
+            simultaneous_count += int(active_owner and active_handle)
+            assert int(active_owner) + int(active_handle) <= 1
+            release_replacement.set()
+            deadline = time.monotonic() + 1
+            while (
+                server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+                and time.monotonic() < deadline
+            ):
+                await asyncio.sleep(0.005)
+            await asyncio.sleep(0.08)
+            assert calls["count"] == 3
+            assert server._task_runtime_group_deletion_error_retry_handle is None  # noqa: SLF001
+        finally:
+            release_replacement.set()
+            await server._stop_task_runtime_group_deletion_reconcile()  # noqa: SLF001
+            _close_server(server)
+    assert simultaneous_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("burst_size", "replacement_fails"), (
+    (100, False),
+    (1_000, True),
+))
+async def test_replacement_owner_interleavings_keep_single_lifecycle_resource(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    burst_size: int, replacement_fails: bool,
+) -> None:
+    monkeypatch.setattr(
+        KnoweServer, "TASK_RUNTIME_DELETION_ERROR_RETRY_BASE_SECONDS", 0.01,
+    )
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+    listener = server.task_runtime.store.group_deletion_prepare_listener
+    assert listener is not None
+    original_reconcile = server._reconcile_task_runtime_group_deletions  # noqa: SLF001
+    replacement_started = asyncio.Event()
+    release_replacement = asyncio.Event()
+    calls = {"count": 0}
+
+    def active_resource_count() -> int:
+        with server._task_runtime_group_deletion_wake_lock:  # noqa: SLF001
+            task = server._task_runtime_group_deletion_task  # noqa: SLF001
+            handle = server._task_runtime_group_deletion_error_retry_handle  # noqa: SLF001
+            return int(task is not None and not task.done()) + int(
+                handle is not None and not handle.cancelled()
+            )
+
+    async def controlled_owner() -> None:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            listener()
+            return
+        if calls["count"] == 2:
+            replacement_started.set()
+            await release_replacement.wait()
+            if replacement_fails:
+                raise RuntimeError("synthetic replacement owner failure")
+        await original_reconcile()
+
+    monkeypatch.setattr(
+        server, "_task_runtime_group_deletion_reconcile_loop", controlled_owner,
+    )
+    listener()
+    try:
+        await asyncio.wait_for(replacement_started.wait(), timeout=1)
+        assert active_resource_count() == 1
+
+        def produce_interleavings() -> None:
+            for _ in range(burst_size):
+                listener()
+
+        producer = threading.Thread(target=produce_interleavings, daemon=True)
+        producer.start()
+        producer.join(timeout=5)
+        assert not producer.is_alive()
+        assert active_resource_count() == 1
+        release_replacement.set()
+
+        expected_calls = 3 if replacement_fails else 2
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            assert active_resource_count() <= 1
+            task = server._task_runtime_group_deletion_task  # noqa: SLF001
+            handle = server._task_runtime_group_deletion_error_retry_handle  # noqa: SLF001
+            if calls["count"] >= expected_calls and task is None and handle is None:
+                break
+            await asyncio.sleep(0.002)
+        else:
+            raise AssertionError("replacement lifecycle did not settle")
+        await asyncio.sleep(0.05)
+        assert calls["count"] == expected_calls
+        assert active_resource_count() == 0
+    finally:
+        release_replacement.set()
+        server._shutdown_event.set()  # noqa: SLF001
+        await server._stop_task_runtime_group_deletion_reconcile()  # noqa: SLF001
+        assert active_resource_count() == 0
+        _close_server(server)
+
+
 def test_ten_thousand_intent_page_and_restart_cursor_stay_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
