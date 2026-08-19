@@ -1120,43 +1120,12 @@ class TaskRuntimeService:
     def group_snapshot(self, group_id: str) -> dict[str, Any]:
         self.expire_pending_approvals()
         canonical = self._canonical_group(group_id)
-        summary = self.group_summary(canonical)
-        runs = self.store.list_runs(group_id=canonical)
-        approvals = self.store.pending_approvals(canonical)
-        authority_epoch, group_snapshot_revision = self.store.group_snapshot_authority(canonical)
-        return {
-            "schema_version": 1, "group_id": canonical,
-            "authority_epoch": authority_epoch,
-            "group_snapshot_revision": group_snapshot_revision,
-            "runs": [run.to_public_dict() for run in runs],
-            "pending_approvals": [item.to_dict() for item in approvals],
-            "summary": summary,
-        }
+        return self.store.group_snapshot_projection(canonical)
 
     def group_summary(self, group_id: str) -> dict[str, Any]:
         self.expire_pending_approvals()
         canonical = self._canonical_group(group_id)
-        runs = self.store.list_runs(group_id=canonical)
-        primary = next((run for run in reversed(runs) if run.kind is RunKind.PRIMARY and run.status in _NONTERMINAL), None)
-        usage = BudgetUsage(
-            wall_clock_seconds=sum(run.budget_usage.wall_clock_seconds for run in runs),
-            model_turns=sum(run.budget_usage.model_turns for run in runs),
-            tool_calls=sum(run.budget_usage.tool_calls for run in runs),
-            tokens=sum(run.budget_usage.tokens for run in runs),
-            cost_usd=sum(run.budget_usage.cost_usd for run in runs),
-        )
-        return {
-            "active_primary_run_id": primary.run_id if primary else None,
-            "primary_task_status": primary.status.value if primary else None,
-            "queued_task_count": sum(run.status is TaskStatus.QUEUED for run in runs),
-            "active_side_task_count": sum(
-                run.kind is RunKind.SIDE and run.queue_class is QueueClass.FOREGROUND
-                and run.status in _EXECUTING for run in runs
-            ),
-            "pending_approval_count": len(self.store.pending_approvals(canonical)),
-            "budget_usage": usage.__dict__,
-            "indexing_state": self._indexing_state(runs),
-        }
+        return dict(self.store.group_snapshot_projection(canonical)["summary"])
 
     @staticmethod
     def _indexing_state(runs: Sequence[TaskRun]) -> str:

@@ -142,7 +142,20 @@ async def test_every_non_health_route_requires_one_canonical_group_and_filters_e
     own = repo.create_group("own", legacy_project_id="matrix-project")
     repo.bind_course(own.group_id, "course-own")
     source_id = repo.link_source(own.group_id).source_id
-    allowed = {"ref": "node-own", "source_ids": [source_id], "course_ids": ["course-own"]}
+    foreign_source = "src_" + "f" * 32
+    allowed = {
+        "ref": "node-own", "source_ids": [source_id, foreign_source],
+        "course_ids": ["course-own", "course-x"],
+        "evidence": [
+            {"evidence_id": "own", "source_id": source_id, "course_id": "course-own"},
+            {"evidence_id": "foreign", "source_id": foreign_source, "course_id": "course-x"},
+            {"evidence_id": "ownerless"},
+        ],
+        "related": [
+            {"ref": "related-own", "source_ids": [source_id], "course_ids": ["course-own"]},
+            {"ref": "related-foreign", "source_ids": [foreign_source], "course_ids": ["course-x"]},
+        ],
+    }
     foreign = {"ref": "node-foreign", "source_ids": ["src_" + "f" * 32], "course_ids": ["course-x"]}
     manager = _Manager([allowed, foreign])
     assets = _Assets("matrix-project", [{
@@ -191,6 +204,10 @@ async def test_every_non_health_route_requires_one_canonical_group_and_filters_e
         scoped = base + f"&source_id={source_id}&course_id=course-own"
         nodes = await dispatch_knowledge_http("GET", "/api/knowledge/nodes", scoped, b"", repo)
         assert [row["ref"] for row in nodes.body["nodes"]] == ["node-own"]
+        assert nodes.body["nodes"][0]["source_ids"] == [source_id]
+        assert nodes.body["nodes"][0]["course_ids"] == ["course-own"]
+        assert [row["evidence_id"] for row in nodes.body["nodes"][0]["evidence"]] == ["own"]
+        assert [row["ref"] for row in nodes.body["nodes"][0]["related"]] == ["related-own"]
         search = await dispatch_knowledge_http(
             "GET", "/api/knowledge/matrix-project/search", scoped + "&q=x", b"", repo,
         )
@@ -199,6 +216,16 @@ async def test_every_non_health_route_requires_one_canonical_group_and_filters_e
             "GET", "/api/knowledge/matrix-project/node", scoped + "&ref=node-foreign", b"", repo,
         )
         assert detail.status == 403
+        allowed_detail = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/matrix-project/node", scoped + "&ref=node-own", b"", repo,
+        )
+        assert allowed_detail.status == 200
+        assert [row["evidence_id"] for row in allowed_detail.body["node"]["evidence"]] == ["own"]
+        narrow_profile = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/matrix-project/profile", scoped, b"", repo,
+        )
+        assert narrow_profile.status == 403
+        assert narrow_profile.body["error"] == "profile_outside_narrow_group_scope"
         foreign_asset = await dispatch_knowledge_http(
             "GET", "/api/knowledge/matrix-project/assets/asset-foreign", scoped, b"", repo,
         )

@@ -22,6 +22,9 @@ import {
 } from '../contract/group';
 import { runtimeFetch } from '../shared/runtimeFetch';
 import { runtimeHttpBase } from '../shared/runtimeEndpoints';
+import {
+  fenceDeletedGroup, groupCommitAllowed, groupDeletionGeneration, isGroupDeletionFenced,
+} from './groupDeletionFence';
 
 export interface CreateGroupInput {
   name: string;
@@ -110,6 +113,27 @@ function assertAddressedGroup(groupId: GroupId, actualGroupId: GroupId): void {
 
 const duplicateRequestIds = new Map<string, string>();
 
+export function clearGroupRequestCaches(groupId: GroupId): void {
+  for (const key of duplicateRequestIds.keys()) {
+    if (key.startsWith(`${groupId}\u0000`)) duplicateRequestIds.delete(key);
+  }
+}
+
+export function pendingGroupRequestCacheCount(groupId: GroupId): number {
+  return [...duplicateRequestIds.keys()].filter((key) => key.startsWith(`${groupId}\u0000`)).length;
+}
+
+function startGroupRequest(groupId: GroupId): number {
+  if (isGroupDeletionFenced(groupId)) throw new Error('Deleted Group cannot be mutated');
+  return groupDeletionGeneration(groupId);
+}
+
+function assertGroupRequestCurrent(groupId: GroupId, generation: number): void {
+  if (!groupCommitAllowed(groupId, generation)) {
+    throw new Error('Group was deleted while request was in flight');
+  }
+}
+
 function duplicateRequestId(groupId: GroupId, projectDir: string, name?: string): string {
   const key = `${groupId}\u0000${projectDir}\u0000${name || ''}`;
   const existing = duplicateRequestIds.get(key);
@@ -130,7 +154,8 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
   ingest(groups): void {
     // Each Group schema validates that roster/bindings/links carry the same group_id,
     // preventing an API projection from leaking one group's state into another.
-    const parsed = groups.map((group) => GroupSchema.parse(group));
+    const parsed = groups.map((group) => GroupSchema.parse(group))
+      .filter((group) => !isGroupDeletionFenced(group.group_id));
     set({
       groups: Object.fromEntries(parsed.map((group) => [group.group_id, group])),
       order: parsed.map((group) => group.group_id),
@@ -156,7 +181,8 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
 
   async createGroup(input): Promise<Group> {
     const group = parseGroupResponse(await groupJson('/groups/create', input));
-    set((state) => ({
+    if (isGroupDeletionFenced(group.group_id)) throw new Error('Created Group identity is deletion-fenced');
+    set((state) => isGroupDeletionFenced(group.group_id) ? state : ({
       groups: { ...state.groups, [group.group_id]: group },
       order: state.order.includes(group.group_id) ? state.order : [group.group_id, ...state.order],
     }));
@@ -164,35 +190,45 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
   },
 
   async renameGroup(groupId, name): Promise<Group> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const group = parseGroupResponse(await groupJson('/groups/rename', {
       ...transportIdentity(current), name,
     }));
     assertAddressedGroup(groupId, group.group_id);
-    set((state) => ({ groups: { ...state.groups, [group.group_id]: group } }));
+    assertGroupRequestCurrent(groupId, generation);
+    set((state) => groupCommitAllowed(groupId, generation)
+      ? { groups: { ...state.groups, [group.group_id]: group } } : state);
     return group;
   },
 
   async archiveGroup(groupId): Promise<Group> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const group = parseGroupResponse(await groupJson('/groups/archive', transportIdentity(current)));
     assertAddressedGroup(groupId, group.group_id);
-    set((state) => ({ groups: { ...state.groups, [group.group_id]: group } }));
+    assertGroupRequestCurrent(groupId, generation);
+    set((state) => groupCommitAllowed(groupId, generation)
+      ? { groups: { ...state.groups, [group.group_id]: group } } : state);
     return group;
   },
 
   async restoreGroup(groupId): Promise<Group> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const group = parseGroupResponse(await groupJson('/groups/restore', transportIdentity(current)));
     assertAddressedGroup(groupId, group.group_id);
-    set((state) => ({ groups: { ...state.groups, [group.group_id]: group } }));
+    assertGroupRequestCurrent(groupId, generation);
+    set((state) => groupCommitAllowed(groupId, generation)
+      ? { groups: { ...state.groups, [group.group_id]: group } } : state);
     return group;
   },
 
   async duplicateGroup(groupId, projectDir, name): Promise<Group> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const requestId = duplicateRequestId(groupId, projectDir, name);
@@ -202,15 +238,18 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
       request_id: requestId,
       ...(name ? { name } : {}),
     }));
-    set((state) => ({
+    assertGroupRequestCurrent(groupId, generation);
+    if (isGroupDeletionFenced(group.group_id)) throw new Error('Duplicated Group identity is deletion-fenced');
+    set((state) => groupCommitAllowed(groupId, generation) ? ({
       groups: { ...state.groups, [group.group_id]: group },
       order: [group.group_id, ...state.order],
-    }));
+    }) : state);
     duplicateRequestIds.delete(`${groupId}\u0000${projectDir}\u0000${name || ''}`);
     return group;
   },
 
   async bindCourse(groupId, courseId): Promise<GroupCourseBinding> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const raw = await groupJson('/groups/course-bind', {
@@ -218,7 +257,8 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
     });
     const binding = GroupCourseBindingSchema.parse((raw as { binding?: unknown }).binding);
     assertAddressedGroup(groupId, binding.group_id);
-    set((state) => ({ groups: {
+    assertGroupRequestCurrent(groupId, generation);
+    set((state) => groupCommitAllowed(groupId, generation) ? ({ groups: {
       ...state.groups,
       [groupId]: {
         ...state.groups[groupId]!,
@@ -227,19 +267,21 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
           binding,
         ],
       },
-    } }));
+    } }) : state);
     return binding;
   },
 
   async unbindCourse(groupId, courseId): Promise<boolean> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const raw = CourseUnbindResponseSchema.parse(await groupJson('/groups/course-unbind', {
       ...transportIdentity(current), course_id: courseId,
     }));
     assertAddressedGroup(groupId, raw.group_id);
+    assertGroupRequestCurrent(groupId, generation);
     const removed = raw.removed;
-    if (removed) set((state) => ({ groups: {
+    if (removed) set((state) => groupCommitAllowed(groupId, generation) ? ({ groups: {
       ...state.groups,
       [groupId]: {
         ...state.groups[groupId]!,
@@ -247,11 +289,12 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
           (item) => item.course_id !== courseId,
         ),
       },
-    } }));
+    } }) : state);
     return removed;
   },
 
   async updateRoster(groupId, roster): Promise<Group> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     if (roster.some((agent) => agent.group_id !== groupId)) {
@@ -261,11 +304,14 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
       ...transportIdentity(current), roster,
     }));
     assertAddressedGroup(groupId, group.group_id);
-    set((state) => ({ groups: { ...state.groups, [groupId]: group } }));
+    assertGroupRequestCurrent(groupId, generation);
+    set((state) => groupCommitAllowed(groupId, generation)
+      ? { groups: { ...state.groups, [groupId]: group } } : state);
     return group;
   },
 
   async linkSource(groupId, sourceId): Promise<GroupSourceLink> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const raw = await groupJson('/groups/source-link', {
@@ -273,8 +319,9 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
     }) as { link?: unknown; reference_count?: unknown };
     const link = GroupSourceLinkSchema.parse(raw.link);
     assertAddressedGroup(groupId, link.group_id);
+    assertGroupRequestCurrent(groupId, generation);
     const referenceCount = typeof raw.reference_count === 'number' ? raw.reference_count : 1;
-    set((state) => ({
+    set((state) => groupCommitAllowed(groupId, generation) ? ({
       groups: {
         ...state.groups,
         [groupId]: {
@@ -289,19 +336,22 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
         ...state.sourceReferenceCounts,
         [groupId]: { ...state.sourceReferenceCounts[groupId], [link.source_id]: referenceCount },
       },
-    }));
+    }) : state);
     return link;
   },
 
   async unlinkSource(groupId, sourceId): Promise<boolean> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const raw = SourceUnlinkResponseSchema.parse(await groupJson('/groups/source-unlink', {
       ...transportIdentity(current), source_id: sourceId,
     }));
     assertAddressedGroup(groupId, raw.group_id);
+    assertGroupRequestCurrent(groupId, generation);
     const removed = raw.removed;
     if (removed) set((state) => {
+      if (!groupCommitAllowed(groupId, generation)) return state;
       const counts = { ...state.sourceReferenceCounts[groupId] };
       const referenceCount = raw.reference_count;
       if (referenceCount > 0) counts[sourceId] = referenceCount;
@@ -323,18 +373,21 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
   },
 
   async loadRuntimeSummary(groupId): Promise<GroupRuntimeSummary> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const raw = await groupJson('/groups/runtime-summary', transportIdentity(current));
     const summary = GroupRuntimeSummarySchema.parse((raw as { summary?: unknown }).summary);
     assertAddressedGroup(groupId, summary.group_id);
-    set((state) => ({
+    assertGroupRequestCurrent(groupId, generation);
+    set((state) => groupCommitAllowed(groupId, generation) ? ({
       runtimeSummaries: { ...state.runtimeSummaries, [groupId]: summary },
-    }));
+    }) : state);
     return summary;
   },
 
   ingestRuntimeProjection(groupId, projection, updatedAt): void {
+    if (isGroupDeletionFenced(groupId)) return;
     const group = get().groups[groupId];
     if (!group) return;
     const previous = get().runtimeSummaries[groupId];
@@ -349,21 +402,24 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
       ...projection,
       updated_at: updatedAt || previous?.updated_at || group.updated_at,
     });
-    set((state) => ({
+    set((state) => isGroupDeletionFenced(groupId) ? state : ({
       runtimeSummaries: { ...state.runtimeSummaries, [groupId]: summary },
     }));
   },
 
   async previewDelete(groupId): Promise<GroupDeletePreview> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const raw = await groupJson('/groups/delete-preview', transportIdentity(current));
     const preview = GroupDeletePreviewSchema.parse((raw as { preview?: unknown }).preview);
     assertAddressedGroup(groupId, preview.group_id);
+    assertGroupRequestCurrent(groupId, generation);
     return preview;
   },
 
   async confirmedDelete(groupId, confirmationToken): Promise<GroupDeletionReceipt> {
+    const generation = startGroupRequest(groupId);
     const current = get().groups[groupId];
     if (!current) throw new Error(`Unknown group: ${groupId}`);
     const raw = await groupJson('/groups/delete', {
@@ -371,7 +427,9 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
     });
     const receipt = GroupDeletionReceiptSchema.parse((raw as { receipt?: unknown }).receipt);
     assertAddressedGroup(groupId, receipt.group_id);
+    assertGroupRequestCurrent(groupId, generation);
     const legacyProjectId = current.legacy_project_id;
+    fenceDeletedGroup(groupId);
     set((state) => {
       const groups = { ...state.groups };
       delete groups[groupId];

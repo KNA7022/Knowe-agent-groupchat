@@ -333,6 +333,86 @@ class TaskRuntimeStore:
             ).fetchone()
         return str(row["epoch"]), int(row["revision"])
 
+    def group_snapshot_projection(self, group_id: str) -> dict[str, Any]:
+        """Read the complete public Group projection at one SQLite consistency point.
+
+        The authority cursor is intentionally selected in the same transaction as runs and
+        approvals.  A service must never compose these rows with separate store calls: another
+        process may commit a transition between those calls while legitimately advancing the
+        same durable revision.
+        """
+        with self.db.transaction() as conn:
+            global_row = conn.execute(
+                "SELECT epoch FROM studycrew_runtime_authority WHERE authority_key='global'",
+            ).fetchone()
+            if global_row is None:
+                raise RuntimeStoreError("Task Runtime authority epoch is unavailable")
+            conn.execute(
+                """INSERT OR IGNORE INTO studycrew_runtime_authority(authority_key, epoch, revision)
+                   VALUES (?, ?, 0)""",
+                (f"group:{group_id}", str(global_row["epoch"])),
+            )
+            authority = conn.execute(
+                "SELECT epoch, revision FROM studycrew_runtime_authority WHERE authority_key=?",
+                (f"group:{group_id}",),
+            ).fetchone()
+            run_rows = conn.execute(
+                """SELECT payload_json FROM studycrew_task_runs
+                   WHERE group_id=? ORDER BY created_at, run_id""",
+                (group_id,),
+            ).fetchall()
+            approval_rows = conn.execute(
+                """SELECT payload_json FROM studycrew_approvals
+                   WHERE group_id=? AND status='pending' ORDER BY created_at, approval_id""",
+                (group_id,),
+            ).fetchall()
+            runs = tuple(self._row_run(row) for row in run_rows)
+            approvals = tuple(
+                self._approval_from_raw(_loads(row["payload_json"])) for row in approval_rows
+            )
+            primary = next((
+                run for run in reversed(runs)
+                if run.kind.value == "primary" and not run.status.terminal
+            ), None)
+            executing = {"routing", "running", "verifying"}
+            index_runs = tuple(run for run in runs if run.queue_class.value == "index")
+            if any(run.status.value in executing for run in index_runs):
+                indexing_state = "running"
+            elif any(run.status is TaskStatus.QUEUED for run in index_runs):
+                indexing_state = "queued"
+            else:
+                latest_index = max(index_runs, key=lambda run: run.updated_at, default=None)
+                indexing_state = (
+                    "failed" if latest_index and latest_index.status is TaskStatus.FAILED else "idle"
+                )
+            summary = {
+                "active_primary_run_id": primary.run_id if primary else None,
+                "primary_task_status": primary.status.value if primary else None,
+                "queued_task_count": sum(run.status is TaskStatus.QUEUED for run in runs),
+                "active_side_task_count": sum(
+                    run.kind.value == "side" and run.queue_class.value == "foreground"
+                    and run.status.value in executing for run in runs
+                ),
+                "pending_approval_count": len(approvals),
+                "budget_usage": {
+                    "wall_clock_seconds": sum(run.budget_usage.wall_clock_seconds for run in runs),
+                    "model_turns": sum(run.budget_usage.model_turns for run in runs),
+                    "tool_calls": sum(run.budget_usage.tool_calls for run in runs),
+                    "tokens": sum(run.budget_usage.tokens for run in runs),
+                    "cost_usd": sum(run.budget_usage.cost_usd for run in runs),
+                },
+                "indexing_state": indexing_state,
+            }
+            return {
+                "schema_version": 1,
+                "group_id": group_id,
+                "authority_epoch": str(authority["epoch"]),
+                "group_snapshot_revision": int(authority["revision"]),
+                "runs": [run.to_public_dict() for run in runs],
+                "pending_approvals": [approval.to_dict() for approval in approvals],
+                "summary": summary,
+            }
+
     def _migrate_group_live_recovery(self) -> None:
         """Collapse the preceding per-Run outbox markers into one lossless Group intent."""
         with self.db.transaction() as conn:

@@ -8,7 +8,7 @@ import { getState as getDirectoryState, openRequest } from './directoryRecovery'
 import { useRecordsStore } from './records';
 import { agentBindingKey, useSettingsStore } from './settings';
 import { useSideTaskReadStore } from './sideTaskRead';
-import { useKnoweStore } from './store';
+import { pendingTransientFrameFallbackCount, useKnoweStore } from './store';
 import { scheduleTaskRuntimeAuthorityRefresh, useTaskRuntimeStore } from './taskRuntime';
 
 const groupId = `grp_${'4'.repeat(32)}` as const;
@@ -26,6 +26,12 @@ describe('confirmed Group renderer teardown', () => {
     vi.useFakeTimers();
     const approvalId = `apr_${'3'.repeat(32)}`;
     useKnoweStore.getState().ensureProject('legacy-deleted', 'Deleted');
+    useKnoweStore.getState().applyIncrementalEvents('legacy-deleted', [
+      { type: 'agent_thinking', project_id: 'legacy-deleted', agent_id: 'coordinator', seq: 1 },
+      { type: 'message', project_id: 'legacy-deleted', agent_id: 'coordinator',
+        content: 'Late frame must not commit', seq: 2 },
+    ]);
+    expect(pendingTransientFrameFallbackCount('legacy-deleted')).toBe(1);
     useKnoweStore.getState().enterDm('legacy-deleted', 'coordinator');
     useKnowledgeStore.getState().setScope({
       groupIds: [groupId], projectIds: ['legacy-deleted'], sourceIds: [], courseId: null,
@@ -81,6 +87,7 @@ describe('confirmed Group renderer teardown', () => {
       },
     });
     vi.advanceTimersByTime(100);
+    expect(pendingTransientFrameFallbackCount('legacy-deleted')).toBe(0);
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/task-runtime/snapshot'))).toBe(false);
 
     const runtime = useTaskRuntimeStore.getState();

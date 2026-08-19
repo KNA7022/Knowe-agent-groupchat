@@ -65,6 +65,14 @@ Task 4 已把已有的 Group 与 Task Runtime 权威状态接入 Electron render
 - Knowledge Graph 与资产公开投影补充结构化 source/course ownership，不再根据自由文本猜作用域。新增路由矩阵覆盖缺 group、伪造 group/project/source/course、foreign row/detail 和 POST 越权。
 - confirmed deletion 建立持久 renderer tombstone；删除后 direct snapshot、WS event、已排队 authority timer 与控制/审批入口均零写入，同一 Group ID 不复用。统一 teardown 额外清除 source reference counts、directory recovery、records、Group/legacy approval timeout、`${legacy}::agent` model binding、snapshot/delete module cache 及所有既有 run/evidence/approval/preview/watermark 投影；跨 store 序列化测试检不出已删 group、legacy project、run 或 evidence 标识。
 
+## Round 5 最终复审修复
+
+- `TaskRuntimeStore.group_snapshot_projection` 现在在单个 SQLite transaction/lock 一致点读取 durable epoch/revision、runs 与 pending approvals，并在事务内从同一 ledger 派生主任务、队列、旁路、审批、预算与 index summary。Service 不再用多个 store 查询拼装 Group snapshot/summary。双 Service 压测交错执行 100 次 pause/resume/approval/cancel 写入和 1000 次读取；相同 revision 从未出现不同 payload，summary 逐次与 runs/approvals 一致。
+- 无 revision 的空 legacy snapshot 只允许建立一次握手；同一 renderer 生命周期内后续无版本响应不能填入 run 或覆盖投影。带 authority 的 snapshot 仍严格受 epoch/revision 整包游标控制。
+- Knowledge 窄 source/course scope 下，无法安全拆分的 Project profile GET 明确返回 403。node/asset list、search 与 detail 会裁剪混合行中的 foreign `source_ids/course_ids`，并逐条过滤嵌套 evidence/related/nodes/sources；ownerless 嵌套证据 fail closed。正式测试覆盖 valid、foreign、mixed 与 narrow profile/detail 矩阵。
+- renderer 新增共享 durable Group deletion fence 与 generation。rename/archive/restore/duplicate/bind/unbind/roster/link/unlink/runtime summary/delete preview/control/approval/reconcile/refresh 等 await 前后均校验；load/create 也按返回身份 fail closed。删除发生在请求 await 中时，迟到 rename/load/control/approval/reconcile 响应不会复活任何 Group/run/approval/error 投影。
+- teardown 现在取消 legacy transient-frame 双帧回执，清空 duplicate idempotency request cache，并且没有 legacy project 的 canonical Group 也会清除 records、Group approval timeout 与 `${groupId}::agent` model binding。正式 fake-timer/deferred-promise 测试证明回调和响应迟到后，序列化 store 不再包含已删 Group/Run/Approval。
+
 ## 自动化验证
 
 最终回归命令：
@@ -76,7 +84,7 @@ node --test scripts/python-command.test.mjs
 
 覆盖精确 Project→Group 映射/隔离、live 主任务切换、主旁路分离、terminal answer 未读、空闲折叠、公开工具投影、权威主任务与全状态控制矩阵、resync、exact run 审批、四模板默认、绑定失败不重复创建、删除 token 身份/版本、Today summary、Knowledge cross-group exclusion、canonical roster、modal inert、连续事件焦点稳定、键盘/Escape、tabs、真实索引状态和 reduced motion。
 
-最终全量为 **41 个 Vitest 文件、490 个测试全部通过**；独立 Node command 测试 **2/2 通过**；Task Runtime 全组、Knowledge scope 与 Knowledge Graph backend 回归 **226 个测试全部通过**；全仓 `npm run lint` 通过。仓库全量 TypeScript 仍含 Task 4 之前的历史错误；本轮新增或修改的行没有新增诊断，`taskRuntime`/`groupTeardown`/Knowledge contract 等本轮主体文件为 0 诊断。全 backend suite 在收集阶段仍被四个历史测试导入已不存在的 `ACTION_CONTRACT` 阻断（`test_v10182_runtime_ui.py`、`test_v22_dispatch_reliability.py`、`test_v27_weld.py`、`test_v28_weld.py`），本轮触及后端测试不包含在该失败中。
+最终全量为 **41 个 Vitest 文件、496 个测试全部通过**；独立 Node command 测试 **2/2 通过**；Task Runtime、Knowledge scope/Graph、Group store/HTTP backend 共 **251 个测试**，按稳定边界复跑为普通集合 **183/183**、quarantine isolation **68/68**；全仓 `npm run lint` 通过。仓库全量 TypeScript 仍含 Task 4 之前的历史错误；本轮新增或修改的行没有新增诊断，`taskRuntime`/`groups`/`groupTeardown`/Knowledge 等本轮主体文件为 0 诊断。全 backend suite 在收集阶段仍被四个历史测试导入已不存在的 `ACTION_CONTRACT` 阻断（`test_v10182_runtime_ui.py`、`test_v22_dispatch_reliability.py`、`test_v27_weld.py`、`test_v28_weld.py`）。251 项合并长跑两次各有一个既有 quarantine 后台重试/游标用例受 4 秒时限影响而偶发失败；对应单例与完整 quarantine 文件随后均通过，因此没有把合并长跑不稳定性虚报为单次 251/251。
 
 ## 实际渲染检查
 
@@ -94,6 +102,8 @@ Round 2 再次按同一规定流程连接，`iab` 仍返回 `Browser is not avai
 Round 3 做了本轮唯一一次 Browser 重试：复用既有 runtime 后，binding 在 documentation 阶段返回 `Browser is not available`；按 `bootstrap-troubleshooting` 只执行一次 discovery，结果仍为 `[]`。因此没有 post-fix viewport、modal hit-test 或截图证据，也没有使用 standalone Playwright 规避限制。本轮乱序 authority、80ms event retention、跨群 Knowledge detail/profile/skillpack、统一 teardown 与 side/index 语义均由自动化测试验证。
 
 Round 4 按 skill 的绝对插件路径重新初始化 Browser runtime，默认 browser selection 返回 `No browser is available`；随后读取 `bootstrap-troubleshooting` 并按要求仅执行一次 discovery，结果为 `[]`。因此本轮仍没有声称完成 900/1024/1440 post-fix hit-test 或生成截图，也没有用 standalone Playwright 绕过约束；authority cursor、严格 Knowledge 路由、删除迟到入口和 200 条事件保留均由正式自动化测试覆盖。
+
+Round 5 依照同一 skill 做了最终且唯一一次连接尝试：目标本地 demo URL 的 browser selection 返回 `No browser is available`，读取 `bootstrap-troubleshooting` 后唯一 discovery 仍为 `[]`。因此没有伪造最终 viewport、modal hit-test 或截图；本轮单事务 snapshot、narrow profile/evidence、post-await deletion fence 与 cache/timer teardown 均由正式自动化验证。
 
 ## 主要文件
 

@@ -189,6 +189,54 @@ def _row_allowed(row: dict[str, Any], project_id: str, scope: _KnowledgeScope) -
     return True
 
 
+def _sanitize_scoped_row(row: dict[str, Any], scope: _KnowledgeScope) -> dict[str, Any]:
+    """Remove ownership labels and nested evidence outside a requested narrow scope."""
+    sanitized = dict(row)
+    if scope.source_ids:
+        sanitized["source_ids"] = sorted(_structured_ids(row, "source_ids") & scope.source_ids)
+    if scope.course_id:
+        sanitized["course_ids"] = [
+            scope.course_id
+        ] if scope.course_id in _structured_ids(row, "course_ids") else []
+    narrow = bool(scope.source_ids or scope.course_id)
+    if not narrow:
+        return sanitized
+
+    def nested_allowed(item: dict[str, Any]) -> bool:
+        item_sources = set(_structured_ids(item, "source_ids"))
+        if item.get("source_id"):
+            item_sources.add(str(item["source_id"]))
+        item_courses = set(_structured_ids(item, "course_ids"))
+        if item.get("course_id"):
+            item_courses.add(str(item["course_id"]))
+        if scope.source_ids and not (item_sources & scope.source_ids):
+            return False
+        if scope.course_id and scope.course_id not in item_courses:
+            return False
+        return True
+
+    for key in ("evidence", "related", "nodes", "sources"):
+        raw_items = row.get(key)
+        if not isinstance(raw_items, list):
+            continue
+        kept: list[Any] = []
+        for item in raw_items:
+            if isinstance(item, dict) and nested_allowed(item):
+                kept.append(_sanitize_scoped_row(item, scope))
+        sanitized[key] = kept
+    return sanitized
+
+
+def _sanitize_result_row(
+    result: dict[str, Any], key: str, scope: _KnowledgeScope,
+) -> dict[str, Any]:
+    sanitized = dict(result)
+    row = sanitized.get(key)
+    if isinstance(row, dict):
+        sanitized[key] = _sanitize_scoped_row(row, scope)
+    return sanitized
+
+
 def _project_rows(scope: _KnowledgeScope | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for reg in _registrations():
@@ -231,7 +279,7 @@ def _merged_nodes(
             if isinstance(raw, dict):
                 row = {**raw, "project_id": reg.project_id}
                 if _row_allowed(row, reg.project_id, scope):
-                    nodes.append(row)
+                    nodes.append(_sanitize_scoped_row(row, scope))
     nodes.sort(key=lambda row: str(row.get("last_seen") or ""), reverse=True)
     return {"ok": True, "projects": projects, "nodes": nodes}
 
@@ -262,7 +310,7 @@ def _merged_assets(only_project: str | None, scope: _KnowledgeScope | None = Non
                 row = dict(raw)
                 row["project_id"] = reg.project_id
                 if _row_allowed(row, reg.project_id, scope):
-                    assets.append(row)
+                    assets.append(_sanitize_scoped_row(row, scope))
     assets.sort(key=lambda row: str(row.get("updated_at") or ""), reverse=True)
     return {"ok": True, "projects": projects, "assets": assets}
 
@@ -367,8 +415,8 @@ def _dispatch_get_sync(
         if reg.assets is None:
             return _fail(503, "assets_unavailable", project_id=rest[0])
         snap = reg.assets.snapshot(reg.project_id, reg.workspace_provider())
-        assets = [dict(row) for row in snap.get("assets") or [] if isinstance(row, dict)
-                  and _row_allowed(row, reg.project_id, scope)]
+        assets = [_sanitize_scoped_row(dict(row), scope) for row in snap.get("assets") or []
+                  if isinstance(row, dict) and _row_allowed(row, reg.project_id, scope)]
         return _ok({"ok": True, **snap, "assets": assets})
     if len(rest) == 3 and rest[1] == "assets":
         reg = _registration(rest[0])
@@ -380,7 +428,7 @@ def _dispatch_get_sync(
         row = result.get("asset") if isinstance(result.get("asset"), dict) else result
         if result.get("found") and not _row_allowed(row, reg.project_id, scope):
             return _fail(403, "asset_outside_group_scope", asset_id=rest[2])
-        return _ok({"ok": True, **result})
+        return _ok({"ok": True, **_sanitize_result_row(result, "asset", scope)})
     if len(rest) == 2 and rest[1] == "profile":
         reg = _registration(rest[0])
         if scope is not None and reg is not None and reg.project_id not in scope.project_ids:
@@ -389,6 +437,8 @@ def _dispatch_get_sync(
             return _fail(404, "unknown_project", project_id=rest[0])
         if reg.assets is None:
             return _fail(503, "assets_unavailable", project_id=rest[0])
+        if scope.source_ids or scope.course_id:
+            return _fail(403, "profile_outside_narrow_group_scope", project_id=rest[0])
         text = reg.assets.profile_text(reg.workspace_provider())
         return _ok({"ok": True, "project_id": reg.project_id, "text": text})
     if len(rest) == 2 and rest[1] == "nodes":
@@ -398,8 +448,8 @@ def _dispatch_get_sync(
         if reg is None:
             return _fail(404, "unknown_project", project_id=rest[0])
         snap = reg.manager.snapshot(reg.project_id, reg.workspace_provider())
-        nodes = [dict(row) for row in snap.get("nodes") or [] if isinstance(row, dict)
-                 and _row_allowed(row, reg.project_id, scope)]
+        nodes = [_sanitize_scoped_row(dict(row), scope) for row in snap.get("nodes") or []
+                 if isinstance(row, dict) and _row_allowed(row, reg.project_id, scope)]
         return _ok({"ok": True, **snap, "nodes": nodes})
     if len(rest) == 2 and rest[1] == "search":
         reg = _registration(rest[0])
@@ -412,8 +462,8 @@ def _dispatch_get_sync(
         result = reg.manager.search(reg.project_id, reg.workspace_provider(), q, limit=limit)
         for key in ("results", "hits", "nodes"):
             if isinstance(result.get(key), list):
-                result[key] = [row for row in result[key] if isinstance(row, dict)
-                               and _row_allowed(row, reg.project_id, scope)]
+                result[key] = [_sanitize_scoped_row(row, scope) for row in result[key]
+                               if isinstance(row, dict) and _row_allowed(row, reg.project_id, scope)]
         return _ok({"ok": True, **result})
     if len(rest) == 2 and rest[1] == "node":
         reg = _registration(rest[0])
@@ -426,7 +476,7 @@ def _dispatch_get_sync(
         row = result.get("node") if isinstance(result.get("node"), dict) else result
         if result.get("found") and not _row_allowed(row, reg.project_id, scope):
             return _fail(403, "node_outside_group_scope", ref=ref)
-        return _ok({"ok": True, **result})
+        return _ok({"ok": True, **_sanitize_result_row(result, "node", scope)})
     return _fail(404, "not_found")
 
 

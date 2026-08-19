@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Group } from '../contract/group';
-import { useGroupStore } from './groups';
+import { pendingGroupRequestCacheCount, useGroupStore } from './groups';
+import { fenceDeletedGroup } from './groupDeletionFence';
+import { teardownGroup } from './groupTeardown';
+import { useRecordsStore } from './records';
+import { agentBindingKey, useSettingsStore } from './settings';
 
 const firstId = `grp_${'1'.repeat(32)}` as const;
 const secondId = `grp_${'2'.repeat(32)}` as const;
@@ -212,5 +216,85 @@ describe('canonical Group store', () => {
       .rejects.toThrow();
     expect(useGroupStore.getState().groups).toEqual(beforeGroups);
     expect(useGroupStore.getState().sourceReferenceCounts).toEqual(beforeCounts);
+  });
+
+  it('does not resurrect a Group when rename or load resolves after deletion', async () => {
+    const renamedId = `grp_${'e'.repeat(32)}` as typeof firstId;
+    const loadedId = `grp_${'f'.repeat(32)}` as typeof firstId;
+    const deletedRename = structuredClone(group(firstId));
+    deletedRename.group_id = renamedId;
+    deletedRename.name = 'Deleted rename';
+    deletedRename.roster = deletedRename.roster.map((agent) => ({ ...agent, group_id: renamedId }));
+    useGroupStore.getState().ingest([deletedRename]);
+
+    let resolveRename!: (response: Response) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => { resolveRename = resolve; })));
+    const rename = useGroupStore.getState().renameGroup(renamedId, 'Late name');
+    await vi.waitFor(() => expect(resolveRename).toBeTypeOf('function'));
+    fenceDeletedGroup(renamedId);
+    useGroupStore.setState((state) => {
+      const groups = { ...state.groups }; delete groups[renamedId];
+      return { groups, order: state.order.filter((id) => id !== renamedId) };
+    });
+    resolveRename(new Response(JSON.stringify({
+      group: { ...deletedRename, name: 'Late name', updated_at: '2026-08-18T00:00:01Z' },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    await expect(rename).rejects.toThrow(/deleted/i);
+    expect(useGroupStore.getState().groups[renamedId]).toBeUndefined();
+
+    const deletedLoad = structuredClone(group(firstId));
+    deletedLoad.group_id = loadedId;
+    deletedLoad.name = 'Deleted load';
+    deletedLoad.roster = deletedLoad.roster.map((agent) => ({ ...agent, group_id: loadedId }));
+    let resolveLoad!: (response: Response) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => { resolveLoad = resolve; })));
+    const load = useGroupStore.getState().load();
+    await vi.waitFor(() => expect(resolveLoad).toBeTypeOf('function'));
+    fenceDeletedGroup(loadedId);
+    resolveLoad(new Response(JSON.stringify({ groups: [deletedLoad] }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }));
+    await load;
+    expect(useGroupStore.getState().groups[loadedId]).toBeUndefined();
+    expect(JSON.stringify(useGroupStore.getState())).not.toContain(loadedId);
+  });
+
+  it('teardown clears an in-flight duplicate idempotency cache', async () => {
+    const deletedId = `grp_${'b'.repeat(32)}` as typeof firstId;
+    const seeded = structuredClone(group(firstId));
+    seeded.group_id = deletedId;
+    seeded.roster = seeded.roster.map((agent) => ({ ...agent, group_id: deletedId }));
+    useGroupStore.getState().ingest([seeded]);
+    useSettingsStore.setState((state) => ({
+      groupApprovalTimeouts: { ...state.groupApprovalTimeouts, [deletedId]: 30 },
+      agentModels: { ...state.agentModels, [agentBindingKey(deletedId, 'expert')]: {
+        provider: 'openai', model: 'test', apiKey: '', hasApiKey: false, clearApiKey: false,
+        baseUrl: '', sealed: true,
+      } },
+    }));
+    useRecordsStore.setState({ open: true, items: [{ seq: 1, type: 'message', agent_id: 'agent',
+      content: deletedId, ts: null, has_files: false, has_images: false,
+      has_videos: false, has_links: false }], handoffs: [] });
+    let resolveDuplicate!: (response: Response) => void;
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => (
+      String(input).includes('/groups/duplicate')
+        ? new Promise<Response>((resolve) => { resolveDuplicate = resolve; })
+        : Promise.resolve(new Response(JSON.stringify({ ok: true }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        }))
+    )));
+    const duplicate = useGroupStore.getState().duplicateGroup(deletedId, 'D:\\StudyCrew\\copy');
+    await vi.waitFor(() => expect(resolveDuplicate).toBeTypeOf('function'));
+    expect(pendingGroupRequestCacheCount(deletedId)).toBe(1);
+    teardownGroup(deletedId);
+    expect(pendingGroupRequestCacheCount(deletedId)).toBe(0);
+    expect(useSettingsStore.getState().groupApprovalTimeouts[deletedId]).toBeUndefined();
+    expect(useSettingsStore.getState().agentModels[agentBindingKey(deletedId, 'expert')]).toBeUndefined();
+    expect(useRecordsStore.getState().items).toEqual([]);
+    resolveDuplicate(new Response(JSON.stringify({ group: group(secondId) }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }));
+    await expect(duplicate).rejects.toThrow(/deleted/i);
+    expect(JSON.stringify(useGroupStore.getState())).not.toContain(deletedId);
   });
 });

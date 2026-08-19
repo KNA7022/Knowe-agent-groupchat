@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import threading
 
 import pytest
 
@@ -87,6 +89,70 @@ def test_group_snapshot_authority_cursor_is_monotonic_and_durable(tmp_path: Path
         assert durable["group_snapshot_revision"] >= advanced["group_snapshot_revision"]
     finally:
         reopened.close()
+
+
+def test_group_snapshot_is_atomic_across_two_services_under_100_writes_1000_reads(
+    tmp_path: Path,
+) -> None:
+    groups = GroupRepository(tmp_path)
+    group = groups.create_group("Atomic projection")
+    writer = TaskRuntimeService(tmp_path, groups)
+    reader = TaskRuntimeService(tmp_path, groups)
+    run = writer.submit(group.group_id, title="Interleaved", request_key="atomic-submit")
+    writer.schedule()
+    failures: list[BaseException] = []
+    start = threading.Barrier(2)
+
+    def mutate() -> None:
+        try:
+            start.wait()
+            for index in range(100):
+                if index == 50:
+                    approval = writer.request_approval(
+                        group.group_id, run.run_id, kind="tool", summary="Check atomic approval",
+                        risk=RiskLevel.LOW, request_key=f"atomic-approval-{index}",
+                        requested_capabilities=("read",), purpose="atomic_test",
+                    )
+                    writer.resolve_approval(
+                        group.group_id, approval.approval_id, approved=True,
+                        request_key=f"atomic-resolve-{index}",
+                    )
+                    writer.schedule()
+                else:
+                    writer.pause(group.group_id, run.run_id, request_key=f"atomic-pause-{index}")
+                    writer.resume(group.group_id, run.run_id, request_key=f"atomic-resume-{index}")
+            writer.cancel(group.group_id, run.run_id, request_key="atomic-cancel")
+        except BaseException as exc:  # pragma: no cover - re-raised by the main assertion
+            failures.append(exc)
+
+    thread = threading.Thread(target=mutate, daemon=True)
+    thread.start()
+    start.wait()
+    seen: dict[int, str] = {}
+    for _ in range(1000):
+        snapshot = reader.group_snapshot(group.group_id)
+        revision = int(snapshot["group_snapshot_revision"])
+        encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+        assert seen.setdefault(revision, encoded) == encoded
+        runs = snapshot["runs"]
+        approvals = snapshot["pending_approvals"]
+        assert snapshot["summary"]["pending_approval_count"] == len(approvals)
+        assert snapshot["summary"]["queued_task_count"] == sum(
+            item["status"] == "queued" for item in runs
+        )
+        active = [item for item in runs if item["kind"] == "primary" and item["status"] not in {
+            "succeeded", "partial", "failed", "cancelled",
+        }]
+        assert snapshot["summary"]["active_primary_run_id"] == (
+            active[-1]["run_id"] if active else None
+        )
+    thread.join(timeout=20)
+    try:
+        assert not thread.is_alive()
+        assert failures == []
+    finally:
+        writer.close()
+        reader.close()
 
 
 def test_state_machine_rejects_invalid_transitions_and_requires_verifier(runtime) -> None:

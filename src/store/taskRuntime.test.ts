@@ -378,4 +378,85 @@ describe('authoritative Task Runtime projection', () => {
       active_side_task_count: 0, indexing_state: 'failed',
     });
   });
+
+  it('allows an unversioned empty legacy handshake exactly once', () => {
+    const legacyGroup = `grp_${'c'.repeat(32)}` as const;
+    const legacyRun = `run_${'c'.repeat(32)}`;
+    const summary = {
+      active_primary_run_id: null, primary_task_status: null, queued_task_count: 0,
+      active_side_task_count: 0, pending_approval_count: 0,
+      budget_usage: { wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0 },
+      indexing_state: 'idle',
+    };
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(legacyGroup, {
+      schema_version: 1, group_id: legacyGroup, runs: [], pending_approvals: [], summary,
+    });
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(legacyGroup, {
+      schema_version: 1, group_id: legacyGroup,
+      runs: [taskRunFixture({ group_id: legacyGroup, run_id: legacyRun,
+        task_id: `task_${'c'.repeat(32)}` })], pending_approvals: [], summary,
+    });
+    expect(useTaskRuntimeStore.getState().byGroup[legacyGroup]).toEqual([]);
+    expect(useTaskRuntimeStore.getState().byRun[legacyRun]).toBeUndefined();
+  });
+
+  it.each(['control', 'approval', 'reconcile'] as const)(
+    'drops a late %s response after its Group is deletion-fenced', async (kind) => {
+      const digit = kind === 'control' ? 'd' : kind === 'approval' ? 'e' : 'f';
+      const deletedGroup = `grp_${digit.repeat(32)}` as const;
+      const deletedRun = `run_${digit.repeat(32)}`;
+      const approvalId = `apr_${digit.repeat(32)}`;
+      const seededRun = taskRunFixture({
+        group_id: deletedGroup, run_id: deletedRun, task_id: `task_${digit.repeat(32)}`,
+        ...(kind === 'approval' ? { status: 'waiting_approval' as const } : {}),
+      }) as Record<string, unknown>;
+      const approval = {
+        approval_id: approvalId, run_id: deletedRun, group_id: deletedGroup,
+        kind: 'tool', summary: 'Confirm', risk: 'high', requested_capabilities: ['send'],
+        tool_name: 'send', operation_scope: {}, purpose: 'send', expires_at: null,
+        status: 'pending', created_at: '2026-08-18T00:00:00Z', resolved_at: null,
+        schema_version: 1,
+      };
+      useTaskRuntimeStore.getState().ingestGroupSnapshot(deletedGroup, {
+        schema_version: 1, group_id: deletedGroup,
+        authority_epoch: `epoch_${digit.repeat(32)}`, group_snapshot_revision: 1,
+        runs: [seededRun], pending_approvals: kind === 'approval' ? [approval] : [],
+        summary: {
+          active_primary_run_id: deletedRun,
+          primary_task_status: kind === 'approval' ? 'waiting_approval' : 'running',
+          queued_task_count: 0, active_side_task_count: 0,
+          pending_approval_count: kind === 'approval' ? 1 : 0,
+          budget_usage: { wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0 },
+          indexing_state: 'idle',
+        },
+      });
+      let resolveFetch!: (response: Response) => void;
+      vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => { resolveFetch = resolve; })));
+      const action = kind === 'control'
+        ? useTaskRuntimeStore.getState().control(deletedGroup, deletedRun, 'pause')
+        : kind === 'approval'
+          ? useTaskRuntimeStore.getState().resolveApproval(
+            deletedGroup, deletedRun, approvalId, true,
+          )
+          : useTaskRuntimeStore.getState().reconcile(deletedGroup, deletedRun);
+      await vi.waitFor(() => expect(resolveFetch).toBeTypeOf('function'));
+      useTaskRuntimeStore.getState().teardownGroupProjection(deletedGroup);
+      const payload = kind === 'control'
+        ? { run: { ...seededRun, status: 'paused', version: 2, last_seq: 2 } }
+        : kind === 'approval'
+          ? { run: { ...seededRun, status: 'queued', version: 2, last_seq: 2 },
+            approval: { ...approval, status: 'approved', resolved_at: '2026-08-18T00:00:01Z' } }
+          : { schema_version: 1, group_id: deletedGroup, run_id: deletedRun,
+            after_seq: 1, last_seq: 1, version: 1, gap: false, events: [], snapshot: null };
+      resolveFetch(new Response(JSON.stringify(payload), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }));
+      if (kind === 'reconcile') await expect(action).resolves.toBeUndefined();
+      else await expect(action).rejects.toThrow(/deleted/i);
+      const serialized = JSON.stringify(useTaskRuntimeStore.getState());
+      expect(serialized).not.toContain(deletedGroup);
+      expect(serialized).not.toContain(deletedRun);
+      expect(serialized).not.toContain(approvalId);
+    },
+  );
 });

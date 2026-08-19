@@ -1,5 +1,5 @@
 import type { GroupId } from '../contract/group';
-import { useGroupStore } from './groups';
+import { clearGroupRequestCaches, useGroupStore } from './groups';
 import { useKnowledgeStore } from './knowledge';
 import { resolve as resolveDirectoryRecovery } from './directoryRecovery';
 import { useRecordsStore } from './records';
@@ -12,6 +12,7 @@ import { useTaskRuntimeStore } from './taskRuntime';
 
 /** Purge every renderer projection only after the backend confirms durable deletion. */
 export function teardownGroup(groupId: GroupId, legacyProjectId?: string | null): void {
+  clearGroupRequestCaches(groupId);
   useGroupStore.setState((state) => {
     const groups = { ...state.groups }; delete groups[groupId];
     const runtimeSummaries = { ...state.runtimeSummaries }; delete runtimeSummaries[groupId];
@@ -22,10 +23,6 @@ export function teardownGroup(groupId: GroupId, legacyProjectId?: string | null)
   const runIds = useTaskRuntimeStore.getState().teardownGroupProjection(groupId);
   useSideTaskReadStore.getState().clearRuns(runIds);
   useKnowledgeStore.getState().teardownGroupScope(groupId, legacyProjectId);
-  if (!legacyProjectId) return;
-
-  resolveDirectoryRecovery(legacyProjectId);
-  teardownLegacyProjectCaches(legacyProjectId);
   useRecordsStore.setState({
     open: false, items: [], handoffs: [], total: 0, page: 1, loading: false,
     handoffsLoading: false, jumpSeq: null, error: null,
@@ -33,12 +30,17 @@ export function teardownGroup(groupId: GroupId, legacyProjectId?: string | null)
   useSettingsStore.setState((state) => {
     const groupApprovalTimeouts = { ...state.groupApprovalTimeouts };
     delete groupApprovalTimeouts[groupId];
-    delete groupApprovalTimeouts[legacyProjectId];
+    if (legacyProjectId) delete groupApprovalTimeouts[legacyProjectId];
     const agentModels = Object.fromEntries(Object.entries(state.agentModels)
-      .filter(([key]) => !key.startsWith(`${legacyProjectId}::`) && !key.startsWith(`${groupId}::`)));
+      .filter(([key]) => !key.startsWith(`${groupId}::`)
+        && (!legacyProjectId || !key.startsWith(`${legacyProjectId}::`))));
     return { groupApprovalTimeouts, agentModels, modelApplyState: 'stale' };
   });
   void useSettingsStore.getState().pushToBackend().catch(() => undefined);
+  if (!legacyProjectId) return;
+
+  resolveDirectoryRecovery(legacyProjectId);
+  teardownLegacyProjectCaches(legacyProjectId);
 
   useKnoweStore.setState((state) => {
     const belongs = (conversationId: string): boolean => conversationId === legacyProjectId

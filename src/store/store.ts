@@ -47,34 +47,48 @@ import {
 } from './state';
 import i18n from '../i18n';
 
-const _transientFrameFallbacks = new Set<string>();
+const _transientFrameFallbacks = new Map<string, () => void>();
 
 /**
  * 未挂载/后台会话没有 StreamBubble 可回执首帧；双 RAF 后按同一路径确认，既给当前
  * renderer 留出真实 paint 机会，也保证临时态不会永久卡住。测试/SSR 无 RAF 时用约
  * 两帧的定时器兜底。
  */
-function afterTwoPaints(callback: () => void): void {
+function afterTwoPaints(callback: () => void): () => void {
   const raf = typeof globalThis.requestAnimationFrame === 'function'
     ? globalThis.requestAnimationFrame.bind(globalThis)
     : null;
   if (!raf) {
-    setTimeout(callback, 34);
-    return;
+    const timer = setTimeout(callback, 34);
+    return () => clearTimeout(timer);
   }
-  raf(() => { raf(callback); });
+  let second: number | null = null;
+  let cancelled = false;
+  const first = raf(() => {
+    if (!cancelled) second = raf(() => { if (!cancelled) callback(); });
+  });
+  return () => {
+    cancelled = true;
+    globalThis.cancelAnimationFrame?.(first);
+    if (second !== null) globalThis.cancelAnimationFrame?.(second);
+  };
 }
 
 function scheduleTransientFrameFallback(projectId: string, frameIds: string[]): void {
   for (const frameId of frameIds) {
     const key = `${projectId}\u0000${frameId}`;
     if (_transientFrameFallbacks.has(key)) continue;
-    _transientFrameFallbacks.add(key);
-    afterTwoPaints(() => {
+    const cancel = afterTwoPaints(() => {
       _transientFrameFallbacks.delete(key);
       useKnoweStore.getState().ackTransientFrame(projectId, frameId);
     });
+    _transientFrameFallbacks.set(key, cancel);
   }
+}
+
+export function pendingTransientFrameFallbackCount(projectId: string): number {
+  return [..._transientFrameFallbacks.keys()]
+    .filter((key) => key.startsWith(`${projectId}\u0000`)).length;
 }
 
 /**
@@ -137,6 +151,11 @@ export function teardownLegacyProjectCaches(projectId: string): void {
     if (progress.projectId !== projectId) continue;
     clearTimeout(progress.timer);
     _deleteProgress.delete(operationId);
+  }
+  for (const [key, cancel] of _transientFrameFallbacks) {
+    if (!key.startsWith(`${projectId}\u0000`)) continue;
+    cancel();
+    _transientFrameFallbacks.delete(key);
   }
 }
 
