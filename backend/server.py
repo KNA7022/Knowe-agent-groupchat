@@ -1274,9 +1274,9 @@ class KnoweServer:
                     if item[0] != group_id
                 }
                 self._normalize_client_recovery_slots_locked(client)
-        if self.task_runtime is not None and confirmed_group_delete:
-            self.task_runtime.store.clear_group_live_recovery(group_id)
-            self.task_runtime.store.clear_group_live_publication(group_id)
+        # Durable recovery/publication rows are deleted only by the authenticated
+        # TaskRuntimeService deletion state machine.  This method prunes in-memory
+        # bridge state after that state machine has completed.
 
     @staticmethod
     def _client_recovery_keys(client: Client) -> set[tuple[str, str, int]]:
@@ -8096,6 +8096,16 @@ class KnoweServer:
         stage = str(transaction.get("stage") or "prepared")
         runtime_cleanup: dict[str, int] = {}
         if self.task_runtime is not None and stage != "committed":
+            runtime_intent_exists = any(
+                item["group_id"] == group_id
+                for item in self.task_runtime.store.group_deletion_intents()
+            )
+            if stage == "prepared" and not runtime_intent_exists:
+                self.task_runtime.suspend_group_for_deletion(
+                    group_id, str(transaction["transaction_id"]),
+                    reason="Group deletion confirmed",
+                )
+                await self._task_runtime_delete_boundary("after_runtime_suspend", group_id)
             self.task_runtime.prepare_group_deletion(
                 group_id, str(transaction["transaction_id"]),
             )
@@ -8143,19 +8153,35 @@ class KnoweServer:
     async def _reconcile_task_runtime_group_deletions(self) -> None:
         if self.task_runtime is None or self.groups is None:
             return
-        runtime_intents = {
-            intent["group_id"]: intent
-            for intent in self.task_runtime.store.group_deletion_intents()
+        reports = {
+            item["group_id"]: item
+            for item in self.task_runtime.reconcile_group_deletions()
         }
+        for item in reports.values():
+            if item.get("status") == "quarantined":
+                log.error(
+                    "Quarantined orphan Task Runtime deletion intent for %s (%s)",
+                    item["group_id"], item.get("reason", "invalid proof"),
+                )
         group_transactions = {
             str(transaction["group_id"]): transaction
             for transaction in self.groups.pending_delete_transactions()
         }
-        for group_id in sorted(set(runtime_intents) | set(group_transactions)):
+        candidates = set(group_transactions) | {
+            group_id for group_id, item in reports.items()
+            if item.get("status") != "quarantined"
+        }
+        for group_id in sorted(candidates):
             transaction = self.groups.delete_transaction(group_id)
             if transaction is None:
-                # Group commit may have completed before the Task Runtime final marker.
-                self.task_runtime.complete_group_deletion(group_id)
+                # Absence is never evidence of a commit. The service has already
+                # quarantined any orphan runtime intent and preserved its content.
+                log.error(
+                    "Canonical Group deletion proof missing for runtime intent %s",
+                    group_id,
+                )
+                continue
+            if reports.get(group_id, {}).get("status") == "complete":
                 self._prune_task_runtime_bridge_group(
                     group_id, confirmed_group_delete=True,
                 )

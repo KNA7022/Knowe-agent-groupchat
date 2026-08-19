@@ -412,8 +412,14 @@ def test_group_deletion_removes_runtime_events_approvals_tools_and_checkpoints(r
         operation_scope={"target": "workspace"}, purpose="delete_test",
     )
     service.suspend_group(group.group_id, reason="Delete")
-    service.prepare_group_deletion(group.group_id, "txn_delete_runtime_content")
     preview = groups.delete_preview(group.group_id)
+    transaction = groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id=str(group.legacy_project_id or group.group_id),
+    )
+    service.prepare_group_deletion(
+        group.group_id, str(transaction["transaction_id"]),
+    )
     groups.confirmed_delete(group.group_id, preview.confirmation_token)
     counts = service.delete_group_data(group.group_id)
     assert counts["runs"] > 0 and counts["events"] > 0

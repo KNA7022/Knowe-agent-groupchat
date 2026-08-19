@@ -190,7 +190,11 @@ class TaskRuntimeStore:
             CREATE TABLE IF NOT EXISTS studycrew_group_deletions (
                 group_id TEXT PRIMARY KEY,
                 group_transaction_id TEXT NOT NULL,
+                group_proof_digest TEXT NOT NULL DEFAULT '',
+                confirmation_token TEXT NOT NULL DEFAULT '',
+                runtime_project_id TEXT NOT NULL DEFAULT '',
                 stage TEXT NOT NULL,
+                audit_code TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -258,6 +262,12 @@ class TaskRuntimeStore:
         self.db.ensure_columns("studycrew_approvals", {"request_key": "TEXT"})
         self.db.ensure_columns("studycrew_checkpoints", {"idempotency_key": "TEXT"})
         self.db.ensure_columns("studycrew_migration_tombstones", {"winner_id": "TEXT NOT NULL DEFAULT ''"})
+        self.db.ensure_columns("studycrew_group_deletions", {
+            "group_proof_digest": "TEXT NOT NULL DEFAULT ''",
+            "confirmation_token": "TEXT NOT NULL DEFAULT ''",
+            "runtime_project_id": "TEXT NOT NULL DEFAULT ''",
+            "audit_code": "TEXT NOT NULL DEFAULT ''",
+        })
         self._migrate_group_live_recovery()
         self.db.ensure_columns("studycrew_live_recovery", {
             "affected_run_id": "TEXT NOT NULL DEFAULT ''",
@@ -1333,24 +1343,79 @@ class TaskRuntimeStore:
             schema_version=int(raw.get("schema_version") or 1),
         )
 
-    def prepare_group_deletion(self, group_id: str, group_transaction_id: str) -> dict[str, str]:
+    def prepare_group_deletion(
+        self, group_id: str, group_transaction_id: str, *,
+        group_proof_digest: str, confirmation_token: str,
+        runtime_project_id: str,
+    ) -> dict[str, str]:
+        if not group_proof_digest or not confirmation_token or not runtime_project_id:
+            raise RuntimeStoreError("canonical Group deletion proof is required")
         now = utc_now()
         with self.db.transaction() as conn:
             conn.execute(
                 """INSERT INTO studycrew_group_deletions(
-                       group_id, group_transaction_id, stage, created_at, updated_at
-                   ) VALUES (?, ?, 'prepared', ?, ?)
+                       group_id, group_transaction_id, group_proof_digest,
+                       confirmation_token, runtime_project_id, stage, audit_code,
+                       created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, 'prepared', '', ?, ?)
                    ON CONFLICT(group_id) DO NOTHING""",
-                (group_id, group_transaction_id, now, now),
+                (
+                    group_id, group_transaction_id, group_proof_digest,
+                    confirmation_token, runtime_project_id, now, now,
+                ),
             )
             row = conn.execute(
                 "SELECT * FROM studycrew_group_deletions WHERE group_id=?", (group_id,),
             ).fetchone()
-        if row is None or str(row["group_transaction_id"]) != group_transaction_id:
+        if row is None or any((
+            str(row["group_transaction_id"]) != group_transaction_id,
+            str(row["group_proof_digest"]) != group_proof_digest,
+            str(row["confirmation_token"]) != confirmation_token,
+            str(row["runtime_project_id"]) != runtime_project_id,
+        )):
             raise RuntimeStoreError("group deletion intent conflicts with existing transaction")
         return {key: str(row[key]) for key in row.keys()}
 
+    def bind_group_deletion_proof(
+        self, group_id: str, group_transaction_id: str, *,
+        group_proof_digest: str, confirmation_token: str,
+        runtime_project_id: str,
+    ) -> dict[str, str]:
+        """Backfill proof only for an exact legacy runtime intent."""
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE studycrew_group_deletions
+                   SET group_proof_digest=?, confirmation_token=?, runtime_project_id=?,
+                       audit_code='', updated_at=?
+                   WHERE group_id=? AND group_transaction_id=?
+                     AND group_proof_digest='' AND confirmation_token=''
+                     AND runtime_project_id=''""",
+                (
+                    group_proof_digest, confirmation_token, runtime_project_id,
+                    utc_now(), group_id, group_transaction_id,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM studycrew_group_deletions WHERE group_id=?", (group_id,),
+            ).fetchone()
+        if cursor.rowcount != 1 or row is None:
+            raise RuntimeStoreError("legacy Group deletion proof cannot be bound")
+        return {key: str(row[key]) for key in row.keys()}
+
+    def quarantine_group_deletion(self, group_id: str, audit_code: str) -> None:
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """UPDATE studycrew_group_deletions
+                   SET stage='quarantined', audit_code=?, updated_at=?
+                   WHERE group_id=?""",
+                (str(audit_code)[:120], utc_now(), group_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeStoreError(f"group deletion intent not found: {group_id}")
+
     def set_group_deletion_stage(self, group_id: str, stage: str) -> None:
+        if stage not in {"runtime_cleaned", "complete"}:
+            raise RuntimeStoreError("invalid Task Runtime deletion stage")
         with self.db.transaction() as conn:
             cursor = conn.execute(
                 "UPDATE studycrew_group_deletions SET stage=?, updated_at=? WHERE group_id=?",
@@ -1906,7 +1971,9 @@ class TaskRuntimeStore:
         with self.db.transaction() as conn:
             deletion = conn.execute(
                 """SELECT 1 FROM studycrew_group_deletions
-                   WHERE group_id=? LIMIT 1""",
+                   WHERE group_id=? AND group_proof_digest!=''
+                     AND stage IN ('prepared', 'runtime_cleaned', 'complete')
+                   LIMIT 1""",
                 (group_id,),
             ).fetchone()
             if deletion is None:
@@ -2073,7 +2140,9 @@ class TaskRuntimeStore:
         with self.db.transaction() as conn:
             deletion = conn.execute(
                 """SELECT 1 FROM studycrew_group_deletions
-                   WHERE group_id=? LIMIT 1""",
+                   WHERE group_id=? AND group_proof_digest!=''
+                     AND stage IN ('prepared', 'runtime_cleaned', 'complete')
+                   LIMIT 1""",
                 (group_id,),
             ).fetchone()
             if deletion is None:

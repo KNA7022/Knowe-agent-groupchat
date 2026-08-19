@@ -448,14 +448,21 @@ def test_group_deletion_atomically_cleans_bridge_rows_and_rolls_back_fault(tmp_p
     server.task_runtime.store.record_live_publication(
         run_id=run.run_id, group_id=group.group_id, last_seq=1,
     )
-    server.task_runtime.prepare_group_deletion(group.group_id, "txn_delete_bridge")
+    preview = server.groups.delete_preview(group.group_id)
+    transaction = server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id=str(group.legacy_project_id or group.group_id),
+    )
+    server.task_runtime.prepare_group_deletion(
+        group.group_id, str(transaction["transaction_id"]),
+    )
     with server.task_runtime.store.db.transaction() as conn:
         conn.execute(
             """CREATE TRIGGER fail_group_delete BEFORE DELETE ON studycrew_task_runs
                BEGIN SELECT RAISE(ABORT, 'fault boundary'); END""",
         )
     with pytest.raises(sqlite3.DatabaseError, match="fault boundary"):
-        server.task_runtime.complete_group_deletion(group.group_id)
+        server.task_runtime.clean_prepared_group_deletion(group.group_id)
     counts = server.task_runtime.store.group_content_counts(group.group_id)
     assert counts["runs"] == counts["live_recovery"] == counts["live_publication"] == 1
     debt = server.task_runtime.store.live_recovery(group.group_id)
@@ -468,6 +475,9 @@ def test_group_deletion_atomically_cleans_bridge_rows_and_rolls_back_fault(tmp_p
     assert intent["stage"] != "complete"
     with server.task_runtime.store.db.transaction() as conn:
         conn.execute("DROP TRIGGER fail_group_delete")
+    server.task_runtime.clean_prepared_group_deletion(group.group_id)
+    server.groups.mark_runtime_deleted(str(transaction["transaction_id"]))
+    server.groups.commit_delete(str(transaction["transaction_id"]))
     server.task_runtime.complete_group_deletion(group.group_id)
     assert not any(server.task_runtime.store.group_content_counts(group.group_id).values())
     assert server.task_runtime.store.live_recovery_dirty_count(group.group_id) == 0

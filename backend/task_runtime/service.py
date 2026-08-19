@@ -225,9 +225,12 @@ class TaskRuntimeService:
         idempotency_key: str, summary: str = "", blocking_reason: str = "",
         failure_type: FailureType | None = None,
         _transaction_hook: Any | None = None,
+        _allow_deleting: bool = False,
     ) -> TaskRun:
         with self._lock:
-            current = self._owned_run(run_id, group_id)
+            current = self._owned_run(
+                run_id, group_id, allow_deleting=_allow_deleting,
+            )
             if self.store.event_by_key(run_id, idempotency_key) is not None:
                 return current
 
@@ -1117,10 +1120,9 @@ class TaskRuntimeService:
             ) else "idle"),
         }
 
-    def suspend_group(self, group_id: str, *, reason: str) -> tuple[str, ...]:
-        """Fence all work before a Group archive/delete lifecycle transition."""
-        canonical = self._canonical_group(group_id, require_active=True)
-        self._assert_group_mutable(canonical)
+    def _suspend_group_runs(
+        self, canonical: str, *, reason: str, allow_deleting: bool,
+    ) -> tuple[str, ...]:
         changed: list[str] = []
         with self._lock:
             for run in self.store.list_runs(group_id=canonical, statuses=_NONTERMINAL):
@@ -1134,27 +1136,151 @@ class TaskRuntimeService:
                     canonical, run.run_id, target,
                     idempotency_key=f"group-suspend:{run.run_id}:{run.version}",
                     summary=reason, blocking_reason=reason,
+                    _allow_deleting=allow_deleting,
                 )
                 changed.append(run.run_id)
             self.store.revoke_group_grants(canonical)
         self.schedule()
         return tuple(changed)
 
+    def suspend_group(self, group_id: str, *, reason: str) -> tuple[str, ...]:
+        """Fence all work before a non-destructive Group archive transition."""
+        canonical = self._canonical_group(group_id, require_active=True)
+        self._assert_group_mutable(canonical)
+        return self._suspend_group_runs(
+            canonical, reason=reason, allow_deleting=False,
+        )
+
+    def suspend_group_for_deletion(
+        self, group_id: str, group_transaction_id: str, *, reason: str,
+    ) -> tuple[str, ...]:
+        """Fence work only for the exact user-confirmed canonical delete intent."""
+        canonical = self._canonical_group(group_id)
+        _transaction, proof = self._canonical_group_deletion_transaction(
+            canonical, group_transaction_id,
+            allowed_stages={"prepared", "runtime_deleted"},
+        )
+        intent = next((
+            item for item in self.store.group_deletion_intents()
+            if item["group_id"] == canonical
+        ), None)
+        if intent is not None and any((
+            intent["group_transaction_id"] != group_transaction_id,
+            intent.get("group_proof_digest") != proof,
+            intent.get("stage") not in {"prepared"},
+        )):
+            raise RuntimeConflictError("Task Runtime deletion proof mismatch")
+        return self._suspend_group_runs(
+            canonical, reason=reason, allow_deleting=True,
+        )
+
     def delete_group_data(self, group_id: str) -> dict[str, int]:
         """Called only after the Group repository committed its deletion receipt."""
         with self._lock:
+            self._validated_runtime_group_deletion(
+                str(group_id), canonical_stages={"committed"},
+                runtime_stages={"prepared", "runtime_cleaned", "complete"},
+            )
             return self.store.delete_group(str(group_id))
 
     def prepare_group_deletion(self, group_id: str, group_transaction_id: str) -> dict[str, str]:
         canonical = self._canonical_group(group_id)
-        return self.store.prepare_group_deletion(canonical, group_transaction_id)
+        transaction, proof = self._canonical_group_deletion_transaction(
+            canonical, group_transaction_id,
+            allowed_stages={"prepared", "runtime_deleted"},
+        )
+        return self.store.prepare_group_deletion(
+            canonical, group_transaction_id,
+            group_proof_digest=proof,
+            confirmation_token=str(transaction["confirmation_token"]),
+            runtime_project_id=str(transaction["runtime_project_id"]),
+        )
 
-    def clean_prepared_group_deletion(self, group_id: str) -> dict[str, int]:
-        intents = {item["group_id"]: item for item in self.store.group_deletion_intents()}
-        intent = intents.get(group_id)
+    @staticmethod
+    def _group_deletion_proof(transaction: Mapping[str, Any]) -> str:
+        receipt = transaction.get("receipt")
+        if not isinstance(receipt, Mapping):
+            raise RuntimeConflictError("canonical Group deletion receipt proof is missing")
+        required = (
+            transaction.get("transaction_id"), transaction.get("group_id"),
+            transaction.get("runtime_project_id"), transaction.get("confirmation_token"),
+            receipt.get("receipt_id"), receipt.get("group_id"),
+        )
+        if not all(str(value or "") for value in required):
+            raise RuntimeConflictError("canonical Group deletion proof is incomplete")
+        # Stage/timestamps and the final deleted-source set are the only fields the
+        # Group state machine is allowed to change.  Hash everything else so a
+        # modified source scope, receipt count, identity, or confirmation token
+        # cannot inherit the original Task Runtime authorization.
+        proof = dict(transaction)
+        proof.pop("stage", None)
+        proof.pop("updated_at", None)
+        proof_receipt = dict(receipt)
+        proof_receipt.pop("deleted_source_ids", None)
+        proof["receipt"] = proof_receipt
+        return hashlib.sha256(
+            json.dumps(proof, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        ).hexdigest()
+
+    def _canonical_group_deletion_transaction(
+        self, group_id: str, group_transaction_id: str, *,
+        allowed_stages: set[str],
+    ) -> tuple[dict[str, Any], str]:
+        transaction = self.groups.delete_transaction(group_id)
+        if transaction is None:
+            raise RuntimeConflictError("canonical Group deletion transaction is required")
+        if str(transaction.get("group_id") or "") != group_id:
+            raise RuntimeConflictError("canonical Group deletion identity mismatch")
+        if str(transaction.get("transaction_id") or "") != group_transaction_id:
+            raise RuntimeConflictError("canonical Group deletion transaction mismatch")
+        if str(transaction.get("stage") or "") not in allowed_stages:
+            raise RuntimeConflictError("canonical Group deletion stage is not authorized")
+        proof = self._group_deletion_proof(transaction)
+        return transaction, proof
+
+    def _validated_runtime_group_deletion(
+        self, group_id: str, *, canonical_stages: set[str],
+        runtime_stages: set[str], allow_legacy_proof_bind: bool = False,
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        intent = next((
+            item for item in self.store.group_deletion_intents()
+            if item["group_id"] == group_id
+        ), None)
         if intent is None:
             raise RuntimeConflictError("Task Runtime deletion intent is required")
+        if intent.get("stage") not in runtime_stages:
+            raise RuntimeConflictError("Task Runtime deletion intent stage is not authorized")
+        transaction, proof = self._canonical_group_deletion_transaction(
+            group_id, str(intent["group_transaction_id"]),
+            allowed_stages=canonical_stages,
+        )
+        if (
+            allow_legacy_proof_bind
+            and not intent.get("group_proof_digest")
+            and not intent.get("confirmation_token")
+            and not intent.get("runtime_project_id")
+        ):
+            intent = self.store.bind_group_deletion_proof(
+                group_id, str(intent["group_transaction_id"]),
+                group_proof_digest=proof,
+                confirmation_token=str(transaction["confirmation_token"]),
+                runtime_project_id=str(transaction["runtime_project_id"]),
+            )
+        if any((
+            intent.get("group_proof_digest") != proof,
+            intent.get("confirmation_token") != str(transaction["confirmation_token"]),
+            intent.get("runtime_project_id") != str(transaction["runtime_project_id"]),
+        )):
+            raise RuntimeConflictError("Task Runtime deletion proof does not match canonical Group")
+        return intent, transaction
+
+    def clean_prepared_group_deletion(self, group_id: str) -> dict[str, int]:
         with self._lock:
+            intent, _transaction = self._validated_runtime_group_deletion(
+                group_id,
+                canonical_stages={"prepared", "runtime_deleted", "committed"},
+                runtime_stages={"prepared", "runtime_cleaned"},
+            )
             # The durable intent itself is the mutation fence.  Re-clean on every
             # reconciliation so a row written by an older binary or a pre-fence race
             # can never brick startup after the canonical Group commit.
@@ -1166,23 +1292,61 @@ class TaskRuntimeService:
     def complete_group_deletion(self, group_id: str) -> None:
         # Idempotently sweep legacy/race residue before marking completion.  The
         # deletion row remains as a permanent write fence without retaining content.
-        self.store.delete_group(group_id)
-        remaining = self.store.group_content_counts(group_id)
-        if any(remaining.values()):
-            raise RuntimeConflictError(f"Task Runtime content remains after deletion: {remaining}")
-        self.store.set_group_deletion_stage(group_id, "complete")
+        with self._lock:
+            self._validated_runtime_group_deletion(
+                group_id, canonical_stages={"committed"},
+                runtime_stages={"prepared", "runtime_cleaned", "complete"},
+            )
+            self.store.delete_group(group_id)
+            remaining = self.store.group_content_counts(group_id)
+            if any(remaining.values()):
+                raise RuntimeConflictError(
+                    f"Task Runtime content remains after deletion: {remaining}",
+                )
+            self.store.set_group_deletion_stage(group_id, "complete")
 
     def reconcile_group_deletions(self) -> list[dict[str, str]]:
         report: list[dict[str, str]] = []
         for intent in self.store.group_deletion_intents():
             group_id = intent["group_id"]
-            transaction = self.groups.delete_transaction(group_id)
-            self.clean_prepared_group_deletion(group_id)
-            if transaction is None or transaction.get("stage") == "committed":
-                self.complete_group_deletion(group_id)
-                report.append({"group_id": group_id, "status": "complete"})
-            else:
-                report.append({"group_id": group_id, "status": "awaiting_group_commit"})
+            if intent.get("stage") == "quarantined":
+                report.append({
+                    "group_id": group_id, "status": "quarantined",
+                    "reason": str(intent.get("audit_code") or "invalid_canonical_proof"),
+                })
+                continue
+            try:
+                _bound, transaction = self._validated_runtime_group_deletion(
+                    group_id,
+                    canonical_stages={"prepared", "runtime_deleted", "committed"},
+                    runtime_stages={"prepared", "runtime_cleaned", "complete"},
+                    allow_legacy_proof_bind=True,
+                )
+                if transaction.get("stage") == "committed":
+                    if intent.get("stage") != "complete":
+                        self.clean_prepared_group_deletion(group_id)
+                    self.complete_group_deletion(group_id)
+                    report.append({"group_id": group_id, "status": "complete"})
+                elif intent.get("stage") == "complete":
+                    raise RuntimeConflictError(
+                        "Runtime deletion completed before canonical Group commit",
+                    )
+                else:
+                    self.clean_prepared_group_deletion(group_id)
+                    report.append({"group_id": group_id, "status": "awaiting_group_commit"})
+            except RuntimeConflictError as exc:
+                self.store.quarantine_group_deletion(group_id, type(exc).__name__)
+                report.append({
+                    "group_id": group_id, "status": "quarantined",
+                    "reason": type(exc).__name__,
+                })
+            except RuntimeStoreError as exc:
+                # A storage outage is retryable and must not rewrite a valid
+                # canonical authorization into a permanent quarantine.
+                report.append({
+                    "group_id": group_id, "status": "deferred",
+                    "reason": type(exc).__name__,
+                })
         return report
 
     def _round_robin(self, candidates: list[TaskRun], lane: str) -> list[TaskRun]:
