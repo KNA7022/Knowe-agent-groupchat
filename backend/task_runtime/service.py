@@ -1433,15 +1433,18 @@ class TaskRuntimeService:
     def reconcile_group_deletions(
         self, *, limit: int | None = None,
         cursor_owner: str = "task_runtime_service",
+        persist_cursor: bool = True,
     ) -> dict[str, Any]:
         with self._lock:
             return self._reconcile_group_deletions_locked(
                 limit=limit, cursor_owner=cursor_owner,
+                persist_cursor=persist_cursor,
             )
 
     def _reconcile_group_deletions_locked(
         self, *, limit: int | None = None,
         cursor_owner: str = "task_runtime_service",
+        persist_cursor: bool = True,
     ) -> dict[str, Any]:
         bounded = max(1, min(
             int(limit or self.DELETION_RECONCILE_BATCH_SIZE),
@@ -1551,16 +1554,17 @@ class TaskRuntimeService:
             if len(sample) < bounded:
                 sample.append(row)
         next_cursor = str(page["cursor"] if page["has_more"] else "")
-        if service_owned_cursor:
+        if service_owned_cursor and persist_cursor:
             self._deletion_reconcile_cursor = next_cursor
             self._deletion_reconcile_has_more = bool(page["has_more"])
         cursor_error = ""
-        try:
-            self.store.set_deletion_reconcile_cursor(
-                owner, next_cursor,
-            )
-        except Exception as exc:  # noqa: BLE001 - repeat page safely after restart
-            cursor_error = type(exc).__name__
+        if persist_cursor:
+            try:
+                self.store.set_deletion_reconcile_cursor(
+                    owner, next_cursor,
+                )
+            except Exception as exc:  # noqa: BLE001 - repeat page safely after restart
+                cursor_error = type(exc).__name__
         report = {
             "processed_count": len(page["items"]),
             "quarantined_count": counts["quarantined"],
@@ -1571,7 +1575,7 @@ class TaskRuntimeService:
             "has_more": bool(page["has_more"]), "view_unavailable": False,
             "last_error": cursor_error, "limit": bounded,
         }
-        if service_owned_cursor:
+        if service_owned_cursor and persist_cursor:
             self._arm_deferred_quarantine_retry()
         return report
 

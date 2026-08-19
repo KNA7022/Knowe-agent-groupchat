@@ -1485,6 +1485,23 @@ class TaskRuntimeStore:
                 (name, str(cursor or "")),
             )
 
+    def set_deletion_reconcile_checkpoints(
+        self, checkpoints: Mapping[str, str],
+    ) -> None:
+        """Atomically publish bounded source cursors, sweep debt, and next turn."""
+        values = tuple(
+            (f"deletion_cursor:{str(owner)}", str(value or ""))
+            for owner, value in checkpoints.items()
+        )
+        if not values or len(values) > 8:
+            raise RuntimeStoreError("invalid deletion reconciliation checkpoint")
+        with self.db.transaction() as conn:
+            conn.executemany(
+                """INSERT INTO studycrew_scheduler_state(name, value) VALUES (?, ?)
+                   ON CONFLICT(name) DO UPDATE SET value=excluded.value""",
+                values,
+            )
+
     def record_live_recovery(
         self, *, run_id: str, group_id: str, through_seq: int, reason: str,
         attempts: int, recovery_token: str, run_version: int | None = None,

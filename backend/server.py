@@ -8221,6 +8221,7 @@ class KnoweServer:
                     report = self.task_runtime.reconcile_group_deletions(
                         limit=runtime_quota,
                         cursor_owner="server_task_runtime_source",
+                        persist_cursor=False,
                     )
                 except Exception as exc:  # noqa: BLE001 - startup availability boundary
                     report = {
@@ -8231,7 +8232,10 @@ class KnoweServer:
                 self.task_runtime.recovery_report["deletions"] = report
                 runtime_pending = bool(report.get("has_more"))
                 runtime_had_failure = (
-                    runtime_had_failure or bool(report.get("view_unavailable"))
+                    runtime_had_failure
+                    or bool(report.get("view_unavailable"))
+                    or bool(report.get("last_error"))
+                    or int(report.get("deferred_count") or 0) > 0
                 )
             else:
                 report = {
@@ -8298,17 +8302,6 @@ class KnoweServer:
             next_group_cursor = str(
                 group_page["cursor"] if group_page.get("has_more") else ""
             )
-            try:
-                store.set_deletion_reconcile_cursor(
-                    "group_repository", next_group_cursor,
-                )
-            except Exception as exc:  # noqa: BLE001 - repeat the page after restart
-                group_had_failure = True
-                if len(diagnostics) < batch:
-                    diagnostics.append({
-                        "group_id": "", "status": "deferred_global",
-                        "reason": type(exc).__name__,
-                    })
             for transaction in group_page.get("items") or ():
                 if len(candidates) >= batch:
                     break
@@ -8322,6 +8315,8 @@ class KnoweServer:
                             "group_id": group_id, "status": "deferred",
                             "reason": "RuntimeStoreError",
                         })
+                    if view_unavailable:
+                        group_had_failure = True
                     continue
                 if group_id in candidates or len(candidates) < batch:
                     candidates.setdefault(group_id, transaction)
@@ -8382,16 +8377,21 @@ class KnoweServer:
             runtime_pending = runtime_source_state != "done"
             group_pending = group_source_state != "done"
             try:
-                store.set_deletion_reconcile_cursor(
-                    "server_task_runtime_source_state", runtime_source_state,
-                )
-                store.set_deletion_reconcile_cursor(
-                    "server_group_repository_source_state", group_source_state,
-                )
-                store.set_deletion_reconcile_cursor(
-                    "server_deletion_source_turn", next_source_turn,
-                )
+                # Candidate effects complete (or durable retry debt is classified)
+                # before this single checkpoint can move either source frontier.
+                # Cancellation before this transaction leaves the old page replayable;
+                # cancellation after it is safe because every destructive effect is
+                # idempotent and already durable.
+                store.set_deletion_reconcile_checkpoints({
+                    "server_task_runtime_source": str(report.get("cursor") or ""),
+                    "group_repository": next_group_cursor,
+                    "server_task_runtime_source_state": runtime_source_state,
+                    "server_group_repository_source_state": group_source_state,
+                    "server_deletion_source_turn": next_source_turn,
+                })
             except Exception as exc:  # noqa: BLE001 - repeat safely after restart
+                runtime_pending = group_pending = True
+                runtime_source_state = group_source_state = "failed"
                 if len(diagnostics) < batch:
                     diagnostics.append({
                         "group_id": "", "status": "deferred_global",

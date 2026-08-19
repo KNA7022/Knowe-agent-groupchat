@@ -102,9 +102,10 @@ DONE
 - `GroupRepository` remains the existing single-user JSON snapshot and therefore loads
   the registry itself as a whole. The reconciliation page and all derived collections
   are bounded, but replacing the underlying registry with a database is outside Task 3D.
-- The three small scheduler-state writes are individually transactional rather than one
-  multi-key transaction. A crash may replay a bounded page or source turn, but immutable
-  proofs and idempotent deletion receipts prevent duplicate destructive effects.
+- Runtime/canonical cursors, both source states, and the next turn now commit in one
+  SQLite transaction after candidate effects. A crash may replay a bounded page, but
+  immutable proofs and idempotent deletion receipts prevent duplicate destructive
+  effects.
 - A permanent storage/permission failure intentionally remains fail-closed and retries
   with capped backoff until storage is repaired; it is never auto-cleared.
 
@@ -112,3 +113,60 @@ DONE
 
 This report is included in the single focused Task 3D commit. Its immutable Git hash is
 reported in the handoff because a commit cannot embed its own content hash.
+
+## Independent review fix round 1/5
+
+### Status
+
+DONE
+
+### Effect-before-advance and atomic source checkpoint
+
+- The Server asks `TaskRuntimeService` to reconcile its page without persisting the
+  Server-owned cursor. Runtime cleanup may complete idempotently, but the durable
+  Server frontier stays at the old page until every candidate effect either succeeds
+  or is classified into durable retry debt.
+- Runtime cursor, canonical cursor, both sweep states, and next-source turn now publish
+  in one SQLite transaction after candidate processing. `CancelledError` at any prior
+  await leaves the complete page replayable after restart.
+- A page whose first candidate committed and second candidate was cancelled replays
+  safely: the committed canonical transaction is excluded, remaining candidates each
+  execute once, and no destructive effect is duplicated.
+- Checkpoint failure both before the SQLite transaction and after an ambiguous committed
+  transaction is safe. The owned loop remains pending, converges automatically, and
+  the authenticated deletion effect executes once.
+
+### Authoritative-view retry debt
+
+- `(blocked=True, view_unavailable=True)` now marks the canonical source failed before
+  the page checkpoint. On the last page this becomes `retry`, not `done`, and the owned
+  continuation observes storage restoration without a foreground call.
+- Runtime `view_unavailable`, non-empty `last_error`, and bounded `deferred` reports all
+  carry the same durable failure debt through later pages and a retry sweep.
+- Permanent outages remain fail-closed and use the existing capped exponential idle
+  backoff. A clean sweep after recovery is the only transition to `done`.
+
+### Exact boundary coverage
+
+- The two independent reviewer probes first failed exactly as reported: the cancelled
+  candidate remained `prepared` after restart, and the one-shot authority outage had no
+  owned continuation. Both now pass.
+- Parameterized crash probes cover every deletion boundary: Group prepare, runtime
+  suspend, runtime intent, runtime cleanup, legacy runtime deletion, Group commit, and
+  runtime completion. Every restart converges to canonical `committed` plus runtime
+  `complete` with the pre-effect cursor unchanged.
+- Mixed-page cancellation, checkpoint pre/post-commit uncertainty, canonical exact-view
+  outage, runtime `deferred`, and runtime `last_error` all recover autonomously.
+
+### Verification evidence
+
+- Final Task 3D quarantine/fairness/crash suite: `28 passed in 7.87s`.
+- Complete Task 1-3 Group/HTTP/Task Runtime/recovery/deletion suites:
+  `196 passed in 53.62s`.
+- Legacy Engine suites: `26 passed, 10 subtests passed in 1.84s`.
+- Frontend Group/Task Runtime contracts, stores, and real socket transport:
+  `5 files / 45 tests passed in 12.56s`.
+- Node `v24.19.0`, Python `3.12.10`; foundation/runtime verification, ESLint,
+  targeted Python compilation, and `git diff --check` passed.
+- The documented pre-existing broad TypeScript baseline is unchanged; this round
+  modifies no TypeScript files.
