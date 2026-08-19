@@ -753,7 +753,7 @@ export const useKnoweStore = create<KnoweStore>()(
     // ── State ──
     convs: {},
     activeProjectId: null,
-    activeView: 'chats',
+    activeView: 'today',
     cmdKOpen: false,
     conn: 'closed' as ConnStatus,
     notices: [],

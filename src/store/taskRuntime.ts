@@ -37,6 +37,9 @@ interface TaskRuntimeState {
   reconcile: (groupId: GroupId, runId: string) => Promise<void>;
   refreshGroup: (groupId: GroupId) => Promise<void>;
   control: (groupId: GroupId, runId: string, command: 'pause' | 'cancel' | 'resume') => Promise<TaskRun>;
+  resolveApproval: (
+    groupId: GroupId, runId: string, approvalId: string, approved: boolean,
+  ) => Promise<TaskRun>;
 }
 
 async function taskRuntimeJson(path: string, body: object): Promise<unknown> {
@@ -289,6 +292,45 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         [runId]: { run, events: state.byRun[runId]?.events || [], needsResync: false },
       },
     }));
+    return run;
+  },
+
+  async resolveApproval(groupId, runId, approvalId, approved): Promise<TaskRun> {
+    const current = get().byRun[runId];
+    const approval = get().approvals[approvalId];
+    if (!current || current.run.group_id !== groupId) throw new Error(`Unknown run: ${runId}`);
+    if (!approval || approval.group_id !== groupId || approval.run_id !== runId
+        || approval.status !== 'pending') {
+      throw new Error('Approval identity does not match the addressed Group and run');
+    }
+    const raw = await taskRuntimeJson('approval', {
+      group_id: groupId,
+      run_id: runId,
+      approval_id: approvalId,
+      approved,
+      capabilities: approved ? approval.requested_capabilities : [],
+      request_key: requestKey(approved ? 'approve' : 'reject'),
+    });
+    const envelope = raw as { run?: unknown; approval?: unknown };
+    const run = TaskRunSchema.parse(envelope.run);
+    const resolved = ApprovalRequestSchema.parse(envelope.approval);
+    if (run.group_id !== groupId || run.run_id !== runId
+        || resolved.group_id !== groupId || resolved.run_id !== runId
+        || resolved.approval_id !== approvalId) {
+      throw new Error('Task Runtime approval response crosses the addressed identity boundary');
+    }
+    set((state) => {
+      const approvals = { ...state.approvals };
+      delete approvals[approvalId];
+      return {
+        byRun: {
+          ...state.byRun,
+          [runId]: { run, events: state.byRun[runId]?.events || [], needsResync: false },
+        },
+        approvals,
+        error: null,
+      };
+    });
     return run;
   },
 }));

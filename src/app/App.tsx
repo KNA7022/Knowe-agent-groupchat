@@ -36,6 +36,7 @@ import { record as recordDiagnostic } from '../observe/corridor';
 import { useKnoweStore } from '../store/store';
 import { useTaskRuntimeStore } from '../store/taskRuntime';
 import type { GroupId } from '../contract/group';
+import { useGroupStore } from '../store/groups';
 import { selectActiveView, selectActiveProjectId } from '../store/selectors';
 
 /*
@@ -120,6 +121,8 @@ import ContactsView from '../components/ContactsView';
 import FavoritesView from '../components/FavoritesView';
 import KnowledgeView from '../components/KnowledgeView';
 import SettingsView from '../components/SettingsView';
+import TodayShell from '../components/TodayView';
+import ProductShell from '../components/ProductShell';
 import CommandPalette, { type GlobalSearchTarget } from '../components/GlobalSearch';
 import { useKnowledgeStore } from '../store/knowledge';
 import FloatingLayers from '../components/ContextMenu';
@@ -129,6 +132,7 @@ import { useRecordsStore } from '../store/records';
 import { bindTokenUsageSocket, handleTokenUsageEvent, useTokenUsageStore, } from '../store/tokenUsage';
 
 import { invokeWindowControl } from '../shared/windowControl';
+import { seedStudyCrewDemo } from '../dev/studycrewDemo';
 
 /**
  * [v1.0.20.2] 未读明细的时间标签：今天 → HH:mm；昨天 → 「昨天」；
@@ -161,6 +165,7 @@ export const App: React.FC = () => {
   //   · BackendGate 刻意保持无条件挂载——它的「设置同步」副作用（后端 ready →
   //     reconcileFromBackend）正式版也必须执行，显示隐藏由组件内部按 isPackaged 处理。
   const isPackaged = window.knowe?.isPackaged === true;
+  const demoMode = !isPackaged && new URLSearchParams(window.location.search).get('studycrew-demo') === '1';
   const activeView = useKnoweStore(selectActiveView);
   const activeId = useKnoweStore(selectActiveProjectId);
   const [rosterOpen, setRosterOpen] = useState(false);
@@ -306,6 +311,24 @@ export const App: React.FC = () => {
   useEffect(() => {
     void useSettingsStore.getState().reconcileFromBackend();
   }, []);
+
+  // Canonical Groups are loaded independently from legacy conversation replay. The adapter
+  // boundary is the persisted legacy_project_id on each Group; the renderer never guesses IDs.
+  useEffect(() => {
+    if (demoMode) {
+      seedStudyCrewDemo();
+      return;
+    }
+    void useGroupStore.getState().load().then(async () => {
+      const groups = useGroupStore.getState();
+      await Promise.allSettled(groups.order.map(async (groupId) => {
+        await Promise.all([
+          groups.loadRuntimeSummary(groupId),
+          useTaskRuntimeStore.getState().refreshGroup(groupId),
+        ]);
+      }));
+    }).catch(() => undefined);
+  }, [demoMode]);
 
   /*
    * [v0.8c #5] 私聊（知知）**根本不挂花名册面板** —— 连那个 0 宽度的壳都不挂。
@@ -650,7 +673,9 @@ export const App: React.FC = () => {
                              （store/knowledge.ts → knowledge_api.py，禁 mock）。 */}
                 {/* [v0.44]   「设置」接入：同款 .side + .stage 骨架（.set-nav + .set-pane），
                              五个分区（账户与身份 / 模型与提供方 / 通知 / 外观 / 关于）。 */}
-                {activeView === 'contacts' ? (
+                {activeView === 'today' ? (
+                  <TodayShell />
+                ) : activeView === 'contacts' ? (
                   <ContactsView
                     searchFocus={contactsSearchFocus}
                     onSearchFocusDone={clearSearchFocus}
@@ -662,6 +687,10 @@ export const App: React.FC = () => {
                   />
                 ) : activeView === 'knowledge' ? (
                   <KnowledgeView />
+                ) : activeView === 'review' ? (
+                  <ProductShell kind="review" />
+                ) : activeView === 'privacy' ? (
+                  <ProductShell kind="privacy" />
                 ) : activeView === 'settings' ? (
                   <SettingsView
                     searchFocus={settingsSearchFocus}
@@ -700,7 +729,7 @@ export const App: React.FC = () => {
         [v0.44.1 Bug3] 首次启动·强制模型引导。挂在最后 = z 序最高：还没配置全局主模型时
         铺一层雾化遮罩把整屏（含浮层/DevDrawer）罩住，走完「选模型→连接测试→进入」才放行。
       */}
-      <FirstRunModelGate />
+      {!demoMode && <FirstRunModelGate />}
     </>
   );
 };

@@ -25,7 +25,8 @@ import type { Member } from '../store/state';
 import { useDirectoryPending } from '../store/directoryRecovery';
 import { IconPlus, IconSearch, IconChevR } from './icons';
 import { openAgentMenu, openConversationMenu } from './ContextMenu';
-import NewProjectModal from './NewProjectModal';
+import GroupCreationWizard from './GroupCreationWizard';
+import { useGroupStore } from '../store/groups';
 import ResizeHandle from './ResizeHandle';
 import {
   GlobalSearchResults, useGlobalSearchGroups, type GlobalSearchTarget,
@@ -136,8 +137,8 @@ export const ConvList: React.FC<ConvListProps> = ({
         </div>
         <button
           className="icon-btn"
-          data-tip={t('conv.list.07')}
-          aria-label={t('conv.list.02')}
+          data-tip="新建群组"
+          aria-label="新建群组"
           onClick={() => setModalOpen(true)}
         >
           <IconPlus />
@@ -254,7 +255,7 @@ export const ConvList: React.FC<ConvListProps> = ({
             )}
 
             {/* [v0.8b #11] 分组标签：上面是平台，下面是「项目」（设计稿 §会话列表） */}
-            <div className="grp-label">{t('common.14')}</div>
+            <div className="grp-label">群组</div>
 
             {normal.length === 0 ? (
               <div className="grp-empty">{t('conv.list.09')}</div>
@@ -317,7 +318,13 @@ export const ConvList: React.FC<ConvListProps> = ({
         )}
       </div>
 
-      <NewProjectModal open={modalOpen} onClose={() => setModalOpen(false)} />
+      <GroupCreationWizard
+        open={modalOpen}
+        onClose={() => setModalOpen(false)}
+        onCreated={(_groupId, legacyProjectId) => {
+          if (legacyProjectId) switchProject(legacyProjectId);
+        }}
+      />
 
       {/* [v0.5 #14] 左栏右边缘这条线可以拖——拖窄了自动进紧凑模式（只剩头像） */}
       <ResizeHandle />
@@ -413,6 +420,16 @@ export const ConvListItem: React.FC<ConvListItemProps> = ({
       (it) => it.kind === 'approval' && it.state === 'pending',
     ).length,
   );
+  const mappedGroup = useGroupStore((state) => {
+    for (const groupId of state.order) {
+      const candidate = state.groups[groupId];
+      if (candidate?.legacy_project_id === id) return candidate;
+    }
+    return null;
+  });
+  const runtimeSummary = useGroupStore((state) => mappedGroup
+    ? state.runtimeSummaries[mappedGroup.group_id]
+    : undefined);
   /*
    * [v0.23 问题四] 左栏预览：**跳过空文本的条目**。
    *
@@ -460,13 +477,14 @@ export const ConvListItem: React.FC<ConvListItemProps> = ({
         + (menuFolded ? ' knowe-conv-folded' : '')
         + (draftText ? ' has-draft' : '')
         + (workingText ? ' working' : '')
-        + (unread > 0 ? ' has-unread' : '')} /* [v0.8d #5] */
+        + (unread > 0 ? ' has-unread' : '')
+        + (mappedGroup?.lifecycle === 'archived' ? ' group-archived' : '')} /* [v0.8d #5] */
       data-conv={id}
       data-knowe-menu-hidden={menuHidden || undefined}
       aria-hidden={menuHidden || undefined}
       tabIndex={0}
       role="button"
-      aria-label={priv ? `${t('context.menu.05')} ${name}` : `${t('common.14')} ${name}`}
+      aria-label={priv ? `${t('context.menu.05')} ${name}` : `群组 ${name}`}
       aria-current={active}
       onClick={onOpen}
       onContextMenu={id === PLATFORM_PROJECT_ID ? undefined : (e) => {
@@ -548,6 +566,14 @@ export const ConvListItem: React.FC<ConvListItemProps> = ({
         ) : (
           <div className="cprev">{lastText || subtitle || t('conv.list.08')}</div>
         )}
+        {mappedGroup ? <div className="group-runtime-badges" aria-label="群组运行摘要">
+          {mappedGroup.lifecycle === 'archived' ? <span className="is-muted">已归档</span> : null}
+          {runtimeSummary?.primary_task_status ? <span className="is-primary">主任务 {runtimeSummary.primary_task_status}</span> : null}
+          {runtimeSummary?.queued_task_count ? <span>排队 {runtimeSummary.queued_task_count}</span> : null}
+          {runtimeSummary?.pending_approval_count ? <span className="is-warning">待审批 {runtimeSummary.pending_approval_count}</span> : null}
+          {runtimeSummary?.active_side_task_count ? <span>旁路 {runtimeSummary.active_side_task_count}</span> : null}
+          {runtimeSummary?.indexing_state === 'failed' ? <span className="is-danger">索引异常</span> : null}
+        </div> : null}
       </div>
       <div className="cmeta">
         <div className="ctime tnum" />

@@ -211,6 +211,107 @@ button:focus-visible,.citem:focus-visible {outline:none;box-shadow:0 0 0 4px var
 .stack .avatar {border:2px solid var(--surface);margin-left:-8px}
 .stack .avatar:first-child {margin-left:0}
 
+/* === StudyCrew · authoritative Group runtime === */
+.agent-status {position:relative;z-index:4;border-top:1px solid var(--hairline);border-bottom:1px solid var(--hairline);
+  background:var(--surface-sunken);padding:10px var(--space-6);color:var(--ink);max-height:42vh;overflow-y:auto}
+.agent-status-primary {display:grid;grid-template-columns:30px minmax(0,1fr) auto;align-items:start;gap:var(--space-3)}
+.agent-status-mark {width:30px;height:30px;border-radius:var(--r-sm);display:flex;align-items:center;justify-content:center;
+  background:var(--accent-tint);color:var(--accent)}
+.agent-status-copy>strong {display:block;font-size:14px;line-height:20px;font-weight:650;color:var(--ink)}
+.agent-status-kicker,.agent-status-meta {display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.agent-status-kicker {margin-bottom:2px;font-size:11px;line-height:15px;color:var(--ink-2)}
+.agent-status-kicker span:first-child {font-weight:700;color:var(--accent)}
+.agent-status-kicker span+span::before,.agent-status-meta span+span::before {content:"·";margin-right:8px;color:var(--ink-3)}
+.agent-status-meta {margin-top:3px;font-size:11px;line-height:15px;color:var(--ink-2);font-variant-numeric:tabular-nums}
+.agent-status-actions {display:flex;align-items:center;justify-content:flex-end;gap:6px;flex-wrap:wrap;max-width:330px}
+.agent-status-actions button,.agent-status-approval button,.runtime-tabs button,.study-secondary,
+.group-manager button:not(.icon-btn),.study-link-button {min-height:30px;border:1px solid var(--hairline);border-radius:var(--r-sm);
+  padding:5px 9px;background:var(--surface);color:var(--ink-2);font-size:12px;line-height:16px;display:inline-flex;align-items:center;gap:4px}
+.agent-status-actions button:hover,.agent-status-approval button:hover,.runtime-tabs button:hover,
+.group-manager button:not(.icon-btn):hover,.study-link-button:hover {background:var(--surface-2);color:var(--ink)}
+.agent-status-actions button:disabled,.agent-status-approval button:disabled,.group-manager button:disabled {opacity:.66;cursor:not-allowed}
+.agent-status-workers {margin:8px 0 0 42px;display:flex;gap:6px;flex-wrap:wrap}
+.agent-status-worker {display:flex;align-items:center;gap:6px;padding:4px 8px;border-radius:var(--r-xs);background:var(--surface);
+  font-size:11px;line-height:16px;color:var(--ink-2)}
+.agent-status-worker strong {color:var(--ink);font-weight:650}.agent-status-worker em {color:var(--danger);font-style:normal}
+.status-shape {width:7px;height:7px;border:2px solid var(--accent);border-radius:2px;transform:rotate(45deg)}
+.agent-status-idle,.agent-status-side {margin:7px 0 0 42px;font-size:11px;line-height:16px;color:var(--ink-2)}
+.agent-status-idle button {padding:0;background:transparent;color:var(--ink-2);text-decoration:underline;text-underline-offset:2px}
+.agent-status-idle span {margin-left:8px}.agent-status-side {display:flex;gap:8px;flex-wrap:wrap}.agent-status-side strong {color:var(--ink)}
+.agent-status-approval {margin:8px 0 0 42px;padding:8px 10px;border:1px solid var(--warning);border-radius:var(--r-sm);
+  background:var(--warning-bg);display:flex;align-items:center;gap:8px;font-size:12px}
+.agent-status-approval>svg {color:var(--warning)}.agent-status-approval>div {flex:1;display:flex;flex-direction:column}
+.agent-status-approval>div span {color:var(--ink-2);font-size:11px}.agent-status-block,.agent-status-error {display:flex;gap:6px;align-items:center;margin:5px 0 0;color:var(--danger);font-size:11px}
+
+.runtime-drawer {position:absolute;inset:0 0 0 auto;width:min(430px,90%);z-index:40;background:var(--surface);box-shadow:var(--shadow-panel);
+  border-left:1px solid var(--hairline);display:flex;flex-direction:column;min-height:360px;max-height:calc(100vh - 70px)}
+.runtime-drawer-head {display:flex;justify-content:space-between;align-items:center;padding:var(--space-4);border-bottom:1px solid var(--hairline)}
+.runtime-drawer-head>div {display:flex;flex-direction:column}.runtime-drawer-head span {font-size:11px;color:var(--ink-3);font-variant-numeric:tabular-nums}
+.runtime-tabs {display:flex;gap:3px;padding:8px 10px;border-bottom:1px solid var(--hairline);overflow-x:auto}.runtime-tabs button {white-space:nowrap}
+.runtime-tabs button.active {background:var(--accent-tint);color:var(--accent);border-color:var(--accent)}
+.runtime-drawer-body {overflow:auto;padding:var(--space-4);flex:1}.runtime-event-list {list-style:none;padding:0;margin:0}
+.runtime-event-list li {content-visibility:auto;contain-intrinsic-size:44px;display:grid;grid-template-columns:72px 120px minmax(0,1fr);gap:8px;
+  padding:9px 0;border-bottom:1px solid var(--hairline);font-size:12px}.runtime-event-list time {color:var(--ink-3);font-variant-numeric:tabular-nums}
+.runtime-event-list span,.runtime-detail-card span {color:var(--ink-2)}.runtime-empty {color:var(--ink-2);font-size:13px}
+.runtime-detail-card {display:flex;flex-direction:column;gap:3px;padding:10px 0;border-bottom:1px solid var(--hairline);font-size:12px}
+.runtime-budget-list {margin:0}.runtime-budget-list>div {display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--hairline)}
+.runtime-budget-list dd {font-variant-numeric:tabular-nums}.runtime-side-note {margin-top:var(--space-4);color:var(--ink-3);font-size:11px}
+
+.group-runtime-badges {display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}.group-runtime-badges span {font-size:10px;line-height:14px;
+  padding:1px 5px;border:1px solid var(--hairline);border-radius:var(--r-xs);color:var(--ink-2)}
+.group-runtime-badges .is-primary {border-color:var(--accent);color:var(--accent)}.group-runtime-badges .is-warning {border-color:var(--warning);color:var(--ink)}
+.group-runtime-badges .is-danger {border-color:var(--danger);color:var(--danger)}.citem.group-archived {opacity:.72}.citem.group-archived .cname {text-decoration:line-through}
+
+/* === StudyCrew dialogs === */
+.study-modal-backdrop {position:fixed;inset:0;z-index:180;background:rgba(20,19,16,.46);display:flex;align-items:center;justify-content:center;padding:24px}
+.study-modal {width:min(760px,calc(100vw - 48px));max-height:calc(100vh - 64px);overflow:auto;background:var(--surface);color:var(--ink);
+  border:1px solid var(--hairline);border-radius:var(--r-lg);box-shadow:var(--shadow-3)}
+.study-modal>header {display:flex;align-items:flex-start;justify-content:space-between;padding:20px 22px 14px;border-bottom:1px solid var(--hairline);position:sticky;top:0;background:var(--surface);z-index:2}
+.study-modal h2 {font-size:20px;line-height:27px;margin:2px 0 0}.study-eyebrow {font-size:10px;line-height:14px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--accent)}
+.group-wizard form {padding:18px 22px 22px}.group-template-list,.role-options {border:0;padding:0;margin:0 0 18px}.group-template-list legend,.role-options legend {font-size:12px;font-weight:700;margin-bottom:8px}
+.group-template-list {display:grid;grid-template-columns:1fr 1fr;gap:8px}.group-template-list legend {grid-column:1/-1}
+.group-template-list label {display:grid;grid-template-columns:18px minmax(0,1fr) 16px;gap:8px;align-items:start;padding:10px;border:1px solid var(--hairline);border-radius:var(--r-sm);cursor:pointer}
+.group-template-list label.selected {border-color:var(--accent);background:var(--accent-tint)}.group-template-list label>span {display:flex;flex-direction:column}.group-template-list small {color:var(--ink-2);margin-top:2px}
+.study-form-grid,.expert-fields {display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}.study-form-grid label,.expert-fields label,.study-inline-form label,.delete-preview>label {display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--ink-2)}
+.study-form-grid input,.expert-fields input,.study-inline-form input,.delete-preview input {height:36px;border:1px solid var(--hairline);border-radius:var(--r-sm);background:var(--surface-sunken);color:var(--ink);padding:0 10px}
+.study-form-grid input:focus,.expert-fields input:focus,.study-inline-form input:focus,.delete-preview input:focus {border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-ring);outline:0}.study-form-wide {grid-column:1/-1}
+.role-options {display:flex;gap:8px;flex-wrap:wrap}.role-options legend {width:100%}.role-options label {display:flex;align-items:center;gap:5px;padding:6px 8px;background:var(--surface-2);border-radius:var(--r-xs);font-size:12px}.role-options small {color:var(--ink-3)}
+.study-link-button {margin-bottom:14px}.expert-fields {padding:12px;background:var(--surface-sunken);border-radius:var(--r-sm)}.expert-fields p {grid-column:1/-1;margin:0;color:var(--ink-2);font-size:11px}
+.study-form-error {color:var(--danger);background:var(--danger-bg);border:1px solid var(--danger);border-radius:var(--r-sm);padding:8px 10px;font-size:12px}
+.group-wizard footer {display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.study-primary {min-height:34px;border-radius:var(--r-sm);padding:7px 14px;background:var(--fill);color:var(--fill-ink);font-size:12px}.study-primary:disabled {opacity:.68}
+.group-manager {width:min(720px,calc(100vw - 48px))}.group-manager-body {padding:0 22px 22px}.group-manager-body section {padding:18px 0;border-bottom:1px solid var(--hairline)}
+.group-manager-body h3 {display:flex;align-items:center;gap:6px;margin:0 0 10px;font-size:14px}.study-inline-form {display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:end}.study-inline-form button {height:36px}
+.group-manager-actions {margin-top:8px}.role-options.compact {margin:0}.manager-tags {display:flex;gap:6px;flex-wrap:wrap;margin:7px 0 12px}.manager-tags button {font-size:10px!important;min-height:24px!important;padding:3px 6px!important}
+.danger-zone {border-bottom:0!important}.danger-zone>p {color:var(--ink-2);font-size:12px}.delete-preview dl {display:flex;gap:8px;margin:0 0 12px}.delete-preview dl div {flex:1;padding:8px;background:var(--danger-bg);border-radius:var(--r-xs)}.delete-preview dt {font-size:10px;color:var(--ink-2)}.delete-preview dd {margin:2px 0 0;font-weight:700}
+.group-manager .danger-button {margin-top:10px;border-color:var(--danger)!important;color:var(--danger)!important}.manager-progress {color:var(--ink-2);font-size:12px}
+
+/* === Today / honest product shells === */
+.today-view,.product-shell {flex:1;min-width:0;height:100%;overflow:auto;padding:clamp(28px,5vw,72px);background:var(--canvas)}
+.today-hero,.product-shell>header {max-width:780px;margin-bottom:48px}.today-hero h1,.product-shell h1 {font-size:clamp(30px,4vw,52px);line-height:1.08;letter-spacing:-.035em;margin:8px 0 14px;font-weight:680}
+.today-hero>p,.product-shell>header>p {max-width:620px;color:var(--ink-2);font-size:14px;line-height:23px}.today-hero dl,.product-shell dl {display:flex;gap:28px;margin:28px 0 0}.today-hero dl div,.product-shell dl div {display:flex;flex-direction:column-reverse}.today-hero dt,.product-shell dt {font-size:11px;color:var(--ink-2)}.today-hero dd,.product-shell dd {margin:0;font-size:24px;font-weight:650;font-variant-numeric:tabular-nums}
+.today-groups {max-width:940px}.today-section-title {display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:10px}.today-section-title h2 {margin:2px 0 0;font-size:18px}.today-section-title>span {color:var(--ink-3);font-size:11px}
+.today-group {display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:14px;align-items:start;padding:17px 0;border-top:1px solid var(--hairline)}.today-group.primary {padding:22px 18px;margin:0 -18px;background:var(--surface);border-radius:var(--r-md);border-top:0;box-shadow:var(--shadow-1)}
+.today-group-mark {width:34px;height:34px;display:flex;align-items:center;justify-content:center;border-radius:var(--r-sm);background:var(--accent-tint);color:var(--accent)}
+.today-group h3 {margin:0;font-size:15px}.today-group p {margin:3px 0;color:var(--ink-2);font-size:12px}.today-group ul {display:flex;gap:10px;flex-wrap:wrap;list-style:none;padding:0;margin:7px 0 0}.today-group li {display:flex;align-items:center;gap:4px;font-size:11px;color:var(--ink-2)}
+.today-group>button {align-self:center;display:flex;align-items:center;gap:5px;color:var(--accent);font-size:12px}.today-group>button:disabled {color:var(--ink-3);cursor:not-allowed}.today-zero {padding:40px 0;color:var(--ink-2)}.today-zero h2 {color:var(--ink);font-size:16px}
+.product-shell>header>.product-shell-icon {display:flex;width:38px;height:38px;align-items:center;justify-content:center;background:var(--accent-tint);color:var(--accent);border-radius:var(--r-sm);margin-bottom:16px}.product-shell>section {max-width:780px}.product-shell>section h2 {font-size:16px}.product-shell-notice {display:flex;gap:12px;padding:16px;margin-top:24px;border-top:1px solid var(--hairline);border-bottom:1px solid var(--hairline)}.product-shell-notice>svg {color:var(--accent)}.product-shell-notice p {margin:4px 0 0;color:var(--ink-2);font-size:12px;line-height:19px}
+
+@media (max-width:1024px) {
+  .agent-status {padding-inline:var(--space-4)}.agent-status-primary {grid-template-columns:26px minmax(0,1fr)}
+  .agent-status-actions {grid-column:2;justify-content:flex-start;max-width:none}.agent-status-workers,.agent-status-idle,.agent-status-side,.agent-status-approval {margin-left:38px}
+  .today-view,.product-shell {padding:32px}.today-hero,.product-shell>header {margin-bottom:36px}
+}
+@media (max-width:900px) {
+  .clist,.side{width:76px}.clist .cbody,.clist .cmeta,.clist .grp-label,.clist .search-wrap,
+  .clist .clist-head .wordmark,.fold-entry .lbl,.fold-entry .n,.side .side-head .side-title,.side .search-wrap{display:none}
+  .clist .clist-head{justify-content:center;padding-right:0}.clist .citem{justify-content:center;padding:10px 0;margin:2px 8px}
+  .agent-status-meta span:nth-last-child(-n+2) {display:none}.agent-status-actions button {padding:5px 7px;font-size:11px}
+  .runtime-drawer {width:100%}.group-template-list,.study-form-grid,.expert-fields {grid-template-columns:1fr}.study-form-wide {grid-column:auto}
+}
+@media (prefers-reduced-motion:reduce) {
+  .agent-status *,.runtime-drawer *,.study-modal *,.today-view *,.product-shell * {animation:none!important;transition:none!important;scroll-behavior:auto!important}
+}
+
 /* === MessageArea · 消息流容?+ 顶部横幅 + 回底按钮 · ?.msgs-wrap === */
 .msgs-wrap {flex:1;position:relative;min-height:0;display:flex;flex-direction:column}
 .msgs {flex:1;overflow-y:auto;
@@ -2920,4 +3021,13 @@ html.dark .md pre code .ln {
 .tk-context-empty {
   flex:1;display:flex;align-items:center;justify-content:center;
   color:var(--ink-3);opacity:.6;font-size:13px;
+}
+
+/* StudyCrew 窄屏覆盖必须位于旧会话列表规则之后，否则旧固定宽度会反向覆盖。 */
+@media (max-width:900px) {
+  .clist,.side {width:76px}
+  .clist .cbody,.clist .cmeta,.clist .grp-label,.clist .search-wrap,
+  .clist .clist-head .wordmark,.fold-entry .lbl,.fold-entry .n,.side .side-head .side-title,.side .search-wrap {display:none}
+  .clist .clist-head {justify-content:center;padding-right:0}
+  .clist .citem {justify-content:center;padding:10px 0;margin:2px 8px}
 }

@@ -158,4 +158,25 @@ describe('authoritative Task Runtime projection', () => {
     expect(useTaskRuntimeStore.getState().byRun[runId]?.run.last_seq).toBe(1);
     expect(useTaskRuntimeStore.getState().byRun[`run_${'8'.repeat(32)}`]).toBeUndefined();
   });
+
+  it('refuses forged Group/Run/Approval identity before approval dispatch', async () => {
+    const approval = {
+      approval_id: `apr_${'4'.repeat(32)}`, run_id: runId, group_id: groupId,
+      kind: 'tool', summary: 'Confirm export', risk: 'high', requested_capabilities: ['export'],
+      tool_name: 'export', operation_scope: { destination: 'outside' }, purpose: 'export_notes',
+      expires_at: null, status: 'pending', created_at: '2026-08-18T00:00:00Z',
+      resolved_at: null, schema_version: 1,
+    };
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot([taskRunFixture()], [approval]));
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(useTaskRuntimeStore.getState().resolveApproval(
+      otherGroupId, runId, approval.approval_id, true,
+    )).rejects.toThrow(/Unknown run/);
+    await expect(useTaskRuntimeStore.getState().resolveApproval(
+      groupId, runId, `apr_${'8'.repeat(32)}`, true,
+    )).rejects.toThrow(/identity/);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });

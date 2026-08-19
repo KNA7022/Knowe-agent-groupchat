@@ -71,6 +71,7 @@ import { useDirectoryEntry } from '../store/directoryRecovery';
 import { useRecordsStore } from '../store/records';
 import { useTokenUsageStore } from '../store/tokenUsage';
 import { shouldShowDivider, formatDividerLabel } from '../utils/messageTime';
+import AgentStatusBar from './AgentStatusBar';
 
 /** [v1.0.35] relay 接力对信息（气泡行 + 卡片行的 ik 与行号）。 */
 type RelayPair = {
@@ -202,7 +203,7 @@ export interface ChatStreamProps {
   projectId: string;
   /** [v1.0.24.6-P0] 活动态守卫：false = 隐藏会话「停摆」——停 RO/rAF/动画/倒计时/贴底跟随。
    *  只停循环不停挂载：切回时行高缓存/滚动位置原样恢复（active 变 true 即唤醒）。 */
-  active: boolean;
+  active?: boolean;
   rosterOpen: boolean;
   onToggleRoster: () => void;
   searchJump?: ChatSearchJump | null;
@@ -1305,6 +1306,8 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
           onClose={() => setAddAgentsAnchor(null)}
         />
       )}
+
+      {!priv && projectId !== PLATFORM_PROJECT_ID ? <AgentStatusBar projectId={projectId} /> : null}
 
       {/* ═══ 消息流 ═══ */}
       <div

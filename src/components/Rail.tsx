@@ -15,7 +15,7 @@ import { useSettingsStore } from '../store/settings';
 import {
   IconChats, IconContacts, IconFavorites,
   IconKnowledge, IconSearchSm, IconSettings,
-  IconMoon, IconSun,
+  IconMoon, IconSun, IconTask, IconReport, IconAlert,
 } from './icons';
 import { useTranslation } from 'react-i18next';
 
@@ -33,10 +33,13 @@ export const Rail: React.FC = () => {
   const toggleCmdK = useKnoweStore((s) => s.toggleCmdK);
 
   const MAIN_ITEMS: RailItem[] = [
+    { view: 'today', label: '今日', icon: <IconTask /> },
     { view: 'chats', label: t('common.14'), icon: <IconChats /> },
     { view: 'contacts', label: t('contacts.view.29'), icon: <IconContacts /> },
     { view: 'favorites', label: t('common.09'), icon: <IconFavorites /> },
     { view: 'knowledge', label: t('knowledge.view.06'), icon: <IconKnowledge /> },
+    { view: 'review', label: '审核', icon: <IconReport /> },
+    { view: 'privacy', label: '隐私', icon: <IconAlert /> },
   ];
 
   /*
