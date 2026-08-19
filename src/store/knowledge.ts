@@ -339,7 +339,7 @@ interface KnowledgeStore {
   preview: KnowPreviewState | null;
   previewWidth: number;
 
-  load: (opts?: { silent?: boolean }) => Promise<void>;
+  load: (opts?: { silent?: boolean; scope?: KnowledgeQueryScope }) => Promise<void>;
   loadSkillpacks: () => Promise<void>;
   reviewSkillpack: (pack: SkillPack, action: 'approve' | 'reject') => Promise<boolean>;
   setSkillpackStatus: (pack: SkillPack, status: SkillPackStatus) => Promise<boolean>;
@@ -354,6 +354,24 @@ interface KnowledgeStore {
   openPreview: (p: KnowPreviewState) => void;
   closePreview: () => void;
   setPreviewWidth: (px: number) => void;
+}
+
+export interface KnowledgeQueryScope {
+  groupIds: string[];
+  projectIds: string[];
+  sourceIds: string[];
+  courseId: string | null;
+}
+
+export function knowledgeScopeQuery(scope?: KnowledgeQueryScope): string {
+  if (!scope) return '';
+  const query = new URLSearchParams();
+  for (const id of scope.groupIds) query.append('group_id', id);
+  for (const id of scope.projectIds) query.append('legacy_project_id', id);
+  for (const id of scope.sourceIds) query.append('source_id', id);
+  if (scope.courseId) query.set('course_id', scope.courseId);
+  const value = query.toString();
+  return value ? `?${value}` : '';
 }
 
 export const KN_PREVIEW_MIN = 320;
@@ -380,7 +398,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
       const data = await apiFetch<{
         assets: RawAsset[];
         projects: { project_id?: string; profile_exists?: boolean }[];
-      }>('/assets');
+      }>(`/assets${knowledgeScopeQuery(opts?.scope)}`);
       const cards = (data.assets || [])
         .map(toCard)
         .filter((c): c is KnowCard => c !== null);

@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 
 import type { Group } from '../contract/group';
 import { taskRunFixture } from '../contract/taskRuntime.fixture';
+import type { TaskRun } from '../contract/taskRuntime';
 import { useGroupStore } from '../store/groups';
 import { useTaskRuntimeStore } from '../store/taskRuntime';
 import { useSideTaskReadStore } from '../store/sideTaskRead';
@@ -12,6 +13,8 @@ import AgentStatusBar, {
   controlCommandsForStatus,
   groupForLegacyProject,
   primaryProjectionForSummary,
+  sideAnswerSequence,
+  verifierLabel,
 } from './AgentStatusBar';
 import GroupCreationWizard, { roleDefaultsForTemplate } from './GroupCreationWizard';
 import GroupManagementDialog from './GroupManagementDialog';
@@ -204,6 +207,29 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
     expect(primaryProjectionForSummary(projections, `run_${'c'.repeat(32)}`)).toBeNull();
   });
 
+  it('switches the rendered primary when a live authoritative snapshot changes its exact id', () => {
+    const nextRunId = `run_${'b'.repeat(32)}`;
+    useGroupStore.getState().ingest([makeGroup()]);
+    const first = snapshot() as any;
+    (first as any).runs.push(taskRunFixture({
+      run_id: nextRunId, task_id: `task_${'c'.repeat(32)}`, kind: 'primary',
+      status: 'queued', title: '下一主任务', public_summary: '等待接力',
+    }));
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, first);
+    render(<AgentStatusBar projectId="legacy-calculus" />);
+    expect(screen.getByTestId('primary-run')).toHaveTextContent('正在整理极限错题');
+
+    const next = structuredClone(first) as any;
+    next.summary.active_primary_run_id = nextRunId;
+    next.summary.primary_task_status = 'running';
+    next.runs = next.runs.map((run: any) => run.run_id === nextRunId
+      ? { ...run, status: 'running', public_summary: '接力任务已开始', version: 2, last_seq: 2 }
+      : run);
+    act(() => useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, next));
+    expect(screen.getByTestId('primary-run')).toHaveTextContent('接力任务已开始');
+    expect(useGroupStore.getState().runtimeSummaries[groupId]?.active_primary_run_id).toBe(nextRunId);
+  });
+
   it('shows only the public tool projection in the details drawer', () => {
     useGroupStore.getState().ingest([makeGroup()]);
     useGroupStore.setState({ runtimeSummaries: { [groupId]: runtimeSummary() } });
@@ -234,6 +260,27 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
     fireEvent.keyDown(toolTab, { key: 'ArrowRight' });
     expect(screen.getByRole('tab', { name: '证据' })).toHaveFocus();
     expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', expect.stringContaining('tab-evidence'));
+    act(() => {
+      for (let seq = 3; seq <= 12; seq += 1) {
+        useTaskRuntimeStore.getState().applyEvent(groupId, {
+          event_id: `evt_${seq.toString(16).padStart(32, '0')}`,
+          run_id: runId, group_id: groupId, seq, version: seq,
+          event_type: 'budget_updated',
+          public_payload: {
+            usage: { wall_clock_seconds: seq, model_turns: 2, tool_calls: 2, tokens: 500 + seq, cost_usd: 0.02 },
+            status: 'running',
+          },
+          sensitivity: 'public', created_at: `2026-08-18T00:00:${seq.toString().padStart(2, '0')}Z`, schema_version: 1,
+        });
+      }
+    });
+    expect(screen.getByRole('tab', { name: '证据' })).toHaveFocus();
+    act(() => useGroupStore.setState((state) => ({ runtimeSummaries: {
+      ...state.runtimeSummaries,
+      [groupId]: { ...state.runtimeSummaries[groupId]!, indexing_state: 'running' },
+    } })));
+    fireEvent.click(screen.getByRole('tab', { name: '索引' }));
+    expect(screen.getByRole('tabpanel')).toHaveTextContent('正在为当前群组建立索引');
   });
 
   it('addresses primary and side approvals with their exact run identities', async () => {
@@ -256,14 +303,27 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
     await waitFor(() => expect(resolveApproval).toHaveBeenCalledWith(groupId, sideRunId, sideApproval.approval_id, true));
   });
 
-  it('projects and acknowledges side-task unread watermarks locally', () => {
+  it('marks only terminal side answers unread, not planning or tool progress', () => {
     useGroupStore.getState().ingest([makeGroup()]);
     useGroupStore.setState({ runtimeSummaries: { [groupId]: runtimeSummary() } });
     useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot());
     render(<AgentStatusBar projectId="legacy-calculus" />);
-    const unread = screen.getByRole('button', { name: /未读，点击标记已读/ });
+    expect(screen.getByRole('button', { name: /进行中/ })).not.toHaveClass('side-run-unread');
+    const terminal = structuredClone(snapshot()) as any;
+    terminal.runs = terminal.runs.map((run: any) => run.kind === 'side'
+      ? { ...run, status: 'succeeded', version: 2, last_seq: 2, finished_at: '2026-08-18T00:00:03Z' }
+      : run);
+    terminal.summary.active_side_task_count = 0;
+    act(() => useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, terminal));
+    const unread = screen.getByRole('button', { name: /未读回答，点击标记已读/ });
     fireEvent.click(unread);
-    expect(screen.getByRole('button', { name: /已读/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /未读回答/ })).not.toBeInTheDocument();
+  });
+
+  it('does not infer a Verifier rejection from a generic executor failure', () => {
+    const failed = taskRunFixture({ status: 'failed', failure_type: 'provider_failure' }) as TaskRun;
+    expect(verifierLabel(failed, [])).toBe('任务执行失败，Verifier 结论未上报');
+    expect(sideAnswerSequence({ run: { ...failed, kind: 'side' }, events: [], needsResync: false })).toBe(failed.last_seq);
   });
 });
 
@@ -289,6 +349,14 @@ describe('Group creation wizard', () => {
     view.rerender(<GroupCreationWizard open={false} onClose={onClose} />);
     expect(trigger).toHaveFocus();
     trigger.remove();
+  });
+
+  it('does not steal focus when the wizard parent rerenders with a new callback', () => {
+    const view = render(<GroupCreationWizard open onClose={() => undefined} />);
+    const input = screen.getByLabelText('群组名称');
+    input.focus();
+    view.rerender(<GroupCreationWizard open onClose={() => undefined} />);
+    expect(input).toHaveFocus();
   });
 
   it('portals above the app root and makes the background inert while open', () => {
@@ -374,6 +442,13 @@ describe('Group creation wizard', () => {
 });
 
 describe('Group lifecycle management', () => {
+  it('does not restart the focus trap when management receives a new callback', () => {
+    const view = render(<GroupManagementDialog group={makeGroup()} open onClose={() => undefined} />);
+    const input = screen.getByLabelText('群组名称');
+    input.focus();
+    view.rerender(<GroupManagementDialog group={makeGroup()} open onClose={() => undefined} />);
+    expect(input).toHaveFocus();
+  });
   it('dispatches archive and restore through the canonical Group identity', async () => {
     const archiveGroup = vi.fn().mockResolvedValue(makeGroup());
     const restoreGroup = vi.fn().mockResolvedValue(makeGroup());

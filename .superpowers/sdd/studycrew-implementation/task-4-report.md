@@ -36,24 +36,28 @@ Task 4 已把已有的 Group 与 Task Runtime 权威状态接入 Electron render
 - 归档群组单独分区且不可激活；知识入口先要求选择 Group/课程范围；旧 Knowe/项目/员工 UI 品牌和心智在 canonical 路径被 StudyCrew/群组/Agent 替换。
 - 完成状态/阶段本地化、Verifier 负向终态诚实措辞、完整 tab/roving keyboard 语义，以及基于 side run `last_seq` 水位的本地未读/确认投影。
 
+## Round 2 独立复审修复
+
+- `GroupRuntimeSnapshot.summary` 不再被 renderer 丢弃：snapshot/replay 会原子更新 Group summary；连续 runtime event 同步投影主任务、队列、审批、预算和旁路数，并在 80ms 窗口后合并为一次带认证的权威 snapshot 刷新。状态栏手动刷新也同时修复 run 与 summary。
+- 新增 live snapshot A→B 主任务切换测试，状态栏始终按最新 `active_primary_run_id` exact 选择，不从数组顺序或聊天文本猜测。
+- Knowledge 范围从装饰性 selector 改为真实数据边界：请求携带 `group_id`、legacy project、source 与 course；卡片、画像和项目技能包同时按 Group ownership 过滤，课程缺少精确 evidence identity 时 fail closed。跨群项目资产不可见，显式 source link 和全局已批准资产仍可使用。
+- App 对 canonical Group 永不挂载 legacy `RosterPanel`，legacy→canonical 与 canonical→canonical 切换均关闭旧面板；canonical roster 只来自 Group contract。
+- 向导、管理框和 runtime drawer 使用 latest-callback ref，focus trap 生命周期只依赖 `open`。父级 callback 改变或连续 10 条 runtime event 不再把输入框/tab 焦点抢回关闭按钮。
+- generic `failed` 只显示“任务执行失败，Verifier 结论未上报”；只有公开 `verifier_decision` 才显示通过/未通过。旁路任务仅在 terminal/公开回答完成后产生未读水位，规划、工具与审批进度只显示“进行中”。Index tab 显示真实 `indexing_state`。
+- 修复全量基线：统一 RTL cleanup；preview control origin fail closed；迁移 v24 对已删除 DOM/协议的脆弱断言；Vitest 不再误收 Node `scripts/*.test.mjs`。
+
 ## 自动化验证
 
-最终相关回归命令：
+最终回归命令：
 
 ```text
-npm test -- --run src/components/studycrew-ui.test.tsx src/components/studycrew-css.test.ts src/store/taskRuntime.test.ts src/store/groups.test.ts src/components/sessionHost.test.tsx src/transport/socket.wars.test.ts
+npm test -- --run
+node --test scripts/python-command.test.mjs
 ```
 
-覆盖精确 Project→Group 映射/隔离、主旁路分离、空闲折叠、公开工具投影、权威主任务与全状态控制矩阵、resync、exact run 审批、四模板默认、绑定失败不重复创建、删除 token 身份/版本、Today summary、modal inert、键盘/焦点/Escape、tabs、side unread 和 reduced motion。
+覆盖精确 Project→Group 映射/隔离、live 主任务切换、主旁路分离、terminal answer 未读、空闲折叠、公开工具投影、权威主任务与全状态控制矩阵、resync、exact run 审批、四模板默认、绑定失败不重复创建、删除 token 身份/版本、Today summary、Knowledge cross-group exclusion、canonical roster、modal inert、连续事件焦点稳定、键盘/Escape、tabs、真实索引状态和 reduced motion。
 
-直接触达 App/ConvList/ChatStream/Composer/Rail/Group/Runtime 的回归最终为 **8 个文件、162 个测试全绿**。额外迁移旧 accessible-name、异步头像预加载、共享 cleanup、FileCard 新边界、推理收缩动画以及 FakeServer 白名单后，全量从独立审查时的 **91 failed / 370 passed** 降到 **13 failed / 457 passed**。
-
-生产触及文件 ESLint 通过。仓库全量 TypeScript 仍含 Task 4 之前的基线错误；按 Task 4 触及文件过滤为 0。
-
-全量剩余只在两条与 Task 4 无关且可单文件复现的历史路径出现；`git diff 3f32bdd --name-only` 证明本轮没有修改对应生产组件：
-
-- `src/store/v24.test.ts`：6 个脆弱源码字符串断言仍要求旧 `StreamBubble` 八阶段 DOM 和旧 `ApprovalCard` 文本/selector；本轮未修改 `StreamBubble.tsx` 或 `ApprovalCard.tsx`。
-- `src/components/BackendGate.test.tsx`：6 个 bridge 状态/重试断言在现有 jsdom bridge bootstrap 下超时或取不到旧文案；本轮未修改 `BackendGate.tsx`。Vitest 汇总显示 13 failed（输出中具名断言为上述 12 个）/457 passed；未把它们误称为本轮回归。
+最终全量为 **39 个 Vitest 文件、479 个测试全部通过**；独立 Node command 测试 **2/2 通过**；全仓 `npm run lint` 通过。仓库全量 TypeScript 仍含 Task 4 之前的历史错误；对本轮触及路径过滤为 **0 个诊断**。
 
 ## 实际渲染检查
 
@@ -66,6 +70,8 @@ npm test -- --run src/components/studycrew-ui.test.tsx src/components/studycrew-
 
 Round 1 修复后按 `control-in-app-browser` 的 bootstrap/documentation/troubleshooting 流程重新连接时，既有 binding 返回 unavailable，浏览器列表为空。技能明确禁止改用无关 browser-control surface，因此没有伪造本轮 modal hit-test、dark/light 或截图结论；顶层 portal、`inert`/`aria-hidden`、焦点圈闭/恢复与 Escape 由真实 React DOM 测试覆盖。待应用内 Browser 恢复后仍需补跑 900/1024/1440 的 `elementFromPoint` 验收。
 
+Round 2 再次按同一规定流程连接，`iab` 仍返回 `Browser is not available`，唯一一次 discovery 仍为 `[]`；因此没有违规切换 standalone Playwright，也没有生成或复用伪造的 post-fix 截图。Round 2 的 live rerender focus、canonical roster、Knowledge isolation 与 runtime exact switch 均由 React/contract 测试验收，Browser viewport/hit-test 仍是唯一未执行项。
+
 ## 主要文件
 
 - `src/components/AgentStatusBar.tsx`
@@ -77,6 +83,9 @@ Round 1 修复后按 `control-in-app-browser` 的 bootstrap/documentation/troubl
 - `src/components/ChatStream.tsx`
 - `src/app/App.tsx`
 - `src/store/taskRuntime.ts`
+- `src/store/knowledge.ts`
+- `src/components/KnowledgeScopedView.tsx`
+- `src/components/KnowledgeView.tsx`
 - `src/styles/knowe-components.css`
 - `src/components/studycrew-ui.test.tsx`
 - `src/components/studycrew-css.test.ts`
@@ -86,5 +95,5 @@ Round 1 修复后按 `control-in-app-browser` 的 bootstrap/documentation/troubl
 
 - 工具抽屉只展示 Task Runtime 已发布的 `tool_prepared` 公共投影；完整 ToolInvocation 台账属于后续 Tool Gateway 任务，不能在 UI 猜测。
 - Review 与 Privacy 明确标为后续能力，只展示当前真实 Group/runtime 计数；未伪造 RAG、PII 或评测结果。
-- Knowledge 入口已增加 Group/课程范围选择边界；完整 RAG 交互仍由 Task 5 实现。
+- Knowledge 入口已 enforce 现有资产的 Group/课程安全范围并携带未来 endpoint scope；完整解析、切片、混合召回与引用 RAG 仍由 Task 5 实现。
 - 900px 是计划要求的最低桌面验证宽度；不承诺移动端布局。

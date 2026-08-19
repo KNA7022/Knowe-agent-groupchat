@@ -5,6 +5,12 @@
 //    之前的组件测试只好绕着写（toBeTruthy 之类）。这里接上，是纯增量：
 //    多了一批断言，没动任何既有行为。
 import '@testing-library/jest-dom/vitest';
+import { cleanup } from '@testing-library/react';
+import { afterEach } from 'vitest';
+
+// Vitest does not expose Jest globals, so Testing Library's implicit cleanup hook
+// is not registered reliably. Keep every test isolated even in a full-suite run.
+afterEach(() => cleanup());
 
 // jsdom polyfills
 Element.prototype.scrollIntoView = () => {};

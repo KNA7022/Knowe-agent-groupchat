@@ -61,6 +61,14 @@ interface GroupStoreState {
   linkSource: (groupId: GroupId, sourceId?: string) => Promise<GroupSourceLink>;
   unlinkSource: (groupId: GroupId, sourceId: string) => Promise<boolean>;
   loadRuntimeSummary: (groupId: GroupId) => Promise<GroupRuntimeSummary>;
+  ingestRuntimeProjection: (
+    groupId: GroupId,
+    projection: Pick<GroupRuntimeSummary,
+      'active_primary_run_id' | 'primary_task_status' | 'queued_task_count'
+      | 'active_side_task_count' | 'pending_approval_count' | 'budget_usage' | 'indexing_state'>
+      & Partial<Pick<GroupRuntimeSummary, 'active_agent_count'>>,
+    updatedAt?: string,
+  ) => void;
   previewDelete: (groupId: GroupId) => Promise<GroupDeletePreview>;
   confirmedDelete: (
     groupId: GroupId, confirmationToken: string,
@@ -324,6 +332,26 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
       runtimeSummaries: { ...state.runtimeSummaries, [groupId]: summary },
     }));
     return summary;
+  },
+
+  ingestRuntimeProjection(groupId, projection, updatedAt): void {
+    const group = get().groups[groupId];
+    if (!group) return;
+    const previous = get().runtimeSummaries[groupId];
+    const summary = GroupRuntimeSummarySchema.parse({
+      group_id: groupId,
+      lifecycle: group.lifecycle,
+      active_agent_count: projection.active_agent_count ?? previous?.active_agent_count ?? 0,
+      course_binding_count: group.course_bindings.length,
+      source_count: group.source_links.length,
+      shared_source_count: previous?.shared_source_count ?? 0,
+      budget: group.budget,
+      ...projection,
+      updated_at: updatedAt || previous?.updated_at || group.updated_at,
+    });
+    set((state) => ({
+      runtimeSummaries: { ...state.runtimeSummaries, [groupId]: summary },
+    }));
   },
 
   async previewDelete(groupId): Promise<GroupDeletePreview> {

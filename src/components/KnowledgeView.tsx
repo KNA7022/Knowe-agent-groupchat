@@ -49,6 +49,7 @@ import {
   type KnowCard, type KnowCat, type KnowScope, type KnowSt, type KnowAssetDetail,
   type SkillPack, type SkillPackStatus,
 } from '../store/knowledge';
+import type { KnowledgeQueryScope } from '../store/knowledge';
 import {
   IconBook, IconAlert, IconSpark, IconCheckbox, IconFolder,
   IconEdit, IconReport, IconRecover, IconTrash, IconChevR,
@@ -166,14 +167,46 @@ type ModalState =
 
 // ═══════════════════════════════════════════════════════════════
 
-export const KnowledgeView: React.FC = () => {
+export type KnowledgeDataScope = KnowledgeQueryScope;
+
+function refHasIdentity(sourceRef: string, identity: string): boolean {
+  return sourceRef.split(/[\\/:#?&=]+/).some((part) => part === identity);
+}
+
+export function cardAllowedByKnowledgeScope(card: KnowCard, dataScope: KnowledgeDataScope): boolean {
+  if (card.scope === 'global') return true;
+  const ownsProject = dataScope.projectIds.includes(card.projectId);
+  const ownsSource = card.evidence.some((evidence) => dataScope.sourceIds.some(
+    (sourceId) => refHasIdentity(evidence.sourceRef, sourceId),
+  ));
+  if (!ownsProject && !ownsSource) return false;
+  if (!dataScope.courseId) return true;
+  return card.evidence.some((evidence) => refHasIdentity(evidence.sourceRef, dataScope.courseId!));
+}
+
+export const KnowledgeView: React.FC<{ dataScope?: KnowledgeDataScope }> = ({ dataScope }) => {
   const { t } = useTranslation();
-  const cards = useKnowledgeStore((s) => s.cards);
+  const allCards = useKnowledgeStore((s) => s.cards);
+  const cards = useMemo(() => dataScope
+    ? allCards.filter((card) => cardAllowedByKnowledgeScope(card, dataScope))
+    : allCards, [allCards, dataScope]);
   const loading = useKnowledgeStore((s) => s.loading);
   const loadedAt = useKnowledgeStore((s) => s.loadedAt);
   const error = useKnowledgeStore((s) => s.error);
-  const skillpacks = useKnowledgeStore((s) => s.skillpacks);
-  const profileProjects = useKnowledgeStore((s) => s.profileProjects);
+  const allSkillpacks = useKnowledgeStore((s) => s.skillpacks);
+  const allProfileProjects = useKnowledgeStore((s) => s.profileProjects);
+  const skillpacks = useMemo(() => dataScope ? {
+    systemBuiltin: allSkillpacks.systemBuiltin,
+    projectExperience: allSkillpacks.projectExperience.filter(
+      (pack) => pack.scope === 'global' || dataScope.projectIds.includes(pack.projectId),
+    ),
+    thirdParty: allSkillpacks.thirdParty.filter(
+      (pack) => !pack.projectId || pack.scope === 'global' || dataScope.projectIds.includes(pack.projectId),
+    ),
+  } : allSkillpacks, [allSkillpacks, dataScope]);
+  const profileProjects = useMemo(() => dataScope
+    ? allProfileProjects.filter((projectId) => dataScope.projectIds.includes(projectId))
+    : allProfileProjects, [allProfileProjects, dataScope]);
   // 订阅 convs：来源行「项目名 · Agent 名」要跟着花名册/项目事件实时对。
   const convs = useKnoweStore((s) => s.convs);
 
@@ -197,13 +230,13 @@ export const KnowledgeView: React.FC = () => {
 
   // 挂载即拉取；45s 静默刷新；卸载即停。
   useEffect(() => {
-    void useKnowledgeStore.getState().load();
+    void useKnowledgeStore.getState().load({ scope: dataScope });
     const timer = window.setInterval(
-      () => { void useKnowledgeStore.getState().load({ silent: true }); },
+      () => { void useKnowledgeStore.getState().load({ silent: true, scope: dataScope }); },
       REFRESH_MS,
     );
     return () => window.clearInterval(timer);
-  }, []);
+  }, [dataScope]);
 
   // 进【技能包】才拉真实技能数据；保持在该面板时轮询，承接后台 core→待审技能的异步同步。
   useEffect(() => {

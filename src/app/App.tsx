@@ -34,7 +34,7 @@ import { createSocket, initWsAuthToken } from '../transport/socket';
 import { warmUpIncremental } from '../store/incrementalSync';   // [v1.0.23.6] 启动预热
 import { record as recordDiagnostic } from '../observe/corridor';
 import { useKnoweStore } from '../store/store';
-import { useTaskRuntimeStore } from '../store/taskRuntime';
+import { scheduleTaskRuntimeAuthorityRefresh, useTaskRuntimeStore } from '../store/taskRuntime';
 import type { GroupId } from '../contract/group';
 import { useGroupStore } from '../store/groups';
 import { selectActiveView, selectActiveProjectId } from '../store/selectors';
@@ -152,6 +152,20 @@ function formatUnreadTime(ts: number): string {
   return i18n.t('common.dateFull', { y: d.getFullYear(), m: d.getMonth() + 1, d: d.getDate() });
 }
 
+export function shouldMountLegacyRoster(
+  privateChat: boolean,
+  activeCanonicalGroupId: string | null,
+): boolean {
+  return !privateChat && !activeCanonicalGroupId;
+}
+
+export function shouldCloseLegacyRoster(
+  privateChat: boolean,
+  activeCanonicalGroupId: string | null,
+): boolean {
+  return privateChat || Boolean(activeCanonicalGroupId);
+}
+
 
 /**
  * [v1.0 frameless] 窗口控制使用可聚焦、可键盘触发的真 <button>。
@@ -168,6 +182,13 @@ export const App: React.FC = () => {
   const demoMode = !isPackaged && new URLSearchParams(window.location.search).get('studycrew-demo') === '1';
   const activeView = useKnoweStore(selectActiveView);
   const activeId = useKnoweStore(selectActiveProjectId);
+  const activeCanonicalGroupId = useGroupStore((state) => {
+    if (!activeId) return null;
+    for (const groupId of state.order) {
+      if (state.groups[groupId]?.legacy_project_id === activeId) return groupId;
+    }
+    return null;
+  });
   const [rosterOpen, setRosterOpen] = useState(false);
   const [searchFocus, setSearchFocus] = useState<(GlobalSearchTarget & {
     requestId: number;
@@ -253,10 +274,10 @@ export const App: React.FC = () => {
   useLayoutEffect(() => {
     useRecordsStore.getState().closeDrawer();
     useTokenUsageStore.getState().closePanel();
-    // [v1.0.23.5] 原 ChatStream「priv && rosterOpen 自动关花名册」上移至此：
-    //   切到私聊（知知/DM）时关面板（私聊没有花名册）；群↔群切换保持面板状态。
-    if (isPrivateChat(activeId)) setRosterOpen(false);
-  }, [activeId, activeView]);
+    // 私聊与 canonical Group 都不允许继承旧花名册。canonical Group 的 roster
+    // 只由 Group contract 投影，不能同时暴露 legacy members 的第二控制路径。
+    if (shouldCloseLegacyRoster(isPrivateChat(activeId), activeCanonicalGroupId)) setRosterOpen(false);
+  }, [activeCanonicalGroupId, activeId, activeView]);
 
   /*
    * [v0.44 设置] 字号「大」仍是**根节点（.desk）上的一个类**：
@@ -491,6 +512,7 @@ export const App: React.FC = () => {
             const groupId = ev.group_id as GroupId;
             const accepted = useTaskRuntimeStore.getState().applyEvent(groupId, ev.event);
             if (!accepted) void useTaskRuntimeStore.getState().refreshGroup(groupId);
+            else scheduleTaskRuntimeAuthorityRefresh(groupId);
             return;
           }
           // project_created 先喂给目录 store（它只读 directory_required 字段），再照常入主状态机。
@@ -653,7 +675,7 @@ export const App: React.FC = () => {
                       <EmptyState />
                     )}
                   </section>
-                  {!privateChat && (
+                  {shouldMountLegacyRoster(privateChat, activeCanonicalGroupId) && (
                     <RosterPanel open={rosterOpen} onClose={() => setRosterOpen(false)} />
                   )}
                 </main>

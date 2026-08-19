@@ -49,10 +49,10 @@ function parsePreviewUrl(raw: unknown): ParsedPreviewUrl | null {
     if (url.protocol !== 'http:' || url.port !== HTTP_PORT) return null;
 
     if (url.host === CONTROL_HOST) {
-      const project = projectFromTreePath(url.pathname);
-      // /preview/tree/ paths on the control host are isolated preview resources,
-      // not control endpoints — allow them through the frame policy.
-      return project ? { kind: 'isolated', project, url } : null;
+      // The control origin is never a frame origin. Preview tree resources must be
+      // reached through the per-project opaque host so an untrusted document cannot
+      // inherit access to settings/history endpoints on 127.0.0.1.
+      return null;
     }
 
     const match = PREVIEW_HOST_RE.exec(url.host);

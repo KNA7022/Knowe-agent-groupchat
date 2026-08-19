@@ -60,14 +60,31 @@ const PHASE_LABEL: Record<TaskRun['agent_runs'][number]['phase'], string> = {
   waiting: '等待中', verifying: '核验中', responding: '回复中', failed: '失败',
 };
 
-function verifierLabel(status: TaskStatus): string {
+export function verifierLabel(run: TaskRun, events: RunEvent[]): string {
+  const decision = [...events].reverse().find((event) => event.event_type === 'verifier_decision');
+  if (decision) {
+    if (decision.public_payload.approved === true) return 'Verifier 已通过';
+    if (decision.public_payload.approved === false) return 'Verifier 未通过';
+  }
+  const status = run.status;
   if (status === 'verifying') return 'Verifier 正在核验';
-  if (status === 'succeeded') return 'Verifier 已通过';
-  if (status === 'partial') return 'Verifier 仅部分通过';
-  if (status === 'failed') return 'Verifier 未通过';
+  if (status === 'succeeded') return '任务已完成，Verifier 结论未上报';
+  if (status === 'partial') return '任务部分完成，Verifier 结论未上报';
+  if (status === 'failed') return '任务执行失败，Verifier 结论未上报';
   if (status === 'cancelled') return '任务已取消，未形成核验结论';
   if (status === 'waiting_approval') return 'Verifier 等待审批结果';
   return 'Verifier 尚未开始核验';
+}
+
+export function sideAnswerSequence(projection: RuntimeProjection): number | null {
+  if (!TERMINAL.has(projection.run.status)) return null;
+  const terminalEvent = [...projection.events].reverse().find((event) => {
+    if (event.event_type === 'verifier_decision') return true;
+    return event.event_type === 'status_changed'
+      && typeof event.public_payload.status === 'string'
+      && TERMINAL.has(event.public_payload.status as TaskStatus);
+  });
+  return terminalEvent?.seq ?? projection.run.last_seq;
 }
 
 function ratio(used: number, limit: number): string {
@@ -81,13 +98,16 @@ interface RuntimeDrawerProps {
   groupId: GroupId;
   primary: TaskRun;
   sideRuns: TaskRun[];
+  indexingState: 'idle' | 'queued' | 'running' | 'failed';
 }
 
 const RuntimeDrawer = memo(function RuntimeDrawer({
-  open, onClose, groupId, primary, sideRuns,
+  open, onClose, groupId, primary, sideRuns, indexingState,
 }: RuntimeDrawerProps): React.ReactElement | null {
   const drawerRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   const events = useTaskRuntimeStore((state) => state.byRun[primary.run_id]?.events || EMPTY_EVENTS, shallow);
   const approvals = useTaskRuntimeStore((state) => Object.values(state.approvals).filter(
     (approval) => approval.group_id === groupId && approval.run_id === primary.run_id,
@@ -100,7 +120,7 @@ const RuntimeDrawer = memo(function RuntimeDrawer({
     if (!open) return undefined;
     closeRef.current?.focus();
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') onClose();
+      if (event.key === 'Escape') onCloseRef.current();
       if (event.key !== 'Tab' || !drawerRef.current) return;
       const focusable = [...drawerRef.current.querySelectorAll<HTMLElement>('button:not([disabled])')];
       if (!focusable.length) return;
@@ -111,7 +131,7 @@ const RuntimeDrawer = memo(function RuntimeDrawer({
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [onClose, open]);
+  }, [open]);
 
   if (!open) return null;
   const tabs = [
@@ -191,7 +211,11 @@ const RuntimeDrawer = memo(function RuntimeDrawer({
           </dl>
         ) : null}
         {tab === 'recovery' ? <p className="runtime-empty" role="tabpanel" id={`${tabsId}-panel-recovery`} aria-labelledby={`${tabsId}-tab-recovery`}>{primary.blocking_reason || '当前没有恢复阻塞；异常时可执行对账。'}</p> : null}
-        {tab === 'indexing' ? <p className="runtime-empty" role="tabpanel" id={`${tabsId}-panel-indexing`} aria-labelledby={`${tabsId}-tab-indexing`}>索引状态属于群组摘要；此抽屉不推断未上报的索引结果。</p> : null}
+        {tab === 'indexing' ? <p className="runtime-empty" role="tabpanel" id={`${tabsId}-panel-indexing`} aria-labelledby={`${tabsId}-tab-indexing`}>
+          {indexingState === 'idle' ? '当前没有进行中的索引任务。'
+            : indexingState === 'queued' ? '索引任务正在排队。'
+              : indexingState === 'running' ? '正在为当前群组建立索引。' : '索引失败，请检查资料或重试。'}
+        </p> : null}
         {sideRuns.length ? <p className="runtime-side-note">另有 {sideRuns.length} 个旁路任务，证据和费用保持独立。</p> : null}
       </div>
     </aside>
@@ -234,9 +258,13 @@ export const AgentStatusBar = memo(function AgentStatusBar({ projectId }: AgentS
     projections as RuntimeProjection[], summary?.active_primary_run_id,
   );
   const primary = primaryProjection?.run;
-  const sideRuns = runs.filter((run) => run.kind === 'side' && (
-    !TERMINAL.has(run.status) || run.last_seq > (sideReadWatermarks[run.run_id] || 0)
-  ));
+  const sideProjections = (projections as RuntimeProjection[]).filter(
+    (projection) => projection.run.kind === 'side',
+  );
+  const sideRuns = sideProjections.filter((projection) => {
+    const answerSeq = sideAnswerSequence(projection);
+    return answerSeq === null || answerSeq > (sideReadWatermarks[projection.run.run_id] || 0);
+  }).map((projection) => projection.run);
   const activeAgents = primary?.agent_runs.filter((agent) => agent.phase !== 'idle') || [];
   const idleAgents = primary?.agent_runs.filter((agent) => agent.phase === 'idle') || [];
 
@@ -290,7 +318,7 @@ export const AgentStatusBar = memo(function AgentStatusBar({ projectId }: AgentS
           <div className="agent-status-kicker"><span>{STATUS_LABEL[primary.status]}</span><span>{ROUTE_LABEL[primary.route_label]}</span></div>
           <strong>{primary.public_summary || primary.title}</strong>
           <div className="agent-status-meta">
-            <span>{verifierLabel(primary.status)}</span>
+            <span>{verifierLabel(primary, primaryProjection.events)}</span>
             <span>Token {ratio(primary.budget_usage.tokens, primary.budget_limits.tokens)}</span>
             <span>工具 {ratio(primary.budget_usage.tool_calls, primary.budget_limits.tool_calls)}</span>
             <span>{Math.round(primary.budget_usage.wall_clock_seconds)} 秒</span>
@@ -325,11 +353,15 @@ export const AgentStatusBar = memo(function AgentStatusBar({ projectId }: AgentS
       </div> : null}
       {sideRuns.length ? <div className="agent-status-side" data-testid="side-runs">
         <strong>旁路任务</strong>{sideRuns.map((run) => {
-          const unread = run.last_seq > (sideReadWatermarks[run.run_id] || 0);
+          const projection = sideProjections.find((item) => item.run.run_id === run.run_id)!;
+          const answerSeq = sideAnswerSequence(projection);
+          const unread = answerSeq !== null && answerSeq > (sideReadWatermarks[run.run_id] || 0);
           return <button type="button" key={run.run_id} className={unread ? 'side-run-unread' : ''}
-            aria-label={`${run.public_summary || run.title}，${unread ? '未读，点击标记已读' : '已读'}`}
-            onClick={() => useSideTaskReadStore.getState().acknowledge(run.run_id, run.last_seq)}>
-            {run.public_summary || run.title} · {STATUS_LABEL[run.status]}{unread ? ' · 未读' : ''}
+            aria-label={`${run.public_summary || run.title}，${unread ? '未读回答，点击标记已读' : TERMINAL.has(run.status) ? '已读' : '进行中'}`}
+            onClick={() => {
+              if (answerSeq !== null) useSideTaskReadStore.getState().acknowledge(run.run_id, answerSeq);
+            }}>
+            {run.public_summary || run.title} · {STATUS_LABEL[run.status]}{unread ? ' · 未读回答' : ''}
           </button>;
         })}
       </div> : null}
@@ -353,7 +385,7 @@ export const AgentStatusBar = memo(function AgentStatusBar({ projectId }: AgentS
       <RuntimeDrawer open={drawerOpen} onClose={() => {
         setDrawerOpen(false);
         requestAnimationFrame(() => detailsTriggerRef.current?.focus());
-      }} groupId={group.group_id} primary={primary} sideRuns={sideRuns} />
+      }} groupId={group.group_id} primary={primary} sideRuns={sideRuns} indexingState={summary?.indexing_state || 'idle'} />
       <GroupManagementDialog group={group} open={managerOpen} onClose={() => {
         setManagerOpen(false);
         requestAnimationFrame(() => managerTriggerRef.current?.focus());

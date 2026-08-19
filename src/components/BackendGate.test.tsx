@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import BackendGate from './BackendGate';
-import type { BackendPhase, BackendStatus, KnoweBridge } from '../shared/bridge';
+import type { BackendPhase, BackendStatus, KnoweBridge, PreviewOpenPayload } from '../shared/bridge';
 
 // ═══════════════════════════════════════════════════════════════
 // 假桥（模拟 Electron 主进程那一侧）
@@ -23,6 +23,7 @@ function status(phase: BackendPhase, message = ''): BackendStatus {
 
 class FakeBridge implements KnoweBridge {
   readonly isElectron = true as const;
+  readonly platform = 'win32';
   readonly version = 'test';
   readonly runtimeEndpoints = {
     httpBase: 'http://127.0.0.1:8081',
@@ -56,6 +57,10 @@ class FakeBridge implements KnoweBridge {
 
   selectDirectory = (): Promise<string | null> => Promise.resolve(null);   // [v0.7 A0]
   openPath = (_dir: string): Promise<void> => Promise.resolve();            // [v0.39.3]
+  getRuntimeToken = (): Promise<string> => Promise.resolve('test-token');
+  openPreview = (_payload: PreviewOpenPayload): Promise<void> => Promise.resolve();
+  onPreviewOpen = (_cb: (payload: PreviewOpenPayload) => void): (() => void) => () => undefined;
+  previewReady = (): void => undefined;
 
   get listenerCount(): number {
     return this.listeners.size;

@@ -29,6 +29,8 @@ export const GroupManagementDialog: React.FC<{ group: Group; open: boolean; onCl
 }) => {
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const [name, setName] = useState(group.name);
   const [duplicateDir, setDuplicateDir] = useState('');
@@ -52,7 +54,7 @@ export const GroupManagementDialog: React.FC<{ group: Group; open: boolean; onCl
     restoreFocusRef.current = document.activeElement as HTMLElement;
     closeRef.current?.focus();
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') onClose();
+      if (event.key === 'Escape') onCloseRef.current();
       if (event.key !== 'Tab' || !dialogRef.current) return;
       const focusable = [...dialogRef.current.querySelectorAll<HTMLElement>(
         'button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled])',
@@ -68,7 +70,7 @@ export const GroupManagementDialog: React.FC<{ group: Group; open: boolean; onCl
       window.removeEventListener('keydown', onKey);
       restoreFocusRef.current?.focus();
     };
-  }, [onClose, open]);
+  }, [open]);
   if (!open) return null;
 
   const act = async (key: string, operation: () => Promise<unknown>, preservePreview = false): Promise<void> => {

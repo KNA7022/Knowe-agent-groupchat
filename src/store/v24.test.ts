@@ -29,20 +29,20 @@ const approvalCardSrc = read('../components/ApprovalCard.tsx');
 
 // ═══════════════════════════════════════════════════════════════
 describe('v1.0.18.2 · 可观察阶段结构', () => {
-  it('★ 技术活动行仍用块级 <div>，多条不会挤成一行', () => {
-    expect(streamBubbleSrc.includes('<div className="typing-acts">')).toBe(true);
-    expect(streamBubbleSrc.includes('<div className="typing-label typing-act"')).toBe(true);
+  it('★ 临时态仍由单一块级气泡承载，不把多个活动标签铺成一行', () => {
+    expect(streamBubbleSrc.includes("'bubble agent typing-bubble'")).toBe(true);
+    expect(streamBubbleSrc.includes('typing-acts')).toBe(false);
   });
 
-  it('当前阶段与历史阶段是独立块级结构', () => {
-    expect(streamBubbleSrc.includes('typing-stage-current')).toBe(true);
-    expect(streamBubbleSrc.includes('typing-stage-history')).toBe(true);
-    expect(streamBubbleSrc.includes('typing-stage-done')).toBe(true);
+  it('推理反馈与通用等待反馈互斥，避免并列抢夺主视觉', () => {
+    expect(streamBubbleSrc.includes('hasReasoning ? (')).toBe(true);
+    expect(streamBubbleSrc.includes('<ReasoningPanel text={reasoning')).toBe(true);
+    expect(streamBubbleSrc.includes('<ThinkingDot />')).toBe(true);
   });
 
-  it('原子工具动作放进默认折叠的“技术详情”', () => {
-    expect(streamBubbleSrc.includes('<details className="typing-tech">')).toBe(true);
-    expect(streamBubbleSrc.includes('<summary>技术详情</summary>')).toBe(true);
+  it('临时聊天气泡不再渲染原子工具动作或技术详情', () => {
+    expect(streamBubbleSrc.includes('typing-tech')).toBe(false);
+    expect(streamBubbleSrc.includes('toolActions?:')).toBe(false);
   });
 
   it('★ 正文仍然不逐字渲染（v0.8e 的决定，别在这一版偷偷破了）', () => {
@@ -89,25 +89,23 @@ describe('v0.24 #4 · 我有新意见', () => {
   });
 
   it('writing 态：确认/拒绝消失，换成发送/取消', () => {
-    const block = approvalCardSrc.split("feedbackMode === 'writing' ? (")[1]?.slice(0, 600) ?? '';
-    expect(block.includes('发送')).toBe(true);
-    expect(block.includes('取消')).toBe(true);
+    const block = approvalCardSrc.split("feedbackMode === 'writing' ? (")[1]?.slice(0, 900) ?? '';
+    expect(block.includes("t('composer.04')")).toBe(true);
+    expect(block.includes("t('chat.stream.03')")).toBe(true);
   });
 
   it('sent 态：转圈 +「主管正在调整任务指令…」', () => {
     expect(approvalCardSrc.includes('主管正在调整任务指令…')).toBe(true);
-    expect(approvalCardSrc.includes('thinking-dot')).toBe(true);
+    expect(approvalCardSrc.includes('<ThinkingDot />')).toBe(true);
   });
 
   it('空意见不给发（灰键，而不是发一条空话给项目经理）', () => {
     expect(approvalCardSrc.includes('disabled={!feedbackText.trim()}')).toBe(true);
   });
 
-  it('★ 走的是现成的 sendMessage，没有新增任何协议', () => {
-    // 新开一个 WebSocket 指令要同时改 envelope.ts + contract.py + server.py，
-    // 而后两个我手上没有 —— v0.23 的教训：不交自己验不了的东西。
-    expect(approvalCardSrc.includes('const sendMessage = useKnoweStore((s) => s.sendMessage);')).toBe(true);
-    expect(approvalCardSrc.includes('sendMessage(`关于刚才那个任务，我有新意见：${text}`, projectId)')).toBe(true);
+  it('★ 意见走受控 feedback_instruction，不伪装成普通聊天消息', () => {
+    expect(approvalCardSrc.includes('feedbackInstruction(cardId, projectId, text)')).toBe(true);
+    expect(approvalCardSrc.includes('sendMessage(`关于刚才那个任务')).toBe(false);
   });
 
   it('Esc 收起、⌘/Ctrl+Enter 发送（回车留给换行）', () => {

@@ -17,6 +17,7 @@ import {
   type TaskRun,
 } from '../contract/taskRuntime';
 import type { GroupId } from '../contract/group';
+import { useGroupStore } from './groups';
 import { runtimeFetch } from '../shared/runtimeFetch';
 import { runtimeHttpBase } from '../shared/runtimeEndpoints';
 
@@ -62,6 +63,18 @@ function requestKey(prefix: string): string {
   return `${prefix}_${globalThis.crypto?.randomUUID?.().replace(/-/g, '') || Date.now().toString(36)}`;
 }
 
+const authorityRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** Coalesce noisy WS transitions into one authenticated snapshot+summary refresh. */
+export function scheduleTaskRuntimeAuthorityRefresh(groupId: GroupId, delayMs = 80): void {
+  const pending = authorityRefreshTimers.get(groupId);
+  if (pending) clearTimeout(pending);
+  authorityRefreshTimers.set(groupId, setTimeout(() => {
+    authorityRefreshTimers.delete(groupId);
+    void useTaskRuntimeStore.getState().refreshGroup(groupId).catch(() => undefined);
+  }, delayMs));
+}
+
 export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   byRun: {},
   byGroup: {},
@@ -69,6 +82,8 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   error: null,
 
   resetAll(): void {
+    for (const timer of authorityRefreshTimers.values()) clearTimeout(timer);
+    authorityRefreshTimers.clear();
     set({ byRun: {}, byGroup: {}, approvals: {}, error: null });
   },
 
@@ -119,6 +134,15 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         error: null,
       };
     });
+    useGroupStore.getState().ingestRuntimeProjection(
+      groupId,
+      {
+        ...snapshot.summary,
+        active_agent_count: new Set(rows.flatMap((run) => run.agent_runs
+          .filter((agent) => agent.phase !== 'idle').map((agent) => agent.agent_id))).size,
+      },
+      rows.reduce((latest, run) => run.updated_at > latest ? run.updated_at : latest, ''),
+    );
   },
 
   applyEvent(groupId, raw): boolean {
@@ -220,6 +244,43 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         approvals: approvalChanges,
       };
     });
+    const state = get();
+    const runIds = state.byGroup[groupId] || [];
+    const runs = runIds.map((runId) => state.byRun[runId]?.run).filter((run): run is TaskRun => Boolean(run));
+    const previousSummary = useGroupStore.getState().runtimeSummaries[groupId];
+    const activePrimary = previousSummary?.active_primary_run_id
+      ? runs.find((run) => run.run_id === previousSummary.active_primary_run_id) : undefined;
+    const eventRun = state.byRun[event.run_id]?.run;
+    const eventPrimaryIsActive = eventRun?.kind === 'primary' && ![
+      'succeeded', 'partial', 'failed', 'cancelled',
+    ].includes(eventRun.status);
+    const authoritativePrimary = activePrimary && ![
+      'succeeded', 'partial', 'failed', 'cancelled',
+    ].includes(activePrimary.status)
+      ? activePrimary
+      : eventPrimaryIsActive ? eventRun : null;
+    const budgetUsage = runs.reduce((usage, run) => ({
+      wall_clock_seconds: usage.wall_clock_seconds + run.budget_usage.wall_clock_seconds,
+      model_turns: usage.model_turns + run.budget_usage.model_turns,
+      tool_calls: usage.tool_calls + run.budget_usage.tool_calls,
+      tokens: usage.tokens + run.budget_usage.tokens,
+      cost_usd: usage.cost_usd + run.budget_usage.cost_usd,
+    }), { wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0 });
+    useGroupStore.getState().ingestRuntimeProjection(groupId, {
+      active_agent_count: new Set(runs.flatMap((run) => run.agent_runs
+        .filter((agent) => agent.phase !== 'idle').map((agent) => agent.agent_id))).size,
+      active_primary_run_id: authoritativePrimary?.run_id || null,
+      primary_task_status: authoritativePrimary?.status || null,
+      queued_task_count: runs.filter((run) => run.status === 'queued').length,
+      active_side_task_count: runs.filter((run) => run.kind === 'side' && ![
+        'succeeded', 'partial', 'failed', 'cancelled',
+      ].includes(run.status)).length,
+      pending_approval_count: Object.values(state.approvals).filter(
+        (approval) => approval.group_id === groupId && approval.status === 'pending',
+      ).length,
+      budget_usage: budgetUsage,
+      indexing_state: previousSummary?.indexing_state || 'idle',
+    }, event.created_at);
     return true;
   },
 
