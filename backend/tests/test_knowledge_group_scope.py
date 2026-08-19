@@ -273,6 +273,11 @@ async def test_mixed_indivisible_objects_fail_closed_across_read_and_write_matri
         "status": "core", "view_state": "ok", "source_ids": [foreign_source],
         "course_ids": ["course-x"], "summary": "FOREIGN-GLOBAL-SECRET",
     }
+    pending_own_global = {
+        "asset_id": "global-own-pending", "scope": "global", "scope_set_by": "system",
+        "status": "candidate", "view_state": "pending", "source_ids": [], "course_ids": [],
+        "summary": "PENDING-OWN-GLOBAL-MARKER",
+    }
 
     class _MixedAssets(_Assets):
         def list_skillpacks(self, project_id: str, _workspace: Path) -> dict[str, object]:
@@ -297,7 +302,9 @@ async def test_mixed_indivisible_objects_fail_closed_across_read_and_write_matri
         "ref": "node-mixed", "source_ids": [source_id, foreign_source],
         "course_ids": ["course-own", "course-x"], "summary": "FOREIGN-NODE-SECRET",
     }])
-    assets = _MixedAssets("mixed-project", [mixed_asset, clean_global, foreign_global])
+    assets = _MixedAssets(
+        "mixed-project", [mixed_asset, clean_global, foreign_global, pending_own_global],
+    )
     try:
         register_project(
             "mixed-project", manager=manager, assets=assets, workspace_provider=lambda: tmp_path,
@@ -363,6 +370,17 @@ async def test_mixed_indivisible_objects_fail_closed_across_read_and_write_matri
         global_ids = {row["asset_id"] for row in globals_result.body["assets"]}
         assert "global-clean" in global_ids
         assert "global-foreign" not in global_ids
+        assert "global-own-pending" not in global_ids
         assert "FOREIGN-GLOBAL-SECRET" not in str(globals_result.body)
+        assert "PENDING-OWN-GLOBAL-MARKER" not in str(globals_result.body)
+        pending_detail = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/mixed-project/assets/global-own-pending", broad, b"", repo,
+        )
+        pending_write = await dispatch_knowledge_http(
+            "POST", "/api/knowledge/mixed-project/assets/global-own-pending", broad,
+            b'{"title":"changed"}', repo,
+        )
+        assert pending_detail.status == 403
+        assert pending_write.status == 403
     finally:
         unregister_project("mixed-project")

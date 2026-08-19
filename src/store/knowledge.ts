@@ -412,6 +412,13 @@ function knowledgeCommitAllowed(fence: KnowledgeScopeFence | null): boolean {
   ));
 }
 
+function copyKnowledgeScope(scope: KnowledgeQueryScope | null): KnowledgeQueryScope | undefined {
+  return scope ? {
+    groupIds: [...scope.groupIds], projectIds: [...scope.projectIds],
+    sourceIds: [...scope.sourceIds], courseId: scope.courseId,
+  } : undefined;
+}
+
 export const KN_PREVIEW_MIN = 320;
 export function knPreviewMax(): number {
   return Math.max(KN_PREVIEW_MIN, Math.floor(window.innerWidth * 0.62));
@@ -508,60 +515,72 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async reviewSkillpack(pack, action) {
-    const deletionFence = beginKnowledgeRequest(get().activeScope, [pack.projectId]);
-    if (!knowledgeCommitAllowed(deletionFence)) return false;
+    const requestedScope = copyKnowledgeScope(get().activeScope);
+    const requestIdentity = knowledgeScopeKey(requestedScope);
+    const deletionFence = beginKnowledgeRequest(requestedScope, [pack.projectId]);
+    const current = (): boolean => knowledgeCommitAllowed(deletionFence)
+      && get().activeScopeKey === requestIdentity;
+    if (!current()) return false;
     try {
       await apiFetch<{ ok: boolean }>(
-        `/skillpacks/${encodeURIComponent(pack.packId)}/review${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
+        `/skillpacks/${encodeURIComponent(pack.packId)}/review${knowledgeScopeQuery(requestedScope)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action }),
         },
       );
-      if (!knowledgeCommitAllowed(deletionFence)) return false;
-      await get().loadSkillpacks();
+      if (!current()) return false;
+      await get().loadSkillpacks(requestedScope);
       return true;
     } catch {
-      await get().loadSkillpacks();
+      if (current()) await get().loadSkillpacks(requestedScope);
       return false;
     }
   },
 
   async setSkillpackStatus(pack, status) {
-    const deletionFence = beginKnowledgeRequest(get().activeScope, [pack.projectId]);
-    if (!knowledgeCommitAllowed(deletionFence)) return false;
+    const requestedScope = copyKnowledgeScope(get().activeScope);
+    const requestIdentity = knowledgeScopeKey(requestedScope);
+    const deletionFence = beginKnowledgeRequest(requestedScope, [pack.projectId]);
+    const current = (): boolean => knowledgeCommitAllowed(deletionFence)
+      && get().activeScopeKey === requestIdentity;
+    if (!current()) return false;
     try {
       await apiFetch<{ ok: boolean }>(
-        `/skillpacks/${encodeURIComponent(pack.packId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
+        `/skillpacks/${encodeURIComponent(pack.packId)}${knowledgeScopeQuery(requestedScope)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ status }),
         },
       );
-      if (!knowledgeCommitAllowed(deletionFence)) return false;
-      await get().loadSkillpacks();
+      if (!current()) return false;
+      await get().loadSkillpacks(requestedScope);
       return true;
     } catch {
-      await get().loadSkillpacks();
+      if (current()) await get().loadSkillpacks(requestedScope);
       return false;
     }
   },
 
   async purgeSkillpack(pack) {
-    const deletionFence = beginKnowledgeRequest(get().activeScope, [pack.projectId]);
-    if (!knowledgeCommitAllowed(deletionFence)) return false;
+    const requestedScope = copyKnowledgeScope(get().activeScope);
+    const requestIdentity = knowledgeScopeKey(requestedScope);
+    const deletionFence = beginKnowledgeRequest(requestedScope, [pack.projectId]);
+    const current = (): boolean => knowledgeCommitAllowed(deletionFence)
+      && get().activeScopeKey === requestIdentity;
+    if (!current()) return false;
     try {
       await apiFetch<{ ok: boolean }>(
-        `/skillpacks/${encodeURIComponent(pack.packId)}/purge${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
+        `/skillpacks/${encodeURIComponent(pack.packId)}/purge${knowledgeScopeQuery(requestedScope)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         },
       );
-      if (!knowledgeCommitAllowed(deletionFence)) return false;
+      if (!current()) return false;
       set((s) => ({
         skillpacks: {
           systemBuiltin: s.skillpacks.systemBuiltin.filter((p) => p.packId !== pack.packId),
@@ -571,10 +590,10 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
         preview: s.preview?.kind === 'skill' && s.preview.pack?.packId === pack.packId
           ? null : s.preview,
       }));
-      void get().loadSkillpacks();
+      if (current()) void get().loadSkillpacks(requestedScope);
       return true;
     } catch {
-      await get().loadSkillpacks();
+      if (current()) await get().loadSkillpacks(requestedScope);
       return false;
     }
   },
@@ -595,8 +614,12 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async override(card, patch) {
-    const deletionFence = beginKnowledgeRequest(get().activeScope, [card.projectId]);
-    if (!knowledgeCommitAllowed(deletionFence)) return false;
+    const requestedScope = copyKnowledgeScope(get().activeScope);
+    const requestIdentity = knowledgeScopeKey(requestedScope);
+    const deletionFence = beginKnowledgeRequest(requestedScope, [card.projectId]);
+    const current = (): boolean => knowledgeCommitAllowed(deletionFence)
+      && get().activeScopeKey === requestIdentity;
+    if (!current()) return false;
     // 乐观：先把本地卡片改成目标态，POST 失败由 load 重拉回滚。
     const optimistic = get().cards.map((c) => {
       if (c.id !== card.id) return c;
@@ -614,66 +637,74 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     set({ cards: optimistic });
     try {
       await apiFetch<{ ok: boolean }>(
-        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
+        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}${knowledgeScopeQuery(requestedScope)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(patch),
         },
       );
-      if (!knowledgeCommitAllowed(deletionFence)) return false;
+      if (!current()) return false;
       // 后端是真源（refresh 会重算 utility/category/skill 导出等派生态）→ 静默对齐。
-      void get().load({ silent: true });
+      void get().load({ silent: true, scope: requestedScope });
       return true;
     } catch {
-      void get().load({ silent: true });   // 回滚到服务端真实状态
+      if (current()) void get().load({ silent: true, scope: requestedScope });
       return false;
     }
   },
 
   async review(card, action) {
-    const deletionFence = beginKnowledgeRequest(get().activeScope, [card.projectId]);
-    if (!knowledgeCommitAllowed(deletionFence)) return false;
+    const requestedScope = copyKnowledgeScope(get().activeScope);
+    const requestIdentity = knowledgeScopeKey(requestedScope);
+    const deletionFence = beginKnowledgeRequest(requestedScope, [card.projectId]);
+    const current = (): boolean => knowledgeCommitAllowed(deletionFence)
+      && get().activeScopeKey === requestIdentity;
+    if (!current()) return false;
     try {
       await apiFetch<{ ok: boolean }>(
-        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}/review${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
+        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}/review${knowledgeScopeQuery(requestedScope)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action }),
         },
       );
-      if (!knowledgeCommitAllowed(deletionFence)) return false;
-      void get().load({ silent: true });
+      if (!current()) return false;
+      void get().load({ silent: true, scope: requestedScope });
       return true;
     } catch {
-      void get().load({ silent: true });
+      if (current()) void get().load({ silent: true, scope: requestedScope });
       return false;
     }
   },
 
   async purge(card) {
-    const deletionFence = beginKnowledgeRequest(get().activeScope, [card.projectId]);
-    if (!knowledgeCommitAllowed(deletionFence)) return false;
+    const requestedScope = copyKnowledgeScope(get().activeScope);
+    const requestIdentity = knowledgeScopeKey(requestedScope);
+    const deletionFence = beginKnowledgeRequest(requestedScope, [card.projectId]);
+    const current = (): boolean => knowledgeCommitAllowed(deletionFence)
+      && get().activeScopeKey === requestIdentity;
+    if (!current()) return false;
     try {
       await apiFetch<{ ok: boolean }>(
-        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}/purge${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
+        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}/purge${knowledgeScopeQuery(requestedScope)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({}),
         },
       );
-      if (!knowledgeCommitAllowed(deletionFence)) return false;
+      if (!current()) return false;
       // 彻底删除：本地立刻移除；预览开着这张卡就顺手关掉。
       set((s) => ({
         cards: s.cards.filter((c) => c.id !== card.id),
         preview: s.preview?.card?.id === card.id ? null : s.preview,
       }));
-      void get().load({ silent: true });
+      if (current()) void get().load({ silent: true, scope: requestedScope });
       return true;
     } catch {
-      void get().load({ silent: true });
+      if (current()) void get().load({ silent: true, scope: requestedScope });
       return false;
     }
   },

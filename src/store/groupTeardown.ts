@@ -27,10 +27,8 @@ export function teardownGroup(groupId: GroupId, legacyProjectId?: string | null)
   const runIds = useTaskRuntimeStore.getState().teardownGroupProjection(groupId);
   useSideTaskReadStore.getState().clearRuns(runIds);
   useKnowledgeStore.getState().teardownGroupScope(groupId, legacyProjectId);
-  useRecordsStore.setState({
-    open: false, items: [], handoffs: [], total: 0, page: 1, loading: false,
-    handoffsLoading: false, jumpSeq: null, error: null,
-  });
+  if (legacyProjectId) useRecordsStore.getState().invalidateIdentity(legacyProjectId);
+  useRecordsStore.getState().invalidateIdentity(groupId);
   useSettingsStore.setState((state) => {
     const groupApprovalTimeouts = { ...state.groupApprovalTimeouts };
     delete groupApprovalTimeouts[groupId];

@@ -124,6 +124,10 @@ export function groupFileHistory(
 export function historyBase(): string { return runtimeHttpBase(); }
 
 interface RecordsState {
+  activeProjectId: string | null;
+  identityEpoch: number;
+  historyRequestEpoch: number;
+  handoffRequestEpoch: number;
   open: boolean;
   category: RecordsCategory;
   searchQuery: string;
@@ -151,6 +155,7 @@ interface RecordsState {
   load: (projectId: string) => Promise<void>;
   loadMore: (projectId: string) => Promise<void>;
   loadHandoffs: (projectId: string) => Promise<void>;
+  invalidateIdentity: (projectId?: string | null) => void;
   reset: () => void;
 }
 
@@ -183,6 +188,10 @@ async function fetchHistory(p: {
 }
 
 export const useRecordsStore = create<RecordsState>((set, get) => ({
+  activeProjectId: null,
+  identityEpoch: 0,
+  historyRequestEpoch: 0,
+  handoffRequestEpoch: 0,
   open: false,
   category: 'all',
   searchQuery: '',
@@ -198,33 +207,59 @@ export const useRecordsStore = create<RecordsState>((set, get) => ({
   handoffsLoading: false,
 
   openDrawer: () => set({ open: true }),
-  closeDrawer: () => set({ open: false }),
-  toggleDrawer: () => set((s) => ({ open: !s.open })),
+  closeDrawer: () => set((state) => ({
+    open: false, activeProjectId: null, identityEpoch: state.identityEpoch + 1,
+    historyRequestEpoch: state.historyRequestEpoch + 1,
+    handoffRequestEpoch: state.handoffRequestEpoch + 1,
+    items: [], handoffs: [], total: 0, loading: false, handoffsLoading: false, error: null,
+  })),
+  toggleDrawer: () => {
+    if (get().open) get().closeDrawer();
+    else set({ open: true });
+  },
 
   // [v0.38.1 #9] 文件筛选每页最多 10 条；其余分类沿用默认 25。
-  setCategory: (c) => set({
-    category: c, page: 1, items: [], total: 0, error: null,
+  setCategory: (c) => set((state) => ({
+    category: c, page: 1, items: [], total: 0, error: null, loading: false,
     pageSize: c === 'files' ? 10 : DEFAULT_PAGE_SIZE,
-  }),
+    historyRequestEpoch: state.historyRequestEpoch + 1,
+  })),
   setSearchQuery: (q) => set({ searchQuery: q }),
-  setSelectedDate: (d) => set({ selectedDate: d, page: 1, items: [], total: 0, error: null }),
+  setSelectedDate: (d) => set((state) => ({
+    selectedDate: d, page: 1, items: [], total: 0, error: null, loading: false,
+    historyRequestEpoch: state.historyRequestEpoch + 1,
+  })),
   requestJump: (seq) => set({ jumpSeq: seq }),
   clearJump: () => set({ jumpSeq: null }),
 
   async load(projectId) {
     if (!projectId || isGroupDeletionFenced(projectId)) return;
     const generation = groupDeletionGeneration(projectId);
-    const { category, pageSize, selectedDate } = get();
-    set({ loading: true, error: null, page: 1 });
+    const before = get();
+    const switching = before.activeProjectId !== projectId;
+    const identityEpoch = before.identityEpoch + (switching ? 1 : 0);
+    const requestEpoch = before.historyRequestEpoch + 1;
+    const { category, pageSize, selectedDate } = before;
+    set({
+      activeProjectId: projectId, identityEpoch, historyRequestEpoch: requestEpoch,
+      loading: true, error: null, page: 1,
+      ...(switching ? { items: [], handoffs: [], total: 0, handoffsLoading: false } : {}),
+    });
+    const current = (): boolean => {
+      const state = get();
+      return state.activeProjectId === projectId && state.identityEpoch === identityEpoch
+        && state.historyRequestEpoch === requestEpoch
+        && groupCommitAllowed(projectId, generation);
+    };
     try {
       const { items, total } = await fetchHistory({
         projectId, category, page: 1, pageSize,
         date: category === 'date' ? selectedDate : null,
       });
-      if (!groupCommitAllowed(projectId, generation)) return;
+      if (!current()) return;
       set({ items, total, page: 1, loading: false });
     } catch (e) {
-      if (!groupCommitAllowed(projectId, generation)) return;
+      if (!current()) return;
       set({ loading: false, error: e instanceof Error ? e.message : i18n.t('html.preview.01') });
     }
   },
@@ -232,19 +267,30 @@ export const useRecordsStore = create<RecordsState>((set, get) => ({
   async loadMore(projectId) {
     if (!projectId || isGroupDeletionFenced(projectId)) return;
     const generation = groupDeletionGeneration(projectId);
-    const { category, pageSize, selectedDate, page, items, total, loading } = get();
+    const before = get();
+    if (before.activeProjectId && before.activeProjectId !== projectId) return;
+    const identityEpoch = before.identityEpoch + (before.activeProjectId ? 0 : 1);
+    const requestEpoch = before.historyRequestEpoch + 1;
+    const { category, pageSize, selectedDate, page, items, total, loading } = before;
     if (loading || items.length >= total) return;
     const nextPage = page + 1;
-    set({ loading: true, error: null });
+    set({ activeProjectId: projectId, identityEpoch, historyRequestEpoch: requestEpoch,
+      loading: true, error: null });
+    const current = (): boolean => {
+      const state = get();
+      return state.activeProjectId === projectId && state.identityEpoch === identityEpoch
+        && state.historyRequestEpoch === requestEpoch
+        && groupCommitAllowed(projectId, generation);
+    };
     try {
       const res = await fetchHistory({
         projectId, category, page: nextPage, pageSize,
         date: category === 'date' ? selectedDate : null,
       });
-      if (!groupCommitAllowed(projectId, generation)) return;
+      if (!current()) return;
       set({ items: [...items, ...res.items], total: res.total, page: nextPage, loading: false });
     } catch (e) {
-      if (!groupCommitAllowed(projectId, generation)) return;
+      if (!current()) return;
       set({ loading: false, error: e instanceof Error ? e.message : i18n.t('html.preview.01') });
     }
   },
@@ -253,27 +299,58 @@ export const useRecordsStore = create<RecordsState>((set, get) => ({
   async loadHandoffs(projectId) {
     if (!projectId || isGroupDeletionFenced(projectId)) return;
     const generation = groupDeletionGeneration(projectId);
-    set({ handoffsLoading: true, error: null });
+    const before = get();
+    const switching = before.activeProjectId !== projectId;
+    const identityEpoch = before.identityEpoch + (switching ? 1 : 0);
+    const requestEpoch = before.handoffRequestEpoch + 1;
+    set({
+      activeProjectId: projectId, identityEpoch, handoffRequestEpoch: requestEpoch,
+      handoffsLoading: true, error: null,
+      ...(switching ? {
+        items: [], handoffs: [], total: 0, loading: false,
+        historyRequestEpoch: before.historyRequestEpoch + 1,
+      } : {}),
+    });
+    const current = (): boolean => {
+      const state = get();
+      return state.activeProjectId === projectId && state.identityEpoch === identityEpoch
+        && state.handoffRequestEpoch === requestEpoch
+        && groupCommitAllowed(projectId, generation);
+    };
     try {
       const res = await runtimeFetch(`${historyBase()}/history/handoffs?project_id=${encodeURIComponent(projectId)}`);
       if (!res.ok) throw new Error(`handoffs ${res.status}`);
       const data = await res.json();
-      if (!groupCommitAllowed(projectId, generation)) return;
+      if (!current()) return;
       set({
         handoffs: Array.isArray(data.items) ? (data.items as HandoffItem[]) : [],
         handoffsLoading: false,
       });
     } catch (e) {
-      if (!groupCommitAllowed(projectId, generation)) return;
+      if (!current()) return;
       set({ handoffsLoading: false, error: e instanceof Error ? e.message : i18n.t('html.preview.01') });
     }
   },
 
-  reset: () => set({
+  invalidateIdentity: (projectId) => set((state) => {
+    if (projectId && state.activeProjectId && state.activeProjectId !== projectId) return state;
+    return {
+      activeProjectId: null, identityEpoch: state.identityEpoch + 1,
+      historyRequestEpoch: state.historyRequestEpoch + 1,
+      handoffRequestEpoch: state.handoffRequestEpoch + 1,
+      open: false, items: [], handoffs: [], total: 0, page: 1,
+      loading: false, handoffsLoading: false, jumpSeq: null, error: null,
+    };
+  }),
+
+  reset: () => set((state) => ({
     category: 'all', searchQuery: '', selectedDate: null,
     page: 1, items: [], total: 0, loading: false, error: null,
-    handoffs: [], jumpSeq: null,
-  }),
+    handoffs: [], handoffsLoading: false, jumpSeq: null, activeProjectId: null,
+    identityEpoch: state.identityEpoch + 1,
+    historyRequestEpoch: state.historyRequestEpoch + 1,
+    handoffRequestEpoch: state.handoffRequestEpoch + 1,
+  })),
 }));
 
 /** 结合本地搜索词过滤已加载项；文件名/路径与发送人 id 也可命中。 */

@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Group } from '../contract/group';
-import { pendingGroupRequestCacheCount, useGroupStore } from './groups';
-import { fenceDeletedGroup } from './groupDeletionFence';
+import {
+  pendingGroupRequestCacheCount, pendingGroupTeardownCount, retryPendingGroupTeardowns,
+  setGroupTeardownLoaderForTests, useGroupStore,
+} from './groups';
+import { fenceDeletedGroup, isGroupDeletionFenced } from './groupDeletionFence';
 import { teardownGroup } from './groupTeardown';
 import { useRecordsStore } from './records';
 import { agentBindingKey, useSettingsStore } from './settings';
@@ -64,6 +67,7 @@ describe('canonical Group store', () => {
     loading: false, error: null,
   }));
   afterEach(() => {
+    setGroupTeardownLoaderForTests();
     vi.unstubAllGlobals();
   });
 
@@ -296,5 +300,76 @@ describe('canonical Group store', () => {
     }));
     await expect(duplicate).rejects.toThrow(/deleted/i);
     expect(JSON.stringify(useGroupStore.getState())).not.toContain(deletedId);
+  });
+
+  it('fences canonical and legacy identities before the teardown import can resolve', async () => {
+    const deletedId = `grp_${'c'.repeat(32)}` as typeof firstId;
+    const legacyId = 'legacy-import-boundary';
+    const seeded = structuredClone(group(firstId));
+    seeded.group_id = deletedId;
+    seeded.legacy_project_id = legacyId;
+    seeded.roster = seeded.roster.map((agent) => ({ ...agent, group_id: deletedId }));
+    useGroupStore.getState().ingest([seeded]);
+
+    let resolveHistory!: (response: Response) => void;
+    let resolveLoader!: (module: typeof import('./groupTeardown')) => void;
+    setGroupTeardownLoaderForTests(() => new Promise((resolve) => { resolveLoader = resolve; }));
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/history?')) {
+        return new Promise<Response>((resolve) => { resolveHistory = resolve; });
+      }
+      if (url.includes('/groups/delete')) {
+        return Promise.resolve(new Response(JSON.stringify({ receipt: {
+          schema_version: 1, receipt_id: `gdr_${'d'.repeat(32)}`, group_id: deletedId,
+          deleted_at: '2026-08-19T00:00:00Z', removed_agent_count: 2,
+          removed_course_binding_count: 0, removed_source_link_count: 0,
+          deleted_source_ids: [], retained_shared_source_ids: [],
+        } }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      }
+      return Promise.resolve(new Response(JSON.stringify({ ok: true }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      }));
+    }));
+
+    const history = useRecordsStore.getState().load(legacyId);
+    await vi.waitFor(() => expect(resolveHistory).toBeTypeOf('function'));
+    const deleting = useGroupStore.getState().confirmedDelete(deletedId, 'token');
+    await vi.waitFor(() => expect(resolveLoader).toBeTypeOf('function'));
+    expect(isGroupDeletionFenced(deletedId)).toBe(true);
+    expect(isGroupDeletionFenced(legacyId)).toBe(true);
+    resolveHistory(new Response(JSON.stringify({ items: [{
+      seq: 1, type: 'message', agent_id: 'agent', content: 'LATE-LEGACY-BODY',
+    }], total: 1 }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    await history;
+    expect(JSON.stringify(useRecordsStore.getState())).not.toContain('LATE-LEGACY-BODY');
+    resolveLoader({ teardownGroup });
+    await deleting;
+    expect(pendingGroupTeardownCount()).toBe(0);
+  });
+
+  it('retains and retries cleanup when the teardown import fails', async () => {
+    const deletedId = `grp_${'d'.repeat(32)}` as typeof firstId;
+    const legacyId = 'legacy-import-retry';
+    const seeded = structuredClone(group(firstId));
+    seeded.group_id = deletedId;
+    seeded.legacy_project_id = legacyId;
+    seeded.roster = seeded.roster.map((agent) => ({ ...agent, group_id: deletedId }));
+    useGroupStore.getState().ingest([seeded]);
+    setGroupTeardownLoaderForTests(() => Promise.reject(new Error('import unavailable')));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ receipt: {
+      schema_version: 1, receipt_id: `gdr_${'e'.repeat(32)}`, group_id: deletedId,
+      deleted_at: '2026-08-19T00:00:00Z', removed_agent_count: 2,
+      removed_course_binding_count: 0, removed_source_link_count: 0,
+      deleted_source_ids: [], retained_shared_source_ids: [],
+    } }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
+
+    await useGroupStore.getState().confirmedDelete(deletedId, 'token');
+    expect(pendingGroupTeardownCount()).toBe(1);
+    expect(isGroupDeletionFenced(deletedId)).toBe(true);
+    expect(isGroupDeletionFenced(legacyId)).toBe(true);
+    setGroupTeardownLoaderForTests(async () => ({ teardownGroup }));
+    await retryPendingGroupTeardowns();
+    expect(pendingGroupTeardownCount()).toBe(0);
   });
 });

@@ -235,7 +235,9 @@ def _contributors_allowed(value: Any, scope: _KnowledgeScope) -> bool:
 
 
 def _row_allowed(row: dict[str, Any], project_id: str, scope: _KnowledgeScope) -> bool:
-    if project_id not in scope.project_ids and not _approved_global(row):
+    if row.get("scope") == "global" and not _approved_global(row):
+        return False
+    if project_id not in scope.project_ids and row.get("scope") != "global":
         return False
     return _contributors_allowed(row, scope)
 

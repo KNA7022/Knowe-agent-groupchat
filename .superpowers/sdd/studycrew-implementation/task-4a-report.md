@@ -81,3 +81,64 @@ legacy test fixtures, old UI files, PDF worker typing and older store strictness
 initial test-only unused-parameter diagnostic was fixed; no Task 4A production file adds a new
 diagnostic. Electron TypeScript compilation passes independently. This Task does not broaden into
 the planned baseline cleanup or Task 5 Tool/PII/RAG work.
+
+## Independent review fix round 1/5
+
+### Status
+
+DONE
+
+### Unconditional global-object policy
+
+- `scope=global` now always requires `scope_set_by=user`, `validated/core`, and a
+  non-pending/non-retired view, including when the supplying Project belongs to the current Group.
+  Project ownership can no longer bypass global approval.
+- The exact matrix adds an own-Project pending global marker and proves it is absent from lists,
+  denied on detail and denied on write. Clean approved global data remains allowed; approved
+  global data with a foreign private contributor remains excluded.
+
+### Original-scope mutation fence
+
+- All six Knowledge mutation families capture an immutable canonical scope, its scope identity,
+  and the complete deletion generation before dispatch: skill review/status/purge and asset
+  override/review/purge.
+- Every success, failure, local mutation and follow-up reload rechecks that original fence and
+  active scope. Reloads explicitly carry the captured scope; they never consult a teardown-reset
+  `activeScope=null`. A late rejection therefore performs no second unscoped request and writes no
+  error into the cleared Knowledge projection.
+- The formal matrix covers every mutation with both a late successful response and a late
+  rejected response after deletion: `12/12` operations return fail-closed with one request only.
+
+### Records identity and request epochs
+
+- The records singleton now holds its active legacy/canonical identity, an identity epoch and
+  independent history/handoff request epochs. `load`, `loadMore`, `loadHandoffs` and both success
+  and error updaters require identity, epoch and deletion generation equality.
+- A Group switch invalidates both lanes and clears the old projection. Category/date changes
+  invalidate history; close, reset and confirmed teardown invalidate the identity and both lanes.
+  Teardown checks both exact legacy and canonical identities without clearing an unrelated active
+  Group.
+- A/B reverse-order tests prove late A load, loadMore error and handoff success cannot replace B
+  content or error state.
+
+### Synchronous confirmed-delete fence and retryable cleanup
+
+- After validating the backend deletion receipt, `confirmedDelete` synchronously fences the
+  captured canonical and legacy identities before the dynamic teardown-module import can yield.
+- The cleanup obligation remains in an in-memory retry map until teardown succeeds. A failed
+  module import leaves both durable tombstones intact; the next Group load or an explicit retry
+  resumes cleanup. Tests pause the import boundary while a legacy history response resolves, and
+  separately force import failure then recovery.
+
+### Corrected verification evidence
+
+- Frontend full regression: `45 files / 517 tests passed`.
+- Exact Task 4A renderer set: `7 files / 37 tests passed`; the review's broken `_input/input`
+  fixture and both new-test TypeScript diagnostics are fixed.
+- Knowledge scope matrix: `3/3 passed`.
+- Scoped backend ordinary partition: `184/184 passed in 47.97s`.
+- Task Runtime quarantine partition: clean isolated rerun `68/68 passed in 29.34s`.
+- `npm run lint`, Electron TypeScript compilation, Node command tests `2/2`, Python compilation
+  and `git diff --check` pass. Node is `v24.19.0`; Python is `3.12.10`.
+- Full renderer typecheck still exits on the previously disclosed historical baseline, but its
+  output contains zero diagnostics for every Task 4A round-1 production or test file.

@@ -35,7 +35,7 @@ describe('durable deletion generation fence', () => {
 
   it('drops deferred records, settings, Knowledge and directory responses after teardown', async () => {
     const deferred: DeferredResponse[] = [];
-    vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if ((init?.method || 'GET') === 'POST') {
         return Promise.resolve(json({ ok: true, settings_revision: 1 }));
@@ -127,7 +127,7 @@ describe('durable deletion generation fence', () => {
 
   it('keeps 1000 out-of-order late Knowledge responses at zero-write after deletion', async () => {
     const pending: Array<(response: Response) => void> = [];
-    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    vi.stubGlobal('fetch', vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
       if ((init?.method || 'GET') === 'POST') return Promise.resolve(json({ ok: true }));
       return new Promise<Response>((resolve) => pending.push(resolve));
     }));
