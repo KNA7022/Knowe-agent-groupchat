@@ -24,7 +24,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 GROUP_SCHEMA_VERSION = 1
@@ -387,6 +387,7 @@ class GroupRepository:
         self.root = self.data_root / "groups" / f"v{GROUP_SCHEMA_VERSION}"
         self.registry_path = self.root / "registry.json"
         self.receipts_path = self.root / "deletion_receipts.json"
+        self.deletion_prepare_listener: Callable[[], None] | None = None
         self.root.mkdir(parents=True, exist_ok=True)
         self._normalize_duplicate_journal()
 
@@ -395,6 +396,7 @@ class GroupRepository:
             return {
                 "schema_version": GROUP_SCHEMA_VERSION, "revision": 0,
                 "groups": [], "sources": [], "deletion_transactions": [],
+                "deletion_revision": 0,
                 "deletion_receipts": [], "duplicate_transactions": [],
             }
         raw = json.loads(self.registry_path.read_text("utf-8"))
@@ -403,6 +405,7 @@ class GroupRepository:
         if not isinstance(raw.get("groups"), list) or not isinstance(raw.get("sources"), list):
             raise GroupDomainError("corrupt Group registry collections")
         raw.setdefault("deletion_transactions", [])
+        raw.setdefault("deletion_revision", 0)
         raw.setdefault("deletion_receipts", [])
         raw.setdefault("duplicate_transactions", [])
         if not all(isinstance(raw.get(key), list) for key in (
@@ -410,6 +413,9 @@ class GroupRepository:
         )):
             raise GroupDomainError("corrupt Group transaction collections")
         return raw
+
+    def deletion_revision(self) -> int:
+        return max(0, int(self._load_payload().get("deletion_revision") or 0))
 
     def _save_payload(self, payload: dict[str, Any]) -> None:
         payload = dict(payload)
@@ -933,7 +939,11 @@ class GroupRepository:
         if self._pending_delete(payload, group_id) is not None:
             return dict(self._pending_delete(payload, group_id) or transaction)
         payload["deletion_transactions"].append(transaction)
+        payload["deletion_revision"] = int(payload.get("deletion_revision") or 0) + 1
         self._save_payload(payload)
+        listener = self.deletion_prepare_listener
+        if listener is not None:
+            listener()
         return dict(transaction)
 
     def delete_transaction(self, identity: str) -> dict[str, Any] | None:

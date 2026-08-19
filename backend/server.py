@@ -546,7 +546,18 @@ class KnoweServer:
         self._task_runtime_group_deletion_task: asyncio.Task[Any] | None = None
         self._task_runtime_group_deletion_lock = asyncio.Lock()
         self._task_runtime_group_deletion_idle_attempt = 0
+        self._task_runtime_group_deletion_generation_started = False
+        self._task_runtime_group_deletion_generation_invalidated = False
+        self._task_runtime_group_deletion_invalidation_epoch = 0
         self._shutdown_event = asyncio.Event()
+        if self.groups is not None:
+            self.groups.deletion_prepare_listener = (
+                self._invalidate_task_runtime_group_deletion_generation
+            )
+        if self.task_runtime is not None:
+            self.task_runtime.store.group_deletion_prepare_listener = (
+                self._invalidate_task_runtime_group_deletion_generation
+            )
         self._last_pinned_at = 0
 
         # [v0.16 hotfix] persistent inbound-id aliases → canonical project_YYYYMMDDHHMMSS.
@@ -8166,11 +8177,11 @@ class KnoweServer:
             store = self.task_runtime.store
 
             # Runtime intents and canonical Group transactions are independent durable
-            # sources.  Persist their sweep state and the next source turn so a restart
-            # cannot repeatedly hand the whole batch to whichever source happens to be
-            # queried first.  A failure-free completed sweep is reopened only by a
-            # later foreground call; a failed sweep durably rotates into a retry sweep,
-            # and the owned continuation stops only when both sources are done.
+            # sources.  Persist their sweep generation, state, and next source turn so
+            # a restart cannot repeatedly hand the whole batch to whichever source is
+            # queried first.  Both ``done`` proofs are valid only inside the same
+            # generation; startup or a newly durable source identity invalidates both.
+            revision_view_failed = False
             try:
                 runtime_state = store.deletion_reconcile_cursor(
                     "server_task_runtime_source_state",
@@ -8181,19 +8192,48 @@ class KnoweServer:
                 source_turn = store.deletion_reconcile_cursor(
                     "server_deletion_source_turn",
                 )
+                generation = int(store.deletion_reconcile_cursor(
+                    "server_deletion_sweep_generation",
+                ) or 0)
+                observed_runtime_revision = int(store.deletion_reconcile_cursor(
+                    "server_observed_runtime_deletion_revision",
+                ) or -1)
+                observed_group_revision = int(store.deletion_reconcile_cursor(
+                    "server_observed_group_deletion_revision",
+                ) or -1)
+                runtime_revision = store.group_deletion_revision()
+                group_revision = self.groups.deletion_revision()
             except Exception as exc:  # noqa: BLE001 - bounded availability boundary
                 runtime_state = group_state = ""
                 source_turn = "task_runtime_service"
+                generation = 0
+                observed_runtime_revision = observed_group_revision = -1
+                runtime_revision = group_revision = 0
+                revision_view_failed = True
                 diagnostics.append({
                     "group_id": "", "status": "deferred_global",
                     "reason": type(exc).__name__,
                 })
+            start_generation = bool(
+                not self._task_runtime_group_deletion_generation_started
+                or self._task_runtime_group_deletion_generation_invalidated
+                or runtime_revision != observed_runtime_revision
+                or group_revision != observed_group_revision
+                or (runtime_state == "done" and group_state == "done")
+            )
+            if start_generation:
+                generation += 1
+                runtime_state = group_state = "pending"
+            # A callback arriving after this point represents work not covered by the
+            # current generation and will be observed again before checkpoint.
+            reconciliation_invalidation_epoch = (
+                self._task_runtime_group_deletion_invalidation_epoch
+            )
+            self._task_runtime_group_deletion_generation_invalidated = False
             runtime_pending = runtime_state != "done"
             group_pending = group_state != "done"
-            runtime_had_failure = runtime_state == "failed"
-            group_had_failure = group_state == "failed"
-            if not runtime_pending and not group_pending:
-                runtime_pending = group_pending = True
+            runtime_had_failure = runtime_state == "failed" or revision_view_failed
+            group_had_failure = group_state == "failed" or revision_view_failed
             if source_turn not in {"task_runtime_service", "group_repository"}:
                 source_turn = "task_runtime_service"
 
@@ -8222,6 +8262,7 @@ class KnoweServer:
                         limit=runtime_quota,
                         cursor_owner="server_task_runtime_source",
                         persist_cursor=False,
+                        cursor_override="" if start_generation else None,
                     )
                 except Exception as exc:  # noqa: BLE001 - startup availability boundary
                     report = {
@@ -8240,8 +8281,10 @@ class KnoweServer:
             else:
                 report = {
                     "processed_count": 0, "sample": [],
-                    "cursor": store.deletion_reconcile_cursor(
-                        "server_task_runtime_source",
+                    "cursor": (
+                        "" if start_generation else store.deletion_reconcile_cursor(
+                            "server_task_runtime_source",
+                        )
                     ),
                     "has_more": runtime_pending, "view_unavailable": False,
                     "last_error": "", "limit": 0,
@@ -8273,8 +8316,10 @@ class KnoweServer:
                         "task_runtime_service",
                     )
 
-            group_cursor = store.deletion_reconcile_cursor(
-                "group_repository",
+            group_cursor = (
+                "" if start_generation else store.deletion_reconcile_cursor(
+                    "group_repository",
+                )
             )
             if group_quota <= 0:
                 group_page = {
@@ -8374,6 +8419,41 @@ class KnoweServer:
                 else "retry" if group_had_failure
                 else "done"
             )
+            checkpoint_runtime_cursor = str(report.get("cursor") or "")
+            checkpoint_group_cursor = next_group_cursor
+            revision_refresh_failed = False
+            try:
+                latest_runtime_revision = store.group_deletion_revision()
+                latest_group_revision = self.groups.deletion_revision()
+            except Exception as exc:  # noqa: BLE001 - generation proof unavailable
+                revision_refresh_failed = True
+                latest_runtime_revision = runtime_revision
+                latest_group_revision = group_revision
+                runtime_source_state = group_source_state = "failed"
+                self._task_runtime_group_deletion_generation_invalidated = True
+                if len(diagnostics) < batch:
+                    diagnostics.append({
+                        "group_id": "", "status": "deferred_global",
+                        "reason": type(exc).__name__,
+                    })
+            generation_changed = bool(
+                self._task_runtime_group_deletion_generation_invalidated
+                or self._task_runtime_group_deletion_invalidation_epoch
+                != reconciliation_invalidation_epoch
+                or latest_runtime_revision != runtime_revision
+                or latest_group_revision != group_revision
+            )
+            if generation_changed:
+                # Work entered either source after this generation sampled its
+                # revisions.  Publish a new coordinated generation with both proofs
+                # invalidated; already completed effects replay idempotently.
+                generation += 1
+                checkpoint_runtime_cursor = checkpoint_group_cursor = ""
+                runtime_source_state = group_source_state = (
+                    "failed" if revision_refresh_failed else "pending"
+                )
+                runtime_revision = latest_runtime_revision
+                group_revision = latest_group_revision
             runtime_pending = runtime_source_state != "done"
             group_pending = group_source_state != "done"
             try:
@@ -8383,15 +8463,32 @@ class KnoweServer:
                 # cancellation after it is safe because every destructive effect is
                 # idempotent and already durable.
                 store.set_deletion_reconcile_checkpoints({
-                    "server_task_runtime_source": str(report.get("cursor") or ""),
-                    "group_repository": next_group_cursor,
+                    "server_task_runtime_source": checkpoint_runtime_cursor,
+                    "group_repository": checkpoint_group_cursor,
                     "server_task_runtime_source_state": runtime_source_state,
                     "server_group_repository_source_state": group_source_state,
                     "server_deletion_source_turn": next_source_turn,
+                    "server_deletion_sweep_generation": str(generation),
+                    "server_observed_runtime_deletion_revision": str(runtime_revision),
+                    "server_observed_group_deletion_revision": str(group_revision),
                 })
+                self._task_runtime_group_deletion_generation_started = True
+                if (
+                    self._task_runtime_group_deletion_invalidation_epoch
+                    == reconciliation_invalidation_epoch
+                ):
+                    self._task_runtime_group_deletion_generation_invalidated = False
+                else:
+                    # A durable prepare may occur inside the checkpoint call itself.
+                    # Keep the owned loop alive even if the just-written values carried
+                    # terminal states from the prior source snapshot.
+                    self._task_runtime_group_deletion_generation_invalidated = True
+                    runtime_pending = group_pending = True
+                    runtime_source_state = group_source_state = "pending"
             except Exception as exc:  # noqa: BLE001 - repeat safely after restart
                 runtime_pending = group_pending = True
                 runtime_source_state = group_source_state = "failed"
+                self._task_runtime_group_deletion_generation_invalidated = True
                 if len(diagnostics) < batch:
                     diagnostics.append({
                         "group_id": "", "status": "deferred_global",
@@ -8417,8 +8514,9 @@ class KnoweServer:
                 "processed_count": len(candidates),
                 "sample": diagnostics[:batch],
                 "has_more": has_more,
-                "runtime_cursor": str(report.get("cursor") or ""),
-                "group_cursor": next_group_cursor,
+                "runtime_cursor": checkpoint_runtime_cursor,
+                "group_cursor": checkpoint_group_cursor,
+                "generation": generation,
                 "runtime_quota": runtime_quota,
                 "group_quota": group_quota,
                 "next_source": next_source_turn,
@@ -8429,6 +8527,11 @@ class KnoweServer:
             "server_deletion_reconciliation"
         ].get("has_more"):
             self._schedule_task_runtime_group_deletion_reconcile()
+
+    def _invalidate_task_runtime_group_deletion_generation(self) -> None:
+        """Invalidate old dual-source completion proof after a new durable intent."""
+        self._task_runtime_group_deletion_invalidation_epoch += 1
+        self._task_runtime_group_deletion_generation_invalidated = True
 
     def _schedule_task_runtime_group_deletion_reconcile(self) -> None:
         owner = self._task_runtime_group_deletion_task

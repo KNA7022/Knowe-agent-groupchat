@@ -509,10 +509,9 @@ async def test_dual_source_cursors_resume_after_restart_and_process_each_delete_
         server.groups.create_group(f"Paged canonical {index}") for index in range(4)
     ]
     for index, group in enumerate(pending_groups):
-        preview = server.groups.delete_preview(group.group_id)
-        server.groups.prepare_delete(
-            group.group_id, preview.confirmation_token,
-            runtime_project_id=f"project_paged_canonical_{index}",
+        _prepare_runtime_delete(
+            server.task_runtime, server.groups, group.group_id,
+            f"project_paged_canonical_{index}",
         )
     for owner in (
         "task_runtime_service", "server_task_runtime_source", "group_repository",
@@ -522,14 +521,18 @@ async def test_dual_source_cursors_resume_after_restart_and_process_each_delete_
         server.task_runtime.store.set_deletion_reconcile_cursor(owner, "")
     server.task_runtime._deletion_reconcile_cursor = None  # noqa: SLF001
 
-    await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
-    await _cancel_deletion_reconcile_task(server)
-    runtime_cursor = server.task_runtime.store.deletion_reconcile_cursor(
-        "server_task_runtime_source",
-    )
-    group_cursor = server.task_runtime.store.deletion_reconcile_cursor(
-        "group_repository",
-    )
+    runtime_cursor = group_cursor = ""
+    for _ in range(10):
+        await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+        await _cancel_deletion_reconcile_task(server)
+        runtime_cursor = server.task_runtime.store.deletion_reconcile_cursor(
+            "server_task_runtime_source",
+        )
+        group_cursor = server.task_runtime.store.deletion_reconcile_cursor(
+            "group_repository",
+        )
+        if runtime_cursor and group_cursor:
+            break
     assert runtime_cursor and group_cursor
     _close_server(server)
 
@@ -772,6 +775,11 @@ async def test_last_page_authority_view_outage_retries_without_foreground_call(
         else:
             raise AssertionError("authority-view recovery required a foreground call")
         assert calls["count"] >= 2
+        while (
+            server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
         assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
     finally:
         await _cancel_deletion_reconcile_task(server)
@@ -1021,6 +1029,308 @@ async def test_runtime_source_failure_retries_without_foreground_call(
             raise AssertionError("runtime source failure did not recover autonomously")
         assert calls["runtime"] >= 2
         assert server.task_runtime.store.get_run(run_id) is None
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch", (1, 2))
+async def test_restart_generation_invalidates_old_group_done_for_new_prepare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, batch: int,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", batch)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    server.task_runtime.store.set_deletion_reconcile_checkpoints({
+        "server_task_runtime_source": "",
+        "group_repository": "",
+        "server_task_runtime_source_state": "retry",
+        "server_group_repository_source_state": "done",
+        "server_deletion_source_turn": "task_runtime_service",
+    })
+    group = server.groups.create_group("Prepared after old Group done")
+    preview = server.groups.delete_preview(group.group_id)
+    server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id="project_after_old_group_done",
+    )
+    _close_server(server)
+
+    restarted = KnoweServer(str(tmp_path))
+    assert restarted.groups is not None and restarted.task_runtime is not None
+    try:
+        await restarted._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+        deadline = time.monotonic() + 3
+        while (
+            restarted._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        transaction = restarted.groups.delete_transaction(group.group_id)
+        assert transaction is not None and transaction["stage"] == "committed"
+    finally:
+        await _cancel_deletion_reconcile_task(restarted)
+        _close_server(restarted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batch", (1, 2))
+async def test_restart_generation_invalidates_old_runtime_done_for_new_intent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, batch: int,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", batch)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    server.task_runtime.store.set_deletion_reconcile_checkpoints({
+        "server_task_runtime_source": "",
+        "group_repository": "",
+        "server_task_runtime_source_state": "done",
+        "server_group_repository_source_state": "retry",
+        "server_deletion_source_turn": "task_runtime_service",
+    })
+    group = server.groups.create_group("Intent after old runtime done")
+    run_id, _transaction_id = _prepare_runtime_delete(
+        server.task_runtime, server.groups, group.group_id,
+        "project_after_old_runtime_done",
+    )
+    _close_server(server)
+
+    restarted = KnoweServer(str(tmp_path))
+    assert restarted.groups is not None and restarted.task_runtime is not None
+    original_group_page = restarted.groups.pending_delete_transactions_page
+    group_calls = {"count": 0}
+
+    def hide_first_group_page(*, cursor="", limit=64):
+        group_calls["count"] += 1
+        if group_calls["count"] == 1:
+            return {"items": (), "cursor": cursor, "has_more": False, "limit": limit}
+        return original_group_page(cursor=cursor, limit=limit)
+
+    monkeypatch.setattr(
+        restarted.groups, "pending_delete_transactions_page", hide_first_group_page,
+    )
+    try:
+        await restarted._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+        first_state = restarted.task_runtime.recovery_report[
+            "server_deletion_reconciliation"
+        ]
+        assert first_state["runtime_quota"] > 0
+        deadline = time.monotonic() + 3
+        while (
+            restarted._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert restarted.task_runtime.store.get_run(run_id) is None
+        assert restarted.groups.delete_transaction(group.group_id)["stage"] == "committed"
+    finally:
+        await _cancel_deletion_reconcile_task(restarted)
+        _close_server(restarted)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("old_runtime_state", "old_group_state", "new_source"), (
+    ("done", "pending", "runtime"),
+    ("pending", "done", "group"),
+    ("done", "done", "runtime"),
+    ("done", "done", "group"),
+))
+async def test_new_source_revision_opens_coordinated_generation_in_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    old_runtime_state: str, old_group_state: str, new_source: str,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    initial_generation = 7
+    server.task_runtime.store.set_deletion_reconcile_checkpoints({
+        "server_task_runtime_source": "",
+        "group_repository": "",
+        "server_task_runtime_source_state": old_runtime_state,
+        "server_group_repository_source_state": old_group_state,
+        "server_deletion_source_turn": "task_runtime_service",
+        "server_deletion_sweep_generation": str(initial_generation),
+        "server_observed_runtime_deletion_revision": str(
+            server.task_runtime.store.group_deletion_revision()
+        ),
+        "server_observed_group_deletion_revision": str(
+            server.groups.deletion_revision()
+        ),
+    })
+    server._task_runtime_group_deletion_generation_started = True  # noqa: SLF001
+    group = server.groups.create_group(f"In-process new {new_source}")
+    preview = server.groups.delete_preview(group.group_id)
+    transaction = server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id=f"project_in_process_{new_source}",
+    )
+    if new_source == "runtime":
+        server.task_runtime.prepare_group_deletion(
+            group.group_id, str(transaction["transaction_id"]),
+        )
+
+    try:
+        await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+        state = server.task_runtime.recovery_report[
+            "server_deletion_reconciliation"
+        ]
+        assert state["generation"] > initial_generation
+        assert state["runtime_quota"] > 0
+        assert state["group_quota"] > 0
+        deadline = time.monotonic() + 3
+        while (
+            server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        assert server.groups.delete_transaction(group.group_id)["stage"] == "committed"
+        assert int(server.task_runtime.store.deletion_reconcile_cursor(
+            "server_deletion_sweep_generation",
+        )) >= state["generation"]
+    finally:
+        await _cancel_deletion_reconcile_task(server)
+        _close_server(server)
+
+
+def test_source_revisions_advance_once_per_new_durable_intent_and_survive_restart(
+    tmp_path: Path,
+) -> None:
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    initial_group_revision = server.groups.deletion_revision()
+    initial_runtime_revision = server.task_runtime.store.group_deletion_revision()
+    group = server.groups.create_group("Durable source revisions")
+    preview = server.groups.delete_preview(group.group_id)
+    transaction = server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id="project_durable_source_revisions",
+    )
+    # Idempotent replays retain the same source identity and must not continuously
+    # invalidate a clean coordinated sweep.
+    replay = server.groups.prepare_delete(
+        group.group_id, preview.confirmation_token,
+        runtime_project_id="project_durable_source_revisions",
+    )
+    assert replay["transaction_id"] == transaction["transaction_id"]
+    assert server.groups.deletion_revision() == initial_group_revision + 1
+    server.task_runtime.prepare_group_deletion(
+        group.group_id, str(transaction["transaction_id"]),
+    )
+    server.task_runtime.prepare_group_deletion(
+        group.group_id, str(transaction["transaction_id"]),
+    )
+    assert (
+        server.task_runtime.store.group_deletion_revision()
+        == initial_runtime_revision + 1
+    )
+    _close_server(server)
+
+    restarted = KnoweServer(str(tmp_path))
+    assert restarted.groups is not None and restarted.task_runtime is not None
+    try:
+        assert restarted.groups.deletion_revision() == initial_group_revision + 1
+        assert (
+            restarted.task_runtime.store.group_deletion_revision()
+            == initial_runtime_revision + 1
+        )
+    finally:
+        _close_server(restarted)
+
+
+def test_generation_checkpoint_is_atomic_and_persists_all_source_proofs(
+    tmp_path: Path,
+) -> None:
+    store = TaskRuntimeStore(tmp_path / "runtime.sqlite3")
+    owners = (
+        "server_task_runtime_source",
+        "group_repository",
+        "server_task_runtime_source_state",
+        "server_group_repository_source_state",
+        "server_deletion_source_turn",
+        "server_deletion_sweep_generation",
+        "server_observed_runtime_deletion_revision",
+        "server_observed_group_deletion_revision",
+    )
+    before = {owner: f"old-{index}" for index, owner in enumerate(owners)}
+    after = {owner: f"new-{index}" for index, owner in enumerate(owners)}
+    store.set_deletion_reconcile_checkpoints(before)
+    with store.db.transaction() as conn:
+        conn.execute(
+            """CREATE TRIGGER fail_generation_checkpoint
+               BEFORE UPDATE OF value ON studycrew_scheduler_state
+               WHEN NEW.name='deletion_cursor:server_deletion_sweep_generation'
+               BEGIN SELECT RAISE(ABORT, 'synthetic generation checkpoint failure'); END""",
+        )
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match="synthetic generation"):
+            store.set_deletion_reconcile_checkpoints(after)
+        assert {
+            owner: store.deletion_reconcile_cursor(owner) for owner in owners
+        } == before
+        with store.db.transaction() as conn:
+            conn.execute("DROP TRIGGER fail_generation_checkpoint")
+        store.set_deletion_reconcile_checkpoints(after)
+    finally:
+        store.close()
+
+    restarted = TaskRuntimeStore(tmp_path / "runtime.sqlite3")
+    try:
+        assert {
+            owner: restarted.deletion_reconcile_cursor(owner) for owner in owners
+        } == after
+    finally:
+        restarted.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("insert_before_checkpoint_commit", (True, False))
+async def test_prepare_during_checkpoint_opens_followup_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    insert_before_checkpoint_commit: bool,
+) -> None:
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    server = KnoweServer(str(tmp_path))
+    assert server.groups is not None and server.task_runtime is not None
+    group = server.groups.create_group("Prepare during generation checkpoint")
+    preview = server.groups.delete_preview(group.group_id)
+    original_checkpoint = server.task_runtime.store.set_deletion_reconcile_checkpoints
+    checkpoint_calls = {"count": 0}
+
+    def insert_prepare() -> None:
+        server.groups.prepare_delete(
+            group.group_id, preview.confirmation_token,
+            runtime_project_id="project_prepare_during_checkpoint",
+        )
+
+    def checkpoint_with_new_work(values):
+        checkpoint_calls["count"] += 1
+        if checkpoint_calls["count"] != 1:
+            original_checkpoint(values)
+            return
+        if insert_before_checkpoint_commit:
+            insert_prepare()
+            original_checkpoint(values)
+        else:
+            original_checkpoint(values)
+            insert_prepare()
+
+    monkeypatch.setattr(
+        server.task_runtime.store,
+        "set_deletion_reconcile_checkpoints",
+        checkpoint_with_new_work,
+    )
+    try:
+        await server._reconcile_task_runtime_group_deletions()  # noqa: SLF001
+        deadline = time.monotonic() + 3
+        while (
+            server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.01)
+        transaction = server.groups.delete_transaction(group.group_id)
+        assert transaction is not None and transaction["stage"] == "committed"
+        assert checkpoint_calls["count"] >= 2
     finally:
         await _cancel_deletion_reconcile_task(server)
         _close_server(server)

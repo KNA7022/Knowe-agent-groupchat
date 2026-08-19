@@ -1434,17 +1434,20 @@ class TaskRuntimeService:
         self, *, limit: int | None = None,
         cursor_owner: str = "task_runtime_service",
         persist_cursor: bool = True,
+        cursor_override: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             return self._reconcile_group_deletions_locked(
                 limit=limit, cursor_owner=cursor_owner,
                 persist_cursor=persist_cursor,
+                cursor_override=cursor_override,
             )
 
     def _reconcile_group_deletions_locked(
         self, *, limit: int | None = None,
         cursor_owner: str = "task_runtime_service",
         persist_cursor: bool = True,
+        cursor_override: str | None = None,
     ) -> dict[str, Any]:
         bounded = max(1, min(
             int(limit or self.DELETION_RECONCILE_BATCH_SIZE),
@@ -1452,7 +1455,12 @@ class TaskRuntimeService:
         ))
         owner = str(cursor_owner or "task_runtime_service")
         service_owned_cursor = owner == "task_runtime_service"
-        cursor = self._deletion_reconcile_cursor if service_owned_cursor else None
+        cursor = (
+            str(cursor_override)
+            if cursor_override is not None
+            else self._deletion_reconcile_cursor if service_owned_cursor
+            else None
+        )
         if cursor is None:
             try:
                 cursor = self.store.deletion_reconcile_cursor(owner)

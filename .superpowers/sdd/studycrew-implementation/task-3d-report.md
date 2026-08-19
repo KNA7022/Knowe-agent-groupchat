@@ -170,3 +170,93 @@ DONE
   targeted Python compilation, and `git diff --check` passed.
 - The documented pre-existing broad TypeScript baseline is unchanged; this round
   modifies no TypeScript files.
+
+## Independent review fix round 2/5
+
+### Status
+
+DONE
+
+### Coordinated durable sweep generation
+
+- Both source completion proofs now belong to one durable
+  `server_deletion_sweep_generation`. Startup/restart, a newly inserted canonical
+  deletion transaction, a newly inserted Task Runtime deletion intent, or an old
+  dual-`done` foreground sweep opens a new generation and invalidates both source
+  cursors/states together.
+- The canonical JSON registry and Task Runtime SQLite journal each maintain a durable,
+  monotonic source revision. Replaying the same prepare identity does not increment its
+  revision, so idempotent retries cannot cause perpetual generation churn.
+- A revision change observed after page effects opens another coordinated generation
+  before checkpoint. This covers canonical prepare -> runtime intent insertion during
+  reconciliation: already completed effects replay idempotently, while neither source
+  can combine new completion with an older source's `done` proof.
+- An in-memory monotonic invalidation epoch closes the narrower checkpoint-call race:
+  a prepare inserted immediately before or after the atomic checkpoint commit keeps the
+  owned continuation pending and forces a fresh durable generation.
+- Runtime cursor, canonical cursor, both source states, next turn, generation, and both
+  observed revisions publish as one eight-key SQLite transaction. A failure in the
+  generation key rolls back all eight values; restart observes either the complete old
+  proof or the complete new proof.
+- If either revision view is unavailable, both sources retain durable `failed` debt,
+  reset to a replayable frontier, and continue with capped idle backoff. A clean view
+  and clean same-generation sweep are still required before the owned loop terminates.
+
+### Exact boundary coverage
+
+- The reviewer reproduction was admitted as a parameterized test for batch sizes `1`
+  and `2`: `runtime=retry/group=done`, then a canonical-only prepared transaction and
+  restart. Before the fix both cases left the transaction permanently `prepared`; after
+  the fix the Group source receives quota and commits autonomously.
+- The reverse restart skew (`runtime=done/group=retry` plus a newly durable runtime
+  intent) also passes for batch sizes `1` and `2` and proves the runtime lane receives
+  quota before canonical convergence.
+- In-process timing probes insert new work with either source pending or done and with
+  both sources done. Every case advances the durable generation, reopens both quotas,
+  commits the deletion, and terminates without a tight loop.
+- Checkpoint-interleaving probes insert a canonical prepare on both sides of the actual
+  eight-key commit. Both cases schedule a follow-up generation and converge without a
+  foreground reconciliation call.
+- Source-revision tests prove one increment per durable identity and persistence across
+  restart. The eight-key trigger-failure probe proves transaction rollback atomicity,
+  followed by successful persistence across a fresh Store instance.
+- Existing crash-at-every-delete-boundary, pre/post-commit checkpoint ambiguity,
+  mixed-source restart, multi-page, permanent-failure/backoff, and 10,000-row bounded
+  probes remain green under generation fencing.
+
+### Verification evidence
+
+- Final Task 3D quarantine/fairness/crash/generation suite:
+  `40 passed in 11.29s`.
+- Complete Task 1-3 Group/HTTP/Task Runtime/live bridge/recovery/deletion suites:
+  `208 passed in 54.96s`.
+- Legacy Engine suites: `26 passed, 10 subtests passed in 1.74s`.
+- Frontend Group/Task Runtime contracts, stores, and real socket transport:
+  `5 files / 45 tests passed in 13.78s`.
+- Node `v24.19.0`, Python `3.12.10`; foundation/runtime verification, ESLint,
+  targeted Python compilation, and `git diff --check` passed. Git emitted only the
+  repository's existing Windows LF-to-CRLF notices.
+- One focused run encountered the documented transient Windows `PermissionError` and
+  safely retried one idempotent deletion; the exact test then passed in isolation and
+  the complete 40-test focused rerun passed cleanly.
+
+### Changed files in this round
+
+- `backend/groups.py`
+- `backend/server.py`
+- `backend/task_runtime/service.py`
+- `backend/task_runtime/store.py`
+- `backend/tests/test_task_runtime_quarantine_isolation.py`
+- `.superpowers/sdd/studycrew-implementation/task-3d-report.md`
+
+### Residual risks
+
+- The source revisions live in their existing independent durable authorities (Group
+  JSON and Task Runtime SQLite), while their observed revision fence and generation
+  checkpoint live atomically in SQLite. The single-user desktop process receives an
+  in-process invalidation callback; process restart also unconditionally opens a clean
+  generation, so an interruption between the two authorities causes bounded replay,
+  never skipped deletion work.
+- The existing canonical JSON snapshot remains O(N) to load even though page output,
+  candidate maps, diagnostics, and per-turn effects remain bounded. Replacing that
+  storage authority is outside Task 3D.

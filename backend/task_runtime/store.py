@@ -63,6 +63,7 @@ def _loads(value: str | None) -> dict[str, Any]:
 class TaskRuntimeStore:
     def __init__(self, path: str | Path) -> None:
         self.db = SQLiteDatabase(path)
+        self.group_deletion_prepare_listener: Callable[[], None] | None = None
         self._event_listeners: list[Callable[[RunEvent], None]] = []
         self._event_listener_lock = threading.Lock()
         self.db.initialize(
@@ -1351,8 +1352,9 @@ class TaskRuntimeStore:
         if not group_proof_digest or not confirmation_token or not runtime_project_id:
             raise RuntimeStoreError("canonical Group deletion proof is required")
         now = utc_now()
+        inserted = False
         with self.db.transaction() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO studycrew_group_deletions(
                        group_id, group_transaction_id, group_proof_digest,
                        confirmation_token, runtime_project_id, stage, audit_code,
@@ -1364,6 +1366,14 @@ class TaskRuntimeStore:
                     confirmation_token, runtime_project_id, now, now,
                 ),
             )
+            inserted = cursor.rowcount == 1
+            if inserted:
+                conn.execute(
+                    """INSERT INTO studycrew_scheduler_state(name, value)
+                       VALUES ('group_deletion_revision', '1')
+                       ON CONFLICT(name) DO UPDATE SET
+                         value=CAST(studycrew_scheduler_state.value AS INTEGER) + 1""",
+                )
             row = conn.execute(
                 "SELECT * FROM studycrew_group_deletions WHERE group_id=?", (group_id,),
             ).fetchone()
@@ -1374,7 +1384,16 @@ class TaskRuntimeStore:
             str(row["runtime_project_id"]) != runtime_project_id,
         )):
             raise RuntimeStoreError("group deletion intent conflicts with existing transaction")
+        if inserted and self.group_deletion_prepare_listener is not None:
+            self.group_deletion_prepare_listener()
         return {key: str(row[key]) for key in row.keys()}
+
+    def group_deletion_revision(self) -> int:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT value FROM studycrew_scheduler_state WHERE name='group_deletion_revision'",
+            ).fetchone()
+        return 0 if row is None else max(0, int(row["value"]))
 
     def bind_group_deletion_proof(
         self, group_id: str, group_transaction_id: str, *,
