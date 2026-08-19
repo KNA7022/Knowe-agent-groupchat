@@ -81,6 +81,8 @@ class KnowledgeGraphTests(unittest.IsolatedAsyncioTestCase):
         result = manager.search("project_demo", self.internal, "JWT 用户认证", limit=5)
         self.assertTrue(result["results"])
         self.assertEqual(result["results"][0]["title"], "用户认证")
+        self.assertTrue(result["results"][0]["source_ids"])
+        self.assertIsInstance(result["results"][0]["course_ids"], list)
         self.assertTrue((self.internal / "knowledge" / "graph.md").is_file())
         self.assertTrue(any((self.internal / "knowledge" / "nodes").glob("*.md")))
 

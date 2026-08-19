@@ -23,6 +23,7 @@ import { TodayView, buildTodayRows } from './TodayView';
 const groupId = `grp_${'1'.repeat(32)}` as const;
 const otherGroupId = `grp_${'9'.repeat(32)}` as const;
 const runId = `run_${'2'.repeat(32)}`;
+let snapshotRevision = 0;
 
 function makeGroup(id = groupId, legacy = 'legacy-calculus'): Group {
   const at = '2026-08-18T00:00:00Z';
@@ -76,6 +77,8 @@ function snapshot(): unknown {
   return {
     schema_version: 1,
     group_id: groupId,
+    authority_epoch: `epoch_${'a'.repeat(32)}`,
+    group_snapshot_revision: ++snapshotRevision,
     runs: [
       taskRunFixture({
         public_summary: '正在整理极限错题',
@@ -144,6 +147,7 @@ function runtimeSummary(activePrimaryRunId: string | null = runId): never {
 }
 
 beforeEach(() => {
+  snapshotRevision = 0;
   useGroupStore.setState({
     groups: {}, order: [], runtimeSummaries: {}, sourceReferenceCounts: {},
     loading: false, error: null,
@@ -220,6 +224,7 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
     expect(screen.getByTestId('primary-run')).toHaveTextContent('正在整理极限错题');
 
     const next = structuredClone(first) as any;
+    next.group_snapshot_revision += 1;
     next.summary.active_primary_run_id = nextRunId;
     next.summary.primary_task_status = 'running';
     next.runs = next.runs.map((run: any) => run.run_id === nextRunId

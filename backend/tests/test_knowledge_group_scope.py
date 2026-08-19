@@ -54,9 +54,21 @@ class _Assets:
 
 
 class _Manager:
+    def __init__(self, rows: list[dict[str, object]] | None = None) -> None:
+        self.rows = rows or []
+
     def snapshot(self, project_id: str, _workspace: Path, limit: int | None = None) -> dict[str, object]:
         del project_id, limit
-        return {"revision": 1, "updated_at": None, "counts": {}, "nodes": []}
+        return {"revision": 1, "updated_at": None, "counts": {}, "nodes": self.rows}
+
+    def search(self, project_id: str, _workspace: Path, query: str, *, limit: int) -> dict[str, object]:
+        del project_id, query, limit
+        return {"hits": list(self.rows)}
+
+    def read_node(self, project_id: str, _workspace: Path, ref: str) -> dict[str, object]:
+        del project_id
+        row = next((item for item in self.rows if item["ref"] == ref), None)
+        return {"found": bool(row), "node": row} if row else {"found": False, "ref": ref}
 
 
 @pytest.mark.asyncio
@@ -123,3 +135,78 @@ async def test_canonical_group_scope_filters_assets_profiles_and_skillpacks(tmp_
         unregister_project("project-a")
         unregister_project("project-b")
 
+
+@pytest.mark.asyncio
+async def test_every_non_health_route_requires_one_canonical_group_and_filters_each_row(tmp_path: Path) -> None:
+    repo = GroupRepository(tmp_path / "data")
+    own = repo.create_group("own", legacy_project_id="matrix-project")
+    repo.bind_course(own.group_id, "course-own")
+    source_id = repo.link_source(own.group_id).source_id
+    allowed = {"ref": "node-own", "source_ids": [source_id], "course_ids": ["course-own"]}
+    foreign = {"ref": "node-foreign", "source_ids": ["src_" + "f" * 32], "course_ids": ["course-x"]}
+    manager = _Manager([allowed, foreign])
+    assets = _Assets("matrix-project", [{
+        "asset_id": "asset-foreign", "scope": "project", "status": "validated",
+        "source_ids": ["src_" + "f" * 32], "course_ids": ["course-x"],
+    }])
+    try:
+        register_project("matrix-project", manager=manager, assets=assets, workspace_provider=lambda: tmp_path)
+        health = await dispatch_knowledge_http("GET", "/api/knowledge/health", "", b"", repo)
+        assert health.status == 200
+        for method, path, body in (
+            ("GET", "/api/knowledge/projects", b""),
+            ("GET", "/api/knowledge/nodes", b""),
+            ("GET", "/api/knowledge/assets", b""),
+            ("GET", "/api/knowledge/skillpacks", b""),
+            ("GET", "/api/knowledge/skillpacks/pack-matrix-project", b""),
+            ("GET", "/api/knowledge/matrix-project/assets", b""),
+            ("GET", "/api/knowledge/matrix-project/assets/asset-foreign", b""),
+            ("GET", "/api/knowledge/matrix-project/profile", b""),
+            ("GET", "/api/knowledge/matrix-project/nodes", b""),
+            ("GET", "/api/knowledge/matrix-project/search", b""),
+            ("GET", "/api/knowledge/matrix-project/node", b""),
+            ("POST", "/api/knowledge/matrix-project/nodes/node-own", b'{"status":"validated"}'),
+            ("POST", "/api/knowledge/matrix-project/assets/asset-foreign", b'{"status":"validated"}'),
+            ("POST", "/api/knowledge/matrix-project/profile", b'{"text":"x"}'),
+            ("POST", "/api/knowledge/skillpacks/pack-matrix-project", b'{"status":"active"}'),
+        ):
+            response = await dispatch_knowledge_http(method, path, "", body, repo)
+            assert response.status == 403
+            assert response.body["error"] == "exactly_one_canonical_group_required"
+
+        base = f"group_id={own.group_id}&legacy_project_id=matrix-project"
+        forged_group = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/nodes", "group_id=grp_" + "9" * 32, b"", repo,
+        )
+        assert forged_group.status == 403
+        forged_project = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/nodes", f"group_id={own.group_id}&legacy_project_id=elsewhere", b"", repo,
+        )
+        assert forged_project.status == 403
+        forged_course = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/nodes", f"group_id={own.group_id}&course_id=course-x", b"", repo,
+        )
+        assert forged_course.status == 403
+
+        scoped = base + f"&source_id={source_id}&course_id=course-own"
+        nodes = await dispatch_knowledge_http("GET", "/api/knowledge/nodes", scoped, b"", repo)
+        assert [row["ref"] for row in nodes.body["nodes"]] == ["node-own"]
+        search = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/matrix-project/search", scoped + "&q=x", b"", repo,
+        )
+        assert [row["ref"] for row in search.body["hits"]] == ["node-own"]
+        detail = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/matrix-project/node", scoped + "&ref=node-foreign", b"", repo,
+        )
+        assert detail.status == 403
+        foreign_asset = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/matrix-project/assets/asset-foreign", scoped, b"", repo,
+        )
+        assert foreign_asset.status == 403
+        foreign_write = await dispatch_knowledge_http(
+            "POST", "/api/knowledge/matrix-project/assets/asset-foreign/review", scoped,
+            b'{"action":"approve"}', repo,
+        )
+        assert foreign_write.status == 403
+    finally:
+        unregister_project("matrix-project")

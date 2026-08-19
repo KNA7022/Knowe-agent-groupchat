@@ -56,6 +56,15 @@ Task 4 已把已有的 Group 与 Task Runtime 权威状态接入 Electron render
 - backend 与 renderer 共用一致语义：旁路活跃数只计 `kind=side + queue_class=foreground + routing/running/verifying`，index 永不进入旁路回答；index queued/running/failed/idle 由事件实时派生。failed/cancelled 旁路显示“状态通知”，不再称为“未读回答”。
 - 新增单一 `teardownGroup(groupId)`：收到 confirmed-delete receipt 后取消 authority timer，并清除 run/event/evidence/approval/summary、side watermark、Knowledge scope/preview，以及 legacy Group/DM/附件投影；不会遗留已删 Group id。
 
+## Round 4 独立复审修复
+
+- Task Runtime SQLite 新增持久 authority epoch 与每 Group 单调 `group_snapshot_revision`；Group snapshot、run snapshot、HTTP replay 和 WS replay 均携同一 cursor。renderer 成对严格解析 epoch/revision，每 Group 只接收更高 revision；不同 epoch 只能在显式 runtime reset 后建立新权威。无 revision 的旧协议只允许一次空投影握手，不能覆盖已有投影。
+- Group snapshot 以 authority cursor 为整包提交边界。旧 S1(A) 晚于 S2(A+B) 直达时，runs、active primary、queue、foreground side、approvals、budget 与 index 全部保持 S2；保留缺席 run 时也保留其 pending approval，并从 effective ledger 重新派生 summary，不套用旧 envelope summary。
+- gap replay 的 run 与 Group summary 同次提交，cursor 也同步推进。公开事件按 `event_id+seq` 去重、每 run 保留最新 200 条；正式测试跨越 205 条状态事件，并证明 tool、Verifier、approval 事件及审批身份在 80ms authority refresh 后仍保留。
+- Knowledge 除 `/health` 外所有 GET/POST 必须携带恰好一个可由 `GroupRepository` 解析的 canonical `group_id`。`legacy_project_id`、route project、source 与 course 都必须属于该 Group；nodes/assets/search/detail/profile/skillpack 及每个写操作均在对象级验证结构化 `source_ids/course_ids`。跨项目 global 行只允许用户显式批准且为 validated/core，pending、retired、ownerless 均 fail closed。
+- Knowledge Graph 与资产公开投影补充结构化 source/course ownership，不再根据自由文本猜作用域。新增路由矩阵覆盖缺 group、伪造 group/project/source/course、foreign row/detail 和 POST 越权。
+- confirmed deletion 建立持久 renderer tombstone；删除后 direct snapshot、WS event、已排队 authority timer 与控制/审批入口均零写入，同一 Group ID 不复用。统一 teardown 额外清除 source reference counts、directory recovery、records、Group/legacy approval timeout、`${legacy}::agent` model binding、snapshot/delete module cache 及所有既有 run/evidence/approval/preview/watermark 投影；跨 store 序列化测试检不出已删 group、legacy project、run 或 evidence 标识。
+
 ## 自动化验证
 
 最终回归命令：
@@ -67,7 +76,7 @@ node --test scripts/python-command.test.mjs
 
 覆盖精确 Project→Group 映射/隔离、live 主任务切换、主旁路分离、terminal answer 未读、空闲折叠、公开工具投影、权威主任务与全状态控制矩阵、resync、exact run 审批、四模板默认、绑定失败不重复创建、删除 token 身份/版本、Today summary、Knowledge cross-group exclusion、canonical roster、modal inert、连续事件焦点稳定、键盘/Escape、tabs、真实索引状态和 reduced motion。
 
-最终全量为 **41 个 Vitest 文件、488 个测试全部通过**；独立 Node command 测试 **2/2 通过**；Task Runtime 全组加 Knowledge scope 的 backend 回归 **213 个测试全部通过**；全仓 `npm run lint` 通过。仓库全量 TypeScript 仍含 Task 4 之前的历史错误；对本轮触及路径过滤为 **0 个诊断**。全 backend suite 在收集阶段仍被四个历史测试导入已不存在的 `ACTION_CONTRACT` 阻断（`test_v10182_runtime_ui.py`、`test_v22_dispatch_reliability.py`、`test_v27_weld.py`、`test_v28_weld.py`），本轮触及后端测试不包含在该失败中。
+最终全量为 **41 个 Vitest 文件、490 个测试全部通过**；独立 Node command 测试 **2/2 通过**；Task Runtime 全组、Knowledge scope 与 Knowledge Graph backend 回归 **226 个测试全部通过**；全仓 `npm run lint` 通过。仓库全量 TypeScript 仍含 Task 4 之前的历史错误；本轮新增或修改的行没有新增诊断，`taskRuntime`/`groupTeardown`/Knowledge contract 等本轮主体文件为 0 诊断。全 backend suite 在收集阶段仍被四个历史测试导入已不存在的 `ACTION_CONTRACT` 阻断（`test_v10182_runtime_ui.py`、`test_v22_dispatch_reliability.py`、`test_v27_weld.py`、`test_v28_weld.py`），本轮触及后端测试不包含在该失败中。
 
 ## 实际渲染检查
 
@@ -83,6 +92,8 @@ Round 1 修复后按 `control-in-app-browser` 的 bootstrap/documentation/troubl
 Round 2 再次按同一规定流程连接，`iab` 仍返回 `Browser is not available`，唯一一次 discovery 仍为 `[]`；因此没有违规切换 standalone Playwright，也没有生成或复用伪造的 post-fix 截图。Round 2 的 live rerender focus、canonical roster、Knowledge isolation 与 runtime exact switch 均由 React/contract 测试验收，Browser viewport/hit-test 仍是唯一未执行项。
 
 Round 3 做了本轮唯一一次 Browser 重试：复用既有 runtime 后，binding 在 documentation 阶段返回 `Browser is not available`；按 `bootstrap-troubleshooting` 只执行一次 discovery，结果仍为 `[]`。因此没有 post-fix viewport、modal hit-test 或截图证据，也没有使用 standalone Playwright 规避限制。本轮乱序 authority、80ms event retention、跨群 Knowledge detail/profile/skillpack、统一 teardown 与 side/index 语义均由自动化测试验证。
+
+Round 4 按 skill 的绝对插件路径重新初始化 Browser runtime，默认 browser selection 返回 `No browser is available`；随后读取 `bootstrap-troubleshooting` 并按要求仅执行一次 discovery，结果为 `[]`。因此本轮仍没有声称完成 900/1024/1440 post-fix hit-test 或生成截图，也没有用 standalone Playwright 绕过约束；authority cursor、严格 Knowledge 路由、删除迟到入口和 200 条事件保留均由正式自动化测试覆盖。
 
 ## 主要文件
 

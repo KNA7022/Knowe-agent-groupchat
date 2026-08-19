@@ -263,6 +263,8 @@ export const RuntimeReplaySchema = z.object({
   after_seq: z.number().int().nonnegative(),
   last_seq: z.number().int().nonnegative(),
   version: z.number().int().positive(),
+  authority_epoch: z.string().regex(/^epoch_[0-9a-f]{32}$/).optional(),
+  group_snapshot_revision: z.number().int().nonnegative().optional(),
   gap: z.boolean(),
   events: z.array(RunEventSchema),
   snapshot: z.object({
@@ -270,10 +272,25 @@ export const RuntimeReplaySchema = z.object({
     run: TaskRunSchema,
     last_seq: z.number().int().nonnegative(),
     version: z.number().int().positive(),
+    authority_epoch: z.string().regex(/^epoch_[0-9a-f]{32}$/).optional(),
+    group_snapshot_revision: z.number().int().nonnegative().optional(),
   }).strict().nullable(),
 }).strict().superRefine((replay, context) => {
   const issue = (message: string) => context.addIssue({ code: z.ZodIssueCode.custom, message });
+  if ((replay.authority_epoch === undefined) !== (replay.group_snapshot_revision === undefined)) {
+    issue('replay authority epoch and revision must be supplied together');
+  }
   if (replay.snapshot) {
+    if ((replay.snapshot.authority_epoch === undefined)
+        !== (replay.snapshot.group_snapshot_revision === undefined)) {
+      issue('replay snapshot authority epoch and revision must be supplied together');
+    }
+    if (replay.authority_epoch !== undefined && (
+      replay.snapshot.authority_epoch !== replay.authority_epoch
+      || replay.snapshot.group_snapshot_revision !== replay.group_snapshot_revision
+    )) {
+      issue('replay snapshot authority cursor does not match its envelope');
+    }
     if (replay.snapshot.run.run_id !== replay.run_id
         || replay.snapshot.run.group_id !== replay.group_id) {
       issue('replay snapshot crosses the addressed identity boundary');
@@ -304,30 +321,46 @@ export const RuntimeReplaySchema = z.object({
   }
 });
 
+const GroupRuntimeSummaryPayloadSchema = z.object({
+  active_primary_run_id: z.string().regex(/^run_[0-9a-f]{32}$/).nullable(),
+  primary_task_status: TaskStatusSchema.nullable(),
+  queued_task_count: z.number().int().nonnegative(),
+  active_side_task_count: z.number().int().nonnegative(),
+  pending_approval_count: z.number().int().nonnegative(),
+  budget_usage: BudgetUsageSchema,
+  indexing_state: z.enum(['idle', 'queued', 'running', 'failed']),
+}).strict();
+
 export const GroupRuntimeSnapshotSchema = z.object({
   schema_version: TaskRuntimeSchemaVersionSchema,
   group_id: GroupIdSchema,
+  authority_epoch: z.string().regex(/^epoch_[0-9a-f]{32}$/).optional(),
+  group_snapshot_revision: z.number().int().nonnegative().optional(),
   runs: z.array(TaskRunSchema),
   pending_approvals: z.array(ApprovalRequestSchema),
-  summary: z.object({
-    active_primary_run_id: z.string().regex(/^run_[0-9a-f]{32}$/).nullable(),
-    primary_task_status: TaskStatusSchema.nullable(),
-    queued_task_count: z.number().int().nonnegative(),
-    active_side_task_count: z.number().int().nonnegative(),
-    pending_approval_count: z.number().int().nonnegative(),
-    budget_usage: BudgetUsageSchema,
-    indexing_state: z.enum(['idle', 'queued', 'running', 'failed']),
-  }).strict(),
-}).strict();
+  summary: GroupRuntimeSummaryPayloadSchema,
+}).strict().superRefine((snapshot, context) => {
+  if ((snapshot.authority_epoch === undefined) !== (snapshot.group_snapshot_revision === undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom,
+      message: 'snapshot authority epoch and revision must be supplied together' });
+  }
+});
 
 export const GroupRuntimeSnapshotResponseSchema = z.object({
   ok: z.literal(true),
   schema_version: TaskRuntimeSchemaVersionSchema,
   group_id: GroupIdSchema,
+  authority_epoch: z.string().regex(/^epoch_[0-9a-f]{32}$/).optional(),
+  group_snapshot_revision: z.number().int().nonnegative().optional(),
   runs: z.array(TaskRunSchema),
   pending_approvals: z.array(ApprovalRequestSchema),
-  summary: GroupRuntimeSnapshotSchema.shape.summary,
-}).strict();
+  summary: GroupRuntimeSummaryPayloadSchema,
+}).strict().superRefine((snapshot, context) => {
+  if ((snapshot.authority_epoch === undefined) !== (snapshot.group_snapshot_revision === undefined)) {
+    context.addIssue({ code: z.ZodIssueCode.custom,
+      message: 'snapshot authority epoch and revision must be supplied together' });
+  }
+});
 
 export type TaskStatus = z.infer<typeof TaskStatusSchema>;
 export type AgentPhase = z.infer<typeof AgentPhaseSchema>;

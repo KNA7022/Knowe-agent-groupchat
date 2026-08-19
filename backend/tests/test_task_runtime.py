@@ -58,6 +58,37 @@ def approve_completion(service, group, run_id: str, outcome: TaskStatus = TaskSt
     )
 
 
+def test_group_snapshot_authority_cursor_is_monotonic_and_durable(tmp_path: Path) -> None:
+    groups = GroupRepository(tmp_path)
+    group = groups.create_group("Authority")
+    service = TaskRuntimeService(tmp_path, groups)
+    try:
+        empty = service.group_snapshot(group.group_id)
+        run = service.submit(group.group_id, title="One", request_key="authority-one")
+        created = service.group_snapshot(group.group_id)
+        assert created["authority_epoch"] == empty["authority_epoch"]
+        assert created["group_snapshot_revision"] > empty["group_snapshot_revision"]
+        service.schedule()
+        advanced = service.group_snapshot(group.group_id)
+        assert advanced["group_snapshot_revision"] > created["group_snapshot_revision"]
+        replay = service.replay(
+            group.group_id, run.run_id, after_seq=99, after_version=99,
+        )
+        assert replay["authority_epoch"] == advanced["authority_epoch"]
+        assert replay["group_snapshot_revision"] == advanced["group_snapshot_revision"]
+        assert replay["snapshot"]["group_snapshot_revision"] == advanced["group_snapshot_revision"]
+    finally:
+        service.close()
+
+    reopened = TaskRuntimeService(tmp_path, groups)
+    try:
+        durable = reopened.group_snapshot(group.group_id)
+        assert durable["authority_epoch"] == advanced["authority_epoch"]
+        assert durable["group_snapshot_revision"] >= advanced["group_snapshot_revision"]
+    finally:
+        reopened.close()
+
+
 def test_state_machine_rejects_invalid_transitions_and_requires_verifier(runtime) -> None:
     groups, service = runtime
     group = make_group(groups, "State")

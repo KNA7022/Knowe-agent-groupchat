@@ -120,10 +120,10 @@ def _int_of(raw: Any, default: int) -> int:
 
 def _resolve_scope(
     query: dict[str, list[str]], groups: GroupRepository | None,
-) -> _KnowledgeScope | None:
+) -> _KnowledgeScope:
     requested_groups = frozenset(filter(None, query.get("group_id") or ()))
-    if not requested_groups:
-        return None
+    if len(requested_groups) != 1:
+        raise _KnowledgeScopeDenied("exactly_one_canonical_group_required")
     if groups is None:
         raise _KnowledgeScopeDenied("canonical_group_scope_unavailable")
     project_ids: set[str] = set()
@@ -141,9 +141,17 @@ def _resolve_scope(
         source_ids.update(link.source_id for link in group.source_links)
         course_ids.update(binding.course_id for binding in group.course_bindings)
     requested_projects = set(filter(None, query.get("legacy_project_id") or ()))
+    if len(requested_projects) > 1:
+        raise _KnowledgeScopeDenied("exactly_one_legacy_project_allowed")
     requested_sources = set(filter(None, query.get("source_id") or ()))
-    requested_course = next(iter(filter(None, query.get("course_id") or ())), None)
+    requested_courses = set(filter(None, query.get("course_id") or ()))
+    if len(requested_courses) > 1:
+        raise _KnowledgeScopeDenied("exactly_one_course_scope_allowed")
+    requested_course = next(iter(requested_courses), None)
     if requested_projects and not requested_projects.issubset(project_ids):
+        raise _KnowledgeScopeDenied("project_outside_group_scope")
+    requested_route_projects = set(filter(None, query.get("project") or ()))
+    if requested_route_projects and not requested_route_projects.issubset(project_ids):
         raise _KnowledgeScopeDenied("project_outside_group_scope")
     if requested_sources and not requested_sources.issubset(source_ids):
         raise _KnowledgeScopeDenied("source_outside_group_scope")
@@ -166,14 +174,12 @@ def _approved_global(row: dict[str, Any]) -> bool:
     return (
         row.get("scope") == "global"
         and row.get("scope_set_by") == "user"
-        and row.get("status") in {"validated", "core", "active"}
+        and row.get("status") in {"validated", "core"}
         and row.get("view_state") not in {"pending", "retired"}
     )
 
 
-def _row_allowed(row: dict[str, Any], project_id: str, scope: _KnowledgeScope | None) -> bool:
-    if scope is None:
-        return True
+def _row_allowed(row: dict[str, Any], project_id: str, scope: _KnowledgeScope) -> bool:
     if project_id not in scope.project_ids and not _approved_global(row):
         return False
     if scope.source_ids and not (_structured_ids(row, "source_ids") & scope.source_ids):
@@ -202,27 +208,30 @@ def _project_rows(scope: _KnowledgeScope | None = None) -> list[dict[str, Any]]:
 
 
 def _merged_nodes(
-    only_project: str | None, scope: _KnowledgeScope | None = None,
+    only_project: str | None, scope: _KnowledgeScope,
 ) -> dict[str, Any]:
     projects: list[dict[str, Any]] = []
     nodes: list[dict[str, Any]] = []
     for reg in _registrations():
         if only_project and reg.project_id != only_project:
             continue
-        if scope is not None and reg.project_id not in scope.project_ids:
-            continue
         try:
             snap = reg.manager.snapshot(reg.project_id, reg.workspace_provider())
         except Exception:
             log.exception("[%s] 合并快照失败（跳过该项目）", reg.project_id)
             continue
-        projects.append({
-            "project_id": reg.project_id,
-            "revision": snap.get("revision", 0),
-            "updated_at": snap.get("updated_at"),
-            "counts": snap.get("counts") or {},
-        })
-        nodes.extend(snap.get("nodes") or [])
+        if reg.project_id in scope.project_ids:
+            projects.append({
+                "project_id": reg.project_id,
+                "revision": snap.get("revision", 0),
+                "updated_at": snap.get("updated_at"),
+                "counts": snap.get("counts") or {},
+            })
+        for raw in snap.get("nodes") or []:
+            if isinstance(raw, dict):
+                row = {**raw, "project_id": reg.project_id}
+                if _row_allowed(row, reg.project_id, scope):
+                    nodes.append(row)
     nodes.sort(key=lambda row: str(row.get("last_seen") or ""), reverse=True)
     return {"ok": True, "projects": projects, "nodes": nodes}
 
@@ -276,7 +285,7 @@ def _merged_skillpacks(only_project: str | None, scope: _KnowledgeScope | None =
             if isinstance(raw, dict) and raw.get("pack_id"):
                 row = dict(raw)
                 row.setdefault("project_id", reg.project_id)
-                if scope is None or (row.get("immutable") and row.get("status", "active") == "active"):
+                if scope is None or reg.project_id in scope.project_ids or _approved_global(row):
                     system_by_id[str(row["pack_id"])] = row
         for raw in packs.get("project_experience") or []:
             if isinstance(raw, dict) and raw.get("pack_id"):
@@ -311,8 +320,6 @@ def _find_skillpack(
     if not wanted:
         return None
     for reg in _registrations():
-        if scope is not None and reg.project_id not in scope.project_ids:
-            continue
         if reg.assets is None:
             continue
         try:
@@ -332,9 +339,9 @@ def _dispatch_get_sync(
     parts: list[str], query: dict[str, list[str]], groups: GroupRepository | None,
 ) -> KnowledgeHttpResponse:
     rest = parts[2:]
-    scope = _resolve_scope(query, groups)
     if rest == ["health"]:
         return _ok({"ok": True, "projects": project_count()})
+    scope = _resolve_scope(query, groups)
     if rest == ["projects"]:
         return _ok({"ok": True, "projects": _project_rows(scope)})
     if rest == ["nodes"]:
@@ -351,13 +358,18 @@ def _dispatch_get_sync(
         )
     if len(rest) == 2 and rest[1] == "assets":
         reg = _registration(rest[0])
+        if reg is not None and reg.project_id not in scope.project_ids:
+            return _fail(403, "project_outside_group_scope", project_id=rest[0])
         if scope is not None and reg is not None and reg.project_id not in scope.project_ids:
             return _fail(403, "project_outside_group_scope", project_id=rest[0])
         if reg is None:
             return _fail(404, "unknown_project", project_id=rest[0])
         if reg.assets is None:
             return _fail(503, "assets_unavailable", project_id=rest[0])
-        return _ok({"ok": True, **reg.assets.snapshot(reg.project_id, reg.workspace_provider())})
+        snap = reg.assets.snapshot(reg.project_id, reg.workspace_provider())
+        assets = [dict(row) for row in snap.get("assets") or [] if isinstance(row, dict)
+                  and _row_allowed(row, reg.project_id, scope)]
+        return _ok({"ok": True, **snap, "assets": assets})
     if len(rest) == 3 and rest[1] == "assets":
         reg = _registration(rest[0])
         if reg is None:
@@ -381,31 +393,39 @@ def _dispatch_get_sync(
         return _ok({"ok": True, "project_id": reg.project_id, "text": text})
     if len(rest) == 2 and rest[1] == "nodes":
         reg = _registration(rest[0])
-        if scope is not None and reg is not None and reg.project_id not in scope.project_ids:
+        if reg is not None and reg.project_id not in scope.project_ids:
             return _fail(403, "project_outside_group_scope", project_id=rest[0])
         if reg is None:
             return _fail(404, "unknown_project", project_id=rest[0])
-        return _ok({"ok": True, **reg.manager.snapshot(reg.project_id, reg.workspace_provider())})
+        snap = reg.manager.snapshot(reg.project_id, reg.workspace_provider())
+        nodes = [dict(row) for row in snap.get("nodes") or [] if isinstance(row, dict)
+                 and _row_allowed(row, reg.project_id, scope)]
+        return _ok({"ok": True, **snap, "nodes": nodes})
     if len(rest) == 2 and rest[1] == "search":
         reg = _registration(rest[0])
-        if scope is not None and reg is not None and reg.project_id not in scope.project_ids:
+        if reg is not None and reg.project_id not in scope.project_ids:
             return _fail(403, "project_outside_group_scope", project_id=rest[0])
         if reg is None:
             return _fail(404, "unknown_project", project_id=rest[0])
         q = (query.get("q") or [""])[0]
         limit = _int_of((query.get("limit") or ["6"])[0], 6)
         result = reg.manager.search(reg.project_id, reg.workspace_provider(), q, limit=limit)
+        for key in ("results", "hits", "nodes"):
+            if isinstance(result.get(key), list):
+                result[key] = [row for row in result[key] if isinstance(row, dict)
+                               and _row_allowed(row, reg.project_id, scope)]
         return _ok({"ok": True, **result})
     if len(rest) == 2 and rest[1] == "node":
         reg = _registration(rest[0])
-        if scope is not None and reg is not None and reg.project_id not in scope.project_ids:
-            return _fail(403, "project_outside_group_scope", project_id=rest[0])
         if reg is None:
             return _fail(404, "unknown_project", project_id=rest[0])
         ref = (query.get("ref") or [""])[0]
         if not ref:
             return _fail(400, "missing_ref")
         result = reg.manager.read_node(reg.project_id, reg.workspace_provider(), ref)
+        row = result.get("node") if isinstance(result.get("node"), dict) else result
+        if result.get("found") and not _row_allowed(row, reg.project_id, scope):
+            return _fail(403, "node_outside_group_scope", ref=ref)
         return _ok({"ok": True, **result})
     return _fail(404, "not_found")
 
@@ -480,6 +500,10 @@ async def _dispatch_post(
     if reg is None:
         return _fail(404, "unknown_project", project_id=project_id)
     if len(parts) == 5 and parts[3] == "nodes":
+        existing = reg.manager.read_node(reg.project_id, reg.workspace_provider(), parts[4])
+        existing_row = existing.get("node") if isinstance(existing.get("node"), dict) else existing
+        if existing.get("found") and not _row_allowed(existing_row, reg.project_id, scope):
+            return _fail(403, "node_outside_group_scope", ref=parts[4])
         patch = {
             key: body.get(key)
             for key in ("status", "scope", "title", "summary")
@@ -498,6 +522,10 @@ async def _dispatch_post(
         if reg.assets is None:
             return _fail(503, "assets_unavailable", project_id=project_id)
         asset_id = parts[4]
+        existing = reg.assets.read_asset(reg.project_id, reg.workspace_provider(), asset_id)
+        existing_row = existing.get("asset") if isinstance(existing.get("asset"), dict) else existing
+        if existing.get("found") and not _row_allowed(existing_row, reg.project_id, scope):
+            return _fail(403, "asset_outside_group_scope", asset_id=asset_id)
         if len(parts) == 6 and parts[5] == "review":
             return await _run_override(
                 reg,
@@ -531,6 +559,8 @@ async def _dispatch_post(
     if len(parts) == 4 and parts[3] == "profile":
         if reg.assets is None:
             return _fail(503, "assets_unavailable", project_id=project_id)
+        if scope.source_ids or scope.course_id:
+            return _fail(403, "profile_outside_narrow_group_scope", project_id=project_id)
         return await _run_override(
             reg,
             reg.assets.set_profile(

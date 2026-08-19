@@ -238,6 +238,11 @@ class TaskRuntimeStore:
                 name TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS studycrew_runtime_authority (
+                authority_key TEXT PRIMARY KEY,
+                epoch TEXT NOT NULL,
+                revision INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS studycrew_live_publication (
                 run_id TEXT PRIMARY KEY,
                 group_id TEXT NOT NULL,
@@ -294,6 +299,39 @@ class TaskRuntimeStore:
               WHERE idempotency_key IS NOT NULL;
             """
         )
+        with self.db.transaction() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO studycrew_runtime_authority(authority_key, epoch, revision)
+                   VALUES ('global', ?, 0)""",
+                (opaque_id("epoch"),),
+            )
+
+    @staticmethod
+    def _bump_group_snapshot_revision_in_transaction(conn: Any, group_id: str) -> None:
+        conn.execute(
+            """INSERT INTO studycrew_runtime_authority(authority_key, epoch, revision)
+               SELECT ?, epoch, 1 FROM studycrew_runtime_authority WHERE authority_key='global'
+               ON CONFLICT(authority_key) DO UPDATE SET revision=revision + 1""",
+            (f"group:{group_id}",),
+        )
+
+    def group_snapshot_authority(self, group_id: str) -> tuple[str, int]:
+        with self.db.transaction() as conn:
+            global_row = conn.execute(
+                "SELECT epoch FROM studycrew_runtime_authority WHERE authority_key='global'",
+            ).fetchone()
+            if global_row is None:
+                raise RuntimeStoreError("Task Runtime authority epoch is unavailable")
+            conn.execute(
+                """INSERT OR IGNORE INTO studycrew_runtime_authority(authority_key, epoch, revision)
+                   VALUES (?, ?, 0)""",
+                (f"group:{group_id}", str(global_row["epoch"])),
+            )
+            row = conn.execute(
+                "SELECT epoch, revision FROM studycrew_runtime_authority WHERE authority_key=?",
+                (f"group:{group_id}",),
+            ).fetchone()
+        return str(row["epoch"]), int(row["revision"])
 
     def _migrate_group_live_recovery(self) -> None:
         """Collapse the preceding per-Run outbox markers into one lossless Group intent."""
@@ -648,6 +686,7 @@ class TaskRuntimeStore:
                  run.created_at, run.updated_at),
             )
             self._insert_event(conn, event, request_key=f"create:{request_key}")
+            self._bump_group_snapshot_revision_in_transaction(conn, run.group_id)
         self._publish(event)
         return run, event, True
 
@@ -742,6 +781,7 @@ class TaskRuntimeStore:
             self._insert_event(conn, event, request_key=idempotency_key)
             if transaction_hook is not None:
                 transaction_hook(conn, run, event)
+            self._bump_group_snapshot_revision_in_transaction(conn, run.group_id)
         self._publish(event)
         return run, event, True
 
@@ -790,6 +830,7 @@ class TaskRuntimeStore:
         with self.db.transaction() as conn:
             self._assert_group_mutable_in_transaction(conn, approval.group_id)
             self.upsert_approval_in_transaction(conn, approval, request_key=request_key)
+            self._bump_group_snapshot_revision_in_transaction(conn, approval.group_id)
 
     @staticmethod
     def upsert_approval_in_transaction(
@@ -885,6 +926,7 @@ class TaskRuntimeStore:
                     "resolved_at=? WHERE approval_id=? AND status='pending'",
                     (_dumps(raw), resolved_at, approval_id),
                 )
+                self._bump_group_snapshot_revision_in_transaction(conn, str(row["group_id"]))
         return self.get_approval(approval_id)
 
     def normalize_pending_approval_expiry(
@@ -907,6 +949,7 @@ class TaskRuntimeStore:
                     "WHERE approval_id=? AND status='pending'",
                     (_dumps(raw), approval_id),
                 )
+                self._bump_group_snapshot_revision_in_transaction(conn, str(row["group_id"]))
         return self.get_approval(approval_id)
 
     @staticmethod

@@ -1441,6 +1441,24 @@ class KnowledgeGraphManager:
         self, graph: dict[str, Any], node: dict[str, Any], *, include_sources: bool, full: bool = False,
     ) -> dict[str, Any]:
         metrics = dict(node.get("metrics") or {})
+        evidence = [item for item in node.get("source_evidence") or [] if isinstance(item, dict)]
+        source_ids: list[str] = []
+        course_ids: list[str] = []
+        for item in evidence:
+            graph_source_id = str(item.get("source_id") or "")
+            source = (graph.get("sources") or {}).get(graph_source_id) or {}
+            metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
+            lineage = source.get("lineage") if isinstance(source.get("lineage"), dict) else {}
+            source_ids.extend([
+                graph_source_id, str(metadata.get("source_id") or ""), str(lineage.get("source_id") or ""),
+            ])
+            for value in metadata.get("source_ids") if isinstance(metadata.get("source_ids"), list) else []:
+                source_ids.append(str(value or ""))
+            course_ids.extend([
+                str(metadata.get("course_id") or ""), str(lineage.get("course_id") or ""),
+            ])
+            for value in metadata.get("course_ids") if isinstance(metadata.get("course_ids"), list) else []:
+                course_ids.append(str(value or ""))
         result: dict[str, Any] = {
             "node_id": node.get("id"),
             "type": node.get("type"),
@@ -1452,6 +1470,8 @@ class KnowledgeGraphManager:
             "source_count": metrics.get("source_count", 0),
             "promotion_ready": metrics.get("promotion_ready", False),
             "last_seen": node.get("last_seen"),
+            "source_ids": _unique_strings(source_ids),
+            "course_ids": _unique_strings(course_ids),
         }
         if include_sources:
             result["sources"] = _unique_strings([

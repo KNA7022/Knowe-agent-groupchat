@@ -34,6 +34,7 @@ interface TaskRuntimeState {
   approvals: Record<string, ApprovalRequest>;
   groupSummaries: Record<string, GroupRuntimeSummary>;
   refreshGenerations: Record<string, number>;
+  authorityByGroup: Record<string, { epoch: string; revision: number }>;
   error: string | null;
   resetAll: () => void;
   ingestGroupSnapshot: (groupId: GroupId, raw: unknown) => void;
@@ -146,6 +147,19 @@ function requestKey(prefix: string): string {
 }
 
 const authorityRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const DELETED_GROUPS_KEY = 'studycrew.task-runtime.deleted-groups.v1';
+
+function loadDeletedGroups(): Set<string> {
+  try {
+    const rows = JSON.parse(globalThis.localStorage?.getItem(DELETED_GROUPS_KEY) || '[]');
+    return new Set(Array.isArray(rows) ? rows.filter((item): item is string => typeof item === 'string') : []);
+  } catch { return new Set(); }
+}
+
+function persistDeletedGroups(groups: Set<string>): void {
+  try { globalThis.localStorage?.setItem(DELETED_GROUPS_KEY, JSON.stringify([...groups])); } catch { /* best effort */ }
+}
+const deletedGroupTombstones = loadDeletedGroups();
 
 export function cancelTaskRuntimeAuthorityRefresh(groupId: GroupId): void {
   const timer = authorityRefreshTimers.get(groupId);
@@ -169,16 +183,19 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   approvals: {},
   groupSummaries: {},
   refreshGenerations: {},
+  authorityByGroup: {},
   error: null,
 
   resetAll(): void {
     for (const timer of authorityRefreshTimers.values()) clearTimeout(timer);
     authorityRefreshTimers.clear();
-    set({ byRun: {}, byGroup: {}, approvals: {}, groupSummaries: {}, refreshGenerations: {}, error: null });
+    set({ byRun: {}, byGroup: {}, approvals: {}, groupSummaries: {}, refreshGenerations: {},
+      authorityByGroup: {}, error: null });
     useGroupStore.setState({ runtimeSummaries: {} });
   },
 
   ingestGroupSnapshot(groupId, raw): void {
+    if (deletedGroupTombstones.has(groupId)) return;
     const outer = raw && typeof raw === 'object' ? raw as Record<string, unknown> : null;
     if (outer && typeof outer.group_id === 'string' && outer.group_id !== groupId) {
       throw new Error('Task Runtime snapshot envelope crosses the addressed group_id boundary');
@@ -200,7 +217,23 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       throw new Error('Task Runtime snapshot crosses the addressed group_id boundary');
     }
     let installedSummary: GroupRuntimeSummary | undefined;
+    let accepted = false;
     set((state) => {
+      if (deletedGroupTombstones.has(groupId)) return state;
+      const authority = snapshot.authority_epoch === undefined ? null : {
+        epoch: snapshot.authority_epoch,
+        revision: snapshot.group_snapshot_revision!,
+      };
+      const currentAuthority = state.authorityByGroup[groupId];
+      if (!authority) {
+        // Unversioned transports are a one-shot legacy handshake only. They may establish an
+        // empty projection, but can never replace a projection or cursor learned afterwards.
+        if (currentAuthority || (state.byGroup[groupId]?.length || 0) > 0) return state;
+      } else if (currentAuthority) {
+        if (authority.epoch !== currentAuthority.epoch || authority.revision <= currentAuthority.revision) {
+          return state;
+        }
+      }
       const priorGroupRuns = Object.fromEntries(Object.entries(state.byRun)
         .filter(([, projection]) => projection.run.group_id === groupId));
       for (const run of rows) {
@@ -228,9 +261,10 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           needsResync: false,
         };
       }
-      const nextApprovals = Object.fromEntries(
-        Object.entries(state.approvals).filter(([, approval]) => approval.group_id !== groupId),
-      );
+      const preservedRunIds = new Set(preservedAbsent.map((projection) => projection.run.run_id));
+      const nextApprovals = Object.fromEntries(Object.entries(state.approvals).filter(([, approval]) => (
+        approval.group_id !== groupId || preservedRunIds.has(approval.run_id)
+      )));
       for (const approval of approvals) nextApprovals[approval.approval_id] = approval;
       const previousSummary = state.groupSummaries[groupId];
       installedSummary = summarizeGroup(
@@ -240,26 +274,21 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         previousSummary,
         preservedAbsent.length ? previousSummary?.active_primary_run_id : snapshot.summary.active_primary_run_id,
       );
-      installedSummary = {
-        ...installedSummary,
-        queued_task_count: snapshot.summary.queued_task_count,
-        active_side_task_count: snapshot.summary.active_side_task_count,
-        pending_approval_count: snapshot.summary.pending_approval_count,
-        budget_usage: snapshot.summary.budget_usage,
-        indexing_state: snapshot.summary.indexing_state,
-      };
+      accepted = true;
       return {
         byRun: nextRuns,
         byGroup: { ...state.byGroup, [groupId]: effectiveRows.map((run) => run.run_id) },
         approvals: nextApprovals,
         groupSummaries: { ...state.groupSummaries, [groupId]: installedSummary },
+        authorityByGroup: authority ? { ...state.authorityByGroup, [groupId]: authority } : state.authorityByGroup,
         error: null,
       };
     });
-    mirrorSummary(groupId, installedSummary);
+    if (accepted) mirrorSummary(groupId, installedSummary);
   },
 
   applyEvent(groupId, raw): boolean {
+    if (deletedGroupTombstones.has(groupId)) return false;
     const event = RunEventSchema.parse(raw);
     if (event.group_id !== groupId) {
       throw new Error('Task Runtime event crosses the addressed group_id boundary');
@@ -373,6 +402,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   },
 
   async reconcile(groupId, runId): Promise<void> {
+    if (deletedGroupTombstones.has(groupId)) return;
     const current = get().byRun[runId];
     if (!current || current.run.group_id !== groupId) throw new Error(`Unknown run: ${runId}`);
     try {
@@ -400,29 +430,9 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       }
       if (replay.gap) {
         if (!replay.snapshot) throw new Error('Replay gap has no authoritative snapshot');
-        let gapSummary: GroupRuntimeSummary | undefined;
-        set((state) => {
-          const nextByRun = {
-            ...state.byRun,
-            [runId]: {
-              run: replay.snapshot!.run,
-              events: retainedPublicEvents(state.byRun[runId]?.events || [], replay.snapshot!.run.last_seq),
-              needsResync: false,
-            },
-          };
-          const runs = (state.byGroup[groupId] || []).map((id) => nextByRun[id]?.run)
-            .filter((candidate): candidate is TaskRun => Boolean(candidate));
-          gapSummary = summarizeGroup(
-            groupId, runs, state.approvals, state.groupSummaries[groupId],
-            state.groupSummaries[groupId]?.active_primary_run_id,
-            replay.snapshot!.run.updated_at,
-          );
-          return {
-            byRun: nextByRun,
-            groupSummaries: { ...state.groupSummaries, [groupId]: gapSummary },
-          };
-        });
-        mirrorSummary(groupId, gapSummary);
+        // A per-run replay cursor cannot authorize the rest of the Group ledger. Resolve a gap
+        // through the full Group snapshot so run, approvals and summary share one revision.
+        await get().refreshGroup(groupId);
         return;
       }
       for (const event of replay.events) get().applyEvent(groupId, event);
@@ -433,11 +443,12 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   },
 
   async refreshGroup(groupId): Promise<void> {
+    if (deletedGroupTombstones.has(groupId)) return;
     const generation = (get().refreshGenerations[groupId] || 0) + 1;
     set((state) => ({ refreshGenerations: { ...state.refreshGenerations, [groupId]: generation } }));
     try {
       const raw = await taskRuntimeJson('snapshot', { group_id: groupId });
-      if (get().refreshGenerations[groupId] !== generation) return;
+      if (get().refreshGenerations[groupId] !== generation || deletedGroupTombstones.has(groupId)) return;
       get().ingestGroupSnapshot(groupId, raw);
     } catch (error) {
       if (get().refreshGenerations[groupId] !== generation) return;
@@ -447,6 +458,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   },
 
   async control(groupId, runId, command): Promise<TaskRun> {
+    if (deletedGroupTombstones.has(groupId)) throw new Error('Deleted Group cannot be controlled');
     const current = get().byRun[runId];
     if (!current || current.run.group_id !== groupId) throw new Error(`Unknown run: ${runId}`);
     const raw = await taskRuntimeJson('control', {
@@ -475,6 +487,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   },
 
   async resolveApproval(groupId, runId, approvalId, approved): Promise<TaskRun> {
+    if (deletedGroupTombstones.has(groupId)) throw new Error('Deleted Group cannot resolve approvals');
     const current = get().byRun[runId];
     const approval = get().approvals[approvalId];
     if (!current || current.run.group_id !== groupId) throw new Error(`Unknown run: ${runId}`);
@@ -538,7 +551,12 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       delete groupSummaries[groupId];
       const refreshGenerations = { ...state.refreshGenerations };
       delete refreshGenerations[groupId];
-      return { byRun, byGroup, approvals, groupSummaries, refreshGenerations };
+      const authorityByGroup = { ...state.authorityByGroup };
+      delete authorityByGroup[groupId];
+      deletedGroupTombstones.add(groupId);
+      persistDeletedGroups(deletedGroupTombstones);
+      return { byRun, byGroup, approvals, groupSummaries, refreshGenerations,
+        authorityByGroup };
     });
     mirrorSummary(groupId, undefined);
     return removedRunIds;

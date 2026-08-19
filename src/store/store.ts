@@ -122,6 +122,24 @@ interface DeleteProgressState {
 
 const _deleteProgress = new Map<string, DeleteProgressState>();
 
+/** Clear renderer-only queues for a durably deleted legacy project. */
+export function teardownLegacyProjectCaches(projectId: string): void {
+  const belongs = (id: string): boolean => id === projectId || parseDmId(id)?.projectId === projectId;
+  for (const id of Array.from(_synced)) if (belongs(id)) _synced.delete(id);
+  for (let index = _snapQueue.length - 1; index >= 0; index -= 1) {
+    if (belongs(_snapQueue[index]!)) _snapQueue.splice(index, 1);
+  }
+  if (_snapQueue.length === 0 && _snapTimer) {
+    clearTimeout(_snapTimer);
+    _snapTimer = null;
+  }
+  for (const [operationId, progress] of _deleteProgress) {
+    if (progress.projectId !== projectId) continue;
+    clearTimeout(progress.timer);
+    _deleteProgress.delete(operationId);
+  }
+}
+
 function deleteOperationId(): string {
   const uuid = globalThis.crypto?.randomUUID?.().replace(/-/g, '');
   return `del_${uuid || `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`}`;

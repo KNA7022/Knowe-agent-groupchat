@@ -422,6 +422,14 @@ class KnowledgeAssetManager:
         status = "seed" if (cls == "preference"
                             and len(item.get("evidence") or []) < 2) else "candidate"
         now = _now_iso()
+        source_ids = [str(value) for value in (metadata or {}).get("source_ids", [])
+                      if value] if isinstance((metadata or {}).get("source_ids"), list) else []
+        if (metadata or {}).get("source_id"):
+            source_ids.append(str((metadata or {})["source_id"]))
+        course_ids = [str(value) for value in (metadata or {}).get("course_ids", [])
+                      if value] if isinstance((metadata or {}).get("course_ids"), list) else []
+        if (metadata or {}).get("course_id"):
+            course_ids.append(str((metadata or {})["course_id"]))
         asset: dict[str, Any] = {
             "id": asset_id,
             "class": cls,
@@ -447,6 +455,8 @@ class KnowledgeAssetManager:
             "reviewed_action": None,
             "usage_events": [],
             "metrics": {},
+            "source_ids": list(dict.fromkeys(source_ids)),
+            "course_ids": list(dict.fromkeys(course_ids)),
             "origin": {
                 "kind": "distill",
                 "steps": [step] if step is not None else [],

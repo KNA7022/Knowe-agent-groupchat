@@ -377,7 +377,10 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
       delete groups[groupId];
       const runtimeSummaries = { ...state.runtimeSummaries };
       delete runtimeSummaries[groupId];
-      return { groups, runtimeSummaries, order: state.order.filter((id) => id !== groupId) };
+      const sourceReferenceCounts = { ...state.sourceReferenceCounts };
+      delete sourceReferenceCounts[groupId];
+      return { groups, runtimeSummaries, sourceReferenceCounts,
+        order: state.order.filter((id) => id !== groupId) };
     });
     const { teardownGroup } = await import('./groupTeardown');
     teardownGroup(groupId, legacyProjectId);

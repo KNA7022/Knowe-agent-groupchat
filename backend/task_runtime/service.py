@@ -1086,8 +1086,11 @@ class TaskRuntimeService:
     def snapshot(self, group_id: str, run_id: str) -> dict[str, Any]:
         self.expire_pending_approvals()
         run = self._owned_run(run_id, group_id, allow_deleting=True)
+        authority_epoch, group_snapshot_revision = self.store.group_snapshot_authority(run.group_id)
         return {"schema_version": 1, "run": run.to_public_dict(),
-                "last_seq": run.last_seq, "version": run.version}
+                "last_seq": run.last_seq, "version": run.version,
+                "authority_epoch": authority_epoch,
+                "group_snapshot_revision": group_snapshot_revision}
 
     def replay(
         self, group_id: str, run_id: str, *, after_seq: int, after_version: int | None = None,
@@ -1099,22 +1102,35 @@ class TaskRuntimeService:
         events = self.store.events_after(run_id, after_seq) if not (version_ahead or cursor_ahead) else ()
         expected = after_seq + 1
         gap = bool(version_ahead or cursor_ahead or any(event.seq != expected + index for index, event in enumerate(events)))
+        snapshot_payload = self.snapshot(group_id, run_id) if gap else None
+        if snapshot_payload is not None:
+            authority_epoch = str(snapshot_payload["authority_epoch"])
+            group_snapshot_revision = int(snapshot_payload["group_snapshot_revision"])
+        else:
+            authority_epoch, group_snapshot_revision = self.store.group_snapshot_authority(run.group_id)
         return {
             "schema_version": 1, "run_id": run_id, "group_id": run.group_id,
             "after_seq": after_seq, "last_seq": run.last_seq, "version": run.version,
+            "authority_epoch": authority_epoch,
+            "group_snapshot_revision": group_snapshot_revision,
             "gap": gap, "events": [event.to_public_dict() for event in events],
-            "snapshot": self.snapshot(group_id, run_id) if gap else None,
+            "snapshot": snapshot_payload,
         }
 
     def group_snapshot(self, group_id: str) -> dict[str, Any]:
         self.expire_pending_approvals()
         canonical = self._canonical_group(group_id)
+        summary = self.group_summary(canonical)
         runs = self.store.list_runs(group_id=canonical)
+        approvals = self.store.pending_approvals(canonical)
+        authority_epoch, group_snapshot_revision = self.store.group_snapshot_authority(canonical)
         return {
             "schema_version": 1, "group_id": canonical,
+            "authority_epoch": authority_epoch,
+            "group_snapshot_revision": group_snapshot_revision,
             "runs": [run.to_public_dict() for run in runs],
-            "pending_approvals": [item.to_dict() for item in self.store.pending_approvals(canonical)],
-            "summary": self.group_summary(canonical),
+            "pending_approvals": [item.to_dict() for item in approvals],
+            "summary": summary,
         }
 
     def group_summary(self, group_id: str) -> dict[str, Any]:

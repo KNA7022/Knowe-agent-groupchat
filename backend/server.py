@@ -2315,6 +2315,8 @@ class KnoweServer:
         raw = json.dumps(
             {
                 "group_id": snapshot.get("group_id"), "runs": rows,
+                "authority_epoch": snapshot.get("authority_epoch"),
+                "group_snapshot_revision": snapshot.get("group_snapshot_revision"),
                 "recovery": None if marker is None else {
                     "token": marker.get("recovery_token"),
                     "generation": marker.get("generation"),
