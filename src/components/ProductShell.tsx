@@ -1,6 +1,7 @@
 import React from 'react';
 
 import { useGroupStore } from '../store/groups';
+import { useTaskRuntimeStore } from '../store/taskRuntime';
 import { IconAlert, IconBook, IconCheck, IconReport } from './icons';
 
 export type ProductShellKind = 'review' | 'privacy';
@@ -10,7 +11,7 @@ export const ProductShell: React.FC<{ kind: ProductShellKind }> = ({ kind }) => 
   const sourceCount = useGroupStore((state) => Object.values(state.groups).reduce(
     (sum, group) => sum + group.source_links.length, 0,
   ));
-  const pendingApprovals = useGroupStore((state) => Object.values(state.runtimeSummaries).reduce(
+  const pendingApprovals = useTaskRuntimeStore((state) => Object.values(state.groupSummaries).reduce(
     (sum, summary) => sum + summary.pending_approval_count, 0,
   ));
   const review = kind === 'review';

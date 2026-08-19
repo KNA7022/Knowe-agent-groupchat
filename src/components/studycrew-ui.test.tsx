@@ -275,10 +275,21 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
       }
     });
     expect(screen.getByRole('tab', { name: '证据' })).toHaveFocus();
-    act(() => useGroupStore.setState((state) => ({ runtimeSummaries: {
-      ...state.runtimeSummaries,
-      [groupId]: { ...state.runtimeSummaries[groupId]!, indexing_state: 'running' },
-    } })));
+    const indexRunId = `run_${'e'.repeat(32)}`;
+    const withIndex = structuredClone(snapshot()) as any;
+    withIndex.runs = (useTaskRuntimeStore.getState().byGroup[groupId] || [])
+      .map((id) => useTaskRuntimeStore.getState().byRun[id]!.run);
+    withIndex.runs.push(taskRunFixture({
+      run_id: indexRunId, task_id: `task_${'e'.repeat(32)}`, kind: 'side', queue_class: 'index',
+      read_only: true, risk: 'low', status: 'queued', updated_at: '2026-08-18T00:00:13Z',
+    }));
+    withIndex.summary.indexing_state = 'queued';
+    act(() => useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, withIndex));
+    act(() => useTaskRuntimeStore.getState().applyEvent(groupId, {
+      event_id: `evt_${'e'.repeat(32)}`, run_id: indexRunId, group_id: groupId, seq: 2, version: 2,
+      event_type: 'status_changed', public_payload: { status: 'running' }, sensitivity: 'public',
+      created_at: '2026-08-18T00:00:14Z', schema_version: 1,
+    }));
     fireEvent.click(screen.getByRole('tab', { name: '索引' }));
     expect(screen.getByRole('tabpanel')).toHaveTextContent('正在为当前群组建立索引');
   });
@@ -323,7 +334,7 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
   it('does not infer a Verifier rejection from a generic executor failure', () => {
     const failed = taskRunFixture({ status: 'failed', failure_type: 'provider_failure' }) as TaskRun;
     expect(verifierLabel(failed, [])).toBe('任务执行失败，Verifier 结论未上报');
-    expect(sideAnswerSequence({ run: { ...failed, kind: 'side' }, events: [], needsResync: false })).toBe(failed.last_seq);
+    expect(sideAnswerSequence({ run: { ...failed, kind: 'side' }, events: [], needsResync: false })).toBeNull();
   });
 });
 

@@ -12,7 +12,7 @@ import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from backend.groups import GroupLifecycle, GroupNotFoundError, GroupRepository
 
@@ -1139,12 +1139,18 @@ class TaskRuntimeService:
             ),
             "pending_approval_count": len(self.store.pending_approvals(canonical)),
             "budget_usage": usage.__dict__,
-            "indexing_state": "running" if any(
-                run.queue_class is QueueClass.INDEX and run.status in _EXECUTING for run in runs
-            ) else ("queued" if any(
-                run.queue_class is QueueClass.INDEX and run.status is TaskStatus.QUEUED for run in runs
-            ) else "idle"),
+            "indexing_state": self._indexing_state(runs),
         }
+
+    @staticmethod
+    def _indexing_state(runs: Sequence[TaskRun]) -> str:
+        index_runs = [run for run in runs if run.queue_class is QueueClass.INDEX]
+        if any(run.status in _EXECUTING for run in index_runs):
+            return "running"
+        if any(run.status is TaskStatus.QUEUED for run in index_runs):
+            return "queued"
+        latest = max(index_runs, key=lambda run: run.updated_at, default=None)
+        return "failed" if latest and latest.status is TaskStatus.FAILED else "idle"
 
     def _suspend_group_runs(
         self, canonical: str, *, reason: str, allow_deleting: bool,

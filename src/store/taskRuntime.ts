@@ -17,6 +17,7 @@ import {
   type TaskRun,
 } from '../contract/taskRuntime';
 import type { GroupId } from '../contract/group';
+import type { GroupRuntimeSummary } from '../contract/group';
 import { useGroupStore } from './groups';
 import { runtimeFetch } from '../shared/runtimeFetch';
 import { runtimeHttpBase } from '../shared/runtimeEndpoints';
@@ -31,6 +32,8 @@ interface TaskRuntimeState {
   byRun: Record<string, RunProjection>;
   byGroup: Record<string, string[]>;
   approvals: Record<string, ApprovalRequest>;
+  groupSummaries: Record<string, GroupRuntimeSummary>;
+  refreshGenerations: Record<string, number>;
   error: string | null;
   resetAll: () => void;
   ingestGroupSnapshot: (groupId: GroupId, raw: unknown) => void;
@@ -41,6 +44,85 @@ interface TaskRuntimeState {
   resolveApproval: (
     groupId: GroupId, runId: string, approvalId: string, approved: boolean,
   ) => Promise<TaskRun>;
+  teardownGroupProjection: (groupId: GroupId) => string[];
+}
+
+const TERMINAL = new Set(['succeeded', 'partial', 'failed', 'cancelled']);
+const EXECUTING = new Set(['routing', 'running', 'verifying']);
+const MAX_PUBLIC_EVENTS_PER_RUN = 200;
+
+function retainedPublicEvents(events: RunEvent[], throughSeq = Number.POSITIVE_INFINITY): RunEvent[] {
+  const unique = new Map<string, RunEvent>();
+  for (const item of events) {
+    if (item.sensitivity !== 'public' || item.seq > throughSeq) continue;
+    unique.set(`${item.event_id}:${item.seq}`, item);
+  }
+  return [...unique.values()].sort((a, b) => a.seq - b.seq).slice(-MAX_PUBLIC_EVENTS_PER_RUN);
+}
+
+function indexingState(runs: TaskRun[]): GroupRuntimeSummary['indexing_state'] {
+  const indexRuns = runs.filter((run) => run.queue_class === 'index');
+  if (indexRuns.some((run) => EXECUTING.has(run.status))) return 'running';
+  if (indexRuns.some((run) => run.status === 'queued')) return 'queued';
+  const latest = [...indexRuns].sort((a, b) => b.updated_at.localeCompare(a.updated_at))[0];
+  return latest?.status === 'failed' ? 'failed' : 'idle';
+}
+
+function summarizeGroup(
+  groupId: GroupId,
+  runs: TaskRun[],
+  approvals: Record<string, ApprovalRequest>,
+  previous: GroupRuntimeSummary | undefined,
+  preferredPrimaryId?: string | null,
+  updatedAt?: string,
+): GroupRuntimeSummary {
+  const group = useGroupStore.getState().groups[groupId];
+  const preferred = preferredPrimaryId
+    ? runs.find((run) => run.run_id === preferredPrimaryId && run.kind === 'primary' && !TERMINAL.has(run.status))
+    : undefined;
+  const activePrimary = preferred || [...runs]
+    .filter((run) => run.kind === 'primary' && !TERMINAL.has(run.status))
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at))[0];
+  const budgetUsage = runs.reduce((usage, run) => ({
+    wall_clock_seconds: usage.wall_clock_seconds + run.budget_usage.wall_clock_seconds,
+    model_turns: usage.model_turns + run.budget_usage.model_turns,
+    tool_calls: usage.tool_calls + run.budget_usage.tool_calls,
+    tokens: usage.tokens + run.budget_usage.tokens,
+    cost_usd: usage.cost_usd + run.budget_usage.cost_usd,
+  }), { wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0 });
+  return {
+    group_id: groupId,
+    lifecycle: group?.lifecycle || previous?.lifecycle || 'active',
+    active_agent_count: new Set(runs.flatMap((run) => run.agent_runs
+      .filter((agent) => agent.phase !== 'idle').map((agent) => agent.agent_id))).size,
+    course_binding_count: group?.course_bindings.length || previous?.course_binding_count || 0,
+    source_count: group?.source_links.length || previous?.source_count || 0,
+    shared_source_count: previous?.shared_source_count || 0,
+    budget: group?.budget ?? previous?.budget ?? null,
+    active_primary_run_id: activePrimary?.run_id || null,
+    primary_task_status: activePrimary?.status || null,
+    queued_task_count: runs.filter((run) => run.status === 'queued').length,
+    active_side_task_count: runs.filter((run) => run.kind === 'side'
+      && run.queue_class === 'foreground' && EXECUTING.has(run.status)).length,
+    pending_approval_count: Object.values(approvals).filter(
+      (approval) => approval.group_id === groupId && approval.status === 'pending',
+    ).length,
+    budget_usage: budgetUsage,
+    indexing_state: indexingState(runs),
+    updated_at: updatedAt || runs.reduce(
+      (latest, run) => run.updated_at > latest ? run.updated_at : latest,
+      previous?.updated_at || new Date(0).toISOString(),
+    ),
+  };
+}
+
+function mirrorSummary(groupId: GroupId, summary: GroupRuntimeSummary | undefined): void {
+  useGroupStore.setState((state) => {
+    const runtimeSummaries = { ...state.runtimeSummaries };
+    if (summary) runtimeSummaries[groupId] = summary;
+    else delete runtimeSummaries[groupId];
+    return { runtimeSummaries };
+  });
 }
 
 async function taskRuntimeJson(path: string, body: object): Promise<unknown> {
@@ -65,6 +147,12 @@ function requestKey(prefix: string): string {
 
 const authorityRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+export function cancelTaskRuntimeAuthorityRefresh(groupId: GroupId): void {
+  const timer = authorityRefreshTimers.get(groupId);
+  if (timer) clearTimeout(timer);
+  authorityRefreshTimers.delete(groupId);
+}
+
 /** Coalesce noisy WS transitions into one authenticated snapshot+summary refresh. */
 export function scheduleTaskRuntimeAuthorityRefresh(groupId: GroupId, delayMs = 80): void {
   const pending = authorityRefreshTimers.get(groupId);
@@ -79,12 +167,15 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   byRun: {},
   byGroup: {},
   approvals: {},
+  groupSummaries: {},
+  refreshGenerations: {},
   error: null,
 
   resetAll(): void {
     for (const timer of authorityRefreshTimers.values()) clearTimeout(timer);
     authorityRefreshTimers.clear();
-    set({ byRun: {}, byGroup: {}, approvals: {}, error: null });
+    set({ byRun: {}, byGroup: {}, approvals: {}, groupSummaries: {}, refreshGenerations: {}, error: null });
+    useGroupStore.setState({ runtimeSummaries: {} });
   },
 
   ingestGroupSnapshot(groupId, raw): void {
@@ -108,7 +199,10 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         || approvals.some((approval) => approval.group_id !== groupId)) {
       throw new Error('Task Runtime snapshot crosses the addressed group_id boundary');
     }
+    let installedSummary: GroupRuntimeSummary | undefined;
     set((state) => {
+      const priorGroupRuns = Object.fromEntries(Object.entries(state.byRun)
+        .filter(([, projection]) => projection.run.group_id === groupId));
       for (const run of rows) {
         const existing = state.byRun[run.run_id];
         if (existing && (run.version < existing.run.version
@@ -116,33 +210,53 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           throw new Error('Stale Task Runtime snapshot cannot replace a newer projection');
         }
       }
+      // Task runs form an append-only public ledger within one runtime epoch. Absence from a
+      // snapshot is not a deletion signal; epoch reset and confirmed Group teardown are the only
+      // removal paths. This prevents an older A-only reconnect snapshot from deleting newer B.
+      const preservedAbsent = Object.values(priorGroupRuns).filter((projection) => (
+        !rows.some((run) => run.run_id === projection.run.run_id)
+      ));
+      const effectiveRows = [...rows, ...preservedAbsent.map((projection) => projection.run)];
       const nextRuns = Object.fromEntries(
         Object.entries(state.byRun).filter(([, projection]) => projection.run.group_id !== groupId),
       );
-      for (const run of rows) {
-        const existing = nextRuns[run.run_id];
-        nextRuns[run.run_id] = { run, events: existing?.events || [], needsResync: false };
+      for (const run of effectiveRows) {
+        const existing = priorGroupRuns[run.run_id];
+        nextRuns[run.run_id] = {
+          run,
+          events: retainedPublicEvents(existing?.events || [], run.last_seq),
+          needsResync: false,
+        };
       }
       const nextApprovals = Object.fromEntries(
         Object.entries(state.approvals).filter(([, approval]) => approval.group_id !== groupId),
       );
       for (const approval of approvals) nextApprovals[approval.approval_id] = approval;
+      const previousSummary = state.groupSummaries[groupId];
+      installedSummary = summarizeGroup(
+        groupId,
+        effectiveRows,
+        nextApprovals,
+        previousSummary,
+        preservedAbsent.length ? previousSummary?.active_primary_run_id : snapshot.summary.active_primary_run_id,
+      );
+      installedSummary = {
+        ...installedSummary,
+        queued_task_count: snapshot.summary.queued_task_count,
+        active_side_task_count: snapshot.summary.active_side_task_count,
+        pending_approval_count: snapshot.summary.pending_approval_count,
+        budget_usage: snapshot.summary.budget_usage,
+        indexing_state: snapshot.summary.indexing_state,
+      };
       return {
         byRun: nextRuns,
-        byGroup: { ...state.byGroup, [groupId]: rows.map((run) => run.run_id) },
+        byGroup: { ...state.byGroup, [groupId]: effectiveRows.map((run) => run.run_id) },
         approvals: nextApprovals,
+        groupSummaries: { ...state.groupSummaries, [groupId]: installedSummary },
         error: null,
       };
     });
-    useGroupStore.getState().ingestRuntimeProjection(
-      groupId,
-      {
-        ...snapshot.summary,
-        active_agent_count: new Set(rows.flatMap((run) => run.agent_runs
-          .filter((agent) => agent.phase !== 'idle').map((agent) => agent.agent_id))).size,
-      },
-      rows.reduce((latest, run) => run.updated_at > latest ? run.updated_at : latest, ''),
-    );
+    mirrorSummary(groupId, installedSummary);
   },
 
   applyEvent(groupId, raw): boolean {
@@ -174,6 +288,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         return false;
       }
     }
+    let eventSummary: GroupRuntimeSummary | undefined;
     set((state) => {
       const projection = state.byRun[event.run_id]!;
       let run: TaskRun = {
@@ -232,55 +347,28 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       } else if (event.event_type === 'verifier_decision' && typeof payload.status === 'string') {
         run.status = TaskStatusSchema.parse(payload.status);
       }
-      return {
-        byRun: {
+      const nextByRun = {
           ...state.byRun,
           [event.run_id]: {
             run: TaskRunSchema.parse(run),
-            events: [...projection.events, event],
+            events: retainedPublicEvents([...projection.events, event]),
             needsResync: false,
           },
-        },
+      };
+      const runIds = state.byGroup[groupId] || [];
+      const runs = runIds.map((runId) => nextByRun[runId]?.run)
+        .filter((candidate): candidate is TaskRun => Boolean(candidate));
+      eventSummary = summarizeGroup(
+        groupId, runs, approvalChanges, state.groupSummaries[groupId],
+        state.groupSummaries[groupId]?.active_primary_run_id, event.created_at,
+      );
+      return {
+        byRun: nextByRun,
         approvals: approvalChanges,
+        groupSummaries: { ...state.groupSummaries, [groupId]: eventSummary },
       };
     });
-    const state = get();
-    const runIds = state.byGroup[groupId] || [];
-    const runs = runIds.map((runId) => state.byRun[runId]?.run).filter((run): run is TaskRun => Boolean(run));
-    const previousSummary = useGroupStore.getState().runtimeSummaries[groupId];
-    const activePrimary = previousSummary?.active_primary_run_id
-      ? runs.find((run) => run.run_id === previousSummary.active_primary_run_id) : undefined;
-    const eventRun = state.byRun[event.run_id]?.run;
-    const eventPrimaryIsActive = eventRun?.kind === 'primary' && ![
-      'succeeded', 'partial', 'failed', 'cancelled',
-    ].includes(eventRun.status);
-    const authoritativePrimary = activePrimary && ![
-      'succeeded', 'partial', 'failed', 'cancelled',
-    ].includes(activePrimary.status)
-      ? activePrimary
-      : eventPrimaryIsActive ? eventRun : null;
-    const budgetUsage = runs.reduce((usage, run) => ({
-      wall_clock_seconds: usage.wall_clock_seconds + run.budget_usage.wall_clock_seconds,
-      model_turns: usage.model_turns + run.budget_usage.model_turns,
-      tool_calls: usage.tool_calls + run.budget_usage.tool_calls,
-      tokens: usage.tokens + run.budget_usage.tokens,
-      cost_usd: usage.cost_usd + run.budget_usage.cost_usd,
-    }), { wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0 });
-    useGroupStore.getState().ingestRuntimeProjection(groupId, {
-      active_agent_count: new Set(runs.flatMap((run) => run.agent_runs
-        .filter((agent) => agent.phase !== 'idle').map((agent) => agent.agent_id))).size,
-      active_primary_run_id: authoritativePrimary?.run_id || null,
-      primary_task_status: authoritativePrimary?.status || null,
-      queued_task_count: runs.filter((run) => run.status === 'queued').length,
-      active_side_task_count: runs.filter((run) => run.kind === 'side' && ![
-        'succeeded', 'partial', 'failed', 'cancelled',
-      ].includes(run.status)).length,
-      pending_approval_count: Object.values(state.approvals).filter(
-        (approval) => approval.group_id === groupId && approval.status === 'pending',
-      ).length,
-      budget_usage: budgetUsage,
-      indexing_state: previousSummary?.indexing_state || 'idle',
-    }, event.created_at);
+    mirrorSummary(groupId, eventSummary);
     return true;
   },
 
@@ -312,12 +400,29 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       }
       if (replay.gap) {
         if (!replay.snapshot) throw new Error('Replay gap has no authoritative snapshot');
-        set((state) => ({
-          byRun: {
+        let gapSummary: GroupRuntimeSummary | undefined;
+        set((state) => {
+          const nextByRun = {
             ...state.byRun,
-            [runId]: { run: replay.snapshot!.run, events: [], needsResync: false },
-          },
-        }));
+            [runId]: {
+              run: replay.snapshot!.run,
+              events: retainedPublicEvents(state.byRun[runId]?.events || [], replay.snapshot!.run.last_seq),
+              needsResync: false,
+            },
+          };
+          const runs = (state.byGroup[groupId] || []).map((id) => nextByRun[id]?.run)
+            .filter((candidate): candidate is TaskRun => Boolean(candidate));
+          gapSummary = summarizeGroup(
+            groupId, runs, state.approvals, state.groupSummaries[groupId],
+            state.groupSummaries[groupId]?.active_primary_run_id,
+            replay.snapshot!.run.updated_at,
+          );
+          return {
+            byRun: nextByRun,
+            groupSummaries: { ...state.groupSummaries, [groupId]: gapSummary },
+          };
+        });
+        mirrorSummary(groupId, gapSummary);
         return;
       }
       for (const event of replay.events) get().applyEvent(groupId, event);
@@ -328,10 +433,14 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   },
 
   async refreshGroup(groupId): Promise<void> {
+    const generation = (get().refreshGenerations[groupId] || 0) + 1;
+    set((state) => ({ refreshGenerations: { ...state.refreshGenerations, [groupId]: generation } }));
     try {
       const raw = await taskRuntimeJson('snapshot', { group_id: groupId });
+      if (get().refreshGenerations[groupId] !== generation) return;
       get().ingestGroupSnapshot(groupId, raw);
     } catch (error) {
+      if (get().refreshGenerations[groupId] !== generation) return;
       set({ error: error instanceof Error ? error.message : 'Task Runtime snapshot refresh failed' });
       throw error;
     }
@@ -347,12 +456,21 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     if (run.group_id !== groupId || run.run_id !== runId) {
       throw new Error('Task Runtime control response crosses the addressed identity boundary');
     }
-    set((state) => ({
-      byRun: {
+    let controlSummary: GroupRuntimeSummary | undefined;
+    set((state) => {
+      const byRun = {
         ...state.byRun,
         [runId]: { run, events: state.byRun[runId]?.events || [], needsResync: false },
-      },
-    }));
+      };
+      const runs = (state.byGroup[groupId] || []).map((id) => byRun[id]?.run)
+        .filter((candidate): candidate is TaskRun => Boolean(candidate));
+      controlSummary = summarizeGroup(
+        groupId, runs, state.approvals, state.groupSummaries[groupId],
+        state.groupSummaries[groupId]?.active_primary_run_id, run.updated_at,
+      );
+      return { byRun, groupSummaries: { ...state.groupSummaries, [groupId]: controlSummary } };
+    });
+    mirrorSummary(groupId, controlSummary);
     return run;
   },
 
@@ -380,18 +498,49 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         || resolved.approval_id !== approvalId) {
       throw new Error('Task Runtime approval response crosses the addressed identity boundary');
     }
+    let approvalSummary: GroupRuntimeSummary | undefined;
     set((state) => {
       const approvals = { ...state.approvals };
       delete approvals[approvalId];
+      const byRun = {
+        ...state.byRun,
+        [runId]: { run, events: state.byRun[runId]?.events || [], needsResync: false },
+      };
+      const runs = (state.byGroup[groupId] || []).map((id) => byRun[id]?.run)
+        .filter((candidate): candidate is TaskRun => Boolean(candidate));
+      approvalSummary = summarizeGroup(
+        groupId, runs, approvals, state.groupSummaries[groupId],
+        state.groupSummaries[groupId]?.active_primary_run_id, run.updated_at,
+      );
       return {
-        byRun: {
-          ...state.byRun,
-          [runId]: { run, events: state.byRun[runId]?.events || [], needsResync: false },
-        },
+        byRun,
         approvals,
+        groupSummaries: { ...state.groupSummaries, [groupId]: approvalSummary },
         error: null,
       };
     });
+    mirrorSummary(groupId, approvalSummary);
     return run;
+  },
+
+  teardownGroupProjection(groupId): string[] {
+    cancelTaskRuntimeAuthorityRefresh(groupId);
+    const removedRunIds = get().byGroup[groupId] || [];
+    const removedSet = new Set(removedRunIds);
+    set((state) => {
+      const byRun = Object.fromEntries(Object.entries(state.byRun)
+        .filter(([runId, projection]) => !removedSet.has(runId) && projection.run.group_id !== groupId));
+      const byGroup = { ...state.byGroup };
+      delete byGroup[groupId];
+      const approvals = Object.fromEntries(Object.entries(state.approvals)
+        .filter(([, approval]) => approval.group_id !== groupId));
+      const groupSummaries = { ...state.groupSummaries };
+      delete groupSummaries[groupId];
+      const refreshGenerations = { ...state.refreshGenerations };
+      delete refreshGenerations[groupId];
+      return { byRun, byGroup, approvals, groupSummaries, refreshGenerations };
+    });
+    mirrorSummary(groupId, undefined);
+    return removedRunIds;
   },
 }));

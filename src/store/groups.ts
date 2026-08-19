@@ -371,11 +371,16 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
     });
     const receipt = GroupDeletionReceiptSchema.parse((raw as { receipt?: unknown }).receipt);
     assertAddressedGroup(groupId, receipt.group_id);
+    const legacyProjectId = current.legacy_project_id;
     set((state) => {
       const groups = { ...state.groups };
       delete groups[groupId];
-      return { groups, order: state.order.filter((id) => id !== groupId) };
+      const runtimeSummaries = { ...state.runtimeSummaries };
+      delete runtimeSummaries[groupId];
+      return { groups, runtimeSummaries, order: state.order.filter((id) => id !== groupId) };
     });
+    const { teardownGroup } = await import('./groupTeardown');
+    teardownGroup(groupId, legacyProjectId);
     return receipt;
   },
 }));

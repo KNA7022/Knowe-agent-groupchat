@@ -2,6 +2,7 @@ import React from 'react';
 
 import type { Group, GroupRuntimeSummary } from '../contract/group';
 import { useGroupStore } from '../store/groups';
+import { useTaskRuntimeStore } from '../store/taskRuntime';
 import { useKnoweStore } from '../store/store';
 import { IconAlert, IconCheck, IconChevR, IconTask } from './icons';
 
@@ -90,7 +91,7 @@ export const TodayShell: React.FC = () => {
   const groups = useGroupStore((state) => state.order.map((id) => state.groups[id]).filter(
     (group): group is Group => group !== undefined,
   ));
-  const summaries = useGroupStore((state) => state.runtimeSummaries);
+  const summaries = useTaskRuntimeStore((state) => state.groupSummaries);
   return <TodayView groups={groups} summaries={summaries} onOpenGroup={(_groupId, legacyProjectId) => {
     if (!legacyProjectId) return;
     const store = useKnoweStore.getState();

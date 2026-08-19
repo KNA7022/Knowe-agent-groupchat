@@ -13,6 +13,7 @@ function loadWatermarks(): Record<string, number> {
 interface SideTaskReadState {
   watermarks: Record<string, number>;
   acknowledge: (runId: string, seq: number) => void;
+  clearRuns: (runIds: string[]) => void;
   reset: () => void;
 }
 
@@ -21,6 +22,15 @@ export const useSideTaskReadStore = create<SideTaskReadState>((set) => ({
   acknowledge(runId, seq): void {
     set((state) => {
       const watermarks = { ...state.watermarks, [runId]: Math.max(seq, state.watermarks[runId] || 0) };
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(watermarks)); } catch { /* local-only best effort */ }
+      return { watermarks };
+    });
+  },
+  clearRuns(runIds): void {
+    const removed = new Set(runIds);
+    set((state) => {
+      const watermarks = Object.fromEntries(Object.entries(state.watermarks)
+        .filter(([runId]) => !removed.has(runId)));
       try { localStorage.setItem(STORAGE_KEY, JSON.stringify(watermarks)); } catch { /* local-only best effort */ }
       return { watermarks };
     });

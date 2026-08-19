@@ -46,6 +46,7 @@ import { memberNameLabel } from '../shared/roleLabel';
 import { confirmModal, openMenu, toast, type MenuEntry } from './ContextMenu';
 import {
   useKnowledgeStore, knowDateLabel, sourceLabel, USAGE_ZH,
+  knowledgeScopeKey,
   type KnowCard, type KnowCat, type KnowScope, type KnowSt, type KnowAssetDetail,
   type SkillPack, type SkillPackStatus,
 } from '../store/knowledge';
@@ -169,19 +170,15 @@ type ModalState =
 
 export type KnowledgeDataScope = KnowledgeQueryScope;
 
-function refHasIdentity(sourceRef: string, identity: string): boolean {
-  return sourceRef.split(/[\\/:#?&=]+/).some((part) => part === identity);
-}
-
 export function cardAllowedByKnowledgeScope(card: KnowCard, dataScope: KnowledgeDataScope): boolean {
-  if (card.scope === 'global') return true;
+  const approvedGlobal = card.scope === 'global' && card.scopeSetBy === 'user'
+    && (card.status === 'validated' || card.status === 'core') && card.st === 'ok';
   const ownsProject = dataScope.projectIds.includes(card.projectId);
-  const ownsSource = card.evidence.some((evidence) => dataScope.sourceIds.some(
-    (sourceId) => refHasIdentity(evidence.sourceRef, sourceId),
-  ));
-  if (!ownsProject && !ownsSource) return false;
+  const ownsSource = card.sourceIds.some((sourceId) => dataScope.sourceIds.includes(sourceId));
+  if (!ownsProject && !ownsSource && !approvedGlobal) return false;
+  if (dataScope.sourceIds.length && !ownsSource) return false;
   if (!dataScope.courseId) return true;
-  return card.evidence.some((evidence) => refHasIdentity(evidence.sourceRef, dataScope.courseId!));
+  return card.courseIds.includes(dataScope.courseId);
 }
 
 export const KnowledgeView: React.FC<{ dataScope?: KnowledgeDataScope }> = ({ dataScope }) => {
@@ -196,12 +193,14 @@ export const KnowledgeView: React.FC<{ dataScope?: KnowledgeDataScope }> = ({ da
   const allSkillpacks = useKnowledgeStore((s) => s.skillpacks);
   const allProfileProjects = useKnowledgeStore((s) => s.profileProjects);
   const skillpacks = useMemo(() => dataScope ? {
-    systemBuiltin: allSkillpacks.systemBuiltin,
+    systemBuiltin: allSkillpacks.systemBuiltin.filter((pack) => pack.immutable && pack.status === 'active'),
     projectExperience: allSkillpacks.projectExperience.filter(
-      (pack) => pack.scope === 'global' || dataScope.projectIds.includes(pack.projectId),
+      (pack) => dataScope.projectIds.includes(pack.projectId)
+        || (pack.scope === 'global' && pack.status === 'active'),
     ),
     thirdParty: allSkillpacks.thirdParty.filter(
-      (pack) => !pack.projectId || pack.scope === 'global' || dataScope.projectIds.includes(pack.projectId),
+      (pack) => !!pack.projectId && (dataScope.projectIds.includes(pack.projectId)
+        || (pack.scope === 'global' && pack.status === 'active')),
     ),
   } : allSkillpacks, [allSkillpacks, dataScope]);
   const profileProjects = useMemo(() => dataScope
@@ -227,27 +226,37 @@ export const KnowledgeView: React.FC<{ dataScope?: KnowledgeDataScope }> = ({ da
   const [scope, setScope] = useState<KnowScope | null>(null); // L2 选中
   const [cat, setCat] = useState<KnowCat | null>(null);       // L3 选中
   const [skillPane, setSkillPane] = useState<SkillPane>('root');
+  const dataScopeIdentity = knowledgeScopeKey(dataScope);
 
   // 挂载即拉取；45s 静默刷新；卸载即停。
   useEffect(() => {
+    useKnowledgeStore.getState().setScope(dataScope);
+    useKnowledgeStore.getState().closePreview();
+    setModal(null);
+    setPane('graph');
+    setSkillPane('root');
+    setQ('');
+    setSeg(null);
+    setScope(null);
+    setCat(null);
     void useKnowledgeStore.getState().load({ scope: dataScope });
     const timer = window.setInterval(
       () => { void useKnowledgeStore.getState().load({ silent: true, scope: dataScope }); },
       REFRESH_MS,
     );
     return () => window.clearInterval(timer);
-  }, [dataScope]);
+  }, [dataScopeIdentity]);
 
   // 进【技能包】才拉真实技能数据；保持在该面板时轮询，承接后台 core→待审技能的异步同步。
   useEffect(() => {
     if (pane !== 'skills') return undefined;
-    void useKnowledgeStore.getState().loadSkillpacks();
+    void useKnowledgeStore.getState().loadSkillpacks(dataScope);
     const timer = window.setInterval(
-      () => { void useKnowledgeStore.getState().loadSkillpacks(); },
+      () => { void useKnowledgeStore.getState().loadSkillpacks(dataScope); },
       REFRESH_MS,
     );
     return () => window.clearInterval(timer);
-  }, [pane]);
+  }, [pane, dataScopeIdentity]);
 
   const kw = q.trim();
   const shown = useMemo(() => {

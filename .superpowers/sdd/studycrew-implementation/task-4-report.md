@@ -21,7 +21,7 @@ Task 4 已把已有的 Group 与 Task Runtime 权威状态接入 Electron render
 - 新增 `GroupManagementDialog`：重命名、归档/恢复、复制、阵容编辑、课程/资料链接与解除、后端删除影响预览、名称二次确认及原样提交 preview token。
 - 左侧会话区改为“群组”心智模型，并显示主任务文本状态、排队、审批、旁路、索引异常和归档状态；映射仅接受 `legacy_project_id`。
 - 新增 Today 最小跨群摘要以及 Review/Privacy 诚实壳层；Today 只消费 runtime summary，不读取 roster、记忆或正文，并可返回所属群组。
-- App 启动并发加载 Group summary 与 runtime snapshot；runtime-heavy 组件保持在 App 以下。默认 StudyCrew 入口为 Today。
+- App 启动只加载 Task Runtime 的 Group snapshot，由同一投影同时提供 run 与 summary；不再与旧 Group summary 请求竞写。runtime-heavy 组件保持在 App 以下。默认 StudyCrew 入口为 Today。
 - 增加开发专用 `?studycrew-demo=1` 确定性场景，供作品演示与 UI 验收使用，不影响生产数据路径。
 - 样式保持现有暖色画布、靛蓝与 token；公开事件行使用 `content-visibility:auto`；Task 4 区域在 `prefers-reduced-motion` 下关闭动画和过渡。
 
@@ -46,6 +46,16 @@ Task 4 已把已有的 Group 与 Task Runtime 权威状态接入 Electron render
 - generic `failed` 只显示“任务执行失败，Verifier 结论未上报”；只有公开 `verifier_decision` 才显示通过/未通过。旁路任务仅在 terminal/公开回答完成后产生未读水位，规划、工具与审批进度只显示“进行中”。Index tab 显示真实 `indexing_state`。
 - 修复全量基线：统一 RTL cleanup；preview control origin fail closed；迁移 v24 对已删除 DOM/协议的脆弱断言；Vitest 不再误收 Node `scripts/*.test.mjs`。
 
+## Round 3 独立复审修复
+
+- Task Runtime 成为 renderer 的单一实时权威：每个 Group 维护 refresh generation，后发 S2(A+B) 先完成后，旧 S1(A) 响应会被忽略；直接到达的旧 reconnect snapshot 也不能删除时间更新更晚的缺席 run。run、approval 与 `groupSummaries` 在同一次 Zustand projection 内提交，UI 不再订阅另一个 summary store。
+- gap replay 会在同一提交中更新 terminal run 与 active-primary summary；`resetAll` 同步清空 Group summary。连续事件、本地 control/approval 响应均实时派生主任务、队列、审批、预算、foreground side 与 index 状态，不依赖 80ms HTTP 刷新成功。
+- snapshot 更新前先捕获旧 Group 投影；仅保留 `sensitivity=public`、以 `event_id+seq` 去重、每 run 最多 200 条的公开事件。fake-timer 测试执行生产 80ms refresh 后，Verifier/tool 事件仍可在抽屉使用。
+- Knowledge 边界贯通 renderer 与 backend：`knowledge_api` 使用 `GroupRepository` 校验 canonical Group、legacy project、source 与 course allowlist；assets、profile、asset/node detail、search、skillpack 及写路由越界均 fail closed/403。资产从 source metadata 输出结构化 `source_ids/course_ids`，不再解析自由文本 `sourceRef`。
+- Knowledge store 以稳定 scope identity 隔离请求；切 Group/课程立即关闭 preview、清空 cards/profile/skill panes，迟到的旧 scope 响应不再覆盖新 scope。跨群 global 资产仅允许用户显式批准且为 validated/core；pending、retired、ownerless 第三方默认拒绝。
+- backend 与 renderer 共用一致语义：旁路活跃数只计 `kind=side + queue_class=foreground + routing/running/verifying`，index 永不进入旁路回答；index queued/running/failed/idle 由事件实时派生。failed/cancelled 旁路显示“状态通知”，不再称为“未读回答”。
+- 新增单一 `teardownGroup(groupId)`：收到 confirmed-delete receipt 后取消 authority timer，并清除 run/event/evidence/approval/summary、side watermark、Knowledge scope/preview，以及 legacy Group/DM/附件投影；不会遗留已删 Group id。
+
 ## 自动化验证
 
 最终回归命令：
@@ -57,7 +67,7 @@ node --test scripts/python-command.test.mjs
 
 覆盖精确 Project→Group 映射/隔离、live 主任务切换、主旁路分离、terminal answer 未读、空闲折叠、公开工具投影、权威主任务与全状态控制矩阵、resync、exact run 审批、四模板默认、绑定失败不重复创建、删除 token 身份/版本、Today summary、Knowledge cross-group exclusion、canonical roster、modal inert、连续事件焦点稳定、键盘/Escape、tabs、真实索引状态和 reduced motion。
 
-最终全量为 **39 个 Vitest 文件、479 个测试全部通过**；独立 Node command 测试 **2/2 通过**；全仓 `npm run lint` 通过。仓库全量 TypeScript 仍含 Task 4 之前的历史错误；对本轮触及路径过滤为 **0 个诊断**。
+最终全量为 **41 个 Vitest 文件、488 个测试全部通过**；独立 Node command 测试 **2/2 通过**；Task Runtime 全组加 Knowledge scope 的 backend 回归 **213 个测试全部通过**；全仓 `npm run lint` 通过。仓库全量 TypeScript 仍含 Task 4 之前的历史错误；对本轮触及路径过滤为 **0 个诊断**。全 backend suite 在收集阶段仍被四个历史测试导入已不存在的 `ACTION_CONTRACT` 阻断（`test_v10182_runtime_ui.py`、`test_v22_dispatch_reliability.py`、`test_v27_weld.py`、`test_v28_weld.py`），本轮触及后端测试不包含在该失败中。
 
 ## 实际渲染检查
 
@@ -72,6 +82,8 @@ Round 1 修复后按 `control-in-app-browser` 的 bootstrap/documentation/troubl
 
 Round 2 再次按同一规定流程连接，`iab` 仍返回 `Browser is not available`，唯一一次 discovery 仍为 `[]`；因此没有违规切换 standalone Playwright，也没有生成或复用伪造的 post-fix 截图。Round 2 的 live rerender focus、canonical roster、Knowledge isolation 与 runtime exact switch 均由 React/contract 测试验收，Browser viewport/hit-test 仍是唯一未执行项。
 
+Round 3 做了本轮唯一一次 Browser 重试：复用既有 runtime 后，binding 在 documentation 阶段返回 `Browser is not available`；按 `bootstrap-troubleshooting` 只执行一次 discovery，结果仍为 `[]`。因此没有 post-fix viewport、modal hit-test 或截图证据，也没有使用 standalone Playwright 规避限制。本轮乱序 authority、80ms event retention、跨群 Knowledge detail/profile/skillpack、统一 teardown 与 side/index 语义均由自动化测试验证。
+
 ## 主要文件
 
 - `src/components/AgentStatusBar.tsx`
@@ -83,6 +95,7 @@ Round 2 再次按同一规定流程连接，`iab` 仍返回 `Browser is not avai
 - `src/components/ChatStream.tsx`
 - `src/app/App.tsx`
 - `src/store/taskRuntime.ts`
+- `src/store/groupTeardown.ts`
 - `src/store/knowledge.ts`
 - `src/components/KnowledgeScopedView.tsx`
 - `src/components/KnowledgeView.tsx`
@@ -95,5 +108,5 @@ Round 2 再次按同一规定流程连接，`iab` 仍返回 `Browser is not avai
 
 - 工具抽屉只展示 Task Runtime 已发布的 `tool_prepared` 公共投影；完整 ToolInvocation 台账属于后续 Tool Gateway 任务，不能在 UI 猜测。
 - Review 与 Privacy 明确标为后续能力，只展示当前真实 Group/runtime 计数；未伪造 RAG、PII 或评测结果。
-- Knowledge 入口已 enforce 现有资产的 Group/课程安全范围并携带未来 endpoint scope；完整解析、切片、混合召回与引用 RAG 仍由 Task 5 实现。
+- Knowledge 入口和现有 backend asset/profile/detail/skillpack 数据面已 enforce Group/课程安全范围；完整解析、切片、混合召回与引用 RAG 仍由 Task 5 实现。
 - 900px 是计划要求的最低桌面验证宽度；不承诺移动端布局。

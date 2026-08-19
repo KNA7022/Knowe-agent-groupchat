@@ -1832,11 +1832,19 @@ class KnowledgeAssetManager:
             if isinstance(src, dict) and src.get("ref"):
                 ref_to_meta[str(src["ref"])] = src
         evidence_rows: list[dict[str, Any]] = []
+        source_ids: set[str] = set()
+        course_ids: set[str] = set()
         for ev in (asset.get("evidence") or [])[:10]:
             if not isinstance(ev, dict):
                 continue
             src = ref_to_meta.get(str(ev.get("source_ref") or ""), {})
             meta = src.get("metadata") if isinstance(src.get("metadata"), dict) else {}
+            source_id = meta.get("source_id")
+            course_id = meta.get("course_id")
+            if isinstance(source_id, str) and source_id:
+                source_ids.add(source_id)
+            if isinstance(course_id, str) and course_id:
+                course_ids.add(course_id)
             evidence_rows.append({
                 "source_ref": ev.get("source_ref") or "",
                 "node_id": ev.get("node_id") or "",
@@ -1873,6 +1881,8 @@ class KnowledgeAssetManager:
             "created_at": asset.get("created_at"),
             "updated_at": asset.get("updated_at"),
             "evidence": evidence_rows,
+            "source_ids": sorted(source_ids),
+            "course_ids": sorted(course_ids),
         }
 
 

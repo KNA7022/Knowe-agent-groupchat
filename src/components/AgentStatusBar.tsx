@@ -77,14 +77,21 @@ export function verifierLabel(run: TaskRun, events: RunEvent[]): string {
 }
 
 export function sideAnswerSequence(projection: RuntimeProjection): number | null {
-  if (!TERMINAL.has(projection.run.status)) return null;
+  const approvedDecision = [...projection.events].reverse().find((event) => (
+    event.event_type === 'verifier_decision' && event.public_payload.approved === true
+  ));
+  if (!['succeeded', 'partial'].includes(projection.run.status) && !approvedDecision) return null;
   const terminalEvent = [...projection.events].reverse().find((event) => {
-    if (event.event_type === 'verifier_decision') return true;
+    if (event.event_type === 'verifier_decision') return event.public_payload.approved === true;
     return event.event_type === 'status_changed'
       && typeof event.public_payload.status === 'string'
       && TERMINAL.has(event.public_payload.status as TaskStatus);
   });
   return terminalEvent?.seq ?? projection.run.last_seq;
+}
+
+function sideStatusSequence(projection: RuntimeProjection): number | null {
+  return ['failed', 'cancelled'].includes(projection.run.status) ? projection.run.last_seq : null;
 }
 
 function ratio(used: number, limit: number): string {
@@ -233,7 +240,7 @@ export const AgentStatusBar = memo(function AgentStatusBar({ projectId }: AgentS
     return null;
   });
   const groupId = group?.group_id;
-  const summary = useGroupStore((state) => (groupId ? state.runtimeSummaries[groupId] : undefined));
+  const summary = useTaskRuntimeStore((state) => (groupId ? state.groupSummaries[groupId] : undefined));
   const runIds = useTaskRuntimeStore((state) => (groupId ? state.byGroup[groupId] || EMPTY_IDS : EMPTY_IDS), shallow);
   const projections = useTaskRuntimeStore((state) => runIds.map((id) => state.byRun[id]).filter(Boolean), shallow);
   const approvals = useTaskRuntimeStore((state) => groupId ? Object.values(state.approvals).filter(
@@ -259,11 +266,11 @@ export const AgentStatusBar = memo(function AgentStatusBar({ projectId }: AgentS
   );
   const primary = primaryProjection?.run;
   const sideProjections = (projections as RuntimeProjection[]).filter(
-    (projection) => projection.run.kind === 'side',
+    (projection) => projection.run.kind === 'side' && projection.run.queue_class === 'foreground',
   );
   const sideRuns = sideProjections.filter((projection) => {
-    const answerSeq = sideAnswerSequence(projection);
-    return answerSeq === null || answerSeq > (sideReadWatermarks[projection.run.run_id] || 0);
+    const noticeSeq = sideAnswerSequence(projection) ?? sideStatusSequence(projection);
+    return noticeSeq === null || noticeSeq > (sideReadWatermarks[projection.run.run_id] || 0);
   }).map((projection) => projection.run);
   const activeAgents = primary?.agent_runs.filter((agent) => agent.phase !== 'idle') || [];
   const idleAgents = primary?.agent_runs.filter((agent) => agent.phase === 'idle') || [];
@@ -355,13 +362,16 @@ export const AgentStatusBar = memo(function AgentStatusBar({ projectId }: AgentS
         <strong>旁路任务</strong>{sideRuns.map((run) => {
           const projection = sideProjections.find((item) => item.run.run_id === run.run_id)!;
           const answerSeq = sideAnswerSequence(projection);
-          const unread = answerSeq !== null && answerSeq > (sideReadWatermarks[run.run_id] || 0);
-          return <button type="button" key={run.run_id} className={unread ? 'side-run-unread' : ''}
-            aria-label={`${run.public_summary || run.title}，${unread ? '未读回答，点击标记已读' : TERMINAL.has(run.status) ? '已读' : '进行中'}`}
+          const statusSeq = sideStatusSequence(projection);
+          const noticeSeq = answerSeq ?? statusSeq;
+          const unreadAnswer = answerSeq !== null && answerSeq > (sideReadWatermarks[run.run_id] || 0);
+          const unreadStatus = statusSeq !== null && statusSeq > (sideReadWatermarks[run.run_id] || 0);
+          return <button type="button" key={run.run_id} className={unreadAnswer || unreadStatus ? 'side-run-unread' : ''}
+            aria-label={`${run.public_summary || run.title}，${unreadAnswer ? '未读回答，点击标记已读' : unreadStatus ? '未读状态通知，点击标记已读' : TERMINAL.has(run.status) ? '已读' : '进行中'}`}
             onClick={() => {
-              if (answerSeq !== null) useSideTaskReadStore.getState().acknowledge(run.run_id, answerSeq);
+              if (noticeSeq !== null) useSideTaskReadStore.getState().acknowledge(run.run_id, noticeSeq);
             }}>
-            {run.public_summary || run.title} · {STATUS_LABEL[run.status]}{unread ? ' · 未读回答' : ''}
+            {run.public_summary || run.title} · {STATUS_LABEL[run.status]}{unreadAnswer ? ' · 未读回答' : unreadStatus ? ' · 状态通知' : ''}
           </button>;
         })}
       </div> : null}

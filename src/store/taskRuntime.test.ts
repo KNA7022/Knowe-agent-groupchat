@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { taskRunFixture } from '../contract/taskRuntime.fixture';
-import { useTaskRuntimeStore } from './taskRuntime';
+import { scheduleTaskRuntimeAuthorityRefresh, useTaskRuntimeStore } from './taskRuntime';
 
 const groupId = `grp_${'1'.repeat(32)}` as const;
 const otherGroupId = `grp_${'9'.repeat(32)}` as const;
@@ -40,10 +40,11 @@ function snapshot(runs: unknown[] = [taskRunFixture()], pendingApprovals: unknow
 
 describe('authoritative Task Runtime projection', () => {
   beforeEach(() => {
-    useTaskRuntimeStore.setState({ byRun: {}, byGroup: {}, approvals: {}, error: null });
+    useTaskRuntimeStore.getState().resetAll();
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -178,5 +179,113 @@ describe('authoritative Task Runtime projection', () => {
       groupId, runId, `apr_${'8'.repeat(32)}`, true,
     )).rejects.toThrow(/identity/);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps the latest per-Group authority when S2(A+B) resolves before stale S1(A)', async () => {
+    const secondRunId = `run_${'7'.repeat(32)}`;
+    const deferred: Array<(response: Response) => void> = [];
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => deferred.push(resolve))));
+
+    const s1 = useTaskRuntimeStore.getState().refreshGroup(groupId);
+    const s2 = useTaskRuntimeStore.getState().refreshGroup(groupId);
+    await vi.waitFor(() => expect(deferred).toHaveLength(2));
+    const s2Snapshot = snapshot([
+      taskRunFixture(),
+      taskRunFixture({ run_id: secondRunId, task_id: `task_${'7'.repeat(32)}`, updated_at: '2026-08-18T00:00:02Z' }),
+    ]) as { summary: { active_primary_run_id: string | null } };
+    s2Snapshot.summary.active_primary_run_id = secondRunId;
+    deferred[1]!(new Response(JSON.stringify(s2Snapshot), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+    await s2;
+    deferred[0]!(new Response(JSON.stringify(snapshot()), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    }));
+    await s1;
+
+    expect(useTaskRuntimeStore.getState().byRun[secondRunId]).toBeDefined();
+    expect(useTaskRuntimeStore.getState().byGroup[groupId]).toContain(secondRunId);
+    expect(useTaskRuntimeStore.getState().groupSummaries[groupId]?.active_primary_run_id).toBe(secondRunId);
+  });
+
+  it('does not delete a newer absent run when an older reconnect snapshot arrives directly', () => {
+    const secondRunId = `run_${'7'.repeat(32)}`;
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot([
+      taskRunFixture(),
+      taskRunFixture({ run_id: secondRunId, task_id: `task_${'7'.repeat(32)}`, updated_at: '2026-08-18T00:00:03Z' }),
+    ]));
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot([
+      taskRunFixture({ updated_at: '2026-08-18T00:00:01Z' }),
+    ]));
+    expect(useTaskRuntimeStore.getState().byRun[secondRunId]).toBeDefined();
+  });
+
+  it('atomically clears active primary after a terminal gap snapshot and retains public history', async () => {
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot());
+    useTaskRuntimeStore.getState().applyEvent(groupId, event(2, 2, {
+      event_type: 'tool_prepared',
+      public_payload: {
+        status: 'running', invocation_id: `tool_${'6'.repeat(32)}`, tool_name: 'search',
+        disposition: 'created', usage: { wall_clock_seconds: 0, model_turns: 0, tool_calls: 0, tokens: 0, cost_usd: 0 },
+      },
+    }));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      schema_version: 1, run_id: runId, group_id: groupId,
+      after_seq: 2, last_seq: 4, version: 4, gap: true, events: [],
+      snapshot: {
+        schema_version: 1,
+        run: taskRunFixture({ status: 'succeeded', version: 4, last_seq: 4, finished_at: '2026-08-18T00:00:04Z' }),
+        last_seq: 4, version: 4,
+      },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
+
+    await useTaskRuntimeStore.getState().reconcile(groupId, runId);
+    const state = useTaskRuntimeStore.getState();
+    expect(state.groupSummaries[groupId]?.active_primary_run_id).toBeNull();
+    expect(state.byRun[runId]?.events.map((item) => item.event_type)).toContain('tool_prepared');
+  });
+
+  it('preserves bounded public events across the scheduled authority refresh', async () => {
+    vi.useFakeTimers();
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot());
+    useTaskRuntimeStore.getState().applyEvent(groupId, event(2, 2, {
+      event_type: 'verifier_decision',
+      public_payload: { status: 'running', decision_id: `vfd_${'8'.repeat(32)}`, outcome: 'continue', approved: true, evidence_count: 2 },
+    }));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(snapshot([
+      taskRunFixture({ version: 2, last_seq: 2 }),
+    ])), { status: 200, headers: { 'Content-Type': 'application/json' } })));
+    scheduleTaskRuntimeAuthorityRefresh(groupId, 80);
+    await vi.advanceTimersByTimeAsync(80);
+    expect(useTaskRuntimeStore.getState().byRun[runId]?.events).toHaveLength(1);
+    expect(useTaskRuntimeStore.getState().byRun[runId]?.events[0]?.event_type).toBe('verifier_decision');
+  });
+
+  it('projects foreground side and index states from events even when authority refresh fails', async () => {
+    const sideRunId = `run_${'6'.repeat(32)}`;
+    const indexRunId = `run_${'7'.repeat(32)}`;
+    useTaskRuntimeStore.getState().ingestGroupSnapshot(groupId, snapshot([
+      taskRunFixture(),
+      taskRunFixture({ run_id: sideRunId, task_id: `task_${'6'.repeat(32)}`, kind: 'side', read_only: true, risk: 'low', status: 'queued' }),
+      taskRunFixture({ run_id: indexRunId, task_id: `task_${'7'.repeat(32)}`, kind: 'side', queue_class: 'index', read_only: true, risk: 'low', status: 'queued' }),
+    ]));
+    expect(useTaskRuntimeStore.getState().groupSummaries[groupId]?.indexing_state).toBe('idle');
+    const statusEvent = (targetRunId: string, seq: number, status: string) => event(seq, seq, {
+      run_id: targetRunId, event_id: `evt_${targetRunId === sideRunId ? '6' : '7'.repeat(1)}${seq.toString(16).padStart(31, '0')}`,
+      event_type: 'status_changed', public_payload: { status },
+    });
+    useTaskRuntimeStore.getState().applyEvent(groupId, statusEvent(sideRunId, 2, 'running'));
+    useTaskRuntimeStore.getState().applyEvent(groupId, statusEvent(indexRunId, 2, 'running'));
+    expect(useTaskRuntimeStore.getState().groupSummaries[groupId]).toMatchObject({
+      active_side_task_count: 1, indexing_state: 'running',
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'offline' }), {
+      status: 503, headers: { 'Content-Type': 'application/json' },
+    })));
+    await expect(useTaskRuntimeStore.getState().refreshGroup(groupId)).rejects.toThrow('offline');
+    expect(useTaskRuntimeStore.getState().groupSummaries[groupId]?.indexing_state).toBe('running');
+    useTaskRuntimeStore.getState().applyEvent(groupId, statusEvent(sideRunId, 3, 'paused'));
+    useTaskRuntimeStore.getState().applyEvent(groupId, statusEvent(indexRunId, 3, 'failed'));
+    expect(useTaskRuntimeStore.getState().groupSummaries[groupId]).toMatchObject({
+      active_side_task_count: 0, indexing_state: 'failed',
+    });
   });
 });

@@ -343,10 +343,7 @@ export const App: React.FC = () => {
     void useGroupStore.getState().load().then(async () => {
       const groups = useGroupStore.getState();
       await Promise.allSettled(groups.order.map(async (groupId) => {
-        await Promise.all([
-          groups.loadRuntimeSummary(groupId),
-          useTaskRuntimeStore.getState().refreshGroup(groupId),
-        ]);
+        await useTaskRuntimeStore.getState().refreshGroup(groupId);
       }));
     }).catch(() => undefined);
   }, [demoMode]);

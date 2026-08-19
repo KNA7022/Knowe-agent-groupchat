@@ -6619,10 +6619,10 @@ class KnoweServer:
 
                 if path.startswith("/api/knowledge"):
                     response = await dispatch_knowledge_http(
-                        method, path, split.query, body_bytes,
+                        method, path, split.query, body_bytes, self.groups,
                     )
                     status = {
-                        200: b"200 OK", 400: b"400 Bad Request", 404: b"404 Not Found",
+                        200: b"200 OK", 400: b"400 Bad Request", 403: b"403 Forbidden", 404: b"404 Not Found",
                         405: b"405 Method Not Allowed", 413: b"413 Payload Too Large",
                         500: b"500 Internal Server Error", 503: b"503 Service Unavailable",
                         504: b"504 Gateway Timeout",

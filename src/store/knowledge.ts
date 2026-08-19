@@ -91,6 +91,8 @@ export interface KnowCard {
   firstSeen: string | null;
   lastSeen: string | null;
   evidence: KnowEvidence[];
+  sourceIds: string[];
+  courseIds: string[];
 }
 
 /** 「预览」面板的详情（L1）：卡片字段 + ASSET.md 全文 + 使用轨迹 */
@@ -140,6 +142,7 @@ interface RawAsset {
     observed_at?: string | null; excerpt?: string; agent_id?: string | null;
   }[];
   body_md?: string;
+  source_ids?: string[]; course_ids?: string[];
   usage_events?: { kind?: string; step?: number | null; at?: string | null }[];
 }
 
@@ -213,6 +216,8 @@ function toCard(raw: RawAsset): KnowCard | null {
       excerpt: String(ev.excerpt || ''),
       agentId: ev.agent_id ? String(ev.agent_id) : null,
     })),
+    sourceIds: (raw.source_ids || []).map(String),
+    courseIds: (raw.course_ids || []).map(String),
   };
 }
 
@@ -335,12 +340,16 @@ interface KnowledgeStore {
   };
   /** 全局知识存在画像文件的项目（「偏好画像」入口据此点亮） */
   profileProjects: string[];
+  activeScope: KnowledgeQueryScope | null;
+  activeScopeKey: string;
 
   preview: KnowPreviewState | null;
   previewWidth: number;
 
   load: (opts?: { silent?: boolean; scope?: KnowledgeQueryScope }) => Promise<void>;
-  loadSkillpacks: () => Promise<void>;
+  setScope: (scope?: KnowledgeQueryScope) => void;
+  loadSkillpacks: (scope?: KnowledgeQueryScope) => Promise<void>;
+  teardownGroupScope: (groupId: string, projectId?: string | null) => void;
   reviewSkillpack: (pack: SkillPack, action: 'approve' | 'reject') => Promise<boolean>;
   setSkillpackStatus: (pack: SkillPack, status: SkillPackStatus) => Promise<boolean>;
   purgeSkillpack: (pack: SkillPack) => Promise<boolean>;
@@ -374,6 +383,14 @@ export function knowledgeScopeQuery(scope?: KnowledgeQueryScope): string {
   return value ? `?${value}` : '';
 }
 
+export function knowledgeScopeKey(scope?: KnowledgeQueryScope | null): string {
+  if (!scope) return 'legacy:all';
+  return JSON.stringify({
+    groupIds: [...scope.groupIds].sort(), projectIds: [...scope.projectIds].sort(),
+    sourceIds: [...scope.sourceIds].sort(), courseId: scope.courseId,
+  });
+}
+
 export const KN_PREVIEW_MIN = 320;
 export function knPreviewMax(): number {
   return Math.max(KN_PREVIEW_MIN, Math.floor(window.innerWidth * 0.62));
@@ -388,17 +405,36 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   cards: [],
   skillpacks: { systemBuiltin: [], projectExperience: [], thirdParty: [] },
   profileProjects: [],
+  activeScope: null,
+  activeScopeKey: 'legacy:all',
   preview: null,
   previewWidth: 420,
 
+  setScope(scope) {
+    const activeScope = scope ? {
+      groupIds: [...scope.groupIds], projectIds: [...scope.projectIds],
+      sourceIds: [...scope.sourceIds], courseId: scope.courseId,
+    } : null;
+    const activeScopeKey = knowledgeScopeKey(activeScope);
+    if (activeScopeKey === get().activeScopeKey) return;
+    set({
+      activeScope, activeScopeKey, cards: [], profileProjects: [],
+      skillpacks: { systemBuiltin: [], projectExperience: [], thirdParty: [] },
+      preview: null, loadedAt: 0, error: null,
+    });
+  },
+
   async load(opts) {
+    const requestedScope = opts?.scope ?? get().activeScope ?? undefined;
+    const requestIdentity = knowledgeScopeKey(requestedScope);
+    if (opts?.scope && requestIdentity !== get().activeScopeKey) get().setScope(opts.scope);
     const silent = !!opts?.silent;
     if (!silent) set({ loading: true, error: null });
     try {
       const data = await apiFetch<{
         assets: RawAsset[];
         projects: { project_id?: string; profile_exists?: boolean }[];
-      }>(`/assets${knowledgeScopeQuery(opts?.scope)}`);
+      }>(`/assets${knowledgeScopeQuery(requestedScope)}`);
       const cards = (data.assets || [])
         .map(toCard)
         .filter((c): c is KnowCard => c !== null);
@@ -406,10 +442,12 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
         .filter((p) => p.profile_exists)
         .map((p) => String(p.project_id || ''))
         .filter(Boolean);
+      if (get().activeScopeKey !== requestIdentity) return;
       set({ cards, profileProjects, loading: false, loadedAt: Date.now(), error: null });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // 静默刷新失败：留着旧数据继续用，别把界面打回错误态。
+      if (get().activeScopeKey !== requestIdentity) return;
       if (silent && get().loadedAt) {
         set({ loading: false });
       } else {
@@ -418,13 +456,16 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     }
   },
 
-  async loadSkillpacks() {
+  async loadSkillpacks(scope) {
+    const requestedScope = scope ?? get().activeScope ?? undefined;
+    const requestIdentity = knowledgeScopeKey(requestedScope);
     try {
       const data = await apiFetch<{
         system_builtin?: RawSkillPack[];
         project_experience?: RawSkillPack[];
         third_party?: RawSkillPack[];
-      }>('/skillpacks');
+      }>(`/skillpacks${knowledgeScopeQuery(requestedScope)}`);
+      if (get().activeScopeKey !== requestIdentity) return;
       set({
         skillpacks: {
           systemBuiltin: (data.system_builtin || [])
@@ -443,7 +484,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async reviewSkillpack(pack, action) {
     try {
       await apiFetch<{ ok: boolean }>(
-        `/skillpacks/${encodeURIComponent(pack.packId)}/review`,
+        `/skillpacks/${encodeURIComponent(pack.packId)}/review${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -461,7 +502,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async setSkillpackStatus(pack, status) {
     try {
       await apiFetch<{ ok: boolean }>(
-        `/skillpacks/${encodeURIComponent(pack.packId)}`,
+        `/skillpacks/${encodeURIComponent(pack.packId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -479,7 +520,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async purgeSkillpack(pack) {
     try {
       await apiFetch<{ ok: boolean }>(
-        `/skillpacks/${encodeURIComponent(pack.packId)}/purge`,
+        `/skillpacks/${encodeURIComponent(pack.packId)}/purge${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -507,7 +548,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     try {
       const data = await apiFetch<{
         found: boolean; pack?: RawSkillPack; body_md?: string;
-      }>(`/skillpacks/${encodeURIComponent(pack.packId)}`);
+      }>(`/skillpacks/${encodeURIComponent(pack.packId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`);
       if (!data.found || !data.pack) return null;
       const fresh = toSkillPack(data.pack);
       return { pack: fresh ?? pack, bodyMd: String(data.body_md || '') };
@@ -534,7 +575,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     set({ cards: optimistic });
     try {
       await apiFetch<{ ok: boolean }>(
-        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}`,
+        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -553,7 +594,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async review(card, action) {
     try {
       await apiFetch<{ ok: boolean }>(
-        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}/review`,
+        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}/review${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -571,7 +612,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async purge(card) {
     try {
       await apiFetch<{ ok: boolean }>(
-        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}/purge`,
+        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}/purge${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -594,7 +635,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async fetchDetail(card) {
     try {
       const data = await apiFetch<{ found: boolean; asset?: RawAsset }>(
-        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}`,
+        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
       );
       if (!data.found || !data.asset) return null;
       const fresh = toCard({ ...data.asset, project_id: card.projectId });
@@ -615,7 +656,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async fetchProfile(projectId) {
     try {
       const data = await apiFetch<{ text: string }>(
-        `/${encodeURIComponent(projectId)}/profile`,
+        `/${encodeURIComponent(projectId)}/profile${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
       );
       return String(data.text || '');
     } catch {
@@ -626,6 +667,30 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   openPreview(p) { set({ preview: p }); },
   closePreview() { set({ preview: null }); },
   setPreviewWidth(px) { set({ previewWidth: clampW(px) }); },
+  teardownGroupScope(groupId, projectId) {
+    const scope = get().activeScope;
+    const ownsActiveScope = !!scope?.groupIds.includes(groupId)
+      || (!!projectId && !!scope?.projectIds.includes(projectId));
+    if (ownsActiveScope) {
+      set({
+        activeScope: null, activeScopeKey: 'legacy:all', cards: [], profileProjects: [],
+        skillpacks: { systemBuiltin: [], projectExperience: [], thirdParty: [] },
+        preview: null, loadedAt: 0, error: null,
+      });
+      return;
+    }
+    if (!projectId) return;
+    set((state) => ({
+      cards: state.cards.filter((card) => card.projectId !== projectId),
+      profileProjects: state.profileProjects.filter((id) => id !== projectId),
+      skillpacks: {
+        systemBuiltin: state.skillpacks.systemBuiltin,
+        projectExperience: state.skillpacks.projectExperience.filter((pack) => pack.projectId !== projectId),
+        thirdParty: state.skillpacks.thirdParty.filter((pack) => pack.projectId !== projectId),
+      },
+      preview: state.preview?.projectId === projectId ? null : state.preview,
+    }));
+  },
 }));
 
 export default useKnowledgeStore;

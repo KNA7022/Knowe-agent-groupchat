@@ -450,15 +450,23 @@ export const ConvListItem: React.FC<ConvListItemProps> = ({
     }
     return null;
   });
-  const runtimeSummary = useGroupStore((state) => mappedGroup
-    ? state.runtimeSummaries[mappedGroup.group_id]
+  const runtimeSummary = useTaskRuntimeStore((state) => mappedGroup
+    ? state.groupSummaries[mappedGroup.group_id]
     : undefined);
-  const sideRuns = useTaskRuntimeStore((state) => mappedGroup
-    ? (state.byGroup[mappedGroup.group_id] || []).map((runId) => state.byRun[runId]?.run)
-      .filter((run) => run?.kind === 'side')
+  const sideProjections = useTaskRuntimeStore((state) => mappedGroup
+    ? (state.byGroup[mappedGroup.group_id] || []).map((runId) => state.byRun[runId])
+      .filter((projection) => projection?.run.kind === 'side' && projection.run.queue_class === 'foreground')
     : [], shallow);
   const sideReadWatermarks = useSideTaskReadStore((state) => state.watermarks);
-  const unreadSideCount = sideRuns.filter((run) => run && run.last_seq > (sideReadWatermarks[run.run_id] || 0)).length;
+  const unreadSideCount = sideProjections.filter((projection) => {
+    if (!projection) return false;
+    const successEvent = [...projection.events].reverse().find((event) => (
+      event.event_type === 'verifier_decision' && event.public_payload.approved === true
+    ));
+    const answerSeq = ['succeeded', 'partial'].includes(projection.run.status)
+      ? projection.run.last_seq : successEvent?.seq;
+    return answerSeq !== undefined && answerSeq > (sideReadWatermarks[projection.run.run_id] || 0);
+  }).length;
   /*
    * [v0.23 问题四] 左栏预览：**跳过空文本的条目**。
    *
