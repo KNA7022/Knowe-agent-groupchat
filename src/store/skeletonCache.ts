@@ -9,6 +9,8 @@
  * · 骨架丢了只是「慢」，不是「错」——全部数据可从后端重建（可重建原则）。
  */
 
+import { isGroupDeletionFenced } from './groupDeletionFence';
+
 const SCHEMA_VERSION = 1;
 const KEY_PREFIX = 'knowe.skeleton.v1.'; // 前缀含 schemaVersion，升级即换 key 天然隔离
 
@@ -31,6 +33,10 @@ export function skeletonKey(projectId: string): string {
 
 export function loadSkeleton(projectId: string): SessionSkeleton | null {
   try {
+    if (isGroupDeletionFenced(projectId)) {
+      localStorage.removeItem(skeletonKey(projectId));
+      return null;
+    }
     const raw = localStorage.getItem(skeletonKey(projectId));
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<SessionSkeleton>;
@@ -62,6 +68,10 @@ export function saveSkeleton(
   patch: Partial<Pick<SessionSkeleton, 'heights' | 'scrollTop' | 'readSeq'>>,
 ): void {
   try {
+    if (isGroupDeletionFenced(projectId)) {
+      localStorage.removeItem(skeletonKey(projectId));
+      return;
+    }
     const prev = loadSkeleton(projectId);
     const next: SessionSkeleton = {
       schemaVersion: SCHEMA_VERSION,
@@ -94,6 +104,11 @@ export function loadAllSkeletons(): Map<string, SessionSkeleton> {
       if (!key || !key.startsWith(KEY_PREFIX)) continue;
       const projectId = key.slice(KEY_PREFIX.length);
       if (!projectId) continue;
+      if (isGroupDeletionFenced(projectId)) {
+        localStorage.removeItem(key);
+        i -= 1;
+        continue;
+      }
       const sk = loadSkeleton(projectId);
       if (sk) result.set(projectId, sk);
     }

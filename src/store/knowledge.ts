@@ -120,6 +120,8 @@ export interface SkillPack {
   status: SkillPackStatus;
   st: KnowSt;
   immutable: boolean;
+  sourceIds?: string[];
+  courseIds?: string[];
   createdAt: string | null;
   updatedAt: string | null;
 }
@@ -154,6 +156,7 @@ interface RawSkillPack {
   kind?: string; source_kind?: string; source?: string;
   project_id?: string; asset_id?: string; scope?: string;
   status?: string; view_state?: string; immutable?: boolean;
+  source_ids?: string[]; course_ids?: string[];
   created_at?: string | null; updated_at?: string | null;
 }
 
@@ -246,6 +249,8 @@ function toSkillPack(raw: RawSkillPack): SkillPack | null {
     status,
     st: status === 'active' ? 'ok' : status,
     immutable: kind === 'system_builtin' || !!raw.immutable,
+    sourceIds: (raw.source_ids || []).map(String),
+    courseIds: (raw.course_ids || []).map(String),
     createdAt: raw.created_at ?? null,
     updatedAt: raw.updated_at ?? null,
   };
@@ -395,6 +400,7 @@ export function knowledgeScopeKey(scope?: KnowledgeQueryScope | null): string {
 }
 
 type KnowledgeScopeFence = ReadonlyArray<readonly [string, number]>;
+let knowledgeScopeEpoch = 0;
 
 function beginKnowledgeRequest(
   scope?: KnowledgeQueryScope | null, extraIdentities: string[] = [],
@@ -404,6 +410,55 @@ function beginKnowledgeRequest(
   ])];
   if (identities.some(isGroupDeletionFenced)) return null;
   return identities.map((identity) => [identity, groupDeletionGeneration(identity)] as const);
+}
+
+type ScopedKnowledgeObject = {
+  projectId: string;
+  scope?: KnowScope;
+  sourceIds?: string[];
+  courseIds?: string[];
+  scopeSetBy?: 'system' | 'user';
+  status?: AssetStatus | SkillPackStatus;
+  st?: KnowSt;
+  needsReview?: boolean;
+  kind?: SkillPackKind;
+  immutable?: boolean;
+};
+
+function isApprovedGlobalObject(value: ScopedKnowledgeObject): boolean {
+  if (value.scope !== 'global') return true;
+  if (value.kind === 'system_builtin') {
+    return value.immutable === true && value.status === 'active' && value.st === 'ok';
+  }
+  if (value.kind) return value.status === 'active' && value.st === 'ok';
+  return value.scopeSetBy === 'user'
+    && (value.status === 'validated' || value.status === 'core')
+    && value.st === 'ok'
+    && value.needsReview !== true;
+}
+
+function scopedKnowledgeObjectAllowed(
+  scope: KnowledgeQueryScope | null | undefined, value: ScopedKnowledgeObject,
+): boolean {
+  if (!scope || scope.groupIds.length !== 1) return false;
+  const approvedSystemGlobal = value.scope === 'global' && value.kind === 'system_builtin'
+    && isApprovedGlobalObject(value);
+  if (!approvedSystemGlobal && (!value.projectId || !scope.projectIds.includes(value.projectId))) {
+    return false;
+  }
+  if (!isApprovedGlobalObject(value)) return false;
+  if (scope.sourceIds.length && value.sourceIds?.some((id) => !scope.sourceIds.includes(id))) {
+    return false;
+  }
+  if (scope.courseId && value.courseIds?.some((id) => id !== scope.courseId)) return false;
+  return true;
+}
+
+function beginScopedKnowledgeObjectRequest(
+  scope: KnowledgeQueryScope | null | undefined, value: ScopedKnowledgeObject,
+): KnowledgeScopeFence | null {
+  if (!scopedKnowledgeObjectAllowed(scope, value)) return null;
+  return beginKnowledgeRequest(scope, [value.projectId]);
 }
 
 function knowledgeCommitAllowed(fence: KnowledgeScopeFence | null): boolean {
@@ -446,6 +501,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     } : null;
     const activeScopeKey = knowledgeScopeKey(activeScope);
     if (activeScopeKey === get().activeScopeKey) return;
+    knowledgeScopeEpoch += 1;
     set({
       activeScope, activeScopeKey, cards: [], profileProjects: [],
       skillpacks: { systemBuiltin: [], projectExperience: [], thirdParty: [] },
@@ -459,6 +515,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     if (!knowledgeCommitAllowed(deletionFence)) return;
     const requestIdentity = knowledgeScopeKey(requestedScope);
     if (opts?.scope && requestIdentity !== get().activeScopeKey) get().setScope(opts.scope);
+    const requestEpoch = knowledgeScopeEpoch;
     const silent = !!opts?.silent;
     if (!silent) set({ loading: true, error: null });
     try {
@@ -473,12 +530,14 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
         .filter((p) => p.profile_exists)
         .map((p) => String(p.project_id || ''))
         .filter(Boolean);
-      if (get().activeScopeKey !== requestIdentity || !knowledgeCommitAllowed(deletionFence)) return;
+      if (get().activeScopeKey !== requestIdentity || knowledgeScopeEpoch !== requestEpoch
+        || !knowledgeCommitAllowed(deletionFence)) return;
       set({ cards, profileProjects, loading: false, loadedAt: Date.now(), error: null });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // 静默刷新失败：留着旧数据继续用，别把界面打回错误态。
-      if (get().activeScopeKey !== requestIdentity || !knowledgeCommitAllowed(deletionFence)) return;
+      if (get().activeScopeKey !== requestIdentity || knowledgeScopeEpoch !== requestEpoch
+        || !knowledgeCommitAllowed(deletionFence)) return;
       if (silent && get().loadedAt) {
         set({ loading: false });
       } else {
@@ -492,13 +551,15 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     const deletionFence = beginKnowledgeRequest(requestedScope);
     if (!knowledgeCommitAllowed(deletionFence)) return;
     const requestIdentity = knowledgeScopeKey(requestedScope);
+    const requestEpoch = knowledgeScopeEpoch;
     try {
       const data = await apiFetch<{
         system_builtin?: RawSkillPack[];
         project_experience?: RawSkillPack[];
         third_party?: RawSkillPack[];
       }>(`/skillpacks${knowledgeScopeQuery(requestedScope)}`);
-      if (get().activeScopeKey !== requestIdentity || !knowledgeCommitAllowed(deletionFence)) return;
+      if (get().activeScopeKey !== requestIdentity || knowledgeScopeEpoch !== requestEpoch
+        || !knowledgeCommitAllowed(deletionFence)) return;
       set({
         skillpacks: {
           systemBuiltin: (data.system_builtin || [])
@@ -517,9 +578,10 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async reviewSkillpack(pack, action) {
     const requestedScope = copyKnowledgeScope(get().activeScope);
     const requestIdentity = knowledgeScopeKey(requestedScope);
-    const deletionFence = beginKnowledgeRequest(requestedScope, [pack.projectId]);
+    const requestEpoch = knowledgeScopeEpoch;
+    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, pack);
     const current = (): boolean => knowledgeCommitAllowed(deletionFence)
-      && get().activeScopeKey === requestIdentity;
+      && get().activeScopeKey === requestIdentity && knowledgeScopeEpoch === requestEpoch;
     if (!current()) return false;
     try {
       await apiFetch<{ ok: boolean }>(
@@ -532,7 +594,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
       );
       if (!current()) return false;
       await get().loadSkillpacks(requestedScope);
-      return true;
+      return current();
     } catch {
       if (current()) await get().loadSkillpacks(requestedScope);
       return false;
@@ -542,9 +604,10 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async setSkillpackStatus(pack, status) {
     const requestedScope = copyKnowledgeScope(get().activeScope);
     const requestIdentity = knowledgeScopeKey(requestedScope);
-    const deletionFence = beginKnowledgeRequest(requestedScope, [pack.projectId]);
+    const requestEpoch = knowledgeScopeEpoch;
+    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, pack);
     const current = (): boolean => knowledgeCommitAllowed(deletionFence)
-      && get().activeScopeKey === requestIdentity;
+      && get().activeScopeKey === requestIdentity && knowledgeScopeEpoch === requestEpoch;
     if (!current()) return false;
     try {
       await apiFetch<{ ok: boolean }>(
@@ -557,7 +620,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
       );
       if (!current()) return false;
       await get().loadSkillpacks(requestedScope);
-      return true;
+      return current();
     } catch {
       if (current()) await get().loadSkillpacks(requestedScope);
       return false;
@@ -567,9 +630,10 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async purgeSkillpack(pack) {
     const requestedScope = copyKnowledgeScope(get().activeScope);
     const requestIdentity = knowledgeScopeKey(requestedScope);
-    const deletionFence = beginKnowledgeRequest(requestedScope, [pack.projectId]);
+    const requestEpoch = knowledgeScopeEpoch;
+    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, pack);
     const current = (): boolean => knowledgeCommitAllowed(deletionFence)
-      && get().activeScopeKey === requestIdentity;
+      && get().activeScopeKey === requestIdentity && knowledgeScopeEpoch === requestEpoch;
     if (!current()) return false;
     try {
       await apiFetch<{ ok: boolean }>(
@@ -590,8 +654,9 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
         preview: s.preview?.kind === 'skill' && s.preview.pack?.packId === pack.packId
           ? null : s.preview,
       }));
-      if (current()) void get().loadSkillpacks(requestedScope);
-      return true;
+      if (!current()) return false;
+      await get().loadSkillpacks(requestedScope);
+      return current();
     } catch {
       if (current()) await get().loadSkillpacks(requestedScope);
       return false;
@@ -599,13 +664,18 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async fetchSkillpackDetail(pack) {
-    const deletionFence = beginKnowledgeRequest(get().activeScope, [pack.projectId]);
+    const requestedScope = copyKnowledgeScope(get().activeScope);
+    const requestIdentity = knowledgeScopeKey(requestedScope);
+    const requestEpoch = knowledgeScopeEpoch;
+    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, pack);
     if (!knowledgeCommitAllowed(deletionFence)) return null;
     try {
       const data = await apiFetch<{
         found: boolean; pack?: RawSkillPack; body_md?: string;
-      }>(`/skillpacks/${encodeURIComponent(pack.packId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`);
-      if (!knowledgeCommitAllowed(deletionFence) || !data.found || !data.pack) return null;
+      }>(`/skillpacks/${encodeURIComponent(pack.packId)}${knowledgeScopeQuery(requestedScope)}`);
+      if (get().activeScopeKey !== requestIdentity || knowledgeScopeEpoch !== requestEpoch
+        || !knowledgeCommitAllowed(deletionFence)
+        || !data.found || !data.pack) return null;
       const fresh = toSkillPack(data.pack);
       return { pack: fresh ?? pack, bodyMd: String(data.body_md || '') };
     } catch {
@@ -616,9 +686,10 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async override(card, patch) {
     const requestedScope = copyKnowledgeScope(get().activeScope);
     const requestIdentity = knowledgeScopeKey(requestedScope);
-    const deletionFence = beginKnowledgeRequest(requestedScope, [card.projectId]);
+    const requestEpoch = knowledgeScopeEpoch;
+    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, card);
     const current = (): boolean => knowledgeCommitAllowed(deletionFence)
-      && get().activeScopeKey === requestIdentity;
+      && get().activeScopeKey === requestIdentity && knowledgeScopeEpoch === requestEpoch;
     if (!current()) return false;
     // 乐观：先把本地卡片改成目标态，POST 失败由 load 重拉回滚。
     const optimistic = get().cards.map((c) => {
@@ -646,10 +717,10 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
       );
       if (!current()) return false;
       // 后端是真源（refresh 会重算 utility/category/skill 导出等派生态）→ 静默对齐。
-      void get().load({ silent: true, scope: requestedScope });
-      return true;
+      await get().load({ silent: true, scope: requestedScope });
+      return current();
     } catch {
-      if (current()) void get().load({ silent: true, scope: requestedScope });
+      if (current()) await get().load({ silent: true, scope: requestedScope });
       return false;
     }
   },
@@ -657,9 +728,10 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async review(card, action) {
     const requestedScope = copyKnowledgeScope(get().activeScope);
     const requestIdentity = knowledgeScopeKey(requestedScope);
-    const deletionFence = beginKnowledgeRequest(requestedScope, [card.projectId]);
+    const requestEpoch = knowledgeScopeEpoch;
+    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, card);
     const current = (): boolean => knowledgeCommitAllowed(deletionFence)
-      && get().activeScopeKey === requestIdentity;
+      && get().activeScopeKey === requestIdentity && knowledgeScopeEpoch === requestEpoch;
     if (!current()) return false;
     try {
       await apiFetch<{ ok: boolean }>(
@@ -671,10 +743,10 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
         },
       );
       if (!current()) return false;
-      void get().load({ silent: true, scope: requestedScope });
-      return true;
+      await get().load({ silent: true, scope: requestedScope });
+      return current();
     } catch {
-      if (current()) void get().load({ silent: true, scope: requestedScope });
+      if (current()) await get().load({ silent: true, scope: requestedScope });
       return false;
     }
   },
@@ -682,9 +754,10 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   async purge(card) {
     const requestedScope = copyKnowledgeScope(get().activeScope);
     const requestIdentity = knowledgeScopeKey(requestedScope);
-    const deletionFence = beginKnowledgeRequest(requestedScope, [card.projectId]);
+    const requestEpoch = knowledgeScopeEpoch;
+    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, card);
     const current = (): boolean => knowledgeCommitAllowed(deletionFence)
-      && get().activeScopeKey === requestIdentity;
+      && get().activeScopeKey === requestIdentity && knowledgeScopeEpoch === requestEpoch;
     if (!current()) return false;
     try {
       await apiFetch<{ ok: boolean }>(
@@ -701,22 +774,28 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
         cards: s.cards.filter((c) => c.id !== card.id),
         preview: s.preview?.card?.id === card.id ? null : s.preview,
       }));
-      if (current()) void get().load({ silent: true, scope: requestedScope });
-      return true;
+      if (!current()) return false;
+      await get().load({ silent: true, scope: requestedScope });
+      return current();
     } catch {
-      if (current()) void get().load({ silent: true, scope: requestedScope });
+      if (current()) await get().load({ silent: true, scope: requestedScope });
       return false;
     }
   },
 
   async fetchDetail(card) {
-    const deletionFence = beginKnowledgeRequest(get().activeScope, [card.projectId]);
+    const requestedScope = copyKnowledgeScope(get().activeScope);
+    const requestIdentity = knowledgeScopeKey(requestedScope);
+    const requestEpoch = knowledgeScopeEpoch;
+    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, card);
     if (!knowledgeCommitAllowed(deletionFence)) return null;
     try {
       const data = await apiFetch<{ found: boolean; asset?: RawAsset }>(
-        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
+        `/${encodeURIComponent(card.projectId)}/assets/${encodeURIComponent(card.assetId)}${knowledgeScopeQuery(requestedScope)}`,
       );
-      if (!knowledgeCommitAllowed(deletionFence) || !data.found || !data.asset) return null;
+      if (get().activeScopeKey !== requestIdentity || knowledgeScopeEpoch !== requestEpoch
+        || !knowledgeCommitAllowed(deletionFence)
+        || !data.found || !data.asset) return null;
       const fresh = toCard({ ...data.asset, project_id: card.projectId });
       return {
         card: fresh ?? card,
@@ -733,20 +812,26 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   async fetchProfile(projectId) {
-    const deletionFence = beginKnowledgeRequest(get().activeScope, [projectId]);
+    const requestedScope = copyKnowledgeScope(get().activeScope);
+    const requestIdentity = knowledgeScopeKey(requestedScope);
+    const requestEpoch = knowledgeScopeEpoch;
+    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, { projectId });
     if (!knowledgeCommitAllowed(deletionFence)) return null;
     try {
       const data = await apiFetch<{ text: string }>(
-        `/${encodeURIComponent(projectId)}/profile${knowledgeScopeQuery(get().activeScope ?? undefined)}`,
+        `/${encodeURIComponent(projectId)}/profile${knowledgeScopeQuery(requestedScope)}`,
       );
-      return knowledgeCommitAllowed(deletionFence) ? String(data.text || '') : null;
+      return get().activeScopeKey === requestIdentity && knowledgeScopeEpoch === requestEpoch
+        && knowledgeCommitAllowed(deletionFence)
+        ? String(data.text || '') : null;
     } catch {
       return null;
     }
   },
 
   openPreview(p) {
-    if (!knowledgeCommitAllowed(beginKnowledgeRequest(get().activeScope, [p.projectId]))) return;
+    const object = p.kind === 'skill' && p.pack ? p.pack : p.card ?? { projectId: p.projectId };
+    if (!knowledgeCommitAllowed(beginScopedKnowledgeObjectRequest(get().activeScope, object))) return;
     set({ preview: p });
   },
   closePreview() { set({ preview: null }); },
@@ -756,6 +841,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     const ownsActiveScope = !!scope?.groupIds.includes(groupId)
       || (!!projectId && !!scope?.projectIds.includes(projectId));
     if (ownsActiveScope) {
+      knowledgeScopeEpoch += 1;
       set({
         activeScope: null, activeScopeKey: 'legacy:all', cards: [], profileProjects: [],
         skillpacks: { systemBuiltin: [], projectExperience: [], thirdParty: [] },

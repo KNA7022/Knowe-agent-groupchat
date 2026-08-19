@@ -7,6 +7,7 @@ import {
   loadAllSkeletons,
   skeletonKey,
 } from './skeletonCache';
+import { fenceDeletedGroup } from './groupDeletionFence';
 
 describe('skeletonCache · 会话骨架持久化', () => {
   beforeEach(() => {
@@ -73,5 +74,20 @@ describe('skeletonCache · 会话骨架持久化', () => {
   it('readSeq 负数归一为 0', () => {
     saveSkeleton('proj-a', { readSeq: -5 });
     expect(loadSkeleton('proj-a')!.readSeq).toBe(0);
+  });
+
+  it('tombstoned identities cannot load, enumerate, or recreate a durable skeleton', () => {
+    const projectId = `deleted-skeleton-${Date.now()}`;
+    saveSkeleton(projectId, { readSeq: 7 });
+    expect(localStorage.getItem(skeletonKey(projectId))).not.toBeNull();
+    fenceDeletedGroup(projectId);
+    expect(loadSkeleton(projectId)).toBeNull();
+    expect(localStorage.getItem(skeletonKey(projectId))).toBeNull();
+    localStorage.setItem(skeletonKey(projectId), JSON.stringify({
+      schemaVersion: 1, projectId, heights: {}, scrollTop: 0, readSeq: 8, updatedAt: Date.now(),
+    }));
+    expect(loadAllSkeletons().has(projectId)).toBe(false);
+    saveSkeleton(projectId, { readSeq: 9 });
+    expect(localStorage.getItem(skeletonKey(projectId))).toBeNull();
   });
 });

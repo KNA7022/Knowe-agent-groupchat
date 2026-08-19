@@ -3,6 +3,7 @@ import { describe, expect, it, beforeEach, vi } from 'vitest';
 import { fetchIncremental, warmUpIncremental } from './incrementalSync';
 import { saveSkeleton, loadSkeleton } from './skeletonCache';
 import { useKnoweStore } from './store';
+import { fenceDeletedGroup } from './groupDeletionFence';
 
 describe('incrementalSync · HTTP 增量预热', () => {
   beforeEach(() => {
@@ -61,7 +62,7 @@ describe('incrementalSync · HTTP 增量预热', () => {
     // 1. store 已注入 2 条消息（纯数据，convs 存在）
     const conv = useKnoweStore.getState().convs['proj-a'];
     expect(conv).toBeDefined();
-    expect(conv.items.filter((i) => i.kind === 'agent')).toHaveLength(2);
+    expect(conv!.items.filter((i) => i.kind === 'agent')).toHaveLength(2);
 
     // 2. socket 水位抬升到 5
     expect(notes).toEqual([['proj-a', 5]]);
@@ -83,5 +84,20 @@ describe('incrementalSync · HTTP 增量预热', () => {
     expect(injected).toBe(0);
     expect(loadSkeleton('proj-a')!.readSeq).toBe(9);
     expect(useKnoweStore.getState().convs['proj-a']).toBeUndefined();
+  });
+
+  it('restart warm-up removes a stale deleted skeleton without network or projection writes', async () => {
+    const projectId = `deleted-warmup-${Date.now()}`;
+    fenceDeletedGroup(projectId);
+    localStorage.setItem(`knowe.skeleton.v1.${projectId}`, JSON.stringify({
+      schemaVersion: 1, projectId, heights: { stale: 20 }, scrollTop: 5,
+      readSeq: 17, updatedAt: Date.now(),
+    }));
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+    expect(await warmUpIncremental()).toBe(0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(localStorage.getItem(`knowe.skeleton.v1.${projectId}`)).toBeNull();
+    expect(useKnoweStore.getState().convs[projectId]).toBeUndefined();
   });
 });

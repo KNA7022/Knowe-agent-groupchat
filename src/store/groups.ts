@@ -25,6 +25,8 @@ import { runtimeHttpBase } from '../shared/runtimeEndpoints';
 import {
   fenceDeletedGroup, groupCommitAllowed, groupDeletionGeneration, isGroupDeletionFenced,
 } from './groupDeletionFence';
+import { teardownGroupProjections } from './groupTeardownCore';
+import { registerGroupRuntimeBridge } from './groupRuntimeBridge';
 
 export interface CreateGroupInput {
   name: string;
@@ -113,31 +115,6 @@ function assertAddressedGroup(groupId: GroupId, actualGroupId: GroupId): void {
 
 const duplicateRequestIds = new Map<string, string>();
 
-type GroupTeardownModule = typeof import('./groupTeardown');
-type GroupTeardownLoader = () => Promise<GroupTeardownModule>;
-
-const defaultGroupTeardownLoader: GroupTeardownLoader = () => import('./groupTeardown');
-let groupTeardownLoader: GroupTeardownLoader = defaultGroupTeardownLoader;
-const pendingGroupTeardowns = new Map<GroupId, string | null>();
-
-/** Test seam for pausing/failing the dynamic import boundary; production always uses default. */
-export function setGroupTeardownLoaderForTests(loader?: GroupTeardownLoader): void {
-  groupTeardownLoader = loader ?? defaultGroupTeardownLoader;
-}
-
-export function pendingGroupTeardownCount(): number {
-  return pendingGroupTeardowns.size;
-}
-
-export async function retryPendingGroupTeardowns(): Promise<void> {
-  if (!pendingGroupTeardowns.size) return;
-  const module = await groupTeardownLoader();
-  for (const [groupId, legacyProjectId] of [...pendingGroupTeardowns]) {
-    module.teardownGroup(groupId, legacyProjectId);
-    pendingGroupTeardowns.delete(groupId);
-  }
-}
-
 export function clearGroupRequestCaches(groupId: GroupId): void {
   for (const key of duplicateRequestIds.keys()) {
     if (key.startsWith(`${groupId}\u0000`)) duplicateRequestIds.delete(key);
@@ -189,7 +166,6 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
   },
 
   async load(): Promise<void> {
-    await retryPendingGroupTeardowns().catch(() => undefined);
     set({ loading: true, error: null });
     try {
       const raw = await groupJson('/groups');
@@ -455,10 +431,10 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
     assertAddressedGroup(groupId, receipt.group_id);
     assertGroupRequestCurrent(groupId, generation);
     const legacyProjectId = current.legacy_project_id;
-    // The backend receipt is the irreversible boundary. Fence both identities synchronously
-    // before the dynamic import can yield or fail, then retain a retryable cleanup obligation.
+    // The backend receipt is the irreversible boundary. Fence and purge every renderer projection
+    // synchronously; the static core has no Group-store cycle or fallible dynamic-import boundary.
     fenceDeletedGroup(groupId, legacyProjectId);
-    pendingGroupTeardowns.set(groupId, legacyProjectId);
+    clearGroupRequestCaches(groupId);
     set((state) => {
       const groups = { ...state.groups };
       delete groups[groupId];
@@ -469,7 +445,18 @@ export const useGroupStore = create<GroupStoreState>((set, get) => ({
       return { groups, runtimeSummaries, sourceReferenceCounts,
         order: state.order.filter((id) => id !== groupId) };
     });
-    await retryPendingGroupTeardowns().catch(() => undefined);
+    teardownGroupProjections(groupId, legacyProjectId);
     return receipt;
   },
 }));
+
+registerGroupRuntimeBridge({
+  readGroup: (groupId) => useGroupStore.getState().groups[groupId],
+  mirrorSummary: (groupId, summary) => useGroupStore.setState((state) => {
+    const runtimeSummaries = { ...state.runtimeSummaries };
+    if (summary) runtimeSummaries[groupId] = summary;
+    else delete runtimeSummaries[groupId];
+    return { runtimeSummaries };
+  }),
+  clearSummaries: () => useGroupStore.setState({ runtimeSummaries: {} }),
+});

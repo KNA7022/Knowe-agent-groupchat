@@ -18,7 +18,9 @@ import {
 } from '../contract/taskRuntime';
 import type { GroupId } from '../contract/group';
 import type { GroupRuntimeSummary } from '../contract/group';
-import { useGroupStore } from './groups';
+import {
+  clearRuntimeGroupSummaries, mirrorRuntimeGroupSummary, readRuntimeGroup,
+} from './groupRuntimeBridge';
 import {
   fenceDeletedGroup, groupCommitAllowed, groupDeletionGeneration, isGroupDeletionFenced,
 } from './groupDeletionFence';
@@ -81,7 +83,7 @@ function summarizeGroup(
   preferredPrimaryId?: string | null,
   updatedAt?: string,
 ): GroupRuntimeSummary {
-  const group = useGroupStore.getState().groups[groupId];
+  const group = readRuntimeGroup(groupId);
   const preferred = preferredPrimaryId
     ? runs.find((run) => run.run_id === preferredPrimaryId && run.kind === 'primary' && !TERMINAL.has(run.status))
     : undefined;
@@ -122,12 +124,7 @@ function summarizeGroup(
 }
 
 function mirrorSummary(groupId: GroupId, summary: GroupRuntimeSummary | undefined): void {
-  useGroupStore.setState((state) => {
-    const runtimeSummaries = { ...state.runtimeSummaries };
-    if (summary) runtimeSummaries[groupId] = summary;
-    else delete runtimeSummaries[groupId];
-    return { runtimeSummaries };
-  });
+  mirrorRuntimeGroupSummary(groupId, summary);
 }
 
 async function taskRuntimeJson(path: string, body: object): Promise<unknown> {
@@ -182,7 +179,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     authorityRefreshTimers.clear();
     set({ byRun: {}, byGroup: {}, approvals: {}, groupSummaries: {}, refreshGenerations: {},
       authorityByGroup: {}, legacyHandshakeGroups: {}, error: null });
-    useGroupStore.setState({ runtimeSummaries: {} });
+    clearRuntimeGroupSummaries();
   },
 
   ingestGroupSnapshot(groupId, raw): void {

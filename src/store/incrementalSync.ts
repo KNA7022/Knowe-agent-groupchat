@@ -18,23 +18,26 @@ import { runtimeFetch } from '../shared/runtimeFetch';
 import { useKnoweStore } from './store';
 import { loadAllSkeletons, saveSkeleton } from './skeletonCache';
 import type { InboundEvent } from '../contract/envelope';
+import { groupCommitAllowed, groupDeletionGeneration, isGroupDeletionFenced } from './groupDeletionFence';
 
 /** 单项目增量拉取（无 socket 时也能独立工作；失败返回 null → 调用方静默跳过）。 */
 export async function fetchIncremental(
   projectId: string,
   afterSeq: number,
 ): Promise<{ events: InboundEvent[]; lastSeq: number } | null> {
+  if (isGroupDeletionFenced(projectId)) return null;
+  const generation = groupDeletionGeneration(projectId);
   try {
     const url = `${runtimeHttpBase()}/api/events?project_id=${encodeURIComponent(projectId)}&after_seq=${afterSeq}`;
     const res = await runtimeFetch(url, { cache: 'no-store' });
-    if (!res.ok) return null;
+    if (!res.ok || !groupCommitAllowed(projectId, generation)) return null;
     const data = (await res.json()) as {
       events?: unknown[];
       last_seq?: unknown;
     };
     const events = Array.isArray(data.events) ? (data.events as InboundEvent[]) : [];
     const lastSeq = typeof data.last_seq === 'number' ? data.last_seq : afterSeq;
-    return { events, lastSeq };
+    return groupCommitAllowed(projectId, generation) ? { events, lastSeq } : null;
   } catch {
     return null; // 网络/解析失败 → 静默降级（快照兜底）
   }

@@ -142,3 +142,63 @@ DONE
   and `git diff --check` pass. Node is `v24.19.0`; Python is `3.12.10`.
 - Full renderer typecheck still exits on the previously disclosed historical baseline, but its
   output contains zero diagnostics for every Task 4A round-1 production or test file.
+
+## Independent review fix round 2/5
+
+### Status
+
+DONE
+
+### Object-bound Knowledge requests
+
+- Renderer detail/profile/skill-pack and all six mutation families now require exactly one active
+  canonical Group and prove the addressed Project belongs to its captured legacy Project set
+  before dispatch. Asset contributor source/course identities must be subsets of the narrow scope;
+  global assets require explicit user approval plus validated/core live state. Approved immutable
+  system packs retain their controlled global path.
+- A monotonic scope epoch supplements the durable deletion generation. A request started in A is
+  stale after A→B→A even when its serialized scope key matches again. Detail, profile, pack and
+  mutations capture this token and recheck it after every await.
+- Exact tests prove stale A objects under live B perform zero network dispatch, and foreign-source,
+  foreign-course and unapproved-global assets fail before detail or mutation dispatch.
+
+### Nested continuation fence
+
+- Skill review/status and asset/pack override/review/purge now recheck the original scope epoch,
+  object identity and deletion generation after every awaited reconciliation. A nested reload can
+  neither turn a deleted/switched operation into `true` nor commit stale data.
+- The matrix covers deletion and scope switching across successful, rejected and catch-triggered
+  nested reloads. An A→B→A detail response is also rejected.
+
+### Synchronous receipt-boundary purge
+
+- The fallible dynamic teardown import and renderer-local pending map were removed. A static
+  `teardownGroupProjections` core is available at the backend receipt boundary and synchronously
+  purges Task Runtime, side-task, Knowledge, records, settings, directory, conversations, DMs,
+  attachments, transient legacy caches and skeletons before `confirmedDelete` resolves.
+- A narrow runtime bridge removes the former TaskRuntime→Group module dependency, so the static
+  teardown core does not recreate the Group-store import cycle. Group metadata and summary
+  mirroring semantics remain covered by the existing Task Runtime suite.
+- Because no asynchronous cleanup obligation remains after a successful receipt, no pending
+  cleanup persistence or startup retry protocol is required. Tests seed old conversations,
+  records and a deferred history response and prove all content is invisible immediately and
+  cannot revive.
+
+### Durable skeleton fence
+
+- Skeleton load/save/enumeration self-delete tombstoned keys. Direct incremental fetch captures
+  the deletion generation before network I/O and rechecks it before parsing/returning.
+- Both canonical and legacy skeleton keys are cleared during teardown. A simulated restart with a
+  manually restored stale localStorage key produces zero network calls, zero projection writes
+  and removes the key, while ChatStream unmount flushes inherit the guarded save path.
+
+### Round-2 verification evidence
+
+- Exact renderer set after the final scope-epoch/bridge changes: `7 files / 80 tests passed`.
+- Full frontend regression: `45 files / 539 tests passed`.
+- Scoped backend ordinary partition: `184/184 passed in 45.79s`.
+- Task Runtime quarantine partition: `68/68 passed in 31.08s`.
+- `npm run lint`, Electron TypeScript compilation, Node command tests `2/2`, Python compilation
+  and `git diff --check` pass. Node is `v24.19.0`; Python is `3.12.10`.
+- Full renderer typecheck retains only the documented historical baseline; filtering its output
+  for every round-2 production/test file returns zero diagnostics.

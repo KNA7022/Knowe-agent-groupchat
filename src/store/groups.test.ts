@@ -2,13 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Group } from '../contract/group';
 import {
-  pendingGroupRequestCacheCount, pendingGroupTeardownCount, retryPendingGroupTeardowns,
-  setGroupTeardownLoaderForTests, useGroupStore,
+  pendingGroupRequestCacheCount, useGroupStore,
 } from './groups';
 import { fenceDeletedGroup, isGroupDeletionFenced } from './groupDeletionFence';
 import { teardownGroup } from './groupTeardown';
 import { useRecordsStore } from './records';
 import { agentBindingKey, useSettingsStore } from './settings';
+import { useKnoweStore } from './store';
+import { loadSkeleton, saveSkeleton } from './skeletonCache';
 
 const firstId = `grp_${'1'.repeat(32)}` as const;
 const secondId = `grp_${'2'.repeat(32)}` as const;
@@ -66,10 +67,7 @@ describe('canonical Group store', () => {
     groups: {}, order: [], runtimeSummaries: {}, sourceReferenceCounts: {},
     loading: false, error: null,
   }));
-  afterEach(() => {
-    setGroupTeardownLoaderForTests();
-    vi.unstubAllGlobals();
-  });
+  afterEach(() => { vi.unstubAllGlobals(); });
 
   it('keeps independent groups isolated by opaque group_id', () => {
     useGroupStore.getState().ingest([group(firstId), group(secondId)]);
@@ -302,7 +300,7 @@ describe('canonical Group store', () => {
     expect(JSON.stringify(useGroupStore.getState())).not.toContain(deletedId);
   });
 
-  it('fences canonical and legacy identities before the teardown import can resolve', async () => {
+  it('fences canonical and legacy identities and purges projections at the receipt boundary', async () => {
     const deletedId = `grp_${'c'.repeat(32)}` as typeof firstId;
     const legacyId = 'legacy-import-boundary';
     const seeded = structuredClone(group(firstId));
@@ -312,8 +310,14 @@ describe('canonical Group store', () => {
     useGroupStore.getState().ingest([seeded]);
 
     let resolveHistory!: (response: Response) => void;
-    let resolveLoader!: (module: typeof import('./groupTeardown')) => void;
-    setGroupTeardownLoaderForTests(() => new Promise((resolve) => { resolveLoader = resolve; }));
+    useKnoweStore.setState({
+      convs: { [legacyId]: {
+        projectId: legacyId, projectName: 'Deleted', items: [], members: [], banner: null,
+        draft: 'PRIVATE-OLD-DRAFT', unread: 1,
+      } },
+      projectOrder: [legacyId], activeProjectId: legacyId,
+    });
+    saveSkeleton(legacyId, { readSeq: 42 });
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/history?')) {
@@ -334,21 +338,20 @@ describe('canonical Group store', () => {
 
     const history = useRecordsStore.getState().load(legacyId);
     await vi.waitFor(() => expect(resolveHistory).toBeTypeOf('function'));
-    const deleting = useGroupStore.getState().confirmedDelete(deletedId, 'token');
-    await vi.waitFor(() => expect(resolveLoader).toBeTypeOf('function'));
+    await useGroupStore.getState().confirmedDelete(deletedId, 'token');
     expect(isGroupDeletionFenced(deletedId)).toBe(true);
     expect(isGroupDeletionFenced(legacyId)).toBe(true);
+    expect(useKnoweStore.getState().convs[legacyId]).toBeUndefined();
+    expect(useRecordsStore.getState().items).toEqual([]);
+    expect(loadSkeleton(legacyId)).toBeNull();
     resolveHistory(new Response(JSON.stringify({ items: [{
       seq: 1, type: 'message', agent_id: 'agent', content: 'LATE-LEGACY-BODY',
     }], total: 1 }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
     await history;
     expect(JSON.stringify(useRecordsStore.getState())).not.toContain('LATE-LEGACY-BODY');
-    resolveLoader({ teardownGroup });
-    await deleting;
-    expect(pendingGroupTeardownCount()).toBe(0);
   });
 
-  it('retains and retries cleanup when the teardown import fails', async () => {
+  it('does not need a fallible dynamic import or renderer-restart cleanup obligation', async () => {
     const deletedId = `grp_${'d'.repeat(32)}` as typeof firstId;
     const legacyId = 'legacy-import-retry';
     const seeded = structuredClone(group(firstId));
@@ -356,7 +359,17 @@ describe('canonical Group store', () => {
     seeded.legacy_project_id = legacyId;
     seeded.roster = seeded.roster.map((agent) => ({ ...agent, group_id: deletedId }));
     useGroupStore.getState().ingest([seeded]);
-    setGroupTeardownLoaderForTests(() => Promise.reject(new Error('import unavailable')));
+    useRecordsStore.setState({
+      activeProjectId: legacyId,
+      items: [{ seq: 1, type: 'message', agent_id: 'agent', content: 'OLD-RECORD', ts: null,
+        has_files: false, has_images: false, has_videos: false, has_links: false }],
+    });
+    useKnoweStore.setState({
+      convs: { [legacyId]: {
+        projectId: legacyId, items: [], members: [], banner: null, draft: 'OLD-CONVERSATION', unread: 0,
+      } },
+      projectOrder: [legacyId], activeProjectId: legacyId,
+    });
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ receipt: {
       schema_version: 1, receipt_id: `gdr_${'e'.repeat(32)}`, group_id: deletedId,
       deleted_at: '2026-08-19T00:00:00Z', removed_agent_count: 2,
@@ -365,11 +378,9 @@ describe('canonical Group store', () => {
     } }), { status: 200, headers: { 'Content-Type': 'application/json' } })));
 
     await useGroupStore.getState().confirmedDelete(deletedId, 'token');
-    expect(pendingGroupTeardownCount()).toBe(1);
     expect(isGroupDeletionFenced(deletedId)).toBe(true);
     expect(isGroupDeletionFenced(legacyId)).toBe(true);
-    setGroupTeardownLoaderForTests(async () => ({ teardownGroup }));
-    await retryPendingGroupTeardowns();
-    expect(pendingGroupTeardownCount()).toBe(0);
+    expect(JSON.stringify(useKnoweStore.getState())).not.toContain('OLD-CONVERSATION');
+    expect(JSON.stringify(useRecordsStore.getState())).not.toContain('OLD-RECORD');
   });
 });
