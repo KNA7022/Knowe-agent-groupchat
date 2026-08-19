@@ -566,14 +566,9 @@ class KnoweServer:
         self._task_runtime_group_deletion_generation_invalidated = False
         self._task_runtime_group_deletion_invalidation_epoch = 0
         self._shutdown_event = asyncio.Event()
-        if self.groups is not None:
-            self.groups.deletion_prepare_listener = (
-                self._invalidate_task_runtime_group_deletion_generation
-            )
-        if self.task_runtime is not None:
-            self.task_runtime.store.group_deletion_prepare_listener = (
-                self._invalidate_task_runtime_group_deletion_generation
-            )
+        self._publish_task_runtime_group_deletion_listeners_locked(
+            self._task_runtime_group_deletion_lifecycle_generation,
+        )
         self._last_pinned_at = 0
 
         # [v0.16 hotfix] persistent inbound-id aliases → canonical project_YYYYMMDDHHMMSS.
@@ -8560,9 +8555,29 @@ class KnoweServer:
         ].get("has_more"):
             self._schedule_task_runtime_group_deletion_reconcile()
 
-    def _invalidate_task_runtime_group_deletion_generation(self) -> None:
+    def _publish_task_runtime_group_deletion_listeners_locked(
+        self, lifecycle_generation: int,
+    ) -> None:
+        """Publish insertion listeners fenced to one lifecycle generation."""
+        def listener() -> None:
+            self._invalidate_task_runtime_group_deletion_generation(
+                lifecycle_generation,
+            )
+        if self.groups is not None:
+            self.groups.deletion_prepare_listener = listener
+        if self.task_runtime is not None:
+            self.task_runtime.store.group_deletion_prepare_listener = listener
+
+    def _invalidate_task_runtime_group_deletion_generation(
+        self, lifecycle_generation: int,
+    ) -> None:
         """Invalidate and coalesce a wake from either durable insertion thread."""
         with self._task_runtime_group_deletion_wake_lock:
+            if (
+                lifecycle_generation
+                != self._task_runtime_group_deletion_lifecycle_generation
+            ):
+                return
             self._task_runtime_group_deletion_invalidation_epoch += 1
             self._task_runtime_group_deletion_generation_invalidated = True
             if (
@@ -8597,26 +8612,81 @@ class KnoweServer:
             owner = self._task_runtime_group_deletion_loop
             if owner is loop:
                 return True
-            if owner is not None and not owner.is_closed():
+            if owner is not None and owner.is_running():
                 raise RuntimeError(
                     "Task Runtime Group deletion recovery is owned by another loop",
                 )
+
+            # Fence the complete old lifecycle before publishing its replacement.
+            # TimerHandle.cancel() is local state cleanup and remains safe after loop
+            # close; Task.cancel() is not, so a closed-loop pending Task is only
+            # detached and its generation-fenced callback can never mutate the new
+            # owner.  A stopped, reusable loop may accept cancellation for a later
+            # drain if its owner is resumed.
             self._task_runtime_group_deletion_lifecycle_generation += 1
-            self._task_runtime_group_deletion_loop = loop
+            lifecycle_generation = (
+                self._task_runtime_group_deletion_lifecycle_generation
+            )
+            retry_handle = self._task_runtime_group_deletion_error_retry_handle
+            retired_task = self._task_runtime_group_deletion_task
+            retry_handle_active = False
+            if retry_handle is not None:
+                try:
+                    retry_handle_active = not retry_handle.cancelled()
+                except Exception:  # noqa: BLE001 - inaccessible retired handle
+                    retry_handle_active = True
+            preserve_invalidation = bool(
+                self._task_runtime_group_deletion_generation_invalidated
+                or self._task_runtime_group_deletion_wake_scheduled
+                or retired_task is not None
+                or retry_handle_active
+            )
+            self._task_runtime_group_deletion_error_retry_handle = None
+            self._task_runtime_group_deletion_error_retry_token = None
+            self._task_runtime_group_deletion_error_retry_owner_token = None
+            self._task_runtime_group_deletion_task = None
+            self._task_runtime_group_deletion_owner_token = None
             self._task_runtime_group_deletion_wake_scheduled = False
+            self._task_runtime_group_deletion_error_attempt = 0
+            self._task_runtime_group_deletion_idle_attempt = 0
+            self._task_runtime_group_deletion_generation_invalidated = (
+                preserve_invalidation
+            )
+            if retry_handle is not None:
+                try:
+                    retry_handle.cancel()
+                except Exception:  # noqa: BLE001 - inaccessible retired handle
+                    pass
+            if retired_task is not None:
+                if retired_task.done():
+                    if not retired_task.cancelled():
+                        try:
+                            retired_task.exception()
+                        except Exception:  # noqa: BLE001 - exception retrieval boundary
+                            pass
+                elif owner is not None and not owner.is_closed():
+                    try:
+                        retired_task.cancel()
+                    except RuntimeError:
+                        # A concurrent close won after is_closed(); the lifecycle
+                        # generation already makes the old callback a strict no-op.
+                        pass
+            self._task_runtime_group_deletion_loop = loop
+            self._publish_task_runtime_group_deletion_listeners_locked(
+                lifecycle_generation,
+            )
             return True
 
     def _ensure_task_runtime_group_deletion_reconcile(self, generation: int) -> None:
         """Enter the loop-owned task scheduler after a thread-safe wake."""
+        loop = asyncio.get_running_loop()
         with self._task_runtime_group_deletion_wake_lock:
             if (
                 self._task_runtime_group_deletion_stopped
                 or self._shutdown_event.is_set()
                 or generation != self._task_runtime_group_deletion_lifecycle_generation
-                or self._task_runtime_group_deletion_loop is not asyncio.get_running_loop()
+                or self._task_runtime_group_deletion_loop is not loop
             ):
-                if generation == self._task_runtime_group_deletion_lifecycle_generation:
-                    self._task_runtime_group_deletion_wake_scheduled = False
                 return
         # Keep wake_scheduled set while an owner exists. A burst therefore queues at
         # most one cross-thread callback and the owner consumes every newer revision.
@@ -8629,7 +8699,10 @@ class KnoweServer:
         self._task_runtime_group_deletion_error_retry_token = None
         self._task_runtime_group_deletion_error_retry_owner_token = None
         if handle is not None:
-            handle.cancel()
+            try:
+                handle.cancel()
+            except Exception:  # noqa: BLE001 - retired handle containment boundary
+                pass
 
     def _create_task_runtime_group_deletion_owner_locked(
         self, loop: asyncio.AbstractEventLoop, generation: int,
@@ -8714,7 +8787,11 @@ class KnoweServer:
         loop = asyncio.get_running_loop()
         with self._task_runtime_group_deletion_wake_lock:
             if (
-                self._task_runtime_group_deletion_error_retry_token != retry_token
+                self._task_runtime_group_deletion_stopped
+                or self._shutdown_event.is_set()
+                or generation != self._task_runtime_group_deletion_lifecycle_generation
+                or self._task_runtime_group_deletion_loop is not loop
+                or self._task_runtime_group_deletion_error_retry_token != retry_token
                 or self._task_runtime_group_deletion_error_retry_owner_token
                 != failed_owner_token
             ):
@@ -8723,11 +8800,7 @@ class KnoweServer:
             self._task_runtime_group_deletion_error_retry_token = None
             self._task_runtime_group_deletion_error_retry_owner_token = None
             if (
-                self._task_runtime_group_deletion_stopped
-                or self._shutdown_event.is_set()
-                or generation != self._task_runtime_group_deletion_lifecycle_generation
-                or self._task_runtime_group_deletion_loop is not loop
-                or self._task_runtime_group_deletion_task is not None
+                self._task_runtime_group_deletion_task is not None
                 or self._task_runtime_group_deletion_owner_token is not None
             ):
                 self._task_runtime_group_deletion_wake_scheduled = bool(
@@ -8753,7 +8826,10 @@ class KnoweServer:
         if self.task_runtime is not None:
             self.task_runtime.store.group_deletion_prepare_listener = None
         if retry_handle is not None:
-            retry_handle.cancel()
+            try:
+                retry_handle.cancel()
+            except Exception:  # noqa: BLE001 - shutdown containment boundary
+                pass
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)

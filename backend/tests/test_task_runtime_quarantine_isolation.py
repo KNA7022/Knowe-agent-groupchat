@@ -2018,6 +2018,395 @@ async def test_replacement_owner_interleavings_keep_single_lifecycle_resource(
         _close_server(server)
 
 
+@pytest.mark.parametrize("source", ("canonical", "runtime", "both"))
+def test_closed_loop_rebind_retires_retry_and_preserves_automatic_wake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str,
+) -> None:
+    """A closed loop's 60s retry must never fence recovery on its successor."""
+    monkeypatch.setattr(
+        KnoweServer, "TASK_RUNTIME_DELETION_ERROR_RETRY_BASE_SECONDS", 60.0,
+    )
+    monkeypatch.setattr(
+        KnoweServer, "TASK_RUNTIME_DELETION_ERROR_RETRY_MAX_SECONDS", 60.0,
+    )
+    server = KnoweServer(str(tmp_path / source))
+    assert server.groups is not None and server.task_runtime is not None
+    original_reconcile = server._reconcile_task_runtime_group_deletions  # noqa: SLF001
+    first_loop = asyncio.new_event_loop()
+    second_loop = asyncio.new_event_loop()
+
+    async def arm_old_generation_retry():
+        await original_reconcile()
+        old_listener = server.groups.deletion_prepare_listener
+        assert old_listener is not None
+
+        async def fail_owner() -> None:
+            raise RuntimeError("synthetic loop-1 owner failure")
+
+        monkeypatch.setattr(
+            server, "_reconcile_task_runtime_group_deletions", fail_owner,
+        )
+        old_listener()
+        deadline = time.monotonic() + 1
+        while (
+            server._task_runtime_group_deletion_error_retry_handle is None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.005)
+        handle = server._task_runtime_group_deletion_error_retry_handle  # noqa: SLF001
+        assert handle is not None and not handle.cancelled()
+        return (
+            old_listener,
+            server._task_runtime_group_deletion_lifecycle_generation,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_owner_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_token,  # noqa: SLF001
+            handle,
+        )
+
+    old_listener, old_generation, old_owner_token, old_retry_token, old_handle = (
+        first_loop.run_until_complete(arm_old_generation_retry())
+    )
+    assert old_owner_token is not None and old_retry_token is not None
+    first_loop.close()
+    monkeypatch.setattr(
+        server, "_reconcile_task_runtime_group_deletions", original_reconcile,
+    )
+
+    async def migrate_and_recover() -> None:
+        await original_reconcile()
+        assert server._task_runtime_group_deletion_loop is second_loop  # noqa: SLF001
+        assert (  # noqa: SLF001
+            server._task_runtime_group_deletion_lifecycle_generation
+            > old_generation
+        )
+        assert old_handle.cancelled()
+        assert server._task_runtime_group_deletion_error_retry_handle is None  # noqa: SLF001
+        assert server._task_runtime_group_deletion_error_retry_token is None  # noqa: SLF001
+        assert server._task_runtime_group_deletion_error_retry_owner_token is None  # noqa: SLF001
+
+        # A callback captured from loop 1 is stale after publication of loop 2.
+        before_stale_listener = (
+            server._task_runtime_group_deletion_invalidation_epoch,  # noqa: SLF001
+            server._task_runtime_group_deletion_generation_invalidated,  # noqa: SLF001
+            server._task_runtime_group_deletion_wake_scheduled,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_attempt,  # noqa: SLF001
+        )
+        old_listener()
+        assert before_stale_listener == (
+            server._task_runtime_group_deletion_invalidation_epoch,  # noqa: SLF001
+            server._task_runtime_group_deletion_generation_invalidated,  # noqa: SLF001
+            server._task_runtime_group_deletion_wake_scheduled,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_attempt,  # noqa: SLF001
+        )
+
+        group = server.groups.create_group(f"Closed-loop rebind {source}")
+        preview = server.groups.delete_preview(group.group_id)
+        current_group_listener = server.groups.deletion_prepare_listener
+        if source == "runtime":
+            server.groups.deletion_prepare_listener = None
+        transaction = server.groups.prepare_delete(
+            group.group_id,
+            preview.confirmation_token,
+            runtime_project_id=f"project_closed_loop_rebind_{source}",
+        )
+        server.groups.deletion_prepare_listener = current_group_listener
+        if source in {"runtime", "both"}:
+            server.task_runtime.prepare_group_deletion(
+                group.group_id, str(transaction["transaction_id"]),
+            )
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            current = server.groups.delete_transaction(group.group_id)
+            if current is not None and current["stage"] == "committed":
+                break
+            task = server._task_runtime_group_deletion_task  # noqa: SLF001
+            handle = server._task_runtime_group_deletion_error_retry_handle  # noqa: SLF001
+            assert int(task is not None and not task.done()) + int(
+                handle is not None and not handle.cancelled()
+            ) <= 1
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("loop-2 recovery did not converge automatically")
+
+        # A matching old token callback cannot clear or replace loop-2 state.
+        before_stale_timer = (
+            server._task_runtime_group_deletion_task,  # noqa: SLF001
+            server._task_runtime_group_deletion_owner_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_handle,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_owner_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_wake_scheduled,  # noqa: SLF001
+        )
+        server._fire_task_runtime_group_deletion_error_retry(  # noqa: SLF001
+            old_generation, old_owner_token, old_retry_token,
+        )
+        assert before_stale_timer == (
+            server._task_runtime_group_deletion_task,  # noqa: SLF001
+            server._task_runtime_group_deletion_owner_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_handle,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_owner_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_wake_scheduled,  # noqa: SLF001
+        )
+        server._shutdown_event.set()  # noqa: SLF001
+        await server._stop_task_runtime_group_deletion_reconcile()  # noqa: SLF001
+
+    try:
+        second_loop.run_until_complete(migrate_and_recover())
+    finally:
+        if not second_loop.is_closed():
+            second_loop.close()
+        _close_server(server)
+
+
+@pytest.mark.parametrize("burst_size", (100, 1_000))
+def test_stopped_loop_pending_owner_is_fenced_across_loop2_and_loop3(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, burst_size: int,
+) -> None:
+    """A stopped-loop owner and its callbacks cannot mutate later generations."""
+    server = KnoweServer(str(tmp_path / f"pending-{burst_size}"))
+    assert server.groups is not None and server.task_runtime is not None
+    original_reconcile = server._reconcile_task_runtime_group_deletions  # noqa: SLF001
+    original_owner_loop = server._task_runtime_group_deletion_reconcile_loop  # noqa: SLF001
+    first_loop = asyncio.new_event_loop()
+    second_loop = asyncio.new_event_loop()
+    third_loop = asyncio.new_event_loop()
+    first_owner_started: asyncio.Event | None = None
+
+    async def bind_first_loop() -> None:
+        nonlocal first_owner_started
+        await original_reconcile()
+        first_owner_started = asyncio.Event()
+
+    first_loop.run_until_complete(bind_first_loop())
+    assert first_owner_started is not None
+    old_listener = server.groups.deletion_prepare_listener
+    assert old_listener is not None
+
+    async def controlled_owner() -> None:
+        if asyncio.get_running_loop() is first_loop:
+            assert first_owner_started is not None
+            first_owner_started.set()
+            await asyncio.Event().wait()
+        else:
+            await original_owner_loop()
+
+    monkeypatch.setattr(
+        server, "_task_runtime_group_deletion_reconcile_loop", controlled_owner,
+    )
+    old_listener()
+    first_loop.run_until_complete(first_owner_started.wait())
+    old_task = server._task_runtime_group_deletion_task  # noqa: SLF001
+    old_owner_token = server._task_runtime_group_deletion_owner_token  # noqa: SLF001
+    old_generation = server._task_runtime_group_deletion_lifecycle_generation  # noqa: SLF001
+    assert old_task is not None and not old_task.done() and old_owner_token is not None
+    assert not first_loop.is_running() and not first_loop.is_closed()
+
+    async def recover_on_second_loop() -> tuple[object, ...]:
+        await original_reconcile()
+        assert server._task_runtime_group_deletion_loop is second_loop  # noqa: SLF001
+        assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+        assert server._task_runtime_group_deletion_owner_token is None  # noqa: SLF001
+        assert old_task.cancelling()
+        listener = server.groups.deletion_prepare_listener
+        assert listener is not None and listener is not old_listener
+        group = server.groups.create_group(f"Stopped loop burst {burst_size}")
+        preview = server.groups.delete_preview(group.group_id)
+        await asyncio.to_thread(
+            server.groups.prepare_delete,
+            group.group_id,
+            preview.confirmation_token,
+            runtime_project_id=f"project_stopped_loop_{burst_size}",
+        )
+
+        foreign_group_ids = [
+            f"grp_{index + 1:032x}" for index in range(burst_size)
+        ]
+
+        def produce_foreign_inserts() -> None:
+            for index, group_id in enumerate(foreign_group_ids):
+                server.task_runtime.store.prepare_group_deletion(
+                    group_id,
+                    f"gdt_{index + 1:028x}",
+                    group_proof_digest=f"{index + 1:064x}",
+                    confirmation_token=f"foreign-confirmation-{index}",
+                    runtime_project_id=f"foreign-project-{index}",
+                )
+
+        producer = threading.Thread(target=produce_foreign_inserts, daemon=True)
+        producer.start()
+        producer.join(timeout=15)
+        assert not producer.is_alive()
+
+        def pending_foreign_insert_count() -> int:
+            with sqlite3.connect(server.task_runtime.store.db.path) as conn:
+                row = conn.execute(
+                    """SELECT COUNT(*) FROM studycrew_group_deletions
+                       WHERE stage='prepared' AND runtime_project_id LIKE 'foreign-project-%'""",
+                ).fetchone()
+            return 0 if row is None else int(row[0])
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            transaction = server.groups.delete_transaction(group.group_id)
+            task = server._task_runtime_group_deletion_task  # noqa: SLF001
+            handle = server._task_runtime_group_deletion_error_retry_handle  # noqa: SLF001
+            assert int(task is not None and not task.done()) + int(
+                handle is not None and not handle.cancelled()
+            ) <= 1
+            if (
+                transaction is not None
+                and transaction["stage"] == "committed"
+                and await asyncio.to_thread(pending_foreign_insert_count) == 0
+            ):
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("stopped-loop foreign inserts did not converge")
+        with sqlite3.connect(server.task_runtime.store.db.path) as conn:
+            quarantined_count = int(conn.execute(
+                """SELECT COUNT(*) FROM studycrew_group_deletions
+                   WHERE stage='quarantined'
+                     AND runtime_project_id LIKE 'foreign-project-%'""",
+            ).fetchone()[0])
+        assert quarantined_count == burst_size
+        while (
+            server._task_runtime_group_deletion_task is not None  # noqa: SLF001
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.005)
+        return (
+            server._task_runtime_group_deletion_lifecycle_generation,  # noqa: SLF001
+            server._task_runtime_group_deletion_task,  # noqa: SLF001
+            server._task_runtime_group_deletion_owner_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_handle,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_attempt,  # noqa: SLF001
+            server._task_runtime_group_deletion_invalidation_epoch,  # noqa: SLF001
+        )
+
+    second_state = second_loop.run_until_complete(recover_on_second_loop())
+    # Deliver cancellation and the old done callback on loop 1 after loop 2 has
+    # published and settled. The generation fence makes the callback zero-mutation.
+    first_loop.run_until_complete(asyncio.sleep(0))
+    assert old_task.done() and old_task.cancelled()
+    assert second_state == (
+        server._task_runtime_group_deletion_lifecycle_generation,  # noqa: SLF001
+        server._task_runtime_group_deletion_task,  # noqa: SLF001
+        server._task_runtime_group_deletion_owner_token,  # noqa: SLF001
+        server._task_runtime_group_deletion_error_retry_handle,  # noqa: SLF001
+        server._task_runtime_group_deletion_error_attempt,  # noqa: SLF001
+        server._task_runtime_group_deletion_invalidation_epoch,  # noqa: SLF001
+    )
+
+    loop2_listener = server.groups.deletion_prepare_listener
+    assert loop2_listener is not None
+
+    async def recover_on_third_loop_and_close() -> None:
+        await original_reconcile()
+        assert server._task_runtime_group_deletion_loop is third_loop  # noqa: SLF001
+        assert (  # noqa: SLF001
+            server._task_runtime_group_deletion_lifecycle_generation
+            > old_generation
+        )
+        before = (
+            server._task_runtime_group_deletion_invalidation_epoch,  # noqa: SLF001
+            server._task_runtime_group_deletion_generation_invalidated,  # noqa: SLF001
+            server._task_runtime_group_deletion_wake_scheduled,  # noqa: SLF001
+        )
+        loop2_listener()
+        assert before == (
+            server._task_runtime_group_deletion_invalidation_epoch,  # noqa: SLF001
+            server._task_runtime_group_deletion_generation_invalidated,  # noqa: SLF001
+            server._task_runtime_group_deletion_wake_scheduled,  # noqa: SLF001
+        )
+        server._settle_task_runtime_group_deletion_owner(  # noqa: SLF001
+            old_task, first_loop, old_generation, old_owner_token,
+        )
+        assert before == (
+            server._task_runtime_group_deletion_invalidation_epoch,  # noqa: SLF001
+            server._task_runtime_group_deletion_generation_invalidated,  # noqa: SLF001
+            server._task_runtime_group_deletion_wake_scheduled,  # noqa: SLF001
+        )
+        server._shutdown_event.set()  # noqa: SLF001
+        await server._stop_task_runtime_group_deletion_reconcile()  # noqa: SLF001
+
+    try:
+        third_loop.run_until_complete(recover_on_third_loop_and_close())
+    finally:
+        first_loop.close()
+        second_loop.close()
+        third_loop.close()
+        _close_server(server)
+
+
+@pytest.mark.parametrize("owner_raises", (False, True))
+def test_rebind_clears_cancelled_handle_and_retrieves_done_owner(
+    tmp_path: Path, owner_raises: bool,
+) -> None:
+    """Cancelled handles and done/exception owners are retired without leakage."""
+    server = KnoweServer(str(tmp_path / f"done-owner-{owner_raises}"))
+    assert server.groups is not None and server.task_runtime is not None
+    original_reconcile = server._reconcile_task_runtime_group_deletions  # noqa: SLF001
+    first_loop = asyncio.new_event_loop()
+    second_loop = asyncio.new_event_loop()
+    first_loop.run_until_complete(original_reconcile())
+    old_generation = server._task_runtime_group_deletion_lifecycle_generation  # noqa: SLF001
+
+    async def finish_owner() -> None:
+        if owner_raises:
+            raise RuntimeError("synthetic retired owner exception")
+
+    retired_task = first_loop.create_task(finish_owner())
+    first_loop.run_until_complete(asyncio.sleep(0))
+    assert retired_task.done()
+    cancelled_handle = first_loop.call_later(60, lambda: None)
+    cancelled_handle.cancel()
+    with server._task_runtime_group_deletion_wake_lock:  # noqa: SLF001
+        server._task_runtime_group_deletion_owner_serial += 1  # noqa: SLF001
+        owner_token = server._task_runtime_group_deletion_owner_serial  # noqa: SLF001
+        server._task_runtime_group_deletion_task = retired_task  # noqa: SLF001
+        server._task_runtime_group_deletion_owner_token = owner_token  # noqa: SLF001
+        server._task_runtime_group_deletion_error_retry_handle = cancelled_handle  # noqa: SLF001
+        server._task_runtime_group_deletion_error_retry_token = 999  # noqa: SLF001
+        server._task_runtime_group_deletion_error_retry_owner_token = owner_token  # noqa: SLF001
+        server._task_runtime_group_deletion_wake_scheduled = True  # noqa: SLF001
+
+    async def rebind_and_close() -> None:
+        await original_reconcile()
+        assert server._task_runtime_group_deletion_loop is second_loop  # noqa: SLF001
+        assert server._task_runtime_group_deletion_task is None  # noqa: SLF001
+        assert server._task_runtime_group_deletion_owner_token is None  # noqa: SLF001
+        assert server._task_runtime_group_deletion_error_retry_handle is None  # noqa: SLF001
+        assert server._task_runtime_group_deletion_error_retry_token is None  # noqa: SLF001
+        before = (
+            server._task_runtime_group_deletion_task,  # noqa: SLF001
+            server._task_runtime_group_deletion_owner_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_handle,  # noqa: SLF001
+            server._task_runtime_group_deletion_wake_scheduled,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_attempt,  # noqa: SLF001
+        )
+        server._settle_task_runtime_group_deletion_owner(  # noqa: SLF001
+            retired_task, first_loop, old_generation, owner_token,
+        )
+        assert before == (
+            server._task_runtime_group_deletion_task,  # noqa: SLF001
+            server._task_runtime_group_deletion_owner_token,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_retry_handle,  # noqa: SLF001
+            server._task_runtime_group_deletion_wake_scheduled,  # noqa: SLF001
+            server._task_runtime_group_deletion_error_attempt,  # noqa: SLF001
+        )
+        server._shutdown_event.set()  # noqa: SLF001
+        await server._stop_task_runtime_group_deletion_reconcile()  # noqa: SLF001
+
+    try:
+        second_loop.run_until_complete(rebind_and_close())
+    finally:
+        first_loop.close()
+        second_loop.close()
+        _close_server(server)
+
+
 def test_ten_thousand_intent_page_and_restart_cursor_stay_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
