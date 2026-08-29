@@ -6,6 +6,8 @@ Task 2 已在 `feature/studycrew-foundation` 上完成。实现以既有 Task Ru
 
 本任务没有启动 RAG、OCR 或 Mem0，也没有修改 `skills/`。
 
+Round 1 独立验收指出的 5 Critical / 6 Important / 1 Minor 已逐项处置；本报告后文的“Round 1 修复矩阵”和最终验证结果覆盖并取代首轮提交时的旧测试数字。安全门槛内未保留兼容旁路。
+
 ## 2. 架构与权威边界
 
 ### 2.1 统一 Tool Gateway
@@ -30,6 +32,8 @@ atomic claim -> effect boundary -> typed terminal audit
 ```
 
 `ToolExecutionRequest` 将 Shell 的 executable、顺序敏感 argv、cwd、read/write roots、network hosts 和 child-process 能力编译为精确 scope。`ToolGateway` 只允许 renderer/model 申请 `ToolDescriptor` 的子集；路径先绝对化和解析，域名按精确规则或显式子域通配符检查。
+
+这些字段是授权合同，不虚假宣称为 OS sandbox。当前 Windows 交付未提供可验证的 AppContainer/restricted-token + Job Object 隔离，因此生产 Shell 和 MCP stdio 在 effect 前 fail closed。只有测试或部署方明确注入并标记的 `trusted_sandbox` / `trusted_test_seam` executor 可以越过这一可用性闸门；默认实现不会启动普通进程。
 
 高风险副作用必须使用 Task Runtime 的 fresh approval + single-use `PermissionGrant`。Grant 同时绑定 `group_id` / `task_id` / `run_id` / tool / purpose / operation scope / expiry，在创建 `ToolInvocation` 的同一 SQLite transaction 中消费。高风险 invocation 固定 `replay_allowed=false`，进程重启后不自动重放。
 
@@ -62,6 +66,8 @@ ProviderClient Authorization header for this request only
 
 `ModelCapabilityRegistry` 对 failover 执行三重限制：candidate 必须 pre-authorized，privacy protection rank 不得低于 primary，估算成本不得超过剩余预算。当前生产没有自动 failover 调用点，因此也没有绕过 registry 的隐式降级。
 
+普通模型、辅助模型、知识图谱/记忆摘要、视觉和设置探测现在都只能构造 `ProviderGatewayClient`。Gateway 从后端可信 capability registry 精确核对 provider/model/HTTPS endpoint/transport，扫描最终序列化 request body，在网络 effect 前通过当前 Task Runtime 扣减 model-turn/token/cost budget 并写结构化 provider audit；敏感请求需要同一 run/task/group 上 fresh、purpose-bound 的 `provider_egress` approval/grant。底层 `ProviderClient` 的真实网络模式离开 Gateway 会确定性拒绝，只有显式注入 `MockTransport` 的 test seam 可独立运行。
+
 ### 2.3 PII / DLP / 审计
 
 `PiiDlpGateway` 覆盖中文学号、18 位身份证、中国大陆手机号、邮箱、成绩/绩点/排名、个人课表关联和私人笔记。对 MCP 和任何 network-capable tool，扫描内容由 backend 从结构化 arguments/argv 派生，调用方不能通过省略 `outbound_payload` 绕过。敏感出站只能是 high risk 且需 fresh approval。
@@ -74,10 +80,11 @@ MCP 实现了 registry/configuration、initialize、discovery、governed tool in
 
 - prompts 默认且强制禁用：从不发送 `prompts/list`，server 宣告 prompt capability 或 discovery 返回 prompts 时立即拒绝。
 - discovery 最多 16 页，cursor 去重/限长，tool schema 必须是不超 64 KiB 的 object schema，远程 `$ref`、prompt-injection description、非预期 tool/resource 全部拒绝。
-- stdio 必须先作为 high-risk Shell effect 通过统一 Tool Gateway；`create_subprocess_exec` 不使用 shell，空 env，stderr 直接丢弃（可视为 0-byte 安全上限）。JSON-RPC 采用单行 UTF-8 framing，request/response 各不超 1 MiB，必须换行结束，response timeout 30 s，server-initiated request 会关闭 session。
+- stdio 仍按 high-risk Shell capability 表述，但生产在没有受信 sandbox executor 时 fail closed，不会调用普通 `create_subprocess_exec`。测试 transport 只能通过显式 `session_factory + trusted_test_seam` 注入。JSON-RPC 采用单行 UTF-8 framing，request/response 各不超 1 MiB，必须换行结束，response timeout 30 s，server-initiated request 会关闭 session。
 - Streamable HTTP 仅 HTTPS，禁止 URL userinfo，配置域名需 allowlist，且 invocation/resource scope 必须与已注册 endpoint host 精确一致，不能换成同 allowlist 的其他主机。
 - HTTP 每次请求显式 `follow_redirects=false`，任何 3xx 或 Location 都拒绝；request/streamed response 各 1 MiB，production timeout 30 s，只接受 `application/json` 或单 data event 的 `text/event-stream`，session id 限 256 个可显示 ASCII 字符。
-- JSON-RPC 严格比对 version/id，不展示 peer error body。
+- tool/resource capability identity 固定绑定 `server_id + transport + canonical endpoint + operation + remote name/URI + frozen schema/metadata digest`；arguments 按 frozen schema 深验，discovery/schema 变化会使旧 descriptor/grant 失效。
+- JSON-RPC 使用 stdio/HTTP 共享的严格 validator，比对 version/id，拒绝 method/result ambiguity 和 server request，不展示 peer error body。任何 prompts key presence（包括 `{}`）即拒绝；schema 约束类型/复杂度、resource annotations/nested metadata/content/blob 编码都做深验和 DLP/prompt-injection 检查。
 
 ## 3. 合同与 Task Runtime 扩展
 
@@ -108,13 +115,30 @@ Task Runtime store 对历史 payload 执行向前兼容补字段，新 grant con
 
 这些是有意的 fail-closed availability trade-off，不是兼容降级。
 
-## 5. 最小界面
+## 5. Round 1 修复矩阵
+
+| Finding | 处置与可验证边界 | 可用性影响 |
+|---|---|---|
+| C1 Provider 生产旁路 | 建立唯一 `ProviderGatewayClient`；agent/aux/knowledge/memory/vision/settings probe 全部接入可信 capability registry、最终 body DLP、Task Runtime model budget/approval/audit；真实底层 `ProviderClient` 离开 Gateway 拒绝 | 没有 authoritative running TaskRun 的普通/辅助模型调用全部在网络前失败；custom provider 未进入可信 registry 前不可用 |
+| C2 MCP 授权错绑 | immutable identity 精确包含 server/transport/canonical endpoint/operation/name-or-URI/frozen digest；arguments/resources 深验，discovery 变化使旧授权失效 | server schema 或 metadata 改动后必须重新审批 |
+| C3 Shell scope 非 OS 强制 | 删除“已 sandbox”虚假保证；生产 Shell/MCP stdio 没有受信 OS sandbox executor 时 effect 前 fail closed；只有显式测试 seam 可执行 | 当前 Windows 生产 Shell 与 MCP stdio 暂不可用 |
+| C4 Secret purpose 可伪造 | Electron main 从受限 slot/provider/canonical HTTPS endpoint/transport 派生 kind/audience/purpose；Python 逐字段端到端核验；provider resolver 明确拒绝 master-key | HTTP provider/custom endpoint、renderer 自造 purpose、跨 endpoint/transport lease 都不可用 |
+| C5 activity/diagnostic 泄漏 | public activity 固定为 tool name；共享结构化 DLP 默认遮罩未知 body/path/query/url/command；provider diagnostic 复用同一规则 | 原始参数不再作为 UI activity label/错误 detail 展示 |
+| I1 MCP 深验 | prompts key presence 即拒绝；stdio/HTTP 共用 strict JSON-RPC validator；schema 深度/节点/约束类型、resource annotations/nested metadata/content/base64 全部 bounded + prompt/DLP 检查 | 任意 regex pattern 等无法安全限时表达的远端 schema fail closed |
+| I2 effect 终态 | claim/complete/fail/recovery-blocked 与 RunEvent 在同一 SQLite transaction 更新；公开 payload 仅 opaque id/purpose/risk/status/timing/usage/typed error | 无 |
+| I3 Registry fail-open | `ToolRegistry()` 默认 deny-all；只有名称明确的 `unsafe_test_mode=True` 或显式 execution boundary 可执行 | 未装配 Task Runtime boundary 的嵌入式/legacy registry 不再工作 |
+| I4 明文/env | 移除 dotenv 与 Python provider secret env 字段；Electron spawn 过滤 secret-looking env；legacy plaintext settings 必须成功原子清除，否则 `_loaded=False` 并阻断 | 旧明文凭据需要用户在 Settings 重新输入一次 |
+| I5 SecretRef 生命周期 | slot 替换先撤销/删除旧 ref；main 只为 backend 权威 active refs 续租；reconcile/delete/revoke/expiry sweeper/shutdown 均清零 | 不活跃或后端状态未知时不续租 |
+| I6 loopback | credential ingress 启动前解析 bind address 并硬断言 loopback；非 loopback 直接拒绝启动 | `health_host` 误配为公网地址时 backend 不启动 |
+| M1 vault 部分损坏 | vault 全记录、base64/ciphertext/metadata 原子验证；任一坏记录使 vault fail closed，原文件不被过滤覆盖 | 损坏 vault 需人工恢复，不会静默丢记录 |
+
+## 6. 最小界面
 
 - Settings 设置提示凭据由系统加密且只以短 lease 提供给 backend。
 - Review/Privacy 显示共享 Task Runtime approvals、purpose-bound credential lease 和 PII outbound protection。
 - TypeScript 合同补充 Tool/MCP/PII/Secret 类型，preload 只暴露窄 IPC。
 
-## 6. TDD 与攻击覆盖
+## 7. TDD 与攻击覆盖
 
 先写红测再实现。关键红测证据包括：
 
@@ -123,48 +147,43 @@ Task Runtime store 对历史 payload 执行向前兼容补字段，新 grant con
 - MCP malicious schema/prompt injection/unexpected discovery/redirect/oversize/bad framing/bad content-type/bad session/server request/endpoint-host swap；
 - Secret IPC 错 sender/wrong purpose/expired lease/ciphertext 或 plaintext 串行化；
 - Provider privacy downgrade/unapproved candidate/budget exhaustion/retry diagnostics 泄漏；
-- 生产 Provider 明文环境回退检查先得到 `1 failed`，移除 8 个出口后 `1 passed in 0.12s`；
+- auxiliary/provider 生产直连静态检查先得到 `1 failed in 0.30s`，统一接入 Provider Gateway 后得到 `1 passed in 0.22s`；
+- MCP 畸形约束、nested resource metadata 与非法 blob 红测先得到 `2 failed, 13 deselected in 0.36s`，深验实现后 Round 1 文件得到 `15 passed in 0.53s`；
 - Zinnia 无 Task Runtime authority 的 read/network/create 三类入口先得到 `3 failed`，阻断后 `3 passed in 0.29s`。
 
-## 7. 验证命令与原样结果
+## 8. 验证命令与原样结果
 
-### 7.1 Task 2 + Group 最终聚焦集
-
-```powershell
-python -m pytest backend/tests/test_commercial_security_gateway.py backend/tests/test_commercial_gateway_legacy.py backend/tests/test_commercial_audit_redaction.py backend/tests/test_mcp_transports.py backend/tests/test_provider_secret_gateway.py backend/tests/test_secret_lease_ingress.py backend/tests/test_runtime_settings_readiness.py backend/tests/test_task_runtime.py backend/tests/test_groups.py backend/tests/test_group_http.py -q
-```
-
-```text
-........................................................................ [ 69%]
-...............................                                          [100%]
-103 passed in 9.93s
-```
-
-不含 Group 的最终 Task 2 安全集：
-
-```text
-79 passed in 6.14s
-```
-
-### 7.2 Task Runtime / rereview
+### 8.1 Task 2 Round 1 最终聚焦集
 
 ```powershell
-python -m pytest <PowerShell 枚举的 backend/tests/test_task_runtime*.py> -q
+python -m pytest backend/tests/test_task2_round1_security.py backend/tests/test_commercial_security_gateway.py backend/tests/test_mcp_transports.py backend/tests/test_provider_secret_gateway.py backend/tests/test_runtime_settings_readiness.py backend/tests/test_secret_lease_ingress.py backend/tests/test_commercial_gateway_legacy.py backend/tests/test_batch4_web_browser_vision.py::test_vision_missing_key_is_a_message backend/tests/test_batch4_web_browser_vision.py::test_vision_empty_prompt -q
 ```
 
 ```text
-215 passed in 77.30s
+........................................................................ [ 94%]
+....                                                                     [100%]
+76 passed in 3.75s
 ```
+
+Task2 改动触及的既有 AgentLoop/registry/worker/vision/Zinnia 兼容组：
+
+```text
+61 passed in 1.62s
+```
+
+### 8.2 Task Runtime / Group 顺序 gate
 
 ```powershell
-python -m pytest backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_rereview_round3.py backend/tests/test_task_runtime_rereview_round4.py -q
+python -m pytest backend/tests/test_task_runtime.py backend/tests/test_task_runtime_deletion_authorization.py backend/tests/test_task_runtime_review_fixes.py backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_rereview_round5.py backend/tests/test_task_runtime_recovery_ownership.py backend/tests/test_task_runtime_recovery_ack.py backend/tests/test_task_runtime_rereview_round4.py backend/tests/test_task_runtime_rereview_round3.py backend/tests/test_task_runtime_quarantine_isolation.py backend/tests/test_task_runtime_live_event_bridge.py backend/tests/test_groups.py backend/tests/test_group_http.py -q
 ```
 
 ```text
-37 passed in 5.77s
+239 passed in 76.88s (0:01:16)
 ```
 
-### 7.3 Electron / renderer 安全合同
+第一次将此 gate 与 Task4B 并行运行时，`test_limit_two_overflow_never_starves_valid_confirmed_deletion` 的 4 秒 timing wait 超时，结果为 `1 failed, 238 passed in 74.84s`；该 case 立即单独重跑为 `1 passed in 1.30s`，随后上述顺序全组 239 通过，确认是验证机并发负载 flaky，不是 Task2 状态机失败。
+
+### 8.3 Electron / renderer 安全合同
 
 ```powershell
 npx vitest run electron/secretVault.test.ts electron/secretMainBoundary.test.ts src/contract/commercialGateway.test.ts src/store/settingsSecrets.test.ts
@@ -172,8 +191,8 @@ npx vitest run electron/secretVault.test.ts electron/secretMainBoundary.test.ts 
 
 ```text
 Test Files  4 passed (4)
-Tests       12 passed (12)
-Duration    5.18s
+Tests       18 passed (18)
+Duration    5.51s
 ```
 
 ```powershell
@@ -182,11 +201,11 @@ npm test
 
 ```text
 Test Files  50 passed (50)
-Tests       557 passed (557)
-Duration    35.07s
+Tests       563 passed (563)
+Duration    36.03s
 ```
 
-### 7.4 静态、构建与 runtime gates
+### 8.4 静态、构建与 runtime gates
 
 ```powershell
 npm run lint
@@ -210,19 +229,19 @@ compileall: PASS (no output)
 git diff --check: PASS
 ```
 
-### 7.5 Task 4B / core 分区
+### 8.5 Task 4B / core 分区
 
 ```powershell
 python -m pytest backend/tests/test_batch4_file_ops.py backend/tests/test_batch4_terminal.py backend/tests/test_batch4_web_browser_vision.py backend/tests/test_agent_loop_persistence.py backend/tests/test_runtime.py backend/tests/test_worker_completion_v1.py backend/tests/test_tools_knowe_worker.py -q
 ```
 
 ```text
-4 failed, 128 passed, 5 skipped, 10 subtests passed in 8.25s
+4 failed, 128 passed, 5 skipped, 10 subtests passed in 8.92s
 ```
 
 隔离结论：4 个均为当前 Windows 验证环境问题，不是 Task 2 路径：1 个 terminal case 假定 POSIX `bash` loop；3 个 browser case 因 Playwright Chromium 未安装/损坏而失败。Task 2 的 Shell/MCP 测试使用结构化假 effect/session，全部通过。
 
-### 7.6 仓库历史 TypeScript 基线隔离
+### 8.6 仓库历史 TypeScript 基线隔离
 
 ```powershell
 npm run typecheck
@@ -237,7 +256,7 @@ Electron tsc diagnostics: 0
 
 因根 `tsc` 先失败，`npm run typecheck` 的 `&&` 不会继续 Electron tsc；因此另行直接运行 Electron tsc 并得到 0 diagnostics。根 tsc 输出中没有 Task 2 changed file。
 
-### 7.7 仓库历史 backend 基线隔离
+### 8.7 仓库历史 backend 基线隔离
 
 ```powershell
 python -m pytest backend/tests -q
@@ -247,25 +266,26 @@ python -m pytest backend/tests -q
 collection: 4 errors in 1.61s
 ```
 
-4 个 collection error 来自历史 `ACTION_CONTRACT` import；按原列表 ignore 后仍有 3 个同类 collection error（0 tests run, 1.03s）。扩展排除这些历史 collection blockers 后的广泛分区原样结果：
+4 个 collection error 来自历史 `ACTION_CONTRACT` import。排除这 4 个历史 collection blocker 后的广泛 checkpoint 原样结果：
 
 ```text
-42 failed, 910 passed, 5 skipped, 16 errors, 10 subtests passed in 127.32s
+79 failed, 911 passed, 5 skipped, 16 errors, 10 subtests passed in 216.13s (0:03:36)
 ```
 
-隔离过程在该广泛运行中识别出 3 个 Task 2 兼容回归：`server.py` 向 fake/legacy `submit_tracked` 实现无条件传入新 kwarg。已改为只向真实 `ProjectEngine` 传入后端权威，且 rereview round2/3/4 重跑为 `37 passed in 5.77s`。剩余输出是已知 create-project directory contract、旧外部路径自授权预期（Task 2 现有意 fail closed）、prompt/soul 契约以及 terminal/browser 环境问题。未将这些历史项扩展为 Task 6 工作。
+该 checkpoint 中 Task2 真实兼容失败集中于旧 handler-level tests 未显式声明 ToolRegistry test seam、vision binding 新合同及 Zinnia platform effect 的旧可用性预期。生产默认 deny 没有放宽；测试改为显式受信 boundary/新合同/预期 fail-closed 后，相关六文件组顺序得到 `61 passed in 1.62s`。Task Runtime/Group 又独立得到 239 全绿，Task4B 的 4 个失败仍严格隔离为 POSIX shell/本机 Chromium 环境问题。其余 broad baseline 是既有 project-directory、旧 prompt/soul/乱码契约等失败，未扩张为 Task3 或 Task6 工作。
 
-### 7.8 敏感日志/凭据扫描
+### 8.8 敏感日志/凭据扫描
 
-对 31 个 changed non-test source files 执行 log-sink + secret/PII field 模式扫描，并对 provider credential literal 做独立扫描：
+对 BASE 至当前工作树的 34 个 changed non-test source files 的 added lines 执行 log-sink + secret/PII field 模式扫描，并对 provider credential literal 做独立扫描：
 
 ```text
-Changed non-test source files: 31
-Sensitive log sink matches: 0
-Credential literal matches: 0
+Changed non-test source files: 34
+Added source lines scanned: 4915
+Sensitive added log sink matches: 0
+Added credential literal matches: 0
 ```
 
-## 8. 自审
+## 9. 自审
 
 - 授权权威：只使用 Task Runtime approval/grant/store；Gate card、renderer payload、model args 都不是 authority。
 - 边界：Tool Gateway 在 effect 之前执行后端 descriptor、canonical scope、DLP、budget、grant consumption 和 atomic claim。
@@ -275,7 +295,7 @@ Credential literal matches: 0
 - Legacy：能获得 durable authority 的 project-local read 已迁移；无法获得的入口全部 fail closed，并在本报告显式列出受影响功能。
 - 范围：未触碰 `skills/`，未开始 Task 3/RAG/OCR/Mem0。
 
-## 9. 已知限制 / concerns
+## 10. 已知限制 / concerns
 
 1. Zinnia 平台 read/file/web/browser/create-project 在获得 durable Task Runtime group/task/run 适配器前不可用。
 2. ProjectEngine 中无结构化 scope 的 legacy write/Shell/network/proposal tools 不可用；需逐个建立 backend-authored descriptor 才能恢复，不允许加兼容旁路。

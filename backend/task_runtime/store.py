@@ -1230,7 +1230,8 @@ class TaskRuntimeStore:
             grant_id=str(raw.get("grant_id") or ""),
             disposition=str(raw.get("disposition") or "created"),
             error_type=str(raw.get("error_type") or ""),
-            created_at=str(raw.get("created_at") or utc_now()), completed_at=raw.get("completed_at"),
+            created_at=str(raw.get("created_at") or utc_now()),
+            started_at=raw.get("started_at"), completed_at=raw.get("completed_at"),
             schema_version=int(raw.get("schema_version", 1)),
         )
 
@@ -1241,61 +1242,137 @@ class TaskRuntimeStore:
             ).fetchall()
         return tuple(self._tool_from_raw(_loads(row["payload_json"])) for row in rows)
 
+    @staticmethod
+    def _tool_duration_ms(invocation: ToolInvocation) -> int:
+        if not invocation.completed_at:
+            return 0
+        start_raw = invocation.started_at or invocation.created_at
+        try:
+            start = datetime.fromisoformat(str(start_raw).replace("Z", "+00:00"))
+            end = datetime.fromisoformat(str(invocation.completed_at).replace("Z", "+00:00"))
+            return max(0, int((end - start).total_seconds() * 1000))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def _transition_tool_with_event(
+        self,
+        invocation_id: str,
+        *,
+        expected_statuses: frozenset[str],
+        status: str,
+        event_type: str,
+        error_type: str = "",
+        disposition: str | None = None,
+        replay_allowed: bool | None = None,
+    ) -> tuple[ToolInvocation, bool]:
+        """Commit an effect state transition and its public audit event together."""
+
+        published: RunEvent | None = None
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM studycrew_tool_invocations WHERE invocation_id=?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeStoreError(f"tool invocation not found: {invocation_id}")
+            current = self._tool_from_raw(_loads(row["payload_json"]))
+            self._assert_group_mutable_in_transaction(conn, current.group_id)
+            if current.status not in expected_statuses:
+                return current, False
+
+            now = utc_now()
+            changes: dict[str, Any] = {
+                "status": status,
+                "error_type": error_type,
+            }
+            if status == "running":
+                changes["started_at"] = now
+            else:
+                changes["completed_at"] = now
+            if disposition is not None:
+                changes["disposition"] = disposition
+            if replay_allowed is not None:
+                changes["replay_allowed"] = replay_allowed
+            updated = replace(current, **changes)
+
+            run_row = conn.execute(
+                "SELECT payload_json FROM studycrew_task_runs WHERE run_id=?",
+                (current.run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise RuntimeStoreError(f"run not found: {current.run_id}")
+            run = self._row_run(run_row)
+            expected_version = run.version
+            run.version += 1
+            run.last_seq += 1
+            run.updated_at = now
+            payload: dict[str, Any] = {
+                "status": status,
+                "invocation_id": updated.invocation_id,
+                "tool_name": updated.tool_name,
+                "purpose": updated.purpose,
+                "risk": updated.risk.value,
+                "started_at": updated.started_at,
+                "usage": run.budget_usage.__dict__,
+            }
+            if status != "running":
+                payload.update({
+                    "completed_at": updated.completed_at,
+                    "duration_ms": self._tool_duration_ms(updated),
+                    "error_type": updated.error_type,
+                })
+            event = RunEvent(
+                event_id=opaque_id("evt"), run_id=run.run_id, group_id=run.group_id,
+                seq=run.last_seq, version=run.version, event_type=event_type,
+                public_payload=payload,
+            )
+            tool_cursor = conn.execute(
+                "UPDATE studycrew_tool_invocations SET status=?, replay_allowed=?, payload_json=? "
+                "WHERE invocation_id=? AND status=?",
+                (status, int(updated.replay_allowed), _dumps(updated.to_dict()),
+                 invocation_id, current.status),
+            )
+            if tool_cursor.rowcount != 1:
+                raise RuntimeStoreError("tool state transition lost an authority race")
+            conn.execute(
+                """UPDATE studycrew_task_runs SET status=?, version=?, last_seq=?,
+                       payload_json=?, updated_at=? WHERE run_id=? AND version=?""",
+                (run.status.value, run.version, run.last_seq, _dumps(run.to_dict()),
+                 run.updated_at, run.run_id, expected_version),
+            )
+            if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise RuntimeStoreError("TaskRun compare-and-swap conflict")
+            self._insert_event(
+                conn, event, request_key=f"tool-transition:{invocation_id}:{status}",
+            )
+            self._bump_group_snapshot_revision_in_transaction(conn, run.group_id)
+            published = event
+        if published is not None:
+            self._publish(published)
+        return updated, True
+
     def complete_tool(
         self, invocation_id: str, *, status: str, error_type: str = "",
     ) -> ToolInvocation:
         if status not in {"completed", "failed"}:
             raise ValueError("tool terminal status is invalid")
-        with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT payload_json FROM studycrew_tool_invocations WHERE invocation_id=?",
-                (invocation_id,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeStoreError(f"tool invocation not found: {invocation_id}")
-            current = self._tool_from_raw(_loads(row["payload_json"]))
-            self._assert_group_mutable_in_transaction(conn, current.group_id)
-            if current.status in {"completed", "failed", "recovered_blocked"}:
-                return current
-            completed = replace(
-                current,
-                status=status,
-                error_type=error_type,
-                completed_at=utc_now(),
-            )
-            conn.execute(
-                "UPDATE studycrew_tool_invocations SET status=?, payload_json=? WHERE invocation_id=?",
-                (status, _dumps(completed.to_dict()), invocation_id),
-            )
-        return completed
+        updated, _changed = self._transition_tool_with_event(
+            invocation_id,
+            expected_statuses=frozenset({"running"}),
+            status=status,
+            event_type="tool_completed" if status == "completed" else "tool_failed",
+            error_type=error_type,
+        )
+        return updated
 
     def claim_tool_execution(self, invocation_id: str) -> tuple[ToolInvocation, bool]:
         """Atomically move exactly one prepared invocation to the effect boundary."""
-        with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT payload_json FROM studycrew_tool_invocations WHERE invocation_id=?",
-                (invocation_id,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeStoreError(f"tool invocation not found: {invocation_id}")
-            current = self._tool_from_raw(_loads(row["payload_json"]))
-            self._assert_group_mutable_in_transaction(conn, current.group_id)
-            if current.status != "prepared":
-                return current, False
-            running = replace(current, status="running")
-            cursor = conn.execute(
-                "UPDATE studycrew_tool_invocations SET status='running', payload_json=? "
-                "WHERE invocation_id=? AND status='prepared'",
-                (_dumps(running.to_dict()), invocation_id),
-            )
-            if cursor.rowcount != 1:
-                winner_row = conn.execute(
-                    "SELECT payload_json FROM studycrew_tool_invocations WHERE invocation_id=?",
-                    (invocation_id,),
-                ).fetchone()
-                winner = self._tool_from_raw(_loads(winner_row["payload_json"]))
-                return winner, False
-        return running, True
+        return self._transition_tool_with_event(
+            invocation_id,
+            expected_statuses=frozenset({"prepared"}),
+            status="running",
+            event_type="tool_claimed",
+        )
 
     @staticmethod
     def insert_tool_in_transaction(conn: Any, invocation: ToolInvocation) -> None:
@@ -1310,23 +1387,15 @@ class TaskRuntimeStore:
         )
 
     def mark_tool_recovered_blocked(self, invocation_id: str) -> ToolInvocation:
-        with self.db.transaction() as conn:
-            row = conn.execute(
-                "SELECT payload_json FROM studycrew_tool_invocations WHERE invocation_id=?",
-                (invocation_id,),
-            ).fetchone()
-            if row is None:
-                raise RuntimeStoreError(f"tool invocation not found: {invocation_id}")
-            current = self._tool_from_raw(_loads(row["payload_json"]))
-            self._assert_group_mutable_in_transaction(conn, current.group_id)
-            blocked = replace(
-                current, status="recovered_blocked", replay_allowed=False,
-                disposition="recovered_blocked",
-            )
-            conn.execute(
-                "UPDATE studycrew_tool_invocations SET status=?, replay_allowed=0, payload_json=? WHERE invocation_id=?",
-                (blocked.status, _dumps(blocked.to_dict()), invocation_id),
-            )
+        blocked, _changed = self._transition_tool_with_event(
+            invocation_id,
+            expected_statuses=frozenset({"prepared", "running"}),
+            status="recovered_blocked",
+            event_type="tool_recovered_blocked",
+            error_type="RestartRecoveryBlocked",
+            disposition="recovered_blocked",
+            replay_allowed=False,
+        )
         return blocked
 
     def save_verifier_decision_in_transaction(

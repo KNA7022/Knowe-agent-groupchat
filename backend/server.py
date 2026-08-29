@@ -30,6 +30,7 @@ import contextlib
 import hashlib
 import inspect
 import hmac
+import ipaddress
 import json
 import logging
 import mimetypes                # [v0.36] /preview 端点按扩展名猜 Content-Type
@@ -433,11 +434,13 @@ class KnoweServer:
     TASK_RUNTIME_DELETION_ERROR_RETRY_MAX_SECONDS = 1.0
     _SECRET_BROKER_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{64}$")
     _SECRET_LEASE_PURPOSE_RE = re.compile(
-        r"^(?:provider|master-key):[a-z0-9][a-z0-9_.-]{0,63}$",
+        r"^(?:provider:[0-9a-f]{64}|master-key:[a-z0-9][a-z0-9_.-]{0,63})$",
     )
     _SECRET_LEASE_FIELDS = frozenset({
-        "lease_id", "secret_ref", "purpose", "value", "expires_at",
+        "lease_id", "secret_ref", "slot", "kind", "purpose", "audience",
+        "provider_id", "endpoint", "transport", "value", "expires_at",
     })
+    _SECRET_REVOKE_FIELDS = frozenset({"secret_ref"})
     _SECRET_LEASE_BODY_MAX_BYTES = 64 * 1024
 
     def __init__(self, data_dir: str | None = None) -> None:
@@ -4962,7 +4965,6 @@ class KnoweServer:
                           and aux.get("base_url"))
             if not aux_ok:
                 return text
-            aux_key = runtime_settings.resolve_provider_credential(aux)
             out = await asyncio.wait_for(
                 aux_client.chat(
                     [
@@ -4972,9 +4974,7 @@ class KnoweServer:
                         )},
                         {"role": "user", "content": text},
                     ],
-                    api_key=aux_key,
-                    base_url=aux["base_url"],
-                    model=aux["model"],
+                    binding=aux,
                     timeout_s=8.0, what=msg("server.py.088"),
                 ),
                 timeout=9.0,
@@ -6530,7 +6530,7 @@ class KnoweServer:
             # The renderer can obtain the ordinary runtime token for WebSocket/control-plane
             # calls.  Credential material therefore crosses a separate main-process-only
             # capability, accepted only as a header (never a URL/query parameter).
-            if path == "/internal/credential-lease" and method == "POST":
+            if path in {"/internal/credential-lease", "/internal/credential-revoke"} and method == "POST":
                 supplied_broker_token = headers.get("x-knowe-secret-broker-token", "")
                 if (
                     not self._secret_broker_token
@@ -6571,7 +6571,7 @@ class KnoweServer:
             allowed_origins = self._configured_renderer_origins()
             origin = headers.get("origin", "").strip()
             cors_token = None
-            if path != "/internal/credential-lease" and origin in allowed_origins:
+            if path not in {"/internal/credential-lease", "/internal/credential-revoke"} and origin in allowed_origins:
                 cors_token = _HTTP_CORS_ORIGIN.set(origin)
 
             exact_route_methods: dict[str, set[str]] = {
@@ -6580,6 +6580,7 @@ class KnoweServer:
                 "/settings": {"GET", "POST"},
                 "/settings/test": {"POST"},
                 "/internal/credential-lease": {"POST"},
+                "/internal/credential-revoke": {"POST"},
                 "/projects/menu-state": {"GET"},
                 "/projects/pin": {"POST"},
                 "/projects/mute": {"POST"},
@@ -6677,7 +6678,7 @@ class KnoweServer:
                         return
                     body_limit = (
                         self._SECRET_LEASE_BODY_MAX_BYTES
-                        if path == "/internal/credential-lease" else 1_000_000
+                        if path in {"/internal/credential-lease", "/internal/credential-revoke"} else 1_000_000
                     )
                     if content_length > body_limit:
                         self._write_http(
@@ -6685,11 +6686,11 @@ class KnoweServer:
                             b"413 Payload Too Large",
                             (
                                 b'{"error":"request body exceeds route policy"}'
-                                if path == "/internal/credential-lease"
+                                if path in {"/internal/credential-lease", "/internal/credential-revoke"}
                                 else b'{"error":"request body exceeds 1000000 bytes"}'
                             ),
                             b"application/json",
-                            cors=path != "/internal/credential-lease",
+                            cors=path not in {"/internal/credential-lease", "/internal/credential-revoke"},
                         )
                         await writer.drain()
                         return
@@ -6717,6 +6718,10 @@ class KnoweServer:
 
                 if path == "/internal/credential-lease" and method == "POST":
                     self._serve_secret_lease_ingress(writer, body_bytes)
+                    await writer.drain()
+                    return
+                if path == "/internal/credential-revoke" and method == "POST":
+                    self._serve_secret_lease_revoke(writer, body_bytes)
                     await writer.drain()
                     return
 
@@ -7003,6 +7008,48 @@ class KnoweServer:
         ).encode("utf-8")
         self._write_http(
             writer, b"202 Accepted", body, b"application/json", cors=False,
+        )
+
+    @staticmethod
+    def _secret_broker_host_is_loopback(host: str) -> bool:
+        candidate = str(host or "").strip().casefold()
+        if candidate == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(candidate).is_loopback
+        except ValueError:
+            return False
+
+    def _assert_secret_broker_loopback(self) -> None:
+        if self._secret_broker_token and not self._secret_broker_host_is_loopback(
+            CONFIG.health_host
+        ):
+            raise RuntimeError(
+                "credential broker requires a hard loopback HTTP listener"
+            )
+
+    def _serve_secret_lease_revoke(
+        self, writer: asyncio.StreamWriter, body_bytes: bytes,
+    ) -> None:
+        try:
+            payload = json.loads(body_bytes.decode("utf-8"))
+            if (
+                not isinstance(payload, dict)
+                or frozenset(payload) != self._SECRET_REVOKE_FIELDS
+                or not isinstance(payload.get("secret_ref"), str)
+                or re.fullmatch(r"secret_[0-9a-f]{32}", payload["secret_ref"]) is None
+            ):
+                raise ValueError
+            self.secret_leases.revoke_secret(payload["secret_ref"])
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            self._write_http(
+                writer, b"400 Bad Request",
+                b'{"ok":false,"code":"invalid_secret_revocation"}',
+                b"application/json", cors=False,
+            )
+            return
+        self._write_http(
+            writer, b"202 Accepted", b'{"ok":true}', b"application/json", cors=False,
         )
 
     def _menu_project_id(self, payload: dict[str, Any]) -> str:
@@ -10541,6 +10588,7 @@ class KnoweServer:
     async def run(self) -> None:
         if not re.fullmatch(r"[0-9a-fA-F]{64}", CONFIG.runtime_token):
             raise RuntimeError("KNOWE_RUNTIME_TOKEN must be exactly 64 hexadecimal characters")
+        self._assert_secret_broker_loopback()
 
         provenance = activate_build(
             self.data_root,
@@ -10693,6 +10741,8 @@ class KnoweServer:
                 self.store.close(timeout=10.0)
             if self.task_runtime is not None:
                 self.task_runtime.close()
+            self.secret_leases.close()
+            runtime_settings.set_secret_lease_broker(None)
             await ProviderClient.aclose_shared_clients()
 
     # ── [v0.15] Harness Memory：事件驱动 + 去抖 + 定时兜底 ──

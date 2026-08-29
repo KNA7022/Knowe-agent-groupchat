@@ -207,7 +207,7 @@ def test_truncate_empty_is_empty():
 
 @pytest.mark.asyncio
 async def test_registry_register_and_execute_async_handler():
-    reg = ToolRegistry()
+    reg = ToolRegistry(unsafe_test_mode=True)
 
     async def handler(args: dict[str, Any], **kw: Any) -> str:
         await asyncio.sleep(0)                 # ★ 真的 await（工具要等闸门）
@@ -222,28 +222,28 @@ async def test_registry_register_and_execute_async_handler():
 
 @pytest.mark.asyncio
 async def test_registry_accepts_sync_handlers_too():
-    reg = ToolRegistry()
+    reg = ToolRegistry(unsafe_test_mode=True)
     reg.register("s", "d", {}, lambda args, **kw: "sync-ok")
     assert await reg.execute("s", {}) == "sync-ok"
 
 
 @pytest.mark.asyncio
 async def test_registry_unknown_tool_raises():
-    reg = ToolRegistry()
+    reg = ToolRegistry(unsafe_test_mode=True)
     with pytest.raises(ToolNotFoundError):
         await reg.execute("nope", {})
 
 
 def test_registry_duplicate_name_is_rejected():
     """静默覆盖一个工具是灾难——宁可当场炸。"""
-    reg = ToolRegistry()
+    reg = ToolRegistry(unsafe_test_mode=True)
     reg.register("t", "d", {}, lambda a, **k: "")
     with pytest.raises(ValueError):
         reg.register("t", "d2", {}, lambda a, **k: "")
 
 
 def test_registry_schemas_are_openai_shaped():
-    reg = ToolRegistry()
+    reg = ToolRegistry(unsafe_test_mode=True)
     reg.register("t", "干点什么", {"type": "object", "properties": {}},
                  lambda a, **k: "", requires_approval=True)
 
@@ -362,7 +362,7 @@ async def test_loop_executes_tool_then_continues():
         tool_stream("add", {"a": 1, "b": 2}),
         text_stream("答案是 3。"),
     ])
-    reg = ToolRegistry()
+    reg = ToolRegistry(unsafe_test_mode=True)
     called: list[dict[str, Any]] = []
 
     async def add(args: dict[str, Any], **kw: Any) -> str:
@@ -391,7 +391,7 @@ async def test_loop_tool_error_is_fed_back_not_raised():
         tool_stream("boom", {}),
         text_stream("那我换个做法。"),
     ])
-    reg = ToolRegistry()
+    reg = ToolRegistry(unsafe_test_mode=True)
 
     async def boom(args: dict[str, Any], **kw: Any) -> str:
         raise RuntimeError("我炸了")

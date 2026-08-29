@@ -84,15 +84,17 @@ class ToolRegistry:
         schemas = reg.get_schemas()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, unsafe_test_mode: bool = False) -> None:
         self._tools: dict[str, ToolDef] = {}
         self._execution_boundary: ToolExecutionBoundary | None = None
+        self._unsafe_test_mode = bool(unsafe_test_mode)
 
     def set_execution_boundary(self, boundary: ToolExecutionBoundary) -> None:
         """Install the sole execution boundary for this registry.
 
-        Production registries bind the commercial Tool Gateway here.  Tests and pure
-        embedders that do not install a boundary retain the historical in-process seam.
+        Production registries bind the commercial Tool Gateway here.  The historical
+        direct-handler path is available only through the explicit ``unsafe_test_mode``
+        constructor seam; an unbound registry otherwise denies every effect.
         """
 
         if self._execution_boundary is not None:
@@ -146,7 +148,12 @@ class ToolRegistry:
             if inspect.isawaitable(out):
                 out = await out
             return str(out)
-        return await tool.execute(args, **context)
+        if self._unsafe_test_mode:
+            return await tool.execute(args, **context)
+        raise ToolExecutionError(
+            name,
+            PermissionError("ToolRegistry execution boundary is unavailable; effect denied"),
+        )
 
     def is_gated(self, name: str) -> bool:
         """这个工具要不要先问过人。"""

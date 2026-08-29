@@ -16,6 +16,7 @@ from backend.commercial_gateway import (
     SecretLeaseBroker,
     ToolExecutionRequest,
     ToolGateway,
+    derive_provider_credential_purpose,
 )
 from backend.groups import GroupRepository
 from backend.task_runtime.contracts import (
@@ -140,6 +141,7 @@ async def test_forged_scope_cross_tool_and_reused_grant_fail_closed(tmp_path: Pa
             write_roots=(str(workspace),),
         ),
         lambda request: launches.append(request.executable) or "ok",
+        trusted_sandbox=True,
     )
     request = ToolExecutionRequest(
         group_id=group_id,
@@ -285,7 +287,7 @@ def test_mcp_rejects_malicious_discovery_redirects_and_unexpected_capabilities()
         server_id="mcp_" + "1" * 32,
         name="local",
         transport="stdio",
-        command="trusted-mcp",
+        command=sys.executable,
         allowed_tools=("lookup",),
         allowed_resources=("course://catalog",),
         prompts_enabled=False,
@@ -364,10 +366,23 @@ def test_secret_lease_is_purpose_bound_expires_and_never_serializes_plaintext() 
     broker = SecretLeaseBroker(max_ttl_seconds=60)
     secret = "sk-super-secret-value"
     now = datetime.now(timezone.utc)
+    purpose = derive_provider_credential_purpose(
+        slot="main", provider_id="deepseek",
+        endpoint="https://api.deepseek.com/v1", transport="openai_chat",
+    )
+    metadata = {
+        "slot": "main",
+        "kind": "provider_credential",
+        "purpose": purpose,
+        "audience": "provider_gateway",
+        "provider_id": "deepseek",
+        "endpoint": "https://api.deepseek.com/v1",
+        "transport": "openai_chat",
+    }
     broker.provision(
         lease_id="lease_" + "a" * 32,
         secret_ref="secret_" + "b" * 32,
-        purpose="provider:chat",
+        **metadata,
         value=secret,
         expires_at=(now + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
         now=now,
@@ -375,17 +390,17 @@ def test_secret_lease_is_purpose_bound_expires_and_never_serializes_plaintext() 
     with pytest.raises(GatewayDenied, match="purpose"):
         broker.redeem("lease_" + "a" * 32, purpose="diagnostics", now=now)
     assert broker.redeem(
-        "lease_" + "a" * 32, purpose="provider:chat", now=now
+        "lease_" + "a" * 32, purpose=purpose, now=now
     ) == secret
     # Provider clients resolve by the durable opaque SecretRef.  The plaintext remains
     # usable only for this short lease window and a replacement lease rotates it.
     assert broker.redeem_for_secret(
-        "secret_" + "b" * 32, purpose="provider:chat", now=now
+        "secret_" + "b" * 32, purpose=purpose, now=now
     ) == secret
     broker.provision(
         lease_id="lease_" + "c" * 32,
         secret_ref="secret_" + "b" * 32,
-        purpose="provider:chat",
+        **metadata,
         value=secret,
         expires_at=(now + timedelta(seconds=5)).isoformat().replace("+00:00", "Z"),
         now=now,
@@ -393,11 +408,12 @@ def test_secret_lease_is_purpose_bound_expires_and_never_serializes_plaintext() 
     with pytest.raises(GatewayDenied, match="expired"):
         broker.redeem(
             "lease_" + "c" * 32,
-            purpose="provider:chat",
+            purpose=purpose,
             now=now + timedelta(seconds=6),
         )
     assert secret not in str(broker.public_snapshot())
     assert secret not in str(broker.redact_diagnostics({"api_key": secret, "nested": [secret]}))
+    broker.close()
 
 
 def test_provider_failover_never_downgrades_privacy_or_bypasses_budget() -> None:

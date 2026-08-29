@@ -736,7 +736,13 @@ function deliverCredentialLease(lease: PrivateCredentialLease): Promise<void> {
     const body = Buffer.from(JSON.stringify({
       lease_id: lease.lease_id,
       secret_ref: lease.secret_ref,
+      slot: lease.slot,
+      kind: lease.kind,
       purpose: lease.purpose,
+      audience: lease.audience,
+      provider_id: lease.provider_id,
+      endpoint: lease.endpoint,
+      transport: lease.transport,
       value: lease.value,
       expires_at: lease.expires_at,
     }), 'utf8');
@@ -768,15 +774,110 @@ function deliverCredentialLease(lease: PrivateCredentialLease): Promise<void> {
   });
 }
 
+function deliverCredentialRevocation(secretRef: string): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    if (!/^secret_[0-9a-f]{32}$/.test(secretRef)
+        || !/^[0-9a-f]{64}$/.test(runtimeToken)
+        || !/^[0-9a-f]{64}$/.test(secretBrokerToken)
+        || runtimeToken === secretBrokerToken) {
+      rejectPromise(new Error('Credential broker is unavailable.'));
+      return;
+    }
+    const body = Buffer.from(JSON.stringify({ secret_ref: secretRef }), 'utf8');
+    const req = httpRequest(`${RUNTIME_ENDPOINTS.httpBase}/internal/credential-revoke`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(body.byteLength),
+        'X-Knowe-Runtime-Token': runtimeToken,
+        'X-Knowe-Secret-Broker-Token': secretBrokerToken,
+      },
+    }, (res) => {
+      const accepted = res.statusCode === 202;
+      res.resume();
+      res.once('end', () => {
+        body.fill(0);
+        if (accepted) resolvePromise();
+        else rejectPromise(new Error('Credential revocation was rejected.'));
+      });
+    });
+    req.once('error', () => { body.fill(0); rejectPromise(new Error('Credential broker is unavailable.')); });
+    req.setTimeout(5_000, () => req.destroy());
+    req.end(body);
+  });
+}
+
+function activeProviderSecretRefs(): Promise<Set<string>> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    if (!/^[0-9a-f]{64}$/.test(runtimeToken)) {
+      rejectPromise(new Error('Runtime authentication is unavailable.'));
+      return;
+    }
+    const req = httpRequest(`${RUNTIME_ENDPOINTS.httpBase}/settings`, {
+      method: 'GET', headers: { 'X-Knowe-Runtime-Token': runtimeToken },
+    }, (res) => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        rejectPromise(new Error('Active credential settings are unavailable.'));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let size = 0;
+      res.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        if (size > 1_048_576) {
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.once('end', () => {
+        try {
+          if (size > 1_048_576) throw new Error('settings response exceeds policy');
+          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as Record<string, unknown>;
+          const refs = new Set<string>();
+          const collect = (value: unknown): void => {
+            if (!value || typeof value !== 'object') return;
+            const record = value as Record<string, unknown>;
+            const secretRef = record.secret_ref;
+            if (typeof secretRef === 'string' && /^secret_[0-9a-f]{32}$/.test(secretRef)) {
+              refs.add(secretRef);
+            }
+          };
+          collect(parsed.main_model);
+          collect(parsed.aux_model);
+          const agents = parsed.agent_models;
+          if (agents && typeof agents === 'object') Object.values(agents).forEach(collect);
+          resolvePromise(refs);
+        } catch {
+          rejectPromise(new Error('Active credential settings are malformed.'));
+        }
+      });
+      res.once('error', () => rejectPromise(new Error('Active credential settings are unavailable.')));
+    });
+    req.once('error', () => rejectPromise(new Error('Active credential settings are unavailable.')));
+    req.setTimeout(5_000, () => req.destroy());
+    req.end();
+  });
+}
+
 async function refreshProviderCredentialLeases(): Promise<void> {
   const vault = secretVault;
   if (!vault || current.phase !== 'ready') return;
+  let active: Set<string>;
+  try {
+    active = await activeProviderSecretRefs();
+    await vault.reconcileActive(active, deliverCredentialRevocation);
+  } catch {
+    // Unknown active state must not renew every historical record. Existing leases
+    // expire independently in Python and provider calls then fail closed.
+    return;
+  }
   for (const reference of vault.list()) {
-    if (reference.kind !== 'provider_credential') continue;
+    if (reference.kind !== 'provider_credential' || !active.has(reference.secret_ref)) continue;
     try {
       await vault.issueLease({
         secret_ref: reference.secret_ref,
-        purpose: reference.purpose,
         ttl_seconds: SECRET_LEASE_TTL_SECONDS,
         deliver: deliverCredentialLease,
       });
@@ -802,6 +903,7 @@ function registerMainSecretBoundary(): void {
       mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.id : null
     ),
     deliverLease: deliverCredentialLease,
+    revokeLease: deliverCredentialRevocation,
   });
   if (secretLeaseRefreshTimer) clearInterval(secretLeaseRefreshTimer);
   secretLeaseRefreshTimer = setInterval(() => {
@@ -836,8 +938,15 @@ function registerMainSecretBoundary(): void {
 
 /** spawn 后端用的环境变量：固定数据根、固定安装根与 UTF-8 stdio。 */
 function buildBackendEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const inheritedName of Object.keys(env)) {
+    if (/(?:API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|AUTH_TOKEN|MASTER_KEY|SECRET_KEY|PASSWORD)$/i.test(
+      inheritedName,
+    )) {
+      delete env[inheritedName];
+    }
+  }
+  Object.assign(env, {
     PYTHONUNBUFFERED: '1',
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8',
@@ -849,7 +958,7 @@ function buildBackendEnv(): NodeJS.ProcessEnv {
     KNOWE_SECRET_BROKER_TOKEN: secretBrokerToken,
     KNOWE_ATTACHMENT_KEY: getAttachmentSignKey(),
     KNOWE_AGENT: process.env.KNOWE_AGENT ?? 'deepseek',
-  };
+  });
   // [阶段1.5] PYTHONPATH 双保险只对开发态有意义（`python -m backend` 的模块解析兜底）；
   //           打包版是 PyInstaller 自包含产物（依赖在 _internal/），不再注入。
   if (!app.isPackaged) {

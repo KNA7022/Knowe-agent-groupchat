@@ -8,14 +8,9 @@ PRD 说「可使用现有的 DeepSeek API key（如果 DeepSeek 模型支持视�
 或预留多模态模型扩展点」。答案是「不支持」，所以这个模块的重点其实是
 **那个扩展点**，以及**当用户撞上「不支持」时，他会看到什么**。
 
-设计：三个环境变量 KNOWE_VISION_{MODEL,BASE_URL,API_KEY}，默认全部
-继承 DeepSeek 那一套。于是：
-  · 什么都不配 → 走 DeepSeek → 400 → 一句人话告诉他「配一个能看图的模型」
-    （翻译在 aux_client._http_hint，那是唯一知道 HTTP 状态码的地方）
-  · 配了 gpt-4o-mini / qwen-vl-max / gemini → 直接就能用，一行代码没改。
-
-「预留扩展点」不是在代码里留个 TODO，是让用户改三个环境变量就能接上任何
-OpenAI 兼容的多模态服务 —— 而这恰好是今天所有多模态服务的通用形状。
+设计：视觉模型沿用设置中心的 Provider binding；凭据只能以 purpose-bound
+SecretRef/短期 lease 解析，模型请求统一经过 Provider Gateway。没有受管 binding
+或 authoritative Task Runtime 时会在网络 effect 前失败。
 
 `image_generate` 按 PRD 不做：Knowe 是开发工具，不是设计工具。
 """
@@ -25,7 +20,7 @@ from __future__ import annotations
 import base64
 import logging
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from . import aux_client
 from .agent_runtime import ToolError
@@ -116,9 +111,7 @@ async def analyze(
     prompt: str,
     *,
     resolve_local: Callable[[str], Path],
-    api_key: str,
-    base_url: str,
-    model: str,
+    binding: Mapping[str, Any],
     max_tokens: int = 900,
     timeout_s: float = 60.0,
 ) -> str:
@@ -127,11 +120,15 @@ async def analyze(
     # Missing credentials are a deployment/configuration error independent of model
     # capability.  Report that first so operators receive the actionable prerequisite
     # instead of a misleading model-capability diagnosis.
-    if not isinstance(api_key, str) or not api_key.strip():
+    if not (
+        isinstance(binding, Mapping)
+        and binding.get("secret_ref")
+        and binding.get("credential_purpose")
+    ):
         raise ToolError(
-            "视觉分析缺少 API key。请配置 KNOWE_VISION_API_KEY（或对应服务的 API key），"
-            "并同时确认 KNOWE_VISION_MODEL/BASE_URL 指向可接收图片的多模态模型。"
+            "视觉分析缺少受管 API key（SecretRef）。请在设置中配置可接收图片的多模态模型。"
         )
+    model = str(binding.get("model") or "")
     # [v0.34 修复D] 视觉模型是纯文本模型 → 当场诚实报错，别让它幻觉一段「看到了什么」。
     #   这正是「反复截图确认却全是假的」的模型层根因：一个看不了图的模型被要求看图，
     #   只能编。给一条能立刻照做的换路指令，而不是一段假描述。
@@ -142,8 +139,8 @@ async def analyze(
             "① safe_read_file 重新读回目标位置，确认内容真的在；"
             "② 需要看渲染效果时，用 browser_evaluate 读元素的 computed style / "
             "getBoundingClientRect（宽高是否为 0、是否 display:none / opacity:0）。"
-            "要真正看图，请给管理员配置一个多模态模型"
-            "（环境变量 KNOWE_VISION_MODEL/BASE_URL/API_KEY，如 gpt-4o-mini、qwen-vl-max）。"
+            "要真正看图，请让管理员在设置中心配置一个多模态 Provider binding"
+            "（如 gpt-4o-mini、qwen-vl-max）。"
         )
     part = build_image_part(image_ref, resolve_local)
     messages = [{
@@ -151,7 +148,7 @@ async def analyze(
         "content": [part, {"type": "text", "text": prompt.strip()}],
     }]
     text = await aux_client.chat(
-        messages, api_key=api_key, base_url=base_url, model=model,
+        messages, binding=binding,
         timeout_s=timeout_s,
         what="视觉分析",
     )

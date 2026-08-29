@@ -5,6 +5,7 @@ import asyncio
 import unittest
 
 from backend import runtime_settings
+from backend.commercial_gateway import derive_provider_credential_purpose
 
 
 def binding(**changes: str) -> dict[str, str]:
@@ -12,11 +13,20 @@ def binding(**changes: str) -> dict[str, str]:
         "provider": "openai-api",
         "model": "gpt-test",
         "secret_ref": "secret_" + "a" * 32,
-        "credential_purpose": "provider:main",
-        "base_url": "https://example.invalid/v1/",
+        "credential_slot": "main",
+        "credential_kind": "provider_credential",
+        "credential_audience": "provider_gateway",
+        "base_url": "https://example.invalid/v1",
         "transport": "openai_chat",
     }
     value.update(changes)
+    if "credential_purpose" not in changes:
+        value["credential_purpose"] = derive_provider_credential_purpose(
+            slot=value["credential_slot"],
+            provider_id=value["provider"],
+            endpoint=value["base_url"],
+            transport=value["transport"],
+        )
     return value
 
 

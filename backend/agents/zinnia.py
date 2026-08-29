@@ -42,7 +42,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
-from knowe_core.provider_client import ProviderClient, build_http_timeout
+from knowe_core.provider_client import build_http_timeout
 from knowe_core.provider_identity import provider_target
 from knowe_core.stream_assembler import StreamAssembler
 from knowe_core.tool_protocol import decode_text_tool_protocol
@@ -53,6 +53,7 @@ from ..config import CONFIG
 from ..attachments import inject_into_last_user
 from .. import browser_tools, web_tools
 from .. import runtime_settings   # [v0.44.3 场景1] 知知的模型绑定改从设置面板现取
+from ..commercial_gateway import ProviderGatewayClient
 from ..agent_identity import zinnia_identity
 from ..feature_flags import FeatureFlag, enabled as feature_enabled
 from ..agent_runtime import ToolError, runtime_for
@@ -888,7 +889,7 @@ class ZinniaAgent:
         if (aux and aux.get("secret_ref") and aux.get("credential_purpose")
                 and aux.get("base_url")):
             try:
-                client = ProviderClient(
+                client = ProviderGatewayClient(
                     base_url=str(aux["base_url"]).rstrip("/"),
                     api_key="",
                     model=aux.get("model") or "",
@@ -900,6 +901,7 @@ class ZinniaAgent:
                     ),
                     max_retries=0,
                     provider=str(aux.get("provider") or ""),
+                    transport=str(aux.get("transport") or "openai_chat"),
                     credential_provider=(
                         lambda selected=dict(aux): runtime_settings.resolve_provider_credential(selected)
                     ),
@@ -1285,11 +1287,11 @@ class ZinniaAgent:
             )
         return "", list(turn.tool_calls)
 
-    def _make_client(self) -> ProviderClient | None:
+    def _make_client(self) -> ProviderGatewayClient | None:
         binding = self._credential_binding
         if self._client_factory is None and not self.api_key and binding is None:
             return None
-        return ProviderClient(
+        return ProviderGatewayClient(
             base_url=self.base_url,
             api_key=self.api_key,
             model=self.model,
@@ -1302,10 +1304,12 @@ class ZinniaAgent:
             max_retries=CONFIG.provider_max_retries,
             client_factory=self._client_factory,
             provider=self.provider,
+            transport=str((binding or {}).get("transport") or "openai_chat"),
             credential_provider=(
                 (lambda selected=dict(binding): runtime_settings.resolve_provider_credential(selected))
                 if binding is not None else None
             ),
+            allow_ungoverned_test_transport=self._client_factory is not None,
         )
 
 

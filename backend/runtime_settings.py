@@ -21,9 +21,10 @@ config.py 是「装机常量」：进程起来就定死（frozen dataclass）。
  3. 「永不超时」在权威状态中就是 None；只有展示层需要时才使用远期日期。
     前端下发 null / 0 都归一到 None，Gate 不创建自动 timeout 任务。
 
-── Key 的去向 ──
-API Key 随设置落在 CONFIG.data_dir/settings.json（0600 权限），与 DEEPSEEK_API_KEY
-环境变量同一台机器、同一信任边界；不出本机。
+── 凭据边界 ──
+Python 配置只保存 Electron safeStorage 的 opaque SecretRef 与 main 派生的绑定元数据。
+Provider 调用点只能兑换 purpose-bound 短租；dotenv、环境变量和 settings.json 明文均不是
+凭据来源。
 """
 
 from __future__ import annotations
@@ -36,23 +37,19 @@ import logging
 import os
 import re
 import secrets
-import time
-import urllib.error
-import urllib.request
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-from knowe_core.provider_identity import http_status_error_message, provider_target
+from knowe_core.provider_identity import provider_target
 from .i18n_backend import msg
 
 log = logging.getLogger("knowe.settings")
 
 _SECRET_REF_RE = re.compile(r"^secret_[0-9a-f]{32}$")
-_CREDENTIAL_PURPOSE_RE = re.compile(
-    r"^(?:provider|master-key):[a-z0-9][a-z0-9_.-]{0,63}$",
-)
+_CREDENTIAL_PURPOSE_RE = re.compile(r"^provider:[0-9a-f]{64}$")
+_CREDENTIAL_SLOT_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,127}$")
 _secret_lease_broker: Any | None = None
 
 
@@ -73,10 +70,34 @@ def resolve_provider_credential(raw: Any) -> str:
         raise RuntimeError("provider credential lease is unavailable")
     secret_ref = binding.get("secret_ref", "")
     purpose = binding.get("credential_purpose", "")
-    if not secret_ref or not purpose:
+    slot = binding.get("credential_slot", "")
+    if (
+        not secret_ref
+        or not purpose
+        or not slot
+        or binding.get("credential_kind") != "provider_credential"
+        or binding.get("credential_audience") != "provider_gateway"
+    ):
         raise RuntimeError("provider credential lease is unavailable")
     try:
-        value = broker.redeem_for_secret(secret_ref, purpose=purpose)
+        from .commercial_gateway import derive_provider_credential_purpose
+
+        expected = derive_provider_credential_purpose(
+            slot=slot,
+            provider_id=binding["provider"],
+            endpoint=binding["base_url"],
+            transport=binding["transport"],
+        )
+        if not hmac.compare_digest(purpose, expected):
+            raise RuntimeError("provider credential purpose is invalid")
+        value = broker.redeem_provider_credential(
+            secret_ref,
+            slot=slot,
+            provider_id=binding["provider"],
+            endpoint=binding["base_url"],
+            transport=binding["transport"],
+            expected_purpose=expected,
+        )
     except Exception as exc:
         raise RuntimeError("provider credential lease is unavailable") from exc
     if not value:
@@ -167,10 +188,11 @@ def _ensure_loaded() -> None:
     global _loaded
     if _loaded:
         return
-    _loaded = True
     path = _settings_path()
     if path is None or not path.exists():
+        _loaded = True
         return
+    legacy_plaintext = False
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
@@ -191,14 +213,13 @@ def _ensure_loaded() -> None:
                 base["settings_revision"] = max(0, int(base.get("settings_revision") or 0))
             except (TypeError, ValueError):
                 base["settings_revision"] = 0
-            _state.update(base)
             # Legacy settings.json files may contain plaintext API keys.  They are
             # untrusted input after this migration: normalize bindings into opaque
             # handles only and never keep the old value in Python memory.
-            _state["main_model"] = _norm_binding(_state.get("main_model"))
-            _state["aux_model"] = _norm_binding(_state.get("aux_model"))
-            agents = _state.get("agent_models")
-            _state["agent_models"] = {
+            base["main_model"] = _norm_binding(base.get("main_model"))
+            base["aux_model"] = _norm_binding(base.get("aux_model"))
+            agents = base.get("agent_models")
+            base["agent_models"] = {
                 str(key): binding
                 for key, value in (agents.items() if isinstance(agents, dict) else ())
                 if (binding := _norm_binding(value)) is not None
@@ -207,14 +228,30 @@ def _ensure_loaded() -> None:
             # effective in production, so activate it once during migration.  A truly
             # new install starts without a binding and still requires test→apply.
             if raw.get("main_model") and "active_model_fingerprint" not in raw:
-                _state["active_model_fingerprint"] = binding_fingerprint(raw.get("main_model"))
+                base["active_model_fingerprint"] = None
             if legacy_plaintext:
                 # Successful load is also the one-way disk migration.  Keeping the
                 # plaintext in an old file would remain a credential bypass even if
                 # the current Python process had already dropped it from memory.
-                _persist()
+                _persist(base)
+            _state.clear()
+            _state.update(base)
+            _loaded = True
             log.info(msg("runtime_settings.py.001"), path)
-    except Exception as exc:  # noqa: BLE001 — settings.json 坏了不该拖死后端
+        else:
+            _loaded = True
+    except Exception as exc:
+        if legacy_plaintext:
+            # Loading an in-memory redacted copy while leaving plaintext durable
+            # would preserve a credential bypass.  Keep the authority unloaded and
+            # block provider readiness until the old file can be cleaned/quarantined.
+            _state.clear()
+            _state.update(_default_state())
+            _loaded = False
+            raise RuntimeError(
+                "legacy plaintext provider settings could not be removed safely"
+            ) from exc
+        _loaded = True
         log.warning(msg("runtime_settings.py.002"), exc)
 
 
@@ -253,17 +290,54 @@ def _norm_binding(raw: Any) -> dict[str, str] | None:
         return None
     secret_ref = str(raw.get("secret_ref") or "").strip()
     purpose = str(raw.get("credential_purpose") or raw.get("purpose") or "").strip()
+    slot = str(raw.get("credential_slot") or raw.get("slot") or "").strip()
+    kind = str(raw.get("credential_kind") or raw.get("kind") or "").strip()
+    audience = str(raw.get("credential_audience") or raw.get("audience") or "").strip()
+    base_url = str(raw.get("base_url") or "").rstrip("/")
+    transport = str(raw.get("transport") or "openai_chat")
     if secret_ref and _SECRET_REF_RE.fullmatch(secret_ref) is None:
         secret_ref = ""
     if purpose and _CREDENTIAL_PURPOSE_RE.fullmatch(purpose) is None:
         purpose = ""
+    if slot and _CREDENTIAL_SLOT_RE.fullmatch(slot) is None:
+        slot = ""
+    if secret_ref:
+        try:
+            from .commercial_gateway import (
+                _canonical_provider_endpoint,
+                derive_provider_credential_purpose,
+            )
+
+            canonical_endpoint = _canonical_provider_endpoint(base_url)
+            expected_purpose = derive_provider_credential_purpose(
+                slot=slot,
+                provider_id=provider,
+                endpoint=canonical_endpoint,
+                transport=transport,
+            )
+            if (
+                canonical_endpoint != base_url
+                or kind != "provider_credential"
+                or audience != "provider_gateway"
+                or not hmac.compare_digest(purpose, expected_purpose)
+            ):
+                raise ValueError
+        except (ValueError, RuntimeError, PermissionError):
+            secret_ref = ""
+            purpose = ""
+            slot = ""
+            kind = ""
+            audience = ""
     return {
         "provider": provider,
         "model": model,
-        "base_url": str(raw.get("base_url") or "").rstrip("/"),
-        "transport": str(raw.get("transport") or "openai_chat"),
+        "base_url": base_url,
+        "transport": transport,
         "secret_ref": secret_ref,
         "credential_purpose": purpose,
+        "credential_slot": slot,
+        "credential_kind": kind,
+        "credential_audience": audience,
     }
 
 
@@ -274,6 +348,8 @@ def _binding_for_apply(raw: Any, previous: Any) -> dict[str, str] | None:
     binding = _norm_binding(raw)
     if binding is None:
         return None
+    if isinstance(raw, dict) and raw.get("secret_ref") and not binding["secret_ref"]:
+        raise ValueError("provider credential binding metadata is invalid")
     prior = _norm_binding(previous)
     clear_requested = isinstance(raw, dict) and any(
         raw.get(key) is True for key in ("clear_api_key", "api_key_clear", "clearApiKey")
@@ -281,6 +357,9 @@ def _binding_for_apply(raw: Any, previous: Any) -> dict[str, str] | None:
     if clear_requested:
         binding["secret_ref"] = ""
         binding["credential_purpose"] = ""
+        binding["credential_slot"] = ""
+        binding["credential_kind"] = ""
+        binding["credential_audience"] = ""
         return binding
     if (
         not binding["secret_ref"]
@@ -289,6 +368,9 @@ def _binding_for_apply(raw: Any, previous: Any) -> dict[str, str] | None:
     ):
         binding["secret_ref"] = prior["secret_ref"]
         binding["credential_purpose"] = prior["credential_purpose"]
+        binding["credential_slot"] = prior["credential_slot"]
+        binding["credential_kind"] = prior["credential_kind"]
+        binding["credential_audience"] = prior["credential_audience"]
     return binding
 
 
@@ -336,6 +418,9 @@ def binding_for_test(target: str, raw: Any) -> dict[str, str] | None:
     if clear_requested:
         binding["secret_ref"] = ""
         binding["credential_purpose"] = ""
+        binding["credential_slot"] = ""
+        binding["credential_kind"] = ""
+        binding["credential_audience"] = ""
         return binding
     if binding["secret_ref"]:
         return binding
@@ -351,6 +436,9 @@ def binding_for_test(target: str, raw: Any) -> dict[str, str] | None:
         if previous is not None:
             binding["secret_ref"] = previous["secret_ref"]
             binding["credential_purpose"] = previous["credential_purpose"]
+            binding["credential_slot"] = previous["credential_slot"]
+            binding["credential_kind"] = previous["credential_kind"]
+            binding["credential_audience"] = previous["credential_audience"]
     return binding
 
 
@@ -361,6 +449,9 @@ def _binding_complete(binding: dict[str, str] | None) -> bool:
         and binding.get("model")
         and binding.get("secret_ref")
         and binding.get("credential_purpose")
+        and binding.get("credential_slot")
+        and binding.get("credential_kind") == "provider_credential"
+        and binding.get("credential_audience") == "provider_gateway"
         and binding.get("base_url")
     )
 
@@ -384,6 +475,9 @@ def binding_fingerprint(raw: Any) -> str | None:
         binding["transport"].strip().casefold(),
         binding["secret_ref"],
         binding["credential_purpose"],
+        binding["credential_slot"],
+        binding["credential_kind"],
+        binding["credential_audience"],
     )).encode("utf-8")
     salt = str(_state.get("fingerprint_salt") or "").encode("utf-8")
     digest = hmac.new(salt, canonical, hashlib.sha256).hexdigest()
@@ -404,6 +498,9 @@ def public_binding(raw: Any) -> dict[str, Any] | None:
         "has_api_key": bool(binding["secret_ref"]),
         "secret_ref": binding["secret_ref"],
         "credential_purpose": binding["credential_purpose"],
+        "credential_slot": binding["credential_slot"],
+        "credential_kind": binding["credential_kind"],
+        "credential_audience": binding["credential_audience"],
     }
 
 
@@ -920,46 +1017,38 @@ def aux_effective() -> dict[str, str] | None:
 _TEST_TIMEOUT_S = 15
 
 
-def _probe_once(url: str, headers: dict[str, str], body: dict[str, Any],
-                ) -> tuple[int | None, str | None, int | None]:
-    """
-    [v0.44.3] 发一次最小探测。返回 (HTTP 状态码, 网络层错误串, 延迟 ms)。
-    2xx → (200, None, ms)；HTTP 错误 → (code, None, ms)；连不上/超时 → (None, 原因, None)。
-    """
-    # [v0.44.3 对账] 自报家门的 UA：urllib 默认的 `Python-urllib/*` 会被 Cloudflare 的
-    #   Browser Integrity Check（error 1010）直接拒掉——hermes 上游为同一原因专门设了
-    #   自定义 UA（models.py `_HERMES_USER_AGENT` 的注释）。OpenRouter 等前置了
-    #   Cloudflare 的厂商若拦下默认 UA，测试会误报「连不上」，而 Agent 实际调用
-    #   （httpx，另一个 UA）却是通的——测试不许这样冤枉一条好链路。
-    headers = {**headers}
-    headers.setdefault("User-Agent", "Knowe/0.44 (settings-test)")
-    req = urllib.request.Request(
-        url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST",
-    )
-    started = time.monotonic()
-    try:
-        # [v1.0.35][macOS] python.org framework 的 ssl 默认 CA 路径（etc/openssl/cert.pem）
-        # 在 PyInstaller 打包后为空 → urllib 默认上下文拿不到任何根 CA，把所有证书链都判成
-        # 「self signed certificate」而误报连不上；而 Agent 实际路径（httpx）显式用 certifi
-        # 所以正常。这里对齐：显式用 certifi 的 CA bundle 建 SSL 上下文。
-        import certifi
-        import ssl
-        _opener = urllib.request.build_opener(
-            urllib.request.HTTPSHandler(
-                context=ssl.create_default_context(cafile=certifi.where())
-            )
+def _probe_once(binding: Mapping[str, Any]) -> tuple[bool, str]:
+    """Run the settings probe through the same governed provider boundary as Agents."""
+
+    from .commercial_gateway import ProviderGatewayClient
+
+    selected = dict(binding)
+
+    async def run_probe() -> None:
+        client = ProviderGatewayClient(
+            base_url=selected["base_url"],
+            api_key="",
+            model=selected["model"],
+            provider=selected["provider"],
+            transport=selected["transport"],
+            timeout=_TEST_TIMEOUT_S,
+            max_retries=0,
+            credential_provider=(
+                lambda exact=selected: resolve_provider_credential(exact)
+            ),
         )
-        with _opener.open(req, timeout=_TEST_TIMEOUT_S) as resp:
-            resp.read(512)   # 只要能读到响应体开头就算通；内容不重要
-            return (200, None, int((time.monotonic() - started) * 1000))
-    except urllib.error.HTTPError as exc:
-        return (exc.code, None, int((time.monotonic() - started) * 1000))
-    except urllib.error.URLError as exc:
-        return (None, str(getattr(exc, "reason", exc)), None)
-    except TimeoutError:
-        return (None, msg("runtime_settings.py.008", _TEST_TIMEOUT_S=_TEST_TIMEOUT_S), None)
-    except Exception as exc:  # noqa: BLE001 — 测试端点不许把异常抛回 HTTP 层
-        return (None, msg("runtime_settings.py.009", exc=exc), None)
+        try:
+            await client.chat(
+                [{"role": "user", "content": "ping"}], max_tokens=1,
+            )
+        finally:
+            await client.aclose()
+
+    try:
+        asyncio.run(run_probe())
+        return True, ""
+    except Exception as exc:  # settings response exposes only a typed category
+        return False, type(exc).__name__
 
 
 def _test_binding_impl(binding: dict[str, Any]) -> dict[str, Any]:
@@ -987,98 +1076,18 @@ def _test_binding_impl(binding: dict[str, Any]) -> dict[str, Any]:
             "latency_ms": None,
         }
 
-    try:
-        credential = resolve_provider_credential(b)
-    except RuntimeError:
+    ok, failure_type = _probe_once(b)
+    if not ok:
         return {
             "ok": False,
-            "message": "Provider credential lease is unavailable.",
+            "message": f"{target}: governed Provider probe unavailable ({failure_type})",
             "latency_ms": None,
         }
-
-    transport = b["transport"]
-    if transport == "anthropic_messages":
-        url = f"{base}/v1/messages"
-        headers = {
-            "Content-Type": "application/json",
-            "x-api-key": credential,
-            "anthropic-version": "2023-06-01",
-        }
-        body = {
-            "model": b["model"],
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "ping"}],
-        }
-    else:
-        # openai_chat 与 codex_responses 都能吃 /chat/completions 的最小探测
-        # （OpenAI / xAI 两家 codex_responses 厂商的 chat/completions 端点都在）。
-        url = f"{base}/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {credential}",
-        }
-        body = {
-            "model": b["model"],
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "ping"}],
-        }
-
-    code, neterr, latency = _probe_once(url, headers, body)
-    if neterr is not None:
-        return {
-            "ok": False,
-            "message": msg("runtime_settings.py.011", target=target, neterr=neterr),
-            "latency_ms": None,
-        }
-    if code != 200:
-        # 与真实 Agent/知知共用同一套绑定感知文案；切换厂商后测试结果也会明确标出
-        # 当前 provider + model，不再出现“测的是 Z.AI、提示却写 DeepSeek”的歧义。
-        err_msg = http_status_error_message(
-            int(code or 0),
-            provider=b["provider"],
-            base_url=base,
-            model=b["model"],
-        )
-        return {"ok": False, "message": err_msg, "latency_ms": latency}
-
-    # ── [v0.44.3 场景2 · 对账补强] 标准地址通了 → 再探 Agent 实际会打的那条路 ──
-    #   引擎侧：base 经 core_base_url 片段保护后交给 ProviderClient，实际命中的地址是
-    #   {base}/chat/completions（fragment 被 HTTP 丢弃，见 core_base_url）。这里就探这条
-    #   **真实地址**（去掉 fragment 即得），不分绑定的 transport 都探：
-    #     · openai_chat / codex_responses：它 == 上面的标准地址 → 下面 `!=` 判空自动
-    #       跳过，不重复探；
-    #     · anthropic_messages：标准地址是 /v1/messages，Agent 却按 OpenAI 兼容打
-    #       {base}/chat/completions —— api.anthropic.com 有官方兼容层（探测通过，不误伤），
-    #       MiniMax 的 …/anthropic 没有这条路径（探出 404，如实报）。
-    #   老实现「测试绿、聊天 404」的根：探的是 core 曾经乱补 /v1 之后的假地址，非真实地址。
-    agent_url = core_base_url(base).split("#", 1)[0]
-    agent_headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {credential}",
+    return {
+        "ok": True,
+        "message": msg("runtime_settings.py.016", target=target),
+        "latency_ms": None,
     }
-    agent_body = {
-        "model": b["model"],
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "ping"}],
-    }
-    if agent_url != url:
-        a_code, a_neterr, _ = _probe_once(agent_url, agent_headers, agent_body)
-        if a_neterr is None and a_code in (404, 405):
-            # 标准地址活着、Agent 地址却没有这个路径 → 该厂商与引擎的调用方式不兼容。
-            # 网络层错误（a_neterr）不在此列：标准探测已证明网络与鉴权都通，
-            # 偶发抖动不该把整个测试打红。
-            return {
-                "ok": False,
-                "message": (
-                    msg("runtime_settings.py.012", target=target) +
-                    msg("runtime_settings.py.013", agent_url=agent_url, a_code=a_code) +
-                    msg("runtime_settings.py.014") +
-                    msg("runtime_settings.py.015")
-                ),
-                "latency_ms": latency,
-            }
-
-    return {"ok": True, "message": msg("runtime_settings.py.016", target=target), "latency_ms": latency}
 
 
 def test_binding(binding: dict[str, Any]) -> dict[str, Any]:

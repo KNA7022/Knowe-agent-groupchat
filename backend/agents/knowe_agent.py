@@ -14,10 +14,11 @@ from typing import Any, Callable
 
 from knowe_core.agent_loop import AgentLoop, AgentLoopConfig
 from knowe_core.errors import ProviderError
-from knowe_core.provider_client import ClientFactory, ProviderClient, build_http_timeout
+from knowe_core.provider_client import ClientFactory, build_http_timeout
 from knowe_core.tool_registry import ToolRegistry
 
 from ..config import CONFIG
+from ..commercial_gateway import ProviderGatewayClient
 from ..attachments import inject_into_last_user
 from ..context_compressor import project_messages
 from ..token_usage import TokenUsageCollector, extract_token_usage, extract_token_usage_parts
@@ -61,7 +62,7 @@ def _history_key(message: dict[str, Any]) -> tuple[Any, ...]:
 class _UsageTrackingClient:
     """Transparent provider proxy that captures one usage payload per API stream."""
 
-    def __init__(self, delegate: ProviderClient, collector: TokenUsageCollector):
+    def __init__(self, delegate: ProviderGatewayClient, collector: TokenUsageCollector):
         self._delegate = delegate
         self._collector = collector
 
@@ -131,6 +132,7 @@ class ProviderConfig:
         credential_provider: Callable[[], str] | None = None,
         secret_ref: str = "",
         credential_purpose: str = "",
+        transport: str = "openai_chat",
     ) -> None:
         self.provider = provider
         self.model = model
@@ -158,6 +160,7 @@ class ProviderConfig:
         self.credential_provider = credential_provider
         self.secret_ref = str(secret_ref or "")
         self.credential_purpose = str(credential_purpose or "")
+        self.transport = str(transport or "openai_chat")
 
 
 class KnoweAgent:
@@ -187,7 +190,7 @@ class KnoweAgent:
 
         cfg = provider_config or ProviderConfig()
         self._provider_cfg = cfg
-        self._client = ProviderClient(
+        self._client = ProviderGatewayClient(
             base_url=cfg.base_url,
             api_key=cfg.api_key,
             model=cfg.model,
@@ -200,7 +203,9 @@ class KnoweAgent:
             max_retries=cfg.max_retries,
             client_factory=client_factory,
             provider=cfg.provider,
+            transport=cfg.transport,
             credential_provider=cfg.credential_provider,
+            allow_ungoverned_test_transport=client_factory is not None,
         )
         self._tool_registry = tool_registry or ToolRegistry()
         # Only the Coordinator uses durable raw AgentLoop messages. Worker state is

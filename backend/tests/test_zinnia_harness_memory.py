@@ -32,7 +32,9 @@ async def test_zinnia_reads_injected_harness_memory() -> None:
 
     output = await agent._execute(call, None, None)
 
-    assert "全局公告栏" in output
+    assert output == (
+        "error: blocked: legacy platform tool has no authoritative Task Runtime context"
+    )
 
 
 @pytest.mark.asyncio
@@ -42,7 +44,9 @@ async def test_zinnia_missing_harness_memory_is_graceful() -> None:
 
     output = await agent._execute(call, None, None)
 
-    assert "未启用" in output
+    assert output == (
+        "error: blocked: legacy platform tool has no authoritative Task Runtime context"
+    )
 
 
 # ── [v1.0.22.1-对齐 B] 平台级对话记忆（知知频道沉淀）──

@@ -35,13 +35,14 @@ import logging
 import time
 from typing import Any, Callable
 
-from knowe_core.provider_client import ProviderClient, build_http_timeout
+from knowe_core.provider_client import build_http_timeout
 from knowe_core.stream_assembler import StreamAssembler
 
 from ..context_compressor import project_messages
 from ..content_compress import compress_tool_result  # [v1.0.34] 工具结果流压缩
 from ..i18n_backend import msg
 from .. import runtime_settings
+from ..commercial_gateway import ProviderGatewayClient
 
 from ..config import CONFIG
 from ..agent_identity import coordinator_identity, identity_for
@@ -527,7 +528,7 @@ class DeepSeekAgent:
         del client                      # ProviderClient 自己管连接
 
         binding = self._credential_binding
-        provider = ProviderClient(
+        provider = ProviderGatewayClient(
             base_url=self.base_url,
             api_key=self.api_key if binding is None else "",
             model=self.model,
@@ -539,10 +540,13 @@ class DeepSeekAgent:
             ),
             max_retries=CONFIG.provider_max_retries,
             client_factory=self._client_factory,
+            provider=str((binding or {}).get("provider") or "injected"),
+            transport=str((binding or {}).get("transport") or "openai_chat"),
             credential_provider=(
                 (lambda selected=dict(binding): runtime_settings.resolve_provider_credential(selected))
                 if binding is not None else None
             ),
+            allow_ungoverned_test_transport=self._client_factory is not None,
         )
 
         deltas: list[str] = []

@@ -433,7 +433,7 @@ async def test_stdio_transport_launch_is_exact_and_governed_by_shell_gateway(tmp
         tool_name="mcp_stdio_launch", kind="shell", risk=RiskLevel.HIGH,
         executable_allowlist=(sys.executable,), cwd_roots=(str(tmp_path),),
         read_roots=(str(tmp_path),), write_roots=(), allow_child_processes=False,
-    ), lambda _request: None)
+    ), lambda _request: None, trusted_sandbox=True)
     launch = ToolExecutionRequest(
         group_id=group.group_id, task_id=run.task_id, run_id=run.run_id,
         tool_name="mcp_stdio_launch", idempotency_key="stdio-launch-1",
@@ -455,6 +455,7 @@ async def test_stdio_transport_launch_is_exact_and_governed_by_shell_gateway(tmp
     )
     transport = McpStdioTransport(
         config, gateway=gateway, launch_request=launch, session_factory=factory,
+        trusted_test_seam=True,
     )
     policy = McpRegistry()
     policy.register(config)

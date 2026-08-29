@@ -16,6 +16,7 @@ import { cheapTierOf, migrateModelName, providerOf, isCustomProvider } from './m
 import i18n, { normalizeLanguage } from '../i18n'; // [v1.0.21.3] 语言校验（i18n 不依赖 settings，无环）
 import { DEFAULT_AVATAR_DATA_URL } from './defaultAvatar'; // [v1.0.23.5] 首次安装默认头像
 import { groupDeletionFenceRevision, isGroupDeletionFenced } from './groupDeletionFence';
+import type { SecretRef } from '../shared/bridge';
 
 
 export interface ModelBinding {
@@ -31,6 +32,9 @@ export interface ModelBinding {
   secretRef?: string;
   /** Exact purpose accepted when Electron main issues a short Python lease. */
   credentialPurpose?: string;
+  credentialSlot?: string;
+  credentialKind?: 'provider_credential';
+  credentialAudience?: 'provider_gateway';
   /** [v1.0.36] 自定义端点接入点（provider='custom' 时用户填；固定提供商为空、从目录取）。 */
   baseUrl?: string;
   sealed: boolean;
@@ -203,13 +207,16 @@ function bindingWire(b: ModelBinding | null | undefined): JsonObject | null {
   };
   if (b.secretRef) wire.secret_ref = b.secretRef;
   if (b.credentialPurpose) wire.credential_purpose = b.credentialPurpose;
+  if (b.credentialSlot) wire.credential_slot = b.credentialSlot;
+  if (b.credentialKind) wire.credential_kind = b.credentialKind;
+  if (b.credentialAudience) wire.credential_audience = b.credentialAudience;
   if (b.clearApiKey === true) wire.clear_api_key = true;
   return wire;
 }
 
 type SecretSettingsBridge = Pick<
   NonNullable<Window['knowe']>,
-  'storeSecret' | 'deleteSecret' | 'leaseSecret'
+  'storeSecret' | 'getSecret' | 'deleteSecret' | 'leaseSecret'
 >;
 
 function secretSettingsBridge(): SecretSettingsBridge | undefined {
@@ -218,7 +225,7 @@ function secretSettingsBridge(): SecretSettingsBridge | undefined {
 
 // The renderer may run connection-test and apply concurrently for the same transient
 // input.  Cache only a SHA-256 identity -> in-flight/settled opaque ref, never plaintext.
-const credentialRefCache = new Map<string, Promise<string>>();
+const credentialRefCache = new Map<string, Promise<SecretRef>>();
 
 async function credentialCacheKey(
   binding: ModelBinding,
@@ -243,7 +250,7 @@ async function credentialCacheKey(
 async function forgetCachedSecretRef(secretRef: string): Promise<void> {
   await Promise.all(Array.from(credentialRefCache.entries()).map(async ([key, pending]) => {
     try {
-      if (await pending === secretRef) credentialRefCache.delete(key);
+      if ((await pending).secret_ref === secretRef) credentialRefCache.delete(key);
     } catch {
       credentialRefCache.delete(key);
     }
@@ -260,6 +267,7 @@ export async function prepareBindingWireForBackend(
   purpose: string,
   label: string,
 ): Promise<JsonObject | null> {
+  void label;
   const wire = bindingWire(b);
   if (!wire || !b) return wire;
   const bridge = secretSettingsBridge();
@@ -273,9 +281,24 @@ export async function prepareBindingWireForBackend(
     }
     delete wire.secret_ref;
     delete wire.credential_purpose;
+    delete wire.credential_slot;
+    delete wire.credential_kind;
+    delete wire.credential_audience;
     return wire;
   }
+  const slot = purpose === 'provider:main'
+    ? 'main'
+    : purpose === 'provider:aux'
+      ? 'aux'
+      : /^provider:agent-[0-9a-f]{8}$/.test(purpose)
+        ? `agent:${purpose.slice('provider:agent-'.length)}`
+        : '';
+  if (!slot) throw new Error('Provider credential slot intent is invalid');
+  const provider = providerOf(b.provider);
+  const endpoint = (b.baseUrl ?? provider?.baseUrl ?? '').trim().replace(/\/+$/, '');
+  const transport = (provider?.transport ?? 'openai_chat').trim().toLowerCase();
   let secretRef = b.secretRef ?? '';
+  let storedRef: SecretRef | null = null;
   if (b.apiKey) {
     if (!bridge?.storeSecret || !bridge.leaseSecret) {
       throw new Error('Electron secret storage is unavailable');
@@ -284,12 +307,13 @@ export async function prepareBindingWireForBackend(
     let pendingRef = credentialRefCache.get(cacheKey);
     if (!pendingRef) {
       pendingRef = bridge.storeSecret({
-        kind: 'provider_credential', label, purpose, value: b.apiKey,
-      }).then((stored) => stored.secret_ref);
+        slot, provider_id: b.provider, endpoint, transport, value: b.apiKey,
+      });
       credentialRefCache.set(cacheKey, pendingRef);
     }
     try {
-      secretRef = await pendingRef;
+      storedRef = await pendingRef;
+      secretRef = storedRef.secret_ref;
     } catch (error) {
       if (credentialRefCache.get(cacheKey) === pendingRef) {
         credentialRefCache.delete(cacheKey);
@@ -298,12 +322,25 @@ export async function prepareBindingWireForBackend(
     }
   }
   if (secretRef) {
-    if (!bridge?.leaseSecret) {
+    if (!bridge?.leaseSecret || !bridge.getSecret) {
       throw new Error('Electron secret storage is unavailable');
     }
-    await bridge.leaseSecret({ secret_ref: secretRef, purpose, ttl_seconds: 300 });
+    storedRef ??= await bridge.getSecret(secretRef);
+    if (!storedRef
+        || storedRef.slot !== slot
+        || storedRef.provider_id !== b.provider.trim().toLowerCase()
+        || storedRef.endpoint !== endpoint
+        || storedRef.transport !== transport
+        || storedRef.kind !== 'provider_credential'
+        || storedRef.audience !== 'provider_gateway') {
+      throw new Error('Stored provider credential binding is unavailable or mismatched');
+    }
+    await bridge.leaseSecret({ secret_ref: secretRef, ttl_seconds: 300 });
     wire.secret_ref = secretRef;
-    wire.credential_purpose = purpose;
+    wire.credential_purpose = storedRef.purpose;
+    wire.credential_slot = storedRef.slot;
+    wire.credential_kind = storedRef.kind;
+    wire.credential_audience = storedRef.audience;
   }
   return wire;
 }
@@ -330,6 +367,11 @@ function bindingFromBackend(
     clearApiKey: false,
     secretRef: stringValue(raw.secret_ref).trim(),
     credentialPurpose: stringValue(raw.credential_purpose).trim(),
+    credentialSlot: stringValue(raw.credential_slot).trim(),
+    credentialKind: stringValue(raw.credential_kind) === 'provider_credential'
+      ? 'provider_credential' : undefined,
+    credentialAudience: stringValue(raw.credential_audience) === 'provider_gateway'
+      ? 'provider_gateway' : undefined,
     baseUrl: stringValue(raw.base_url).trim(),
     sealed: true,
   };

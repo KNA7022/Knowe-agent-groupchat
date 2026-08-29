@@ -45,7 +45,7 @@ from knowe_provenance import (
 )
 from knowe_provenance.schema_registry import component_version
 
-from . import runtime_settings
+from . import aux_client, runtime_settings
 from .config import CONFIG
 
 log = logging.getLogger("knowe.knowledge")
@@ -781,31 +781,17 @@ class KnowledgeGraphManager:
         )
         if not aux_ok:
             return ""
-        api_key = str(runtime_settings.resolve_provider_credential(aux))
-        base = str(aux["base_url"]).rstrip("/")
-        model = str(aux["model"])
-        if not (api_key and base and model):
-            return ""
-        try:
-            import httpx
-        except ImportError:
-            return ""
-        payload = {
-            "model": model,
-            "messages": [
+        return await aux_client.chat(
+            [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-        }
-        async with httpx.AsyncClient(timeout=_AUX_TIMEOUT_S) as cli:
-            response = await cli.post(
-                base + "/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
-            return str(data["choices"][0]["message"]["content"] or "").strip()
+            binding=aux,
+            max_tokens=_AUX_MAX_TOKENS,
+            temperature=_AUX_TEMPERATURE,
+            timeout_s=_AUX_TIMEOUT_S,
+            what="knowledge extraction",
+        )
 
     # ------------------------------------------------------------------
     # Merge / score

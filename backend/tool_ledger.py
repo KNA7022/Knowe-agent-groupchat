@@ -215,13 +215,10 @@ async def _emit(audit: ToolAudit, text: str) -> None:
 
 
 def activity_token(name: str, args: Mapping[str, Any] | None = None) -> str:
-    detail = ""
-    if args:
-        for key in ("path", "command", "query", "url", "destination", "source"):
-            if args.get(key) not in (None, ""):
-                detail = f"{TOOL_ACTIVITY_SEPARATOR}{_one_line(args[key], 96)}"
-                break
-    return f"{name}{detail}"
+    # Renderer-visible activity is a fixed registry name.  Arguments remain only in
+    # private, hashed audit fields and can never surface paths, URLs, queries or Shell.
+    del args
+    return str(name)
 
 
 def summarize_actions(actions: list[dict[str, Any]]) -> dict[str, Any]:

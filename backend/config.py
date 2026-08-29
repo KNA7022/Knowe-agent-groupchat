@@ -7,7 +7,7 @@ config.py — 全部可调项集中在此，禁止在别处写死。
   KNOWE_STRICT      1 | 0                  （出站契约强校验，默认 1）
   KNOWE_EMIT_TURN_END  1 | 0               （默认 0，见 README「一处契约冲突」）
   KNOWE_WS_HOST/PORT, KNOWE_HEALTH_PORT
-  DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL
+  DEEPSEEK_MODEL, DEEPSEEK_BASE_URL
 
   [v2.2] Worker 的终端 / 网络 / 浏览器 / 视觉服务：
   KNOWE_TERMINAL_ENABLED   1 | 0   （默认 1；关掉 = 工具仍可见并返回稳定 error）
@@ -28,7 +28,7 @@ config.py — 全部可调项集中在此，禁止在别处写死。
   KNOWE_BROWSER_MAX_SESSIONS 个    （默认 4）
   KNOWE_BROWSER_SNAPSHOT_MAX 个    （默认 200，快照最多列几个元素）
   KNOWE_VISION_ENABLED     1 | 0   （默认 1）
-  KNOWE_VISION_MODEL / KNOWE_VISION_BASE_URL / KNOWE_VISION_API_KEY
+  KNOWE_VISION_MODEL / KNOWE_VISION_BASE_URL
                                    （默认继承 DeepSeek 那一套；见 vision_tools 模块头）
 
   [v0.44.5] Project Memory 长期记忆：
@@ -59,14 +59,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-
-# [v0.4] 业主在 v0.3 之后自己加了这两行（key 走 .env）——保留，不要删。
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:      # 没装 python-dotenv 也能跑，只是不读 .env
-    pass
-
 
 def _flag(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -321,9 +313,6 @@ class Config:
         default_factory=lambda: os.environ.get(
             "KNOWE_VISION_BASE_URL",
             os.environ.get("DEEPSEEK_BASE_URL", "")))
-    vision_api_key: str = field(
-        default_factory=lambda: os.environ.get(
-            "KNOWE_VISION_API_KEY", os.environ.get("DEEPSEEK_API_KEY", "")))
     vision_max_tokens: int = field(
         default_factory=lambda: int(os.environ.get("KNOWE_VISION_MAX_TOKENS", "900")))
 
@@ -411,13 +400,8 @@ class Config:
     strict_contract: bool = field(default_factory=lambda: _flag("KNOWE_STRICT", True))
     emit_turn_end: bool = field(default_factory=lambda: _flag("KNOWE_EMIT_TURN_END", False))
 
-    # ── DeepSeek（[v0.44.1 Bug3] 遗留 .env 兼容位，**不再内置任何默认值**）──
-    #   模型的唯一配置入口是「设置 → 模型与提供方」（runtime_settings 权威）。
-    #   开发期写死的 DeepSeek 默认模型 / base_url 已移除：这三项只从环境变量读，
-    #   缺省一律为空串（= 没配）。留着这三个字段仅为兼容「显式在 .env 里配好整套
-    #   DEEPSEEK_* 」的老部署；空着时引擎不会偷偷回落到某个隐藏默认，而是走
-    #   _harness_turn 的「还没有配置模型」提示，把用户引到设置面板。
-    deepseek_api_key: str = field(default_factory=lambda: os.environ.get("DEEPSEEK_API_KEY", ""))
+    # Provider credential plaintext is never configuration.  Electron safeStorage
+    # and purpose-bound short leases are the only production credential ingress.
     deepseek_model: str = field(default_factory=lambda: os.environ.get("DEEPSEEK_MODEL", ""))
     deepseek_base_url: str = field(
         default_factory=lambda: os.environ.get("DEEPSEEK_BASE_URL", "")

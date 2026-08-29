@@ -26,7 +26,9 @@ _BIG_JSON = json.dumps([{"name": "a", "qty": 1}] * 1000, ensure_ascii=False)  # 
 
 
 def _registry_with_verbose_tools() -> tuple[ToolRegistry, list[str]]:
-    reg = ToolRegistry()
+    # Compression tests isolate the carrier; they opt in to the named
+    # test-only execution seam instead of weakening the production default.
+    reg = ToolRegistry(unsafe_test_mode=True)
     calls: list[str] = []
 
     def _log_tool(args, **_ctx):

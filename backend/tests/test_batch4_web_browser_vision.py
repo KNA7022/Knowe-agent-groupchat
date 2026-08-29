@@ -432,7 +432,8 @@ def test_vision_missing_key_is_a_message(tmp_path: Path) -> None:
     with pytest.raises(ToolError) as e:
         asyncio.run(vision_tools.analyze(
             "a.png", "这是什么", resolve_local=lambda rel: tmp_path / rel,
-            api_key="", base_url="https://api.deepseek.com", model="deepseek-chat",
+            binding={"provider": "deepseek", "base_url": "https://api.deepseek.com",
+                     "model": "deepseek-chat", "transport": "openai_chat"},
         ))
     assert "API key" in str(e.value)
 
@@ -441,7 +442,10 @@ def test_vision_empty_prompt(tmp_path: Path) -> None:
     with pytest.raises(ToolError):
         asyncio.run(vision_tools.analyze(
             "a.png", "  ", resolve_local=lambda rel: tmp_path / rel,
-            api_key="k", base_url="https://x", model="m",
+            binding={"provider": "deepseek", "base_url": "https://api.deepseek.com",
+                     "model": "m", "transport": "openai_chat",
+                     "secret_ref": "secret_" + "a" * 32,
+                     "credential_purpose": "provider:" + "b" * 64},
         ))
 
 

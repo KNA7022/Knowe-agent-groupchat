@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import type {
   CredentialLeaseRequest,
@@ -16,9 +16,14 @@ export interface SafeStorageAdapter {
 
 type StoredSecret = Readonly<{
   secret_ref: string;
-  kind: string;
+  slot: string;
+  kind: 'provider_credential';
   label: string;
   purpose: string;
+  audience: 'provider_gateway';
+  provider_id: string;
+  endpoint: string;
+  transport: string;
   created_at: string;
   encrypted_base64: string;
   schema_version: 1;
@@ -36,8 +41,10 @@ type SecretVaultOptions = Readonly<{
 type PrivateCredentialLease = Readonly<CredentialLeaseRef & { value: string }>;
 
 const SECRET_REF_RE = /^secret_[0-9a-f]{32}$/;
-const PURPOSE_RE = /^(?:provider|master-key):[a-z0-9][a-z0-9_.-]{0,63}$/;
-const KIND_RE = /^(?:provider_credential|master_key)$/;
+const PURPOSE_RE = /^provider:[0-9a-f]{64}$/;
+const SLOT_RE = /^[a-z][a-z0-9_.:-]{0,127}$/;
+const PROVIDER_RE = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
+const TRANSPORT_RE = /^(?:openai_chat|anthropic_messages|codex_responses)$/;
 const MAX_LEASE_TTL_SECONDS = 300;
 
 const cleanText = (value: unknown, maximum: number): string => {
@@ -50,12 +57,72 @@ const cleanText = (value: unknown, maximum: number): string => {
 
 const publicRef = (record: StoredSecret): SecretRef => ({
   secret_ref: record.secret_ref,
+  slot: record.slot,
   kind: record.kind,
   label: record.label,
   purpose: record.purpose,
+  audience: record.audience,
+  provider_id: record.provider_id,
+  endpoint: record.endpoint,
+  transport: record.transport,
   created_at: record.created_at,
   schema_version: 1,
 });
+
+const canonicalProviderEndpoint = (raw: unknown): string => {
+  let parsed: URL;
+  try {
+    parsed = new URL(cleanText(raw, 2048));
+  } catch {
+    throw new Error('provider endpoint is invalid');
+  }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.search || parsed.hash) {
+    throw new Error('provider endpoint requires HTTPS without credentials or query');
+  }
+  if (parsed.port === '443') parsed.port = '';
+  const path = parsed.pathname.replace(/\/{2,}/g, '/').replace(/\/+$/, '');
+  return `https://${parsed.hostname.toLowerCase()}${parsed.port ? `:${parsed.port}` : ''}${path}`;
+};
+
+const providerPurpose = (
+  slot: string, providerId: string, endpoint: string, transport: string,
+): string => {
+  const body = [
+    'studycrew-provider-credential-v1', slot, providerId, endpoint, transport, 'provider_gateway',
+  ].join('\u0000');
+  return `provider:${createHash('sha256').update(body, 'utf8').digest('hex')}`;
+};
+
+const validBase64 = (value: unknown): value is string => {
+  if (typeof value !== 'string' || !value || value.length % 4 !== 0
+      || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return false;
+  try {
+    return Buffer.from(value, 'base64').toString('base64') === value;
+  } catch {
+    return false;
+  }
+};
+
+const validateStoredSecret = (key: string, value: StoredSecret): void => {
+  if (!value || typeof value !== 'object'
+      || !SECRET_REF_RE.test(key) || value.secret_ref !== key
+      || !SLOT_RE.test(value.slot)
+      || value.kind !== 'provider_credential'
+      || value.audience !== 'provider_gateway'
+      || !PROVIDER_RE.test(value.provider_id)
+      || !TRANSPORT_RE.test(value.transport)
+      || value.endpoint !== canonicalProviderEndpoint(value.endpoint)
+      || value.purpose !== providerPurpose(
+        value.slot, value.provider_id, value.endpoint, value.transport,
+      )
+      || !PURPOSE_RE.test(value.purpose)
+      || !value.label || value.label.length > 120
+      || !Number.isFinite(Date.parse(value.created_at))
+      || !validBase64(value.encrypted_base64)
+      || value.schema_version !== 1) {
+    throw new Error('encrypted credential vault contains a corrupt record');
+  }
+};
 
 export class SecretVault {
   private readonly safeStorage: SafeStorageAdapter;
@@ -68,26 +135,23 @@ export class SecretVault {
     this.persist = options.save;
     this.now = options.now ?? (() => new Date());
     const loaded = options.load();
-    this.records = Object.fromEntries(Object.entries(loaded).filter(([key, value]) => (
-      SECRET_REF_RE.test(key)
-      && value.secret_ref === key
-      && KIND_RE.test(value.kind)
-      && PURPOSE_RE.test(value.purpose)
-      && typeof value.encrypted_base64 === 'string'
-      && value.schema_version === 1
-    )));
+    for (const [key, value] of Object.entries(loaded)) validateStoredSecret(key, value);
+    this.records = { ...loaded };
   }
 
   async store(input: SecretStoreRequest): Promise<SecretRef> {
     if (!this.safeStorage.isEncryptionAvailable()) {
       throw new Error('OS credential encryption is unavailable');
     }
-    const kind = cleanText(input.kind, 64);
-    const label = cleanText(input.label, 120);
-    const purpose = cleanText(input.purpose, 80);
-    if (!KIND_RE.test(kind) || !PURPOSE_RE.test(purpose)) {
-      throw new Error('secret kind or purpose is not authorized');
+    const slot = cleanText(input.slot, 128).toLowerCase();
+    const providerId = cleanText(input.provider_id, 64).toLowerCase();
+    const endpoint = canonicalProviderEndpoint(input.endpoint);
+    const transport = cleanText(input.transport, 64).toLowerCase();
+    if (!SLOT_RE.test(slot) || !PROVIDER_RE.test(providerId) || !TRANSPORT_RE.test(transport)) {
+      throw new Error('provider credential slot or binding is not authorized');
     }
+    const purpose = providerPurpose(slot, providerId, endpoint, transport);
+    const label = `Provider credential (${slot})`;
     if (typeof input.value !== 'string' || !input.value || input.value.length > 32_768) {
       throw new Error('secret value is invalid');
     }
@@ -98,9 +162,14 @@ export class SecretVault {
     }
     const record: StoredSecret = {
       secret_ref: secretRef,
-      kind,
+      slot,
+      kind: 'provider_credential',
       label,
       purpose,
+      audience: 'provider_gateway',
+      provider_id: providerId,
+      endpoint,
+      transport,
       created_at: this.now().toISOString(),
       encrypted_base64: encrypted.toString('base64'),
       schema_version: 1,
@@ -131,6 +200,36 @@ export class SecretVault {
     return Object.values(this.records).map(publicRef);
   }
 
+  async reconcileActive(
+    activeRefs: ReadonlySet<string>,
+    revoke: (secretRef: string) => Promise<void>,
+  ): Promise<string[]> {
+    const activeBySlot = new Map<string, StoredSecret>();
+    for (const secretRef of activeRefs) {
+      const record = this.records[secretRef];
+      if (record) activeBySlot.set(record.slot, record);
+    }
+    const nowMs = this.now().getTime();
+    const stale: string[] = [];
+    for (const record of Object.values(this.records)) {
+      if (activeRefs.has(record.secret_ref)) continue;
+      const active = activeBySlot.get(record.slot);
+      const recordMs = Date.parse(record.created_at);
+      const activeMs = active ? Date.parse(active.created_at) : Number.NaN;
+      if ((active && recordMs < activeMs) || nowMs - recordMs > 86_400_000) {
+        stale.push(record.secret_ref);
+      }
+    }
+    for (const secretRef of stale) await revoke(secretRef);
+    if (stale.length) {
+      const next = { ...this.records };
+      for (const secretRef of stale) delete next[secretRef];
+      this.persist(next);
+      this.records = next;
+    }
+    return stale;
+  }
+
   async issueLease(input: CredentialLeaseRequest & {
     deliver(lease: PrivateCredentialLease): Promise<void>;
   }): Promise<CredentialLeaseRef> {
@@ -139,9 +238,6 @@ export class SecretVault {
     }
     const record = this.records[input.secret_ref];
     if (!record) throw new Error('secret reference is unavailable');
-    if (input.purpose !== record.purpose || !PURPOSE_RE.test(input.purpose)) {
-      throw new Error('secret lease purpose mismatch');
-    }
     if (!Number.isInteger(input.ttl_seconds)
         || input.ttl_seconds < 1
         || input.ttl_seconds > MAX_LEASE_TTL_SECONDS) {
@@ -150,7 +246,13 @@ export class SecretVault {
     const lease: CredentialLeaseRef = {
       lease_id: `lease_${randomBytes(16).toString('hex')}`,
       secret_ref: record.secret_ref,
+      slot: record.slot,
+      kind: record.kind,
       purpose: record.purpose,
+      audience: record.audience,
+      provider_id: record.provider_id,
+      endpoint: record.endpoint,
+      transport: record.transport,
       expires_at: new Date(this.now().getTime() + input.ttl_seconds * 1000).toISOString(),
     };
     const encrypted = Buffer.from(record.encrypted_base64, 'base64');

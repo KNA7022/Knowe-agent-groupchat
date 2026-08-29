@@ -20,6 +20,7 @@ type RegisterSecretIpcOptions = Readonly<{
   vault: SecretVault;
   trustedWebContentsId(): number | null;
   deliverLease(lease: CredentialLeaseRef & { value: string }): Promise<void>;
+  revokeLease(secretRef: string): Promise<void>;
 }>;
 
 export function registerSecretIpc(options: RegisterSecretIpcOptions): () => void {
@@ -39,6 +40,7 @@ export function registerSecretIpc(options: RegisterSecretIpcOptions): () => void
   });
   options.ipc.handle(IPC.secretDelete, async (event, secretRef: string) => {
     trusted(event);
+    if (options.vault.get(secretRef)) await options.revokeLease(secretRef);
     return options.vault.delete(secretRef);
   });
   options.ipc.handle(IPC.secretLease, async (event, input: CredentialLeaseRequest) => {

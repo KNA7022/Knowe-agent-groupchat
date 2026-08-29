@@ -101,22 +101,14 @@ def provider_target(
 
 
 def redact_provider_diagnostics(value: Any) -> str:
-    """Remove credentials and planned student PII from provider diagnostics."""
+    """Use the commercial structured DLP authority for every provider diagnostic."""
 
-    text = str(value or "")
-    substitutions = (
-        (r"(?i)bearer\s+[A-Za-z0-9._~+\-/=]+", "Bearer [REDACTED_SECRET]"),
-        (r"\bsk-[A-Za-z0-9._-]{6,}\b", "[REDACTED_SECRET]"),
-        (r"(?i)(?:api[_ -]?key|access[_ -]?token|password)\s*[:=]\s*\S+", "[REDACTED_SECRET]"),
-        (r"(?<!\d)1[3-9]\d{9}(?!\d)", "[REDACTED_CONTACT]"),
-        (r"(?<!\d)\d{17}[0-9Xx](?!\d)", "[REDACTED_IDENTITY]"),
-        (r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "[REDACTED_CONTACT]"),
-        (r"(?i)(?:学号|student\s*id)\s*[:：#]?\s*[A-Za-z0-9_-]{4,}", "[REDACTED_STUDENT_ID]"),
-        (r"(?i)(?:成绩|分数|绩点|排名|名次|grade|score|class\s+rank)\s*(?:为|是|[:：])?\s*(?:第\s*)?\d+(?:\.\d+)?(?:\s*[分名])?", "[REDACTED_ACADEMIC_RECORD]"),
-    )
-    for pattern, replacement in substitutions:
-        text = re.sub(pattern, replacement, text)
-    return text
+    # Lazy import avoids pulling backend policy into lightweight identity imports at
+    # module initialization while eliminating the former independent regex drift.
+    from backend.commercial_gateway import PiiDlpGateway
+
+    redacted = PiiDlpGateway().redact_diagnostics(str(value or ""), field_name="diagnostic")
+    return str(redacted)
 
 
 def _clean_response_detail(body: Any, *, limit: int = 180) -> str:

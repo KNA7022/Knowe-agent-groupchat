@@ -33,7 +33,14 @@ async def test_analyze_refuses_on_text_only_model():
         await vt.analyze(
             "screenshots/chapter2.png", "第二章正文是否可见？",
             resolve_local=lambda r: Path(r),
-            api_key="k", base_url="https://api.deepseek.com", model="deepseek-chat",
+            binding={
+                "secret_ref": "secret_" + "1" * 32,
+                "credential_purpose": "provider:" + "a" * 64,
+                "endpoint": "https://api.deepseek.com",
+                "transport": "openai_chat",
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+            },
         )
     msg = str(ei.value)
     assert "看不了图" in msg
@@ -48,7 +55,14 @@ async def test_analyze_proceeds_past_guard_on_vision_model(tmp_path):
         await vt.analyze(
             "nope.png", "看图",
             resolve_local=lambda r: tmp_path / r,
-            api_key="k", base_url="https://api.openai.com", model="gpt-4o-mini",
+            binding={
+                "secret_ref": "secret_" + "2" * 32,
+                "credential_purpose": "provider:" + "b" * 64,
+                "endpoint": "https://api.openai.com",
+                "transport": "openai_chat",
+                "provider": "openai",
+                "model": "gpt-4o-mini",
+            },
         )
     # 越过了纯文本守卫 → 报的是「图片不存在」，而不是「看不了图」
     assert "看不了图" not in str(ei.value)

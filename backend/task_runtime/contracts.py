@@ -59,6 +59,24 @@ _PUBLIC_EVENT_FIELDS: dict[str, frozenset[str]] = {
     "message_routed": frozenset({"route_label", "summary", "classification"}),
     "restart_recovery": frozenset({"status", "blocking_reason"}),
     "tool_prepared": frozenset({"status", "invocation_id", "tool_name", "disposition", "usage"}),
+    "tool_claimed": frozenset({
+        "status", "invocation_id", "tool_name", "purpose", "risk", "started_at", "usage",
+    }),
+    "tool_completed": frozenset({
+        "status", "invocation_id", "tool_name", "purpose", "risk", "started_at",
+        "completed_at", "duration_ms", "usage", "error_type",
+    }),
+    "tool_failed": frozenset({
+        "status", "invocation_id", "tool_name", "purpose", "risk", "started_at",
+        "completed_at", "duration_ms", "usage", "error_type",
+    }),
+    "tool_recovered_blocked": frozenset({
+        "status", "invocation_id", "tool_name", "purpose", "risk", "started_at",
+        "completed_at", "duration_ms", "usage", "error_type",
+    }),
+    "provider_egress": frozenset({
+        "status", "capability_digest", "privacy", "usage", "approval_required",
+    }),
     "verifier_decision": frozenset({"status", "decision_id", "outcome", "approved", "evidence_count"}),
 }
 
@@ -638,6 +656,7 @@ class ToolInvocation:
     disposition: str = "created"
     error_type: str = ""
     created_at: str = field(default_factory=utc_now)
+    started_at: str | None = None
     completed_at: str | None = None
     schema_version: int = TASK_RUNTIME_SCHEMA_VERSION
 
@@ -652,6 +671,8 @@ class ToolInvocation:
             raise ValueError("high-risk invocations cannot be replayable")
         if not self.tool_name.strip() or not self.idempotency_key.strip() or not self.purpose.strip():
             raise ValueError("tool name, idempotency key and purpose are required")
+        if re.fullmatch(r"[a-z][a-z0-9_.:-]{0,95}", self.purpose) is None:
+            raise ValueError("tool purpose must be a structured policy identifier")
         if self.disposition not in {"created", "requires_new_approval", "recovered_blocked"}:
             raise ValueError("invalid tool disposition")
         assert_public_text(self.public_summary, field_name="ToolInvocation.public_summary")

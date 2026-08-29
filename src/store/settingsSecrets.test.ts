@@ -17,6 +17,21 @@ const binding = (): ModelBinding => ({
   sealed: true,
 });
 
+const providerPurpose = `provider:${'1'.repeat(64)}`;
+const secretMetadata = (secretRef: string) => ({
+  secret_ref: secretRef,
+  slot: 'main',
+  kind: 'provider_credential' as const,
+  label: 'Provider credential (main)',
+  purpose: providerPurpose,
+  audience: 'provider_gateway' as const,
+  provider_id: 'openai-api',
+  endpoint: 'https://provider.example/v1',
+  transport: 'codex_responses',
+  created_at: '2026-08-29T00:00:00.000Z',
+  schema_version: 1 as const,
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
@@ -25,34 +40,32 @@ afterEach(() => {
 
 describe('provider credential settings boundary', () => {
   it('stores through main and sends Python only an opaque purpose-bound handle', async () => {
-    const storeSecret = vi.fn().mockResolvedValue({
-      secret_ref: `secret_${'a'.repeat(32)}`,
-      kind: 'provider_credential',
-      label: 'Main provider credential',
-      purpose: 'provider:main',
-      created_at: '2026-08-29T00:00:00.000Z',
-      schema_version: 1,
-    });
+    const stored = secretMetadata(`secret_${'a'.repeat(32)}`);
+    const storeSecret = vi.fn().mockResolvedValue(stored);
+    const getSecret = vi.fn().mockResolvedValue(stored);
     const leaseSecret = vi.fn().mockResolvedValue({
       lease_id: `lease_${'b'.repeat(32)}`,
-      secret_ref: `secret_${'a'.repeat(32)}`,
-      purpose: 'provider:main',
+      ...stored,
       expires_at: '2026-08-29T00:05:00.000Z',
     });
-    (window as unknown as { knowe: unknown }).knowe = { storeSecret, leaseSecret };
+    (window as unknown as { knowe: unknown }).knowe = { storeSecret, getSecret, leaseSecret };
 
     const wire = await prepareBindingWireForBackend(
       binding(), 'provider:main', 'Main provider credential',
     );
-    expect(storeSecret).toHaveBeenCalledWith(expect.objectContaining({
-      kind: 'provider_credential', purpose: 'provider:main', value: 'sk-renderer-input',
-    }));
-    expect(leaseSecret).toHaveBeenCalledWith(expect.objectContaining({
-      secret_ref: `secret_${'a'.repeat(32)}`, purpose: 'provider:main',
-    }));
+    expect(storeSecret).toHaveBeenCalledWith({
+      slot: 'main', provider_id: 'openai-api', endpoint: 'https://provider.example/v1',
+      transport: 'codex_responses', value: 'sk-renderer-input',
+    });
+    expect(leaseSecret).toHaveBeenCalledWith({
+      secret_ref: `secret_${'a'.repeat(32)}`, ttl_seconds: 300,
+    });
     expect(wire).toMatchObject({
       secret_ref: `secret_${'a'.repeat(32)}`,
-      credential_purpose: 'provider:main',
+      credential_purpose: providerPurpose,
+      credential_slot: 'main',
+      credential_kind: 'provider_credential',
+      credential_audience: 'provider_gateway',
     });
     expect(JSON.stringify(wire)).not.toContain('sk-renderer-input');
     expect(wire).not.toHaveProperty('api_key');
@@ -61,21 +74,15 @@ describe('provider credential settings boundary', () => {
 
   it('reuses one encrypted SecretRef across test and apply for the same credential scope', async () => {
     const secretRef = `secret_${'d'.repeat(32)}`;
-    const storeSecret = vi.fn().mockResolvedValue({
-      secret_ref: secretRef,
-      kind: 'provider_credential',
-      label: 'Main provider credential',
-      purpose: 'provider:main',
-      created_at: '2026-08-29T00:00:00.000Z',
-      schema_version: 1,
-    });
+    const stored = secretMetadata(secretRef);
+    const storeSecret = vi.fn().mockResolvedValue(stored);
+    const getSecret = vi.fn().mockResolvedValue(stored);
     const leaseSecret = vi.fn().mockResolvedValue({
       lease_id: `lease_${'e'.repeat(32)}`,
-      secret_ref: secretRef,
-      purpose: 'provider:main',
+      ...stored,
       expires_at: '2026-08-29T00:05:00.000Z',
     });
-    (window as unknown as { knowe: unknown }).knowe = { storeSecret, leaseSecret };
+    (window as unknown as { knowe: unknown }).knowe = { storeSecret, getSecret, leaseSecret };
 
     const scoped = { ...binding(), apiKey: 'sk-test-apply-input' };
     const tested = await prepareBindingWireForBackend(

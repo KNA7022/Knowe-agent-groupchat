@@ -8,12 +8,17 @@ the policy authority: callers submit a requested subset, while backend-authored
 No tool body, raw PII or credential is written to the Task Runtime public ledger.
 """
 
+import base64
+import binascii
 import hashlib
 import inspect
 import json
 import math
 import re
 import asyncio
+import copy
+import threading
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,12 +31,14 @@ from contextvars import ContextVar
 import httpx
 
 from backend.task_runtime.contracts import (
+    BudgetUsage,
     DlpDecision,
     McpServerConfig,
     PiiFinding,
     PrivacyTier,
     RiskLevel,
     ToolDescriptor,
+    TaskStatus,
 )
 from backend.task_runtime.service import RuntimeConflictError, RuntimeNotFoundError, TaskRuntimeService
 from backend.task_runtime.store import RuntimeStoreError
@@ -218,12 +225,23 @@ class ToolGateway:
         self.dlp = dlp or PiiDlpGateway()
         self._descriptors: dict[str, ToolDescriptor] = {}
         self._effects: dict[str, ToolEffect] = {}
+        self._trusted_sandbox_tools: set[str] = set()
 
-    def register(self, descriptor: ToolDescriptor, effect: ToolEffect) -> None:
+    def register(
+        self,
+        descriptor: ToolDescriptor,
+        effect: ToolEffect,
+        *,
+        trusted_sandbox: bool = False,
+    ) -> None:
         if descriptor.tool_name in self._descriptors:
             raise ValueError(f"duplicate Tool Gateway descriptor: {descriptor.tool_name}")
         self._descriptors[descriptor.tool_name] = descriptor
         self._effects[descriptor.tool_name] = effect
+        if trusted_sandbox:
+            if descriptor.kind != "shell":
+                raise ValueError("trusted sandbox markers are valid only for Shell descriptors")
+            self._trusted_sandbox_tools.add(descriptor.tool_name)
 
     def descriptor(self, tool_name: str) -> ToolDescriptor:
         try:
@@ -289,6 +307,14 @@ class ToolGateway:
     ) -> Any:
         descriptor = self.descriptor(request.tool_name)
         self._validate_capability_subset(descriptor, request)
+        if (
+            descriptor.kind == "shell"
+            and descriptor.tool_name not in self._trusted_sandbox_tools
+        ):
+            # Declared argv/path/network scopes are authorization metadata, not an OS
+            # sandbox.  Until a verifiable Windows sandbox executor is injected, no
+            # production Shell or MCP-stdio process may reach its effect boundary.
+            raise GatewayDenied("Shell effect requires an explicitly trusted sandbox executor")
         dlp = self.dlp.decide_outbound(
             request.governed_outbound_text(descriptor), approved=False,
         )
@@ -346,6 +372,7 @@ class LegacyToolAuthority:
     group_id: str
     task_id: str
     run_id: str
+    runtime: TaskRuntimeService | None = field(default=None, repr=False, compare=False)
     approval_id: str = ""
     grant_id: str = ""
 
@@ -457,6 +484,41 @@ class McpRpcSession(Protocol):
     async def close(self) -> None: ...
 
 
+def _validate_jsonrpc_response(raw: Any, *, request_id: int) -> dict[str, Any]:
+    """Validate one unambiguous JSON-RPC 2.0 response for every MCP transport."""
+
+    if not isinstance(raw, Mapping):
+        raise GatewayDenied("MCP peer returned an invalid JSON-RPC response")
+    keys = frozenset(str(key) for key in raw)
+    if "method" in keys or "params" in keys:
+        raise GatewayDenied("MCP peer returned an ambiguous JSON-RPC request/response")
+    has_result = "result" in keys
+    has_error = "error" in keys
+    if (
+        raw.get("jsonrpc") != "2.0"
+        or raw.get("id") != request_id
+        or has_result == has_error
+        or not keys.issubset({"jsonrpc", "id", "result", "error"})
+    ):
+        raise GatewayDenied("MCP peer returned an invalid JSON-RPC response")
+    if has_error:
+        error = raw.get("error")
+        if (
+            not isinstance(error, Mapping)
+            or isinstance(error.get("code"), bool)
+            or not isinstance(error.get("code"), int)
+            or not isinstance(error.get("message"), str)
+            or not str(error.get("message") or "").strip()
+            or not frozenset(error).issubset({"code", "message", "data"})
+        ):
+            raise GatewayDenied("MCP peer returned a malformed JSON-RPC error")
+        raise GatewayDenied("MCP peer rejected the governed request")
+    result = raw.get("result")
+    if not isinstance(result, Mapping):
+        raise GatewayDenied("MCP peer returned a malformed result")
+    return dict(result)
+
+
 class _McpJsonRpcTransport:
     """Bounded MCP JSON-RPC client shared by stdio and Streamable HTTP."""
 
@@ -483,19 +545,7 @@ class _McpJsonRpcTransport:
         if params is not None:
             payload["params"] = dict(params)
         raw = await self._exchange(payload)
-        if (
-            not isinstance(raw, Mapping)
-            or raw.get("jsonrpc") != "2.0"
-            or raw.get("id") != request_id
-        ):
-            raise GatewayDenied("MCP peer returned an invalid JSON-RPC response")
-        if raw.get("error") is not None:
-            # Error bodies are untrusted and can contain prompts, secrets or PII.
-            raise GatewayDenied("MCP peer rejected the governed request")
-        result = raw.get("result")
-        if not isinstance(result, Mapping):
-            raise GatewayDenied("MCP peer returned a malformed result")
-        return dict(result)
+        return _validate_jsonrpc_response(raw, request_id=request_id)
 
     async def initialize(self) -> Mapping[str, Any]:
         if self._initialize_result is not None:
@@ -541,7 +591,7 @@ class _McpJsonRpcTransport:
         # even when a malicious peer advertises it.
         tools = await self._list_all("tools/list", "tools")
         resources = await self._list_all("resources/list", "resources")
-        return {"tools": tools, "resources": resources, "prompts": []}
+        return {"tools": tools, "resources": resources}
 
     async def invoke(self, name: str, arguments: Mapping[str, Any]) -> Any:
         await self.initialize()
@@ -652,6 +702,7 @@ class McpStdioTransport(_McpJsonRpcTransport):
         gateway: ToolGateway,
         launch_request: ToolExecutionRequest,
         session_factory: McpStdioSessionFactory | None = None,
+        trusted_test_seam: bool = False,
     ) -> None:
         super().__init__()
         if config.transport != "stdio":
@@ -659,7 +710,8 @@ class McpStdioTransport(_McpJsonRpcTransport):
         self.config = config
         self.gateway = gateway
         self.launch_request = launch_request
-        self.session_factory = session_factory or _JsonLineMcpSession.launch
+        self.session_factory = session_factory
+        self.trusted_test_seam = bool(trusted_test_seam)
         self._session: McpRpcSession | None = None
 
     def _validate_exact_launch(self) -> None:
@@ -679,8 +731,13 @@ class McpStdioTransport(_McpJsonRpcTransport):
         self._validate_exact_launch()
         if not isinstance(self.gateway, ToolGateway):
             raise GatewayDenied("MCP stdio launch has no Tool Gateway")
+        if self.session_factory is None or not self.trusted_test_seam:
+            raise GatewayDenied(
+                "MCP stdio requires an explicitly trusted sandbox executor"
+            )
 
         async def launch_effect(_request: ToolExecutionRequest) -> McpRpcSession:
+            assert self.session_factory is not None
             value = self.session_factory(self.config, self.launch_request)
             session = await value if inspect.isawaitable(value) else value
             if not all(callable(getattr(session, name, None)) for name in ("request", "notify", "close")):
@@ -840,6 +897,69 @@ class McpStreamableHttpTransport(_McpJsonRpcTransport):
             await client.aclose()
 
 
+@dataclass(frozen=True)
+class McpCapabilityIdentity:
+    server_id: str
+    transport: str
+    canonical_endpoint: str
+    operation: str
+    remote_name: str = ""
+    remote_uri: str = ""
+    schema_digest: str = ""
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(json.dumps(
+            {
+                "server_id": self.server_id,
+                "transport": self.transport,
+                "canonical_endpoint": self.canonical_endpoint,
+                "operation": self.operation,
+                "remote_name": self.remote_name,
+                "remote_uri": self.remote_uri,
+                "schema_digest": self.schema_digest,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+
+def _canonical_mcp_endpoint(config: McpServerConfig) -> str:
+    if config.transport == "stdio":
+        executable = _canonical_path(config.command).as_posix()
+        return "stdio:" + hashlib.sha256(json.dumps(
+            {"executable": executable, "argv": list(config.args)},
+            ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+    parsed = urlparse(config.url)
+    if (
+        parsed.scheme.casefold() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise GatewayDenied("MCP endpoint must be canonical HTTPS")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise GatewayDenied("MCP endpoint port is invalid") from exc
+    host = parsed.hostname.casefold().rstrip(".")
+    authority = host if port in (None, 443) else f"{host}:{port}"
+    path = re.sub(r"/{2,}", "/", parsed.path or "/").rstrip("/") or "/"
+    return f"https://{authority}{'' if path == '/' else path}"
+
+
+def _canonical_schema(schema: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+    frozen = copy.deepcopy(dict(schema))
+    encoded = json.dumps(
+        frozen, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return frozen, hashlib.sha256(encoded).hexdigest()
+
+
 class McpRegistry:
     """MCP configuration, handshake, discovery and invocation policy registry."""
 
@@ -852,6 +972,7 @@ class McpRegistry:
             raise ValueError("duplicate MCP server id")
         if config.transport == "streamable_http":
             self._validate_url(config, config.url)
+        _canonical_mcp_endpoint(config)
         self._configs[config.server_id] = config
 
     def _config(self, server_id: str) -> McpServerConfig:
@@ -904,22 +1025,296 @@ class McpRegistry:
     def _validate_schema(schema: Any) -> None:
         if not isinstance(schema, Mapping) or schema.get("type") != "object":
             raise GatewayDenied("MCP tool schema must be a bounded object schema")
-        encoded = json.dumps(schema, ensure_ascii=True, sort_keys=True, default=str)
-        if len(encoded.encode("utf-8")) > 65_536:
+        try:
+            encoded = json.dumps(
+                schema, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise GatewayDenied("MCP tool schema is not strict JSON") from exc
+        if len(encoded) > 65_536:
             raise GatewayDenied("MCP tool schema exceeds the policy limit")
-        if any(key in encoded for key in ('"$ref":"http:', '"$ref":"https:')):
-            raise GatewayDenied("remote MCP schema references are forbidden")
+
+        allowed_keys = frozenset({
+            "type", "properties", "required", "additionalProperties", "items",
+            "enum", "const", "minLength", "maxLength", "minimum", "maximum",
+            "minItems", "maxItems", "description", "title", "pattern",
+        })
+        node_count = 0
+
+        def walk(node: Any, depth: int) -> None:
+            nonlocal node_count
+            node_count += 1
+            if depth > 16 or node_count > 1024:
+                raise GatewayDenied("MCP tool schema exceeds depth or node limits")
+            if not isinstance(node, Mapping):
+                raise GatewayDenied("MCP tool schema node is malformed")
+            keys = frozenset(str(key) for key in node)
+            if not keys.issubset(allowed_keys) or any(key.startswith("$") for key in keys):
+                raise GatewayDenied("MCP tool schema uses unsupported authority keywords")
+            kind = node.get("type")
+            if kind not in {"object", "array", "string", "integer", "number", "boolean", "null"}:
+                raise GatewayDenied("MCP tool schema type is unsupported")
+            for text_key in ("description", "title", "pattern"):
+                text = node.get(text_key)
+                if text is not None and (not isinstance(text, str) or len(text) > 4096):
+                    raise GatewayDenied("MCP tool schema text is invalid")
+                if isinstance(text, str) and _PROMPT_INJECTION.search(text):
+                    raise GatewayDenied("MCP tool schema contains prompt injection")
+                if (
+                    isinstance(text, str)
+                    and PiiDlpGateway().decide_outbound(text, approved=False).requires_approval
+                ):
+                    raise GatewayDenied("MCP tool schema text contains sensitive data")
+            # Python's backtracking regex engine cannot safely execute an arbitrary
+            # remote pattern under a deterministic time budget.  Such schemas are not
+            # safely expressible by this gateway and therefore fail closed.
+            if "pattern" in node:
+                raise GatewayDenied("MCP tool schema pattern constraints are unsupported")
+
+            constraint_keys = {
+                "minLength", "maxLength", "minimum", "maximum", "minItems", "maxItems",
+            }
+            allowed_constraints = {
+                "string": {"minLength", "maxLength"},
+                "integer": {"minimum", "maximum"},
+                "number": {"minimum", "maximum"},
+                "array": {"minItems", "maxItems"},
+            }.get(str(kind), set())
+            if (keys & constraint_keys) - allowed_constraints:
+                raise GatewayDenied("MCP tool schema constraint does not match its type")
+            if kind == "string":
+                minimum = node.get("minLength", 0)
+                maximum = node.get("maxLength", 65_536)
+                if (
+                    isinstance(minimum, bool)
+                    or isinstance(maximum, bool)
+                    or not isinstance(minimum, int)
+                    or not isinstance(maximum, int)
+                    or not 0 <= minimum <= maximum <= 65_536
+                ):
+                    raise GatewayDenied("MCP string schema constraints are invalid")
+            elif kind in {"integer", "number"}:
+                minimum = node.get("minimum")
+                maximum = node.get("maximum")
+                for bound in (minimum, maximum):
+                    if bound is not None and (
+                        isinstance(bound, bool)
+                        or not isinstance(bound, (int, float))
+                        or not math.isfinite(float(bound))
+                    ):
+                        raise GatewayDenied("MCP numeric schema constraints are invalid")
+                if minimum is not None and maximum is not None and float(minimum) > float(maximum):
+                    raise GatewayDenied("MCP numeric schema constraints are inverted")
+            if "enum" in node:
+                enum = node["enum"]
+                if not isinstance(enum, list) or not enum or len(enum) > 256:
+                    raise GatewayDenied("MCP tool schema enum is invalid")
+                try:
+                    enum_bytes = json.dumps(
+                        enum, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+                    ).encode("utf-8")
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise GatewayDenied("MCP tool schema enum is not strict JSON") from exc
+                if len(enum_bytes) > 16_384:
+                    raise GatewayDenied("MCP tool schema enum is too large")
+            if kind == "object":
+                properties = node.get("properties", {})
+                if not isinstance(properties, Mapping) or len(properties) > 256:
+                    raise GatewayDenied("MCP tool schema properties are invalid")
+                required = node.get("required", [])
+                if (
+                    not isinstance(required, list)
+                    or len(required) != len(set(required))
+                    or any(not isinstance(item, str) or item not in properties for item in required)
+                ):
+                    raise GatewayDenied("MCP tool schema required list is invalid")
+                additional = node.get("additionalProperties", False)
+                if additional is not False:
+                    raise GatewayDenied("MCP tool schemas must forbid additional properties")
+                for key, child in properties.items():
+                    if (
+                        not isinstance(key, str)
+                        or not key
+                        or len(key) > 128
+                        or any(ord(char) < 32 for char in key)
+                    ):
+                        raise GatewayDenied("MCP tool schema property name is invalid")
+                    walk(child, depth + 1)
+            elif kind == "array":
+                if "items" not in node:
+                    raise GatewayDenied("MCP array schema requires bounded items")
+                minimum = node.get("minItems", 0)
+                maximum = node.get("maxItems")
+                if (
+                    isinstance(minimum, bool)
+                    or isinstance(maximum, bool)
+                    or not isinstance(minimum, int)
+                    or not isinstance(maximum, int)
+                    or not 0 <= minimum <= maximum <= 1024
+                ):
+                    raise GatewayDenied("MCP array schema requires a bounded maxItems")
+                walk(node["items"], depth + 1)
+            elif "properties" in node or "required" in node or "items" in node:
+                raise GatewayDenied("MCP schema keywords do not match their type")
+
+        walk(schema, 0)
+
+    @staticmethod
+    def _validate_bounded_metadata(value: Any, *, label: str) -> None:
+        """Validate and content-scan untrusted nested MCP metadata."""
+
+        nodes = 0
+
+        def walk(item: Any, depth: int) -> None:
+            nonlocal nodes
+            nodes += 1
+            if depth > 8 or nodes > 256:
+                raise GatewayDenied(f"MCP {label} metadata exceeds complexity limits")
+            if item is None or isinstance(item, (str, bool)):
+                if isinstance(item, str) and len(item) > 4096:
+                    raise GatewayDenied(f"MCP {label} metadata string is too large")
+                return
+            if isinstance(item, (int, float)) and not isinstance(item, bool):
+                if not math.isfinite(float(item)):
+                    raise GatewayDenied(f"MCP {label} metadata number is invalid")
+                return
+            if isinstance(item, list):
+                if len(item) > 64:
+                    raise GatewayDenied(f"MCP {label} metadata list is too large")
+                for child in item:
+                    walk(child, depth + 1)
+                return
+            if isinstance(item, Mapping):
+                if len(item) > 64:
+                    raise GatewayDenied(f"MCP {label} metadata object is too large")
+                for key, child in item.items():
+                    if (
+                        not isinstance(key, str)
+                        or not key
+                        or len(key) > 128
+                        or any(ord(char) < 32 for char in key)
+                    ):
+                        raise GatewayDenied(f"MCP {label} metadata key is invalid")
+                    walk(child, depth + 1)
+                return
+            raise GatewayDenied(f"MCP {label} metadata is not strict JSON")
+
+        walk(value, 0)
+        try:
+            encoded = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise GatewayDenied(f"MCP {label} metadata is not strict JSON") from exc
+        if len(encoded) > 16_384:
+            raise GatewayDenied(f"MCP {label} metadata exceeds the size limit")
+        text = encoded.decode("utf-8")
+        if (
+            _PROMPT_INJECTION.search(text)
+            or PiiDlpGateway().decide_outbound(text, approved=False).requires_approval
+        ):
+            raise GatewayDenied(f"MCP {label} metadata violates content policy")
+
+    @classmethod
+    def _validate_resource_annotations(cls, value: Any) -> None:
+        if not isinstance(value, Mapping) or not frozenset(value).issubset({
+            "audience", "priority", "lastModified",
+        }):
+            raise GatewayDenied("MCP resource annotations are malformed")
+        audience = value.get("audience")
+        if audience is not None and (
+            not isinstance(audience, list)
+            or not audience
+            or len(audience) > 2
+            or len(audience) != len(set(audience))
+            or any(item not in {"user", "assistant"} for item in audience)
+        ):
+            raise GatewayDenied("MCP resource annotations audience is invalid")
+        priority = value.get("priority")
+        if priority is not None and (
+            isinstance(priority, bool)
+            or not isinstance(priority, (int, float))
+            or not math.isfinite(float(priority))
+            or not 0 <= float(priority) <= 1
+        ):
+            raise GatewayDenied("MCP resource annotations priority is invalid")
+        modified = value.get("lastModified")
+        if modified is not None:
+            if not isinstance(modified, str) or len(modified) > 64:
+                raise GatewayDenied("MCP resource annotations lastModified is invalid")
+            try:
+                parsed = datetime.fromisoformat(modified.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise GatewayDenied("MCP resource annotations lastModified is invalid") from exc
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise GatewayDenied("MCP resource annotations lastModified needs a timezone")
+        cls._validate_bounded_metadata(dict(value), label="resource annotations")
+
+    @classmethod
+    def _validate_arguments(cls, value: Any, schema: Mapping[str, Any], *, path: str = "$") -> None:
+        kind = schema.get("type")
+        valid = {
+            "object": lambda item: isinstance(item, Mapping),
+            "array": lambda item: isinstance(item, list),
+            "string": lambda item: isinstance(item, str),
+            "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+            "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool)
+                and math.isfinite(float(item)),
+            "boolean": lambda item: isinstance(item, bool),
+            "null": lambda item: item is None,
+        }
+        checker = valid.get(str(kind))
+        if checker is None or not checker(value):
+            raise GatewayDenied(f"MCP invocation argument violates schema at {path}")
+        if "enum" in schema and value not in schema["enum"]:
+            raise GatewayDenied(f"MCP invocation argument violates enum at {path}")
+        if "const" in schema and value != schema["const"]:
+            raise GatewayDenied(f"MCP invocation argument violates const at {path}")
+        if kind == "object":
+            properties = schema.get("properties", {})
+            required = schema.get("required", [])
+            missing = set(required) - set(value)
+            extras = set(value) - set(properties)
+            if missing or extras:
+                raise GatewayDenied(f"MCP invocation argument object violates schema at {path}")
+            for key, item in value.items():
+                cls._validate_arguments(item, properties[key], path=f"{path}.{key}")
+        elif kind == "array":
+            minimum = int(schema.get("minItems", 0))
+            maximum = int(schema.get("maxItems", 0))
+            if not minimum <= len(value) <= maximum:
+                raise GatewayDenied(f"MCP invocation array violates schema at {path}")
+            for index, item in enumerate(value):
+                cls._validate_arguments(item, schema["items"], path=f"{path}[{index}]")
+        elif kind == "string":
+            minimum = int(schema.get("minLength", 0))
+            maximum = int(schema.get("maxLength", 65_536))
+            if not minimum <= len(value) <= maximum:
+                raise GatewayDenied(f"MCP invocation string violates schema at {path}")
+            pattern = schema.get("pattern")
+            if pattern:
+                try:
+                    if re.fullmatch(pattern, value) is None:
+                        raise GatewayDenied(f"MCP invocation string violates pattern at {path}")
+                except re.error as exc:
+                    raise GatewayDenied("MCP schema pattern is invalid") from exc
+        elif kind in {"integer", "number"}:
+            if "minimum" in schema and float(value) < float(schema["minimum"]):
+                raise GatewayDenied(f"MCP invocation number violates minimum at {path}")
+            if "maximum" in schema and float(value) > float(schema["maximum"]):
+                raise GatewayDenied(f"MCP invocation number violates maximum at {path}")
 
     def accept_discovery(self, server_id: str, discovery: Mapping[str, Any]) -> dict[str, Any]:
         config = self._config(server_id)
-        prompts = discovery.get("prompts") or ()
-        if prompts:
+        if "prompts" in discovery:
             raise GatewayDenied("MCP prompts are disabled")
         raw_tools = discovery.get("tools") or ()
         raw_resources = discovery.get("resources") or ()
         if not isinstance(raw_tools, (list, tuple)) or not isinstance(raw_resources, (list, tuple)):
             raise GatewayDenied("MCP discovery payload is malformed")
+        endpoint = _canonical_mcp_endpoint(config)
         tool_names: list[str] = []
+        tool_records: dict[str, dict[str, Any]] = {}
         for raw in raw_tools:
             if not isinstance(raw, Mapping):
                 raise GatewayDenied("MCP tool discovery entry is malformed")
@@ -930,12 +1325,91 @@ class McpRegistry:
             if _PROMPT_INJECTION.search(description):
                 raise GatewayDenied("MCP tool description contains prompt injection")
             self._validate_schema(raw.get("inputSchema"))
+            if PiiDlpGateway().decide_outbound(description, approved=False).requires_approval:
+                raise GatewayDenied("MCP tool description contains sensitive data")
+            frozen_schema, schema_digest = _canonical_schema(raw["inputSchema"])
+            identity = McpCapabilityIdentity(
+                server_id=server_id,
+                transport=config.transport,
+                canonical_endpoint=endpoint,
+                operation="tools/call",
+                remote_name=name,
+                schema_digest=schema_digest,
+            )
             tool_names.append(name)
-        resource_uris = []
+            tool_records[name] = {
+                "schema": frozen_schema,
+                "identity": identity,
+            }
+        resource_uris: list[str] = []
+        resource_records: dict[str, dict[str, Any]] = {}
         for raw in raw_resources:
             if not isinstance(raw, Mapping) or not str(raw.get("uri") or "").strip():
                 raise GatewayDenied("MCP resource discovery entry is malformed")
-            resource_uris.append(str(raw["uri"]))
+            if not frozenset(raw).issubset({
+                "uri", "name", "title", "description", "mimeType", "size", "annotations",
+            }):
+                raise GatewayDenied("MCP resource metadata contains unsupported fields")
+            uri = str(raw["uri"]).strip()
+            parsed_uri = urlparse(uri)
+            if (
+                len(uri) > 2048
+                or not parsed_uri.scheme
+                or any(ord(char) < 32 for char in uri)
+                or uri in resource_uris
+            ):
+                raise GatewayDenied("MCP resource URI is invalid")
+            metadata_text = "\n".join(
+                str(raw.get(key) or "") for key in ("name", "title", "description", "mimeType")
+            )
+            for text_key in ("name", "title", "description", "mimeType"):
+                if text_key in raw and (
+                    not isinstance(raw[text_key], str) or len(raw[text_key]) > 4096
+                ):
+                    raise GatewayDenied("MCP resource metadata field is invalid")
+            mime_type = raw.get("mimeType")
+            if isinstance(mime_type, str) and mime_type and re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/"
+                r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}",
+                mime_type,
+            ) is None:
+                raise GatewayDenied("MCP resource MIME type is invalid")
+            if (
+                len(metadata_text) > 8192
+                or _PROMPT_INJECTION.search(metadata_text)
+                or PiiDlpGateway().decide_outbound(
+                    metadata_text, approved=False,
+                ).requires_approval
+            ):
+                raise GatewayDenied("MCP resource metadata violates content policy")
+            size = raw.get("size")
+            if size is not None and (
+                isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= 1_048_576
+            ):
+                raise GatewayDenied("MCP resource metadata size is invalid")
+            if "annotations" in raw:
+                self._validate_resource_annotations(raw["annotations"])
+            self._validate_bounded_metadata(dict(raw), label="resource discovery")
+            try:
+                canonical_metadata = json.dumps(
+                    dict(raw), ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+                ).encode("utf-8")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise GatewayDenied("MCP resource metadata is not strict JSON") from exc
+            schema_digest = hashlib.sha256(canonical_metadata).hexdigest()
+            identity = McpCapabilityIdentity(
+                server_id=server_id,
+                transport=config.transport,
+                canonical_endpoint=endpoint,
+                operation="resources/read",
+                remote_uri=uri,
+                schema_digest=schema_digest,
+            )
+            resource_uris.append(uri)
+            resource_records[uri] = {
+                "metadata": copy.deepcopy(dict(raw)),
+                "identity": identity,
+            }
         unexpected_tools = set(tool_names) - set(config.allowed_tools)
         unexpected_resources = set(resource_uris) - set(config.allowed_resources)
         if unexpected_tools or unexpected_resources:
@@ -944,7 +1418,16 @@ class McpRegistry:
             "server_id": server_id,
             "tools": tuple(tool_names),
             "resources": tuple(resource_uris),
-            "prompts": (),
+            "tool_records": tool_records,
+            "resource_records": resource_records,
+            "discovery_digest": hashlib.sha256(json.dumps(
+                {
+                    "tools": {name: item["identity"].digest for name, item in tool_records.items()},
+                    "resources": {
+                        uri: item["identity"].digest for uri, item in resource_records.items()
+                    },
+                }, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest(),
         }
         self._discovery[server_id] = accepted
         return accepted
@@ -955,11 +1438,123 @@ class McpRegistry:
         protocol = str(initialized.get("protocolVersion") or "")
         if not protocol or len(protocol) > 40:
             raise GatewayDenied("MCP handshake protocol version is invalid")
-        if initialized.get("prompts") or (initialized.get("capabilities") or {}).get("prompts"):
+        capabilities = initialized.get("capabilities")
+        if (
+            "prompts" in initialized
+            or isinstance(capabilities, Mapping) and "prompts" in capabilities
+        ):
             raise GatewayDenied("MCP prompt capability is disabled")
         if config.transport == "streamable_http" and initialized.get("redirect"):
             raise GatewayDenied("MCP redirects are forbidden")
         return self.accept_discovery(server_id, await transport.discover())
+
+    def tool_descriptor(
+        self, server_id: str, name: str, *, risk: RiskLevel,
+    ) -> ToolDescriptor:
+        accepted = self._discovery.get(str(server_id))
+        record = None if accepted is None else accepted["tool_records"].get(str(name))
+        if record is None:
+            raise GatewayDenied("MCP tool was not inspected")
+        config = self._config(server_id)
+        host = urlparse(config.url).hostname if config.transport == "streamable_http" else None
+        return ToolDescriptor(
+            tool_name=f"mcp:{server_id}:tool:{name}",
+            kind="mcp",
+            risk=risk,
+            network_hosts=(str(host),) if host else (),
+            schema_digest=record["identity"].digest,
+        )
+
+    def resource_descriptor(
+        self, server_id: str, uri: str, *, risk: RiskLevel,
+    ) -> ToolDescriptor:
+        accepted = self._discovery.get(str(server_id))
+        record = None if accepted is None else accepted["resource_records"].get(str(uri))
+        if record is None:
+            raise GatewayDenied("MCP resource was not inspected")
+        config = self._config(server_id)
+        host = urlparse(config.url).hostname if config.transport == "streamable_http" else None
+        return ToolDescriptor(
+            tool_name=f"mcp:{server_id}:resource:{hashlib.sha256(uri.encode('utf-8')).hexdigest()}",
+            kind="mcp",
+            risk=risk,
+            network_hosts=(str(host),) if host else (),
+            schema_digest=record["identity"].digest,
+        )
+
+    def validate_tool_capability(
+        self,
+        server_id: str,
+        name: str,
+        arguments: Mapping[str, Any],
+        descriptor: ToolDescriptor,
+    ) -> McpCapabilityIdentity:
+        accepted = self._discovery.get(str(server_id))
+        record = None if accepted is None else accepted["tool_records"].get(str(name))
+        if record is None:
+            raise GatewayDenied("MCP tool was not inspected and granted")
+        identity: McpCapabilityIdentity = record["identity"]
+        if descriptor.kind != "mcp" or descriptor.schema_digest != identity.digest:
+            raise GatewayDenied("MCP capability authorization is stale or mismatched")
+        self._validate_arguments(dict(arguments), record["schema"])
+        return identity
+
+    @staticmethod
+    def _validate_resource_result(uri: str, value: Any) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping) or not frozenset(value).issubset({"contents", "_meta"}):
+            raise GatewayDenied("MCP resource result is malformed")
+        if "_meta" in value:
+            McpRegistry._validate_bounded_metadata(
+                value["_meta"], label="resource result",
+            )
+        contents = value.get("contents")
+        if not isinstance(contents, list) or not contents or len(contents) > 64:
+            raise GatewayDenied("MCP resource contents are malformed")
+        total = 0
+        for item in contents:
+            if not isinstance(item, Mapping) or not frozenset(item).issubset({
+                "uri", "mimeType", "text", "blob", "_meta",
+            }):
+                raise GatewayDenied("MCP resource content entry is malformed")
+            if str(item.get("uri") or "") != uri:
+                raise GatewayDenied("MCP resource content URI changed after authorization")
+            mime_type = item.get("mimeType")
+            if mime_type is not None and (
+                not isinstance(mime_type, str)
+                or len(mime_type) > 255
+                or re.fullmatch(
+                    r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/"
+                    r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}",
+                    mime_type,
+                ) is None
+            ):
+                raise GatewayDenied("MCP resource content MIME type is invalid")
+            metadata = {key: item[key] for key in ("uri", "mimeType", "_meta") if key in item}
+            McpRegistry._validate_bounded_metadata(
+                metadata, label="resource content",
+            )
+            text = item.get("text")
+            blob = item.get("blob")
+            if (isinstance(text, str)) == (isinstance(blob, str)):
+                raise GatewayDenied("MCP resource content requires exactly one body encoding")
+            body = text if isinstance(text, str) else blob
+            assert isinstance(body, str)
+            if isinstance(text, str):
+                body_bytes = text.encode("utf-8")
+            else:
+                try:
+                    body_bytes = base64.b64decode(blob, validate=True)
+                except (binascii.Error, ValueError) as exc:
+                    raise GatewayDenied("MCP resource blob encoding is invalid") from exc
+            total += len(body_bytes)
+            if total > 1_048_576:
+                raise GatewayDenied("MCP resource contents exceed the size limit")
+            if isinstance(text, str) and (
+                _PROMPT_INJECTION.search(text)
+                or PiiDlpGateway().decide_outbound(text, approved=False).requires_approval
+            ):
+                raise GatewayDenied("MCP resource content violates prompt/DLP policy")
+        return value
 
     async def invoke(
         self,
@@ -987,12 +1582,12 @@ class McpRegistry:
         if canonical_requested != canonical_effect:
             raise GatewayDenied("MCP invocation arguments changed after authorization")
 
+        descriptor = gateway.descriptor(request.tool_name)
+        self.validate_tool_capability(server_id, name, arguments, descriptor)
+
         async def governed_effect(_request: ToolExecutionRequest) -> Any:
             return await transport.invoke(name, arguments)
 
-        descriptor = gateway.descriptor(request.tool_name)
-        if descriptor.kind != "mcp":
-            raise GatewayDenied("MCP invocation requires an MCP Tool Gateway descriptor")
         return await gateway.invoke_with_effect(request, governed_effect)
 
     async def read_resource(
@@ -1011,7 +1606,20 @@ class McpRegistry:
         self._validate_effect_network_scope(config, request)
         if str(request.arguments.get("uri") or "") != uri:
             raise GatewayDenied("MCP resource URI changed after authorization")
-        return await gateway.invoke_with_effect(request, lambda _request: effect(uri))
+        record = accepted["resource_records"].get(uri)
+        descriptor = gateway.descriptor(request.tool_name)
+        if (
+            record is None
+            or descriptor.kind != "mcp"
+            or descriptor.schema_digest != record["identity"].digest
+        ):
+            raise GatewayDenied("MCP resource authorization is stale or mismatched")
+
+        async def governed_read(_request: ToolExecutionRequest) -> Any:
+            value = await effect(uri)
+            return self._validate_resource_result(uri, value)
+
+        return await gateway.invoke_with_effect(request, governed_read)
 
 
 _PII_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -1039,6 +1647,9 @@ _SECRET_KEYS = frozenset({
     "access_token", "refresh_token", "authorization", "cookie", "client_secret",
 })
 _BODY_KEYS = frozenset({"tool_body", "request_body", "response_body", "raw_payload"})
+_DIAGNOSTIC_METADATA_KEYS = frozenset({
+    "path", "query", "url", "command", "destination", "source", "cwd", "argv",
+})
 
 
 class PiiDlpGateway:
@@ -1080,8 +1691,10 @@ class PiiDlpGateway:
         folded = str(field_name).strip().casefold().replace("-", "_")
         if folded in _SECRET_KEYS:
             return "[REDACTED_SECRET]" if value not in (None, "") else value
-        if folded in _BODY_KEYS:
+        if folded in _BODY_KEYS or folded.endswith("_body") or folded.endswith("_payload"):
             return "[REDACTED_TOOL_BODY]"
+        if folded in _DIAGNOSTIC_METADATA_KEYS:
+            return "[REDACTED_METADATA]" if value not in (None, "") else value
         if isinstance(value, Mapping):
             return {
                 str(key): self.redact_diagnostics(item, field_name=str(key))
@@ -1105,12 +1718,18 @@ class ProviderCapability:
     privacy: PrivacyTier
     estimated_cost_usd: float
     preauthorized: bool
+    endpoint_authorities: tuple[str, ...] = ()
+    transports: tuple[str, ...] = ("openai_chat",)
 
     def __post_init__(self) -> None:
         if not self.provider_id.strip() or not self.models:
             raise ValueError("provider id and models are required")
         if not math.isfinite(self.estimated_cost_usd) or self.estimated_cost_usd < 0:
             raise ValueError("provider estimated cost is invalid")
+        if not self.transports:
+            raise ValueError("provider transports are required")
+        for endpoint in self.endpoint_authorities:
+            _canonical_provider_endpoint(endpoint)
 
 
 class ModelCapabilityRegistry:
@@ -1127,6 +1746,32 @@ class ModelCapabilityRegistry:
             return self._providers[str(provider_id)]
         except KeyError as exc:
             raise GatewayDenied("provider is not registered") from exc
+
+    def authorize(
+        self,
+        provider_id: str,
+        *,
+        model: str,
+        endpoint: str,
+        transport: str,
+        required_capabilities: Iterable[str],
+    ) -> ProviderCapability:
+        capability = self.get(provider_id)
+        if not capability.preauthorized:
+            raise GatewayDenied("provider capability is not preauthorized")
+        if "*" not in capability.models and str(model) not in capability.models:
+            raise GatewayDenied("provider model is not in the trusted capability registry")
+        if str(transport) not in capability.transports:
+            raise GatewayDenied("provider transport is not in the trusted capability registry")
+        required = frozenset(str(item) for item in required_capabilities)
+        if not required.issubset(capability.capabilities):
+            raise GatewayDenied("provider operation exceeds the trusted capability registry")
+        candidate = _canonical_provider_endpoint(endpoint)
+        if not capability.endpoint_authorities or not any(
+            _provider_endpoint_under(candidate, rule) for rule in capability.endpoint_authorities
+        ):
+            raise GatewayDenied("provider endpoint is not in the trusted capability registry")
+        return capability
 
     def select_failover(
         self,
@@ -1162,11 +1807,359 @@ class ModelCapabilityRegistry:
         raise GatewayDenied("no authorized privacy-preserving provider failover is available")
 
 
+def _canonical_provider_endpoint(value: str) -> str:
+    parsed = urlparse(str(value).strip())
+    if (
+        parsed.scheme.casefold() != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise GatewayDenied("provider endpoint must be canonical HTTPS without credentials or query")
+    host = parsed.hostname.casefold().rstrip(".")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise GatewayDenied("provider endpoint port is invalid") from exc
+    authority = host if port in (None, 443) else f"{host}:{port}"
+    path = re.sub(r"/{2,}", "/", parsed.path or "").rstrip("/")
+    return f"https://{authority}{path}"
+
+
+def _provider_endpoint_under(candidate: str, rule: str) -> bool:
+    canonical_rule = _canonical_provider_endpoint(rule)
+    if candidate == canonical_rule:
+        return True
+    parsed_rule = urlparse(canonical_rule)
+    if parsed_rule.path:
+        return candidate.startswith(canonical_rule + "/")
+    parsed_candidate = urlparse(candidate)
+    return parsed_candidate.netloc == parsed_rule.netloc
+
+
+def derive_provider_credential_purpose(
+    *, slot: str, provider_id: str, endpoint: str, transport: str,
+) -> str:
+    if re.fullmatch(r"[a-z][a-z0-9_.:-]{0,127}", str(slot)) is None:
+        raise GatewayDenied("provider credential slot is invalid")
+    canonical = _canonical_provider_endpoint(endpoint)
+    body = "\0".join((
+        "studycrew-provider-credential-v1",
+        str(slot),
+        str(provider_id),
+        canonical,
+        str(transport),
+        "provider_gateway",
+    ))
+    return "provider:" + hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _provider_capability_digest(
+    capability: ProviderCapability,
+    *,
+    model: str,
+    endpoint: str,
+    transport: str,
+) -> str:
+    body = {
+        "provider_id": capability.provider_id,
+        "model": str(model),
+        "endpoint": _canonical_provider_endpoint(endpoint),
+        "transport": str(transport),
+        "privacy": capability.privacy.value,
+        "capabilities": sorted(capability.capabilities),
+    }
+    return hashlib.sha256(json.dumps(
+        body, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+
+_PRODUCTION_PROVIDER_ENDPOINTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "openrouter": (("https://openrouter.ai",), ("openai_chat",)),
+    "deepseek": (("https://api.deepseek.com",), ("openai_chat",)),
+    "zai": (("https://api.z.ai", "https://open.bigmodel.cn"), ("openai_chat",)),
+    "kimi-coding": (("https://api.moonshot.ai",), ("openai_chat",)),
+    "kimi-coding-cn": (("https://api.moonshot.cn",), ("openai_chat",)),
+    "alibaba": (("https://dashscope.aliyuncs.com", "https://dashscope-intl.aliyuncs.com"), ("openai_chat",)),
+    "minimax": (("https://api.minimax.io",), ("anthropic_messages",)),
+    "minimax-cn": (("https://api.minimaxi.com",), ("anthropic_messages",)),
+    "stepfun": (("https://api.stepfun.com",), ("openai_chat",)),
+    "xai": (("https://api.x.ai",), ("openai_chat",)),
+    "anthropic": (("https://api.anthropic.com",), ("anthropic_messages",)),
+    "openai-api": (("https://api.openai.com",), ("codex_responses", "openai_chat")),
+    "gemini": (("https://generativelanguage.googleapis.com",), ("openai_chat",)),
+    "nvidia": (("https://integrate.api.nvidia.com",), ("openai_chat",)),
+    "huggingface": (("https://api-inference.huggingface.co",), ("openai_chat",)),
+    "novita": (("https://api.novita.ai",), ("openai_chat",)),
+    "arcee": (("https://api.arcee.ai",), ("openai_chat",)),
+    "gmi": (("https://api.gmicloud.ai",), ("openai_chat",)),
+    "copilot": (("https://api.githubcopilot.com",), ("openai_chat",)),
+}
+
+
+def production_model_capability_registry() -> ModelCapabilityRegistry:
+    registry = ModelCapabilityRegistry()
+    for provider_id, (endpoints, transports) in _PRODUCTION_PROVIDER_ENDPOINTS.items():
+        registry.register(ProviderCapability(
+            provider_id=provider_id,
+            models=("*",),
+            capabilities=frozenset({"chat", "stream", "tools"}),
+            privacy=PrivacyTier.STANDARD,
+            estimated_cost_usd=0.01,
+            preauthorized=True,
+            endpoint_authorities=endpoints,
+            transports=transports,
+        ))
+    return registry
+
+
+class ProviderGatewayClient:
+    """The sole production model-egress facade.
+
+    It derives authority from the backend Task Runtime context, validates a trusted
+    provider capability, scans the exact outgoing JSON, reserves model budget before
+    the network effect, and records a structured audit event.  The wrapped
+    ``ProviderClient`` is transport-only and cannot make production requests without
+    this facade.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str = "",
+        *,
+        transport: str = "openai_chat",
+        registry: ModelCapabilityRegistry | None = None,
+        authority_provider: Callable[[], LegacyToolAuthority | None] = current_legacy_tool_authority,
+        timeout: Any = None,
+        max_retries: int = 0,
+        extra_headers: dict[str, str] | None = None,
+        client_factory: Callable[[], Any] | None = None,
+        provider: str = "",
+        backoff_base: float = 1.0,
+        credential_provider: Callable[[], str] | None = None,
+        allow_ungoverned_test_transport: bool = False,
+    ) -> None:
+        from knowe_core.provider_client import ProviderClient
+
+        self.base_url = str(base_url)
+        self.model = str(model)
+        self.provider = str(provider)
+        self.transport = str(transport or "openai_chat")
+        self.registry = registry or production_model_capability_registry()
+        self.authority_provider = authority_provider
+        self._allow_ungoverned_test_transport = bool(allow_ungoverned_test_transport)
+        self._transport = ProviderClient(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            timeout=timeout,
+            max_retries=max_retries,
+            extra_headers=extra_headers,
+            client_factory=client_factory,
+            provider=provider,
+            backoff_base=backoff_base,
+            credential_provider=credential_provider,
+            _gateway_managed=True,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._transport, name)
+
+    @staticmethod
+    def _serialized_request(
+        messages: Any, tools: Any, extra_body: Any,
+    ) -> str:
+        try:
+            return json.dumps(
+                {"messages": messages, "tools": tools, "extra_body": extra_body},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise GatewayDenied("provider request body is not bounded JSON") from exc
+
+    def _authorize(
+        self,
+        *,
+        messages: Any,
+        tools: Any,
+        extra_body: Any,
+        max_tokens: int | None,
+        stream: bool,
+    ) -> tuple[TaskRuntimeService | None, str]:
+        if self._allow_ungoverned_test_transport:
+            return None, ""
+        authority = self.authority_provider()
+        if authority is None or authority.runtime is None:
+            raise GatewayDenied("authoritative Task Runtime context is unavailable for provider egress")
+        runtime = authority.runtime
+        run = runtime.store.get_run(authority.run_id)
+        if (
+            run is None
+            or run.group_id != authority.group_id
+            or run.task_id != authority.task_id
+            or run.status is not TaskStatus.RUNNING
+        ):
+            raise GatewayDenied("provider egress Task Runtime binding is invalid")
+        required = {"chat", "stream" if stream else "chat"}
+        if tools:
+            required.add("tools")
+        capability = self.registry.authorize(
+            self.provider,
+            model=self.model,
+            endpoint=self.base_url,
+            transport=self.transport,
+            required_capabilities=required,
+        )
+        serialized = self._serialized_request(messages, tools, extra_body)
+        decision = PiiDlpGateway().decide_outbound(serialized, approved=False)
+        capability_digest = _provider_capability_digest(
+            capability, model=self.model, endpoint=self.base_url, transport=self.transport,
+        )
+        operation_scope = {
+            "capability": capability_digest,
+            "request": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+            "provider": hashlib.sha256(self.provider.encode("utf-8")).hexdigest(),
+            "model": hashlib.sha256(self.model.encode("utf-8")).hexdigest(),
+            "endpoint": hashlib.sha256(
+                _canonical_provider_endpoint(self.base_url).encode("utf-8")
+            ).hexdigest(),
+            "transport": hashlib.sha256(self.transport.encode("utf-8")).hexdigest(),
+        }
+        invocation_id = ""
+        if decision.requires_approval:
+            if not authority.approval_id or not authority.grant_id:
+                raise GatewayDenied("sensitive provider outbound requires fresh Task Runtime approval")
+            invocation = runtime.prepare_tool(
+                authority.group_id,
+                authority.run_id,
+                task_id=authority.task_id,
+                tool_name="provider_egress",
+                idempotency_key=f"provider:{uuid.uuid4().hex}",
+                risk=RiskLevel.HIGH,
+                public_summary="Governed provider egress prepared",
+                approval_id=authority.approval_id,
+                grant_id=authority.grant_id,
+                operation_scope=operation_scope,
+                purpose="provider_egress",
+            )
+            if invocation.disposition != "created" or invocation.status != "prepared":
+                raise GatewayDenied("fresh provider egress approval is required")
+            running, claimed = runtime.store.claim_tool_execution(invocation.invocation_id)
+            if not claimed or running.status != "running":
+                raise GatewayDenied("provider egress approval was already consumed")
+            invocation_id = invocation.invocation_id
+
+        estimated_input_tokens = max(1, math.ceil(len(serialized) / 4))
+        reserved_output_tokens = max(0, int(max_tokens or 0))
+        budgeted = runtime.consume_budget(
+            authority.group_id,
+            authority.run_id,
+            BudgetUsage(
+                model_turns=1,
+                tokens=estimated_input_tokens + reserved_output_tokens,
+                cost_usd=capability.estimated_cost_usd,
+            ),
+            request_key=f"provider-budget:{uuid.uuid4().hex}",
+        )
+        if budgeted.status is not TaskStatus.RUNNING:
+            if invocation_id:
+                runtime.store.complete_tool(
+                    invocation_id, status="failed", error_type="BudgetExhausted",
+                )
+            raise GatewayDenied("Task Runtime model budget is exhausted")
+        runtime.store.change_run(
+            authority.run_id,
+            event_type="provider_egress",
+            public_payload={
+                "status": "authorized",
+                "capability_digest": capability_digest,
+                "privacy": capability.privacy.value,
+                "usage": budgeted.budget_usage.__dict__,
+                "approval_required": decision.requires_approval,
+            },
+            idempotency_key=f"provider-audit:{uuid.uuid4().hex}",
+            mutate=lambda current: (
+                None if current.status is TaskStatus.RUNNING
+                else (_ for _ in ()).throw(RuntimeStoreError("provider run is no longer running"))
+            ),
+        )
+        return runtime, invocation_id
+
+    @staticmethod
+    def _complete_authorized_effect(
+        runtime: TaskRuntimeService | None,
+        invocation_id: str,
+        *,
+        error: BaseException | None,
+    ) -> None:
+        if runtime is None or not invocation_id:
+            return
+        runtime.store.complete_tool(
+            invocation_id,
+            status="failed" if error is not None else "completed",
+            error_type=type(error).__name__ if error is not None else "",
+        )
+
+    async def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        runtime, invocation_id = self._authorize(
+            messages=messages, tools=tools, extra_body=extra_body,
+            max_tokens=max_tokens, stream=False,
+        )
+        try:
+            result = await self._transport.chat(
+                messages, tools, temperature, max_tokens, extra_body,
+            )
+        except BaseException as exc:
+            self._complete_authorized_effect(runtime, invocation_id, error=exc)
+            raise
+        self._complete_authorized_effect(runtime, invocation_id, error=None)
+        return result
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        extra_body: dict[str, Any] | None = None,
+    ):
+        runtime, invocation_id = self._authorize(
+            messages=messages, tools=tools, extra_body=extra_body,
+            max_tokens=max_tokens, stream=True,
+        )
+        try:
+            async for event in self._transport.chat_stream(
+                messages, tools, temperature, max_tokens, extra_body,
+            ):
+                yield event
+        except BaseException as exc:
+            self._complete_authorized_effect(runtime, invocation_id, error=exc)
+            raise
+        self._complete_authorized_effect(runtime, invocation_id, error=None)
+
+
 @dataclass
 class _SecretLease:
     lease_id: str
     secret_ref: str
+    slot: str
+    kind: str
     purpose: str
+    audience: str
+    provider_id: str
+    endpoint: str
+    transport: str
     value: bytearray = field(repr=False)
     expires_at: datetime
 
@@ -1181,17 +2174,46 @@ class SecretLeaseBroker:
     _LEASE_ID = re.compile(r"^lease_[0-9a-f]{32}$")
     _SECRET_REF = re.compile(r"^secret_[0-9a-f]{32}$")
 
-    def __init__(self, *, max_ttl_seconds: int = 300) -> None:
+    _SLOT = re.compile(r"^[a-z][a-z0-9_.:-]{0,127}$")
+    _PROVIDER = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+
+    def __init__(
+        self,
+        *,
+        max_ttl_seconds: int = 300,
+        sweep_interval_seconds: float = 1.0,
+    ) -> None:
         self.max_ttl_seconds = max(1, int(max_ttl_seconds))
         self._leases: dict[str, _SecretLease] = {}
         self._dlp = PiiDlpGateway()
+        self._lock = threading.RLock()
+        self._closed = threading.Event()
+        self._sweep_interval_seconds = max(0.0, float(sweep_interval_seconds))
+        self._sweeper: threading.Thread | None = None
+        if self._sweep_interval_seconds > 0:
+            self._sweeper = threading.Thread(
+                target=self._sweep_loop,
+                name="studycrew-secret-lease-expiry",
+                daemon=True,
+            )
+            self._sweeper.start()
+
+    def _sweep_loop(self) -> None:
+        while not self._closed.wait(self._sweep_interval_seconds):
+            self.sweep_expired()
 
     def provision(
         self,
         *,
         lease_id: str,
         secret_ref: str,
+        slot: str,
+        kind: str,
         purpose: str,
+        audience: str,
+        provider_id: str,
+        endpoint: str,
+        transport: str,
         value: str,
         expires_at: str,
         now: datetime | None = None,
@@ -1203,75 +2225,192 @@ class SecretLeaseBroker:
             raise GatewayDenied("secret lease id is invalid")
         if self._SECRET_REF.fullmatch(str(secret_ref)) is None:
             raise GatewayDenied("secret reference is invalid")
-        if not purpose.strip() or not value:
-            raise GatewayDenied("secret lease purpose and value are required")
+        if (
+            self._SLOT.fullmatch(str(slot)) is None
+            or kind not in {"provider_credential", "master_key"}
+            or not purpose.strip()
+            or not audience.strip()
+            or not value
+        ):
+            raise GatewayDenied("secret lease metadata and value are required")
+        if kind == "provider_credential":
+            if (
+                audience != "provider_gateway"
+                or self._PROVIDER.fullmatch(str(provider_id)) is None
+                or not str(transport).strip()
+                or _canonical_provider_endpoint(endpoint) != str(endpoint)
+                or purpose != derive_provider_credential_purpose(
+                    slot=slot,
+                    provider_id=provider_id,
+                    endpoint=endpoint,
+                    transport=transport,
+                )
+            ):
+                raise GatewayDenied("provider credential lease binding is invalid")
+        elif (
+            audience == "provider_gateway"
+            or provider_id
+            or endpoint
+            or purpose.startswith("provider:")
+        ):
+            raise GatewayDenied("master key lease cannot carry provider authority")
         if not math.isfinite(ttl) or ttl <= 0 or ttl > self.max_ttl_seconds:
             raise GatewayDenied("secret lease TTL is outside policy")
-        previous = self._leases.pop(lease_id, None)
-        if previous is not None:
-            previous.clear()
-        # Main rotates provider leases before expiry.  Retire the previous lease for
-        # the same durable reference/purpose so Python never accumulates credentials.
-        for existing_id, existing in tuple(self._leases.items()):
-            if existing.secret_ref == secret_ref and existing.purpose == purpose:
-                existing.clear()
-                self._leases.pop(existing_id, None)
-        self._leases[lease_id] = _SecretLease(
-            lease_id=lease_id,
-            secret_ref=secret_ref,
-            purpose=purpose,
-            value=bytearray(value.encode("utf-8")),
-            expires_at=expiry,
-        )
+        with self._lock:
+            if self._closed.is_set():
+                raise GatewayDenied("secret lease broker is closed")
+            previous = self._leases.pop(lease_id, None)
+            if previous is not None:
+                previous.clear()
+            # Main rotates one exact durable reference.  Pending replacement refs may
+            # coexist until backend settings activate one; they cannot be redeemed by
+            # a binding for the other reference.
+            for existing_id, existing in tuple(self._leases.items()):
+                if existing.secret_ref == secret_ref:
+                    existing.clear()
+                    self._leases.pop(existing_id, None)
+            self._leases[lease_id] = _SecretLease(
+                lease_id=lease_id,
+                secret_ref=secret_ref,
+                slot=slot,
+                kind=kind,
+                purpose=purpose,
+                audience=audience,
+                provider_id=provider_id,
+                endpoint=endpoint,
+                transport=transport,
+                value=bytearray(value.encode("utf-8")),
+                expires_at=expiry,
+            )
 
     def redeem(
         self, lease_id: str, *, purpose: str, now: datetime | None = None,
     ) -> str:
-        lease = self._leases.get(str(lease_id))
-        if lease is None:
-            raise GatewayDenied("secret lease is unavailable")
-        reference = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        if reference >= lease.expires_at:
-            lease.clear()
-            self._leases.pop(lease.lease_id, None)
-            raise GatewayDenied("secret lease expired")
-        if purpose != lease.purpose:
-            raise GatewayDenied("secret lease purpose mismatch")
-        return bytes(lease.value).decode("utf-8")
+        with self._lock:
+            lease = self._leases.get(str(lease_id))
+            if lease is None:
+                raise GatewayDenied("secret lease is unavailable")
+            reference = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            if reference >= lease.expires_at:
+                lease.clear()
+                self._leases.pop(lease.lease_id, None)
+                raise GatewayDenied("secret lease expired")
+            if purpose != lease.purpose:
+                raise GatewayDenied("secret lease purpose mismatch")
+            return bytes(lease.value).decode("utf-8")
 
     def redeem_for_secret(
         self, secret_ref: str, *, purpose: str, now: datetime | None = None,
     ) -> str:
         """Resolve the current short lease for a durable opaque secret reference."""
 
+        with self._lock:
+            reference = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            self._sweep_expired_locked(reference)
+            matches = [
+                lease for lease in self._leases.values()
+                if lease.secret_ref == str(secret_ref)
+                and lease.purpose == purpose
+                and lease.kind == "provider_credential"
+                and lease.audience == "provider_gateway"
+            ]
+            if not matches:
+                raise GatewayDenied("provider secret lease is unavailable")
+            current = max(matches, key=lambda item: item.expires_at)
+            return bytes(current.value).decode("utf-8")
+
+    def redeem_provider_credential(
+        self,
+        secret_ref: str,
+        *,
+        slot: str,
+        provider_id: str,
+        endpoint: str,
+        transport: str,
+        expected_purpose: str,
+        now: datetime | None = None,
+    ) -> str:
         reference = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        matches: list[_SecretLease] = []
+        canonical_endpoint = _canonical_provider_endpoint(endpoint)
+        with self._lock:
+            self._sweep_expired_locked(reference)
+            matches = [
+                lease for lease in self._leases.values()
+                if lease.secret_ref == str(secret_ref)
+            ]
+            if not matches:
+                raise GatewayDenied("provider secret lease is unavailable")
+            current = max(matches, key=lambda item: item.expires_at)
+            if (
+                current.kind != "provider_credential"
+                or current.audience != "provider_gateway"
+                or current.slot != slot
+                or current.provider_id != provider_id
+                or current.endpoint != canonical_endpoint
+                or current.transport != transport
+                or current.purpose != expected_purpose
+                or not current.purpose.startswith("provider:")
+            ):
+                raise GatewayDenied("provider secret lease binding mismatch")
+            return bytes(current.value).decode("utf-8")
+
+    def _sweep_expired_locked(self, reference: datetime) -> int:
+        removed = 0
         for lease_id, lease in tuple(self._leases.items()):
             if reference >= lease.expires_at:
                 lease.clear()
                 self._leases.pop(lease_id, None)
-                continue
-            if lease.secret_ref == str(secret_ref) and lease.purpose == purpose:
-                matches.append(lease)
-        if not matches:
-            raise GatewayDenied("secret lease is unavailable")
-        current = max(matches, key=lambda item: item.expires_at)
-        return bytes(current.value).decode("utf-8")
+                removed += 1
+        return removed
+
+    def sweep_expired(self, *, now: datetime | None = None) -> int:
+        reference = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        with self._lock:
+            return self._sweep_expired_locked(reference)
+
+    def revoke_secret(self, secret_ref: str) -> int:
+        removed = 0
+        with self._lock:
+            for lease_id, lease in tuple(self._leases.items()):
+                if lease.secret_ref == str(secret_ref):
+                    lease.clear()
+                    self._leases.pop(lease_id, None)
+                    removed += 1
+        return removed
+
+    def close(self) -> None:
+        self._closed.set()
+        with self._lock:
+            for lease in self._leases.values():
+                lease.clear()
+            self._leases.clear()
+        sweeper = self._sweeper
+        if sweeper is not None and sweeper is not threading.current_thread():
+            sweeper.join(timeout=max(0.1, self._sweep_interval_seconds * 2))
 
     def public_snapshot(self) -> tuple[dict[str, str], ...]:
-        return tuple({
-            "lease_id": lease.lease_id,
-            "secret_ref": lease.secret_ref,
-            "purpose": lease.purpose,
-            "expires_at": lease.expires_at.isoformat().replace("+00:00", "Z"),
-        } for lease in self._leases.values())
+        with self._lock:
+            self._sweep_expired_locked(datetime.now(timezone.utc))
+            return tuple({
+                "lease_id": lease.lease_id,
+                "secret_ref": lease.secret_ref,
+                "slot": lease.slot,
+                "kind": lease.kind,
+                "purpose": lease.purpose,
+                "audience": lease.audience,
+                "provider_id": lease.provider_id,
+                "endpoint": lease.endpoint,
+                "transport": lease.transport,
+                "expires_at": lease.expires_at.isoformat().replace("+00:00", "Z"),
+            } for lease in self._leases.values())
 
     def redact_diagnostics(self, value: Any) -> Any:
-        secrets = {
-            bytes(lease.value).decode("utf-8")
-            for lease in self._leases.values()
-            if lease.value
-        }
+        with self._lock:
+            secrets = {
+                bytes(lease.value).decode("utf-8")
+                for lease in self._leases.values()
+                if lease.value
+            }
         redacted = self._dlp.redact_diagnostics(value)
 
         def scrub(item: Any) -> Any:
@@ -1297,11 +2436,15 @@ __all__ = [
     "current_legacy_tool_authority",
     "legacy_tool_authority_context",
     "McpRegistry",
+    "McpCapabilityIdentity",
     "McpStdioTransport",
     "McpStreamableHttpTransport",
     "ModelCapabilityRegistry",
     "PiiDlpGateway",
     "ProviderCapability",
+    "ProviderGatewayClient",
+    "derive_provider_credential_purpose",
+    "production_model_capability_registry",
     "SecretLeaseBroker",
     "ToolExecutionRequest",
     "ToolGateway",

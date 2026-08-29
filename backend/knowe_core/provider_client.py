@@ -203,6 +203,7 @@ class ProviderClient:
         provider: str = "",
         backoff_base: float = DEFAULT_BACKOFF_BASE,
         credential_provider: CredentialProvider | None = None,
+        _gateway_managed: bool = False,
     ):
         normalized_base = base_url.rstrip("/")
         # HTTPX requires an absolute URL even when MockTransport intercepts the request.
@@ -221,6 +222,10 @@ class ProviderClient:
         self.max_retries = max(0, int(max_retries or 0))
         self.backoff_base = max(0.0, float(backoff_base or 0.0))
         self._client_factory = client_factory
+        # A real network client is an internal transport, never an application policy
+        # boundary.  Production construction must come from ProviderGatewayClient.
+        # An injected client factory is the explicit isolated-test transport seam.
+        self._gateway_managed = bool(_gateway_managed or client_factory is not None)
         self._injected_client: httpx.AsyncClient | None = None
 
         # Never send an invalid ``Bearer `` header.  Omitting it lets the provider return
@@ -360,6 +365,7 @@ class ProviderClient:
     ) -> AsyncGenerator[dict[str, Any], None]:
         """Yield provider-neutral SSE events with safe pre-output retries."""
 
+        self._assert_gateway_managed()
         body = self._build_body(
             messages,
             tools,
@@ -466,6 +472,7 @@ class ProviderClient:
         return body
 
     async def _request(self, body: dict[str, Any]) -> dict[str, Any]:
+        self._assert_gateway_managed()
         total_attempts = self.max_retries + 1
         for attempt in range(total_attempts):
             try:
@@ -522,6 +529,12 @@ class ProviderClient:
                 ) from exc
 
         raise ProviderError("Provider retry loop ended unexpectedly.")
+
+    def _assert_gateway_managed(self) -> None:
+        if not self._gateway_managed:
+            raise PermissionError(
+                "Production provider egress requires the Provider Gateway"
+            )
 
     def _can_retry(self, error: ProviderError, attempt: int) -> bool:
         if attempt >= self.max_retries or not error.retryable:

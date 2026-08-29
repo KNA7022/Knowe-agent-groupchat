@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from backend import server as server_module
-from backend.commercial_gateway import GatewayDenied
+from backend.commercial_gateway import GatewayDenied, derive_provider_credential_purpose
 from backend.config import CONFIG
 from backend.server import KnoweServer
 
@@ -19,13 +19,25 @@ RUNTIME_HEADER = "X-Knowe-Runtime-Token"
 BROKER_HEADER = "X-Knowe-Secret-Broker-Token"
 
 
-def _lease_payload(*, suffix: str = "0", purpose: str = "provider:chat",
+def _lease_payload(*, suffix: str = "0", purpose: str | None = None,
                    ttl_seconds: int = 30) -> dict[str, str]:
     now = datetime.now(timezone.utc)
+    slot = "main"
+    provider_id = "deepseek"
+    endpoint = "https://api.deepseek.com/v1"
+    transport = "openai_chat"
     return {
         "lease_id": f"lease_{suffix * 32}",
         "secret_ref": f"secret_{suffix * 32}",
-        "purpose": purpose,
+        "slot": slot,
+        "kind": "provider_credential",
+        "purpose": purpose or derive_provider_credential_purpose(
+            slot=slot, provider_id=provider_id, endpoint=endpoint, transport=transport,
+        ),
+        "audience": "provider_gateway",
+        "provider_id": provider_id,
+        "endpoint": endpoint,
+        "transport": transport,
         "value": f"sk-private-{suffix}",
         "expires_at": (now + timedelta(seconds=ttl_seconds)).isoformat().replace("+00:00", "Z"),
     }
@@ -78,6 +90,7 @@ async def lease_server(monkeypatch: pytest.MonkeyPatch):
     finally:
         listener.close()
         await listener.wait_closed()
+        server.secret_leases.close()
 
 
 @pytest.mark.asyncio
@@ -131,6 +144,23 @@ async def test_secret_lease_ingress_rejects_reused_runtime_credential(
     finally:
         listener.close()
         await listener.wait_closed()
+        server.secret_leases.close()
+
+
+@pytest.mark.asyncio
+async def test_credential_broker_enabled_on_non_loopback_listener_fails_before_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KNOWE_SECRET_BROKER_TOKEN", BROKER_TOKEN)
+    monkeypatch.setattr(server_module, "CONFIG", replace(
+        CONFIG, runtime_token=RUNTIME_TOKEN, health_host="0.0.0.0",
+    ))
+    server = KnoweServer(data_dir="")
+    try:
+        with pytest.raises(RuntimeError, match="loopback"):
+            await server.run()
+    finally:
+        server.secret_leases.close()
 
 
 @pytest.mark.asyncio
@@ -153,6 +183,19 @@ async def test_secret_lease_ingress_is_strict_private_and_purpose_bound(lease_se
     assert server.secret_leases.redeem(
         payload["lease_id"], purpose=payload["purpose"],
     ) == payload["value"]
+
+    status, _, response = await _raw_http(
+        port,
+        _request(
+            json.dumps({"secret_ref": payload["secret_ref"]}).encode("utf-8"),
+            target="/internal/credential-revoke",
+        ),
+    )
+    assert status == 202 and b'"ok":true' in response
+    with pytest.raises(GatewayDenied, match="unavailable"):
+        server.secret_leases.redeem(
+            payload["lease_id"], purpose=payload["purpose"],
+        )
 
 
 @pytest.mark.asyncio

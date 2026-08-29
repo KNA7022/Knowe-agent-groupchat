@@ -35,7 +35,6 @@ python -m pytest -q                       # 40 passed
 | `KNOWE_AGENT` | `fake` / `deepseek` | `fake` | 零 token 联调 / 真 LLM |
 | `KNOWE_SCRIPT` | `simple` / `full` | `full` | Fake 档剧本：纯消息往返 / 全链路带审批 |
 | `KNOWE_STRICT` | `1` / `0` | `1` | 出站契约强校验：违规直接炸在服务端 |
-| `DEEPSEEK_API_KEY` | — | 空 | 真 LLM 档必填（没配 → 发一条 error 事件，不崩） |
 | `KNOWE_FAKE_DELAY/THINK/WORK` | 秒 | 0.06/0.3/0.8 | Fake 档节奏，调小可以跑得飞快 |
 
 ---

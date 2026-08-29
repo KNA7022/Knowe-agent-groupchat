@@ -34,6 +34,15 @@ def _engine(tmp_path: Path) -> FakeEngine:
 
 
 def _call(registry, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def _trusted_test_boundary(tool, args, context):
+        return await tool.execute(args, **context)
+
+    # Handler-level tests deliberately install an explicit local boundary. The
+    # production builder stays deny-all until ProjectEngine binds Task Runtime.
+    try:
+        registry.set_execution_boundary(_trusted_test_boundary)
+    except ValueError:
+        pass
     raw = asyncio.run(registry.execute(name, arguments))
     value = json.loads(raw)
     assert isinstance(value, dict)

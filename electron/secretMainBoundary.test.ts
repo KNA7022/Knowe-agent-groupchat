@@ -28,4 +28,20 @@ describe('main-only OS credential boundary', () => {
     expect(bridge).not.toContain('secretBrokerToken');
     expect(bridge).not.toContain('KNOWE_SECRET_BROKER_TOKEN');
   });
+
+  it('strips inherited provider and master credentials before backend spawn', () => {
+    const main = source('electron/main.ts');
+    expect(main).toContain('delete env[inheritedName]');
+    expect(main).toMatch(/API_KEY\|ACCESS_TOKEN\|REFRESH_TOKEN\|AUTH_TOKEN/);
+    expect(main).toMatch(/MASTER_KEY|SECRET_KEY/);
+    expect(main).toContain('/internal/credential-revoke');
+  });
+
+  it('renews only backend-authoritative refs and fails closed when active state is unknown', () => {
+    const main = source('electron/main.ts');
+    expect(main).toContain('activeProviderSecretRefs()');
+    expect(main).toContain('vault.reconcileActive(active, deliverCredentialRevocation)');
+    expect(main).toContain('!active.has(reference.secret_ref)');
+    expect(main).toMatch(/Unknown active state must not renew every historical record/);
+  });
 });

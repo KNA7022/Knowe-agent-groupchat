@@ -4771,7 +4771,6 @@ class ProjectEngine:
                           and aux.get("base_url"))
             if not aux_ok:
                 raise RuntimeError("auxiliary provider credential lease is unavailable")
-            aux_key = runtime_settings.resolve_provider_credential(aux)
             new = await aux_client.chat(
                 [
                     {"role": "system", "content": self.ADJUST_SYSTEM},
@@ -4781,9 +4780,7 @@ class ProjectEngine:
                         + msg("engine.185")
                     )},
                 ],
-                api_key=aux_key,
-                base_url=aux["base_url"],
-                model=aux["model"],
+                binding=aux,
                 timeout_s=CONFIG.adjust_timeout_s,
                 what=msg("engine.186"),
             )
@@ -6223,7 +6220,6 @@ class ProjectEngine:
                       and aux.get("base_url"))
         if not aux_ok:
             raise RuntimeError("auxiliary provider credential lease is unavailable")
-        aux_key = runtime_settings.resolve_provider_credential(aux)
         model = (
             CONFIG.knowledge_distill_model
             or aux["model"]
@@ -6233,8 +6229,7 @@ class ProjectEngine:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            api_key=aux_key,
-            base_url=aux["base_url"],
+            binding=aux,
             model=model,
             timeout_s=max(5.0, float(CONFIG.knowledge_distill_timeout_s)),
             what=msg("engine.218"),
@@ -8280,7 +8275,34 @@ class ProjectEngine:
             return None
         if run is None or run.group_id != group_id or run.task_id != task_id:
             return None
-        return LegacyToolAuthority(group_id=group_id, run_id=run_id, task_id=task_id)
+        approval_id = str(raw.get("approval_id") or "")
+        grant_id = str(raw.get("grant_id") or "")
+        if approval_id or grant_id:
+            try:
+                approval = self._task_runtime_service.store.get_approval(approval_id)
+                grant = self._task_runtime_service.store.grant_for_approval(approval_id)
+            except Exception:
+                return None
+            if (
+                approval is None
+                or grant is None
+                or approval.status != "approved"
+                or approval.run_id != run_id
+                or approval.group_id != group_id
+                or grant.grant_id != grant_id
+                or grant.run_id != run_id
+                or grant.group_id != group_id
+                or grant.task_id != task_id
+            ):
+                return None
+        return LegacyToolAuthority(
+            group_id=group_id,
+            run_id=run_id,
+            task_id=task_id,
+            runtime=self._task_runtime_service,
+            approval_id=approval_id,
+            grant_id=grant_id,
+        )
 
     def bind_commercial_tool_registry(
         self,
@@ -8295,6 +8317,7 @@ class ProjectEngine:
         """
 
         if self._task_runtime_service is None:
+            # ToolRegistry itself is deny-all until a boundary is installed.
             return registry
         provider = authority_provider or current_legacy_tool_authority
         registry.set_execution_boundary(LegacyToolBoundary(
@@ -8319,7 +8342,6 @@ class ProjectEngine:
                           and aux.get("base_url"))
             if not aux_ok:
                 return text
-            aux_key = runtime_settings.resolve_provider_credential(aux)
             out = await asyncio.wait_for(
                 aux_client.chat(
                     [
@@ -8329,9 +8351,7 @@ class ProjectEngine:
                         )},
                         {"role": "user", "content": text},
                     ],
-                    api_key=aux_key,
-                    base_url=aux["base_url"],
-                    model=aux["model"],
+                    binding=aux,
                     timeout_s=8.0, what=msg("engine.272"),
                 ),
                 timeout=9.0,
@@ -8390,6 +8410,7 @@ class ProjectEngine:
             credential_provider=credential_provider,
             secret_ref=binding.get("secret_ref", ""),
             credential_purpose=binding.get("credential_purpose", ""),
+            transport=binding.get("transport", "openai_chat"),
         )
         agent = KnoweAgent(
             agent_id=agent_id,
@@ -8530,7 +8551,6 @@ class ProjectEngine:
                           and aux.get("base_url"))
             if not aux_ok:
                 return
-            aux_key = runtime_settings.resolve_provider_credential(aux)
             user_content = text
             if context:
                 user_content = (
@@ -8541,9 +8561,7 @@ class ProjectEngine:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_content},
                 ],
-                api_key=aux_key,
-                base_url=aux["base_url"],
-                model=aux["model"],
+                binding=aux,
                 max_tokens=800,
                 timeout_s=CONFIG.adjust_timeout_s,
                 what=msg("engine.170"),

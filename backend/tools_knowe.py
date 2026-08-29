@@ -3729,9 +3729,7 @@ async def aux_client_chat(system: str, user: str) -> str:
         raise RuntimeError("auxiliary provider credential lease is unavailable")
     return await aux_client.chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        api_key=runtime_settings.resolve_provider_credential(aux),
-        base_url=aux["base_url"],
-        model=aux["model"],
+        binding=aux,
         timeout_s=CONFIG.web_timeout_s + 20,
         what="web summary",
     )

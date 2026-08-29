@@ -36,30 +36,41 @@ export interface RuntimeEndpoints {
 
 export type SecretRef = Readonly<{
   secret_ref: string;
-  kind: string;
+  slot: string;
+  kind: 'provider_credential';
   label: string;
   purpose: string;
+  audience: 'provider_gateway';
+  provider_id: string;
+  endpoint: string;
+  transport: string;
   created_at: string;
   schema_version: 1;
 }>;
 
 export type SecretStoreRequest = Readonly<{
-  kind: 'provider_credential' | 'master_key';
-  label: string;
-  purpose: string;
+  slot: string;
+  provider_id: string;
+  endpoint: string;
+  transport: string;
   value: string;
 }>;
 
 export type CredentialLeaseRequest = Readonly<{
   secret_ref: string;
-  purpose: string;
   ttl_seconds: number;
 }>;
 
 export type CredentialLeaseRef = Readonly<{
   lease_id: string;
   secret_ref: string;
+  slot: string;
+  kind: 'provider_credential';
   purpose: string;
+  audience: 'provider_gateway';
+  provider_id: string;
+  endpoint: string;
+  transport: string;
   expires_at: string;
 }>;
 

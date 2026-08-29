@@ -16,7 +16,9 @@ from tests._fakes import FakeProvider, text_turn, tool_turn
 
 
 def _registry_with_read():
-    reg = ToolRegistry()
+    # This helper intentionally exercises handlers without the production
+    # Task Runtime boundary.  The bypass is explicit and test-only.
+    reg = ToolRegistry(unsafe_test_mode=True)
     calls: list[dict] = []
 
     def _read(args, **_ctx):

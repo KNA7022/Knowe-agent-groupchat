@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from backend import runtime_settings
+from backend.commercial_gateway import derive_provider_credential_purpose
 from backend.knowe_core.provider_client import ProviderClient
 
 
@@ -26,14 +27,23 @@ def _reset_runtime_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
 
 def _leased_binding() -> dict[str, str]:
-    return {
+    binding = {
         "provider": "openai-api",
         "model": "gpt-test",
         "base_url": "https://provider.example/v1",
         "transport": "openai_chat",
         "secret_ref": "secret_" + "a" * 32,
-        "credential_purpose": "provider:main",
+        "credential_slot": "main",
+        "credential_kind": "provider_credential",
+        "credential_audience": "provider_gateway",
     }
+    binding["credential_purpose"] = derive_provider_credential_purpose(
+        slot="main",
+        provider_id=binding["provider"],
+        endpoint=binding["base_url"],
+        transport=binding["transport"],
+    )
+    return binding
 
 
 def test_settings_persist_only_secret_handle_and_quarantine_legacy_plaintext(
@@ -65,6 +75,28 @@ def test_settings_persist_only_secret_handle_and_quarantine_legacy_plaintext(
     migrated = (tmp_path / "settings.json").read_text(encoding="utf-8")
     assert "sk-plaintext-must-never-persist" not in migrated
     assert '"api_key"' not in migrated
+
+
+def test_legacy_plaintext_cleanup_failure_keeps_provider_authority_unloaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy = runtime_settings._default_state()
+    legacy["main_model"] = {
+        **_leased_binding(),
+        "api_key": "sk-legacy-must-remain-blocked",
+    }
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+    def fail_persist(_candidate: object = None) -> None:
+        raise OSError("simulated durable cleanup failure")
+
+    monkeypatch.setattr(runtime_settings, "_persist", fail_persist)
+    with pytest.raises(RuntimeError, match="plaintext.*removed|removed.*safely"):
+        runtime_settings.snapshot()
+    assert runtime_settings._loaded is False
+    assert runtime_settings._state["main_model"] is None
+    assert "sk-legacy-must-remain-blocked" in settings_path.read_text(encoding="utf-8")
 
 
 def test_production_provider_egress_has_no_plaintext_environment_fallback() -> None:

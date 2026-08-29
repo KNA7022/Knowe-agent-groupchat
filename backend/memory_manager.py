@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterator, Mapping
 
-from . import runtime_settings
+from . import aux_client, runtime_settings
 from .i18n_backend import msg
 from .config import CONFIG
 from knowe_provenance import (
@@ -1061,33 +1061,17 @@ class MemoryManager:
         )
         if not aux_ok:
             return ""
-        api_key = str(runtime_settings.resolve_provider_credential(aux))
-        base = str(aux["base_url"]).rstrip("/")
-        model = str(aux["model"])
-        if not (api_key and base and model):
-            return ""                         # 绑定不完整 → 视作不可用（降级）
-        try:
-            import httpx
-        except ImportError:
-            return ""
-
-        payload = {
-            "model": model,
-            "messages": [
+        return await aux_client.chat(
+            [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-        }
-        async with httpx.AsyncClient(timeout=_AUX_TIMEOUT_S) as cli:
-            r = await cli.post(
-                base + "/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}",
-                         "Content-Type": "application/json"},
-                json=payload,
-            )
-            r.raise_for_status()
-            data = r.json()
-            return (data["choices"][0]["message"]["content"] or "").strip()
+            binding=aux,
+            max_tokens=_AUX_MAX_TOKENS,
+            temperature=_AUX_TEMPERATURE,
+            timeout_s=_AUX_TIMEOUT_S,
+            what="memory summary",
+        )
 
 
 # ═══════════════════════════════════════════════════════════════
