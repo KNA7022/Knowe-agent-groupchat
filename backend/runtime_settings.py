@@ -34,8 +34,8 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
-import stat
 import time
 import urllib.error
 import urllib.request
@@ -48,6 +48,40 @@ from knowe_core.provider_identity import http_status_error_message, provider_tar
 from .i18n_backend import msg
 
 log = logging.getLogger("knowe.settings")
+
+_SECRET_REF_RE = re.compile(r"^secret_[0-9a-f]{32}$")
+_CREDENTIAL_PURPOSE_RE = re.compile(
+    r"^(?:provider|master-key):[a-z0-9][a-z0-9_.-]{0,63}$",
+)
+_secret_lease_broker: Any | None = None
+
+
+def set_secret_lease_broker(broker: Any | None) -> None:
+    """Inject the server-owned in-memory lease receiver; never a credential value."""
+
+    global _secret_lease_broker
+    _secret_lease_broker = broker
+    _signal_model_waiters()
+
+
+def resolve_provider_credential(raw: Any) -> str:
+    """Resolve one purpose-bound short lease at the provider request boundary."""
+
+    binding = _norm_binding(raw)
+    broker = _secret_lease_broker
+    if binding is None or broker is None:
+        raise RuntimeError("provider credential lease is unavailable")
+    secret_ref = binding.get("secret_ref", "")
+    purpose = binding.get("credential_purpose", "")
+    if not secret_ref or not purpose:
+        raise RuntimeError("provider credential lease is unavailable")
+    try:
+        value = broker.redeem_for_secret(secret_ref, purpose=purpose)
+    except Exception as exc:
+        raise RuntimeError("provider credential lease is unavailable") from exc
+    if not value:
+        raise RuntimeError("provider credential lease is unavailable")
+    return str(value)
 
 
 class SettingsApplyConflict(ValueError):
@@ -105,7 +139,9 @@ def _default_state() -> dict[str, Any]:
         "active_model_fingerprint": None,
         "user_name": "",                    # 空 = 前端还没下发过，取用方自兜底「用户」
         "language": "zh",                   # [v1.0.21.3] 主要语言：'zh' | 'en'（界面 + 提示词语言）
-        "main_model": None,                 # {provider, model, api_key, base_url, transport}
+        # Credential plaintext is owned by Electron safeStorage.  Bindings retain only
+        # an opaque SecretRef and its authorized lease purpose.
+        "main_model": None,                 # {provider, model, secret_ref, credential_purpose, ...}
         "aux_model": None,                  # 同上（前端已把「跟随主模型便宜档」派生好再发）
         "agent_models": {},                 # {"<project_id>::<agent_id>": binding}
         "approval_timeout_s": DEFAULT_APPROVAL_TIMEOUT_S,   # None = 永不
@@ -138,6 +174,15 @@ def _ensure_loaded() -> None:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
+            legacy_plaintext = any(
+                isinstance(binding, dict) and bool(str(binding.get("api_key") or ""))
+                for binding in (
+                    raw.get("main_model"),
+                    raw.get("aux_model"),
+                    *((raw.get("agent_models") or {}).values()
+                      if isinstance(raw.get("agent_models"), dict) else ()),
+                )
+            )
             base = _default_state()
             base.update({k: raw[k] for k in base.keys() & raw.keys()})
             if not str(base.get("fingerprint_salt") or "").strip():
@@ -147,11 +192,27 @@ def _ensure_loaded() -> None:
             except (TypeError, ValueError):
                 base["settings_revision"] = 0
             _state.update(base)
+            # Legacy settings.json files may contain plaintext API keys.  They are
+            # untrusted input after this migration: normalize bindings into opaque
+            # handles only and never keep the old value in Python memory.
+            _state["main_model"] = _norm_binding(_state.get("main_model"))
+            _state["aux_model"] = _norm_binding(_state.get("aux_model"))
+            agents = _state.get("agent_models")
+            _state["agent_models"] = {
+                str(key): binding
+                for key, value in (agents.items() if isinstance(agents, dict) else ())
+                if (binding := _norm_binding(value)) is not None
+            }
             # Upgrade compatibility: a pre-v1.0.13 persisted main binding was already
             # effective in production, so activate it once during migration.  A truly
             # new install starts without a binding and still requires test→apply.
             if raw.get("main_model") and "active_model_fingerprint" not in raw:
                 _state["active_model_fingerprint"] = binding_fingerprint(raw.get("main_model"))
+            if legacy_plaintext:
+                # Successful load is also the one-way disk migration.  Keeping the
+                # plaintext in an old file would remain a credential bypass even if
+                # the current Python process had already dropped it from memory.
+                _persist()
             log.info(msg("runtime_settings.py.001"), path)
     except Exception as exc:  # noqa: BLE001 — settings.json 坏了不该拖死后端
         log.warning(msg("runtime_settings.py.002"), exc)
@@ -162,15 +223,19 @@ def _persist(candidate: Mapping[str, Any] | None = None) -> None:
     path = _settings_path()
     if path is None:
         return
-    value = _state if candidate is None else candidate
+    source = _state if candidate is None else candidate
+    value = json.loads(json.dumps(source, ensure_ascii=False))
+    value["main_model"] = _norm_binding(value.get("main_model"))
+    value["aux_model"] = _norm_binding(value.get("aux_model"))
+    agents = value.get("agent_models")
+    value["agent_models"] = {
+        str(key): binding
+        for key, raw in (agents.items() if isinstance(agents, dict) else ())
+        if (binding := _norm_binding(raw)) is not None
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
-    # Key 在里面——收紧到 0600（Windows 上 chmod 是尽力而为，本来也是单用户目录）。
-    try:
-        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass
     tmp.replace(path)
 
 
@@ -179,24 +244,33 @@ def _persist(candidate: Mapping[str, Any] | None = None) -> None:
 # ═══════════════════════════════════════════════════════════════
 
 def _norm_binding(raw: Any) -> dict[str, str] | None:
-    """校验并收窄一份模型绑定；缺 provider/model 即视为无效。"""
+    """校验并收窄模型绑定；credential plaintext is never retained."""
     if not isinstance(raw, dict):
         return None
     provider = str(raw.get("provider") or "").strip()
     model = str(raw.get("model") or "").strip()
     if not provider or not model:
         return None
+    secret_ref = str(raw.get("secret_ref") or "").strip()
+    purpose = str(raw.get("credential_purpose") or raw.get("purpose") or "").strip()
+    if secret_ref and _SECRET_REF_RE.fullmatch(secret_ref) is None:
+        secret_ref = ""
+    if purpose and _CREDENTIAL_PURPOSE_RE.fullmatch(purpose) is None:
+        purpose = ""
     return {
         "provider": provider,
         "model": model,
-        "api_key": str(raw.get("api_key") or ""),
         "base_url": str(raw.get("base_url") or "").rstrip("/"),
         "transport": str(raw.get("transport") or "openai_chat"),
+        "secret_ref": secret_ref,
+        "credential_purpose": purpose,
     }
 
 
 def _binding_for_apply(raw: Any, previous: Any) -> dict[str, str] | None:
-    """Normalize a binding; blank preserves a key only inside the same credential scope."""
+    """Normalize handle-only binding and reject renderer-to-Python plaintext."""
+    if isinstance(raw, dict) and str(raw.get("api_key") or ""):
+        raise ValueError("provider credentials must enter through Electron secret leases")
     binding = _norm_binding(raw)
     if binding is None:
         return None
@@ -205,15 +279,16 @@ def _binding_for_apply(raw: Any, previous: Any) -> dict[str, str] | None:
         raw.get(key) is True for key in ("clear_api_key", "api_key_clear", "clearApiKey")
     )
     if clear_requested:
-        # Explicit deletion wins even if a buggy/old caller also supplied a credential value.
-        binding["api_key"] = ""
+        binding["secret_ref"] = ""
+        binding["credential_purpose"] = ""
         return binding
     if (
-        not binding["api_key"]
+        not binding["secret_ref"]
         and prior is not None
         and _same_credential_scope(binding, prior)
     ):
-        binding["api_key"] = prior["api_key"]
+        binding["secret_ref"] = prior["secret_ref"]
+        binding["credential_purpose"] = prior["credential_purpose"]
     return binding
 
 
@@ -256,10 +331,13 @@ def binding_for_test(target: str, raw: Any) -> dict[str, str] | None:
     clear_requested = isinstance(raw, dict) and any(
         raw.get(key) is True for key in ("clear_api_key", "api_key_clear", "clearApiKey")
     )
+    if isinstance(raw, dict) and str(raw.get("api_key") or ""):
+        raise ValueError("provider credentials must enter through Electron secret leases")
     if clear_requested:
-        binding["api_key"] = ""
+        binding["secret_ref"] = ""
+        binding["credential_purpose"] = ""
         return binding
-    if binding["api_key"]:
+    if binding["secret_ref"]:
         return binding
     prior: Any
     if str(target).strip().lower() == "aux":
@@ -271,7 +349,8 @@ def binding_for_test(target: str, raw: Any) -> dict[str, str] | None:
     if prior is not None:
         previous = _norm_binding(prior)
         if previous is not None:
-            binding["api_key"] = previous["api_key"]
+            binding["secret_ref"] = previous["secret_ref"]
+            binding["credential_purpose"] = previous["credential_purpose"]
     return binding
 
 
@@ -280,7 +359,8 @@ def _binding_complete(binding: dict[str, str] | None) -> bool:
         binding
         and binding.get("provider")
         and binding.get("model")
-        and binding.get("api_key")
+        and binding.get("secret_ref")
+        and binding.get("credential_purpose")
         and binding.get("base_url")
     )
 
@@ -289,8 +369,8 @@ def binding_fingerprint(raw: Any) -> str | None:
     """Return an opaque, stable per-install HMAC fingerprint for one binding.
 
     The covered fields are the exact apply/test transaction boundary requested by the
-    first-run gate.  The API key is HMACed as part of the whole canonical message and is
-    never returned or logged.
+    first-run gate.  Only the opaque SecretRef is covered; credential plaintext never
+    enters this state or fingerprint computation.
     """
 
     _ensure_loaded()
@@ -302,7 +382,8 @@ def binding_fingerprint(raw: Any) -> str | None:
         binding["model"].strip(),
         binding["base_url"].strip().rstrip("/").casefold(),
         binding["transport"].strip().casefold(),
-        binding["api_key"],
+        binding["secret_ref"],
+        binding["credential_purpose"],
     )).encode("utf-8")
     salt = str(_state.get("fingerprint_salt") or "").encode("utf-8")
     digest = hmac.new(salt, canonical, hashlib.sha256).hexdigest()
@@ -320,7 +401,9 @@ def public_binding(raw: Any) -> dict[str, Any] | None:
         "model": binding["model"],
         "transport": binding["transport"],
         "base_url": binding["base_url"],
-        "has_api_key": bool(binding["api_key"]),
+        "has_api_key": bool(binding["secret_ref"]),
+        "secret_ref": binding["secret_ref"],
+        "credential_purpose": binding["credential_purpose"],
     }
 
 
@@ -770,7 +853,7 @@ def effective_approval_timeout(project_id: str | None = None) -> float | None:
 def model_binding_for(project_id: str, agent_id: str) -> dict[str, str] | None:
     """
     某个 Agent 的生效模型绑定：个性化（"pid::aid"） > 全局主模型 > None。
-    None = 用户没在设置面板配过 → 调用方（engine._new_agent）落回 CONFIG.deepseek_*。
+    None = 用户没在设置面板配过；provider 出口必须 fail closed。
     """
     _ensure_loaded()
     agents = _state.get("agent_models") or {}
@@ -811,7 +894,7 @@ _CHEAP_TIER: dict[str, str] = {
 def aux_effective() -> dict[str, str] | None:
     """
     辅助模型（摘要/翻译/知识蒸馏）的生效绑定：
-        显式 aux > 由主模型派生（同厂商同 Key，模型换便宜档） > None（落回 CONFIG）。
+        显式 aux > 由主模型派生（同厂商同 SecretRef，模型换便宜档） > None（fail closed）。
     """
     _ensure_loaded()
     aux = _state.get("aux_model")
@@ -904,12 +987,21 @@ def _test_binding_impl(binding: dict[str, Any]) -> dict[str, Any]:
             "latency_ms": None,
         }
 
+    try:
+        credential = resolve_provider_credential(b)
+    except RuntimeError:
+        return {
+            "ok": False,
+            "message": "Provider credential lease is unavailable.",
+            "latency_ms": None,
+        }
+
     transport = b["transport"]
     if transport == "anthropic_messages":
         url = f"{base}/v1/messages"
         headers = {
             "Content-Type": "application/json",
-            "x-api-key": b["api_key"],
+            "x-api-key": credential,
             "anthropic-version": "2023-06-01",
         }
         body = {
@@ -923,7 +1015,7 @@ def _test_binding_impl(binding: dict[str, Any]) -> dict[str, Any]:
         url = f"{base}/chat/completions"
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {b['api_key']}",
+            "Authorization": f"Bearer {credential}",
         }
         body = {
             "model": b["model"],
@@ -962,7 +1054,7 @@ def _test_binding_impl(binding: dict[str, Any]) -> dict[str, Any]:
     agent_url = core_base_url(base).split("#", 1)[0]
     agent_headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {b['api_key']}",
+        "Authorization": f"Bearer {credential}",
     }
     agent_body = {
         "model": b["model"],

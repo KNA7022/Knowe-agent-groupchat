@@ -11,7 +11,7 @@
  */
 
 import {
-  app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, session,
+  app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, session, safeStorage,
   type Session,
 } from 'electron';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -48,7 +48,10 @@ import {
   type PreviewFilePayload,
   type PreviewOpenPayload,
   type UnreadDetail,
+  type CredentialLeaseRef,
 } from '../src/shared/bridge';
+import { SecretVault, type SecretVaultFile } from './secretVault';
+import { registerSecretIpc } from './secretIpc';
 // [v1.0 frameless] 窗口控制的频道名与动作类型——照家规不手写，preload 也从同一处取。
 import { WINDOW_CONTROL_CHANNEL, type WindowControlAction } from '../src/shared/windowControl';
 // [v1.0.19.1] 托盘新消息悬停卡片——独立 BrowserWindow，见 electron/trayCard.ts。
@@ -352,6 +355,13 @@ const APP_ICON = join(PROJECT_ROOT, 'public', 'brand', 'app-icon.png');
 let backendProc: ChildProcess | null = null;
 /** Per-backend-process credential; never persisted, logged, bridged, or placed in a URL. */
 let runtimeToken = '';
+/** Main-to-Python credential broker capability; unlike runtimeToken it is never bridged. */
+let secretBrokerToken = '';
+
+function clearBackendProcessCredentials(): void {
+  runtimeToken = '';
+  secretBrokerToken = '';
+}
 /**
  * [v1.0.19.4] 附件路径签名密钥——**持久化**、与临时 WS runtimeToken 分离。
  *
@@ -644,6 +654,7 @@ function beginHealthWatch(): void {
       if (!ok || current.phase !== 'starting') return;
       clearHealthTimers();
       setStatus('ready');
+      void refreshProviderCredentialLeases();
       // [1.3] 后端真正达到 ready（首次探活成功）→ 重拉周期结束、失败计数清零。
       //       必须在「探活成功」时清而不是 spawn 时清：否则后端每次崩溃都在计数上
       //       叠加，等于「崩一次就烧掉一次重拉机会」，与「ready 后崩溃另起新周期」不符。
@@ -671,6 +682,132 @@ function beginHealthWatch(): void {
 // ═══════════════════════════════════════════════════════════════
 // 后端子进程：spawn / kill
 // ═══════════════════════════════════════════════════════════════
+
+const SECRET_VAULT_PATH = join(ELECTRON_DATA_ROOT, 'secrets.v1.json');
+let unregisterSecretIpc: (() => void) | null = null;
+let secretVault: SecretVault | null = null;
+let secretLeaseRefreshTimer: ReturnType<typeof setInterval> | null = null;
+const SECRET_LEASE_TTL_SECONDS = 300;
+const SECRET_LEASE_REFRESH_MS = 240_000;
+
+function loadSecretVaultFile(): SecretVaultFile {
+  if (!existsSync(SECRET_VAULT_PATH)) return {};
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(SECRET_VAULT_PATH, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('credential vault root is invalid');
+    }
+    return parsed as SecretVaultFile;
+  } catch {
+    // Do not log the file or parse exception: even encrypted credential records and metadata
+    // stay outside diagnostics.  Fail closed rather than silently replacing the vault.
+    throw new Error('The encrypted credential vault cannot be read safely.');
+  }
+}
+
+function saveSecretVaultFile(value: SecretVaultFile): void {
+  mkdirSync(dirname(SECRET_VAULT_PATH), { recursive: true });
+  const temporary = `${SECRET_VAULT_PATH}.next`;
+  try {
+    writeFileSync(temporary, JSON.stringify(value), {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'w',
+    });
+    renameSync(temporary, SECRET_VAULT_PATH);
+  } catch {
+    try { rmSync(temporary, { force: true }); } catch { /* exact temporary file only */ }
+    throw new Error('The encrypted credential vault cannot be saved safely.');
+  }
+}
+
+type PrivateCredentialLease = CredentialLeaseRef & Readonly<{ value: string }>;
+
+/** Send one short-lived lease over loopback without returning or logging its private value. */
+function deliverCredentialLease(lease: PrivateCredentialLease): Promise<void> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    if (!/^[0-9a-f]{64}$/.test(runtimeToken)
+        || !/^[0-9a-f]{64}$/.test(secretBrokerToken)
+        || runtimeToken === secretBrokerToken) {
+      rejectPromise(new Error('Credential broker is unavailable.'));
+      return;
+    }
+
+    const body = Buffer.from(JSON.stringify({
+      lease_id: lease.lease_id,
+      secret_ref: lease.secret_ref,
+      purpose: lease.purpose,
+      value: lease.value,
+      expires_at: lease.expires_at,
+    }), 'utf8');
+    let settled = false;
+    const finish = (accepted: boolean): void => {
+      if (settled) return;
+      settled = true;
+      body.fill(0);
+      if (accepted) resolvePromise();
+      else rejectPromise(new Error('Credential lease delivery was rejected.'));
+    };
+    const req = httpRequest(`${RUNTIME_ENDPOINTS.httpBase}/internal/credential-lease`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(body.byteLength),
+        'X-Knowe-Runtime-Token': runtimeToken,
+        'X-Knowe-Secret-Broker-Token': secretBrokerToken,
+      },
+    }, (res) => {
+      const accepted = res.statusCode === 202;
+      res.resume();
+      res.once('end', () => finish(accepted));
+      res.once('error', () => finish(false));
+    });
+    req.once('error', () => finish(false));
+    req.setTimeout(5_000, () => req.destroy());
+    req.end(body);
+  });
+}
+
+async function refreshProviderCredentialLeases(): Promise<void> {
+  const vault = secretVault;
+  if (!vault || current.phase !== 'ready') return;
+  for (const reference of vault.list()) {
+    if (reference.kind !== 'provider_credential') continue;
+    try {
+      await vault.issueLease({
+        secret_ref: reference.secret_ref,
+        purpose: reference.purpose,
+        ttl_seconds: SECRET_LEASE_TTL_SECONDS,
+        deliver: deliverCredentialLease,
+      });
+    } catch {
+      // Values, encrypted records and decrypt errors stay outside logs.  The provider
+      // request boundary will fail closed until a later refresh succeeds.
+    }
+  }
+}
+
+function registerMainSecretBoundary(): void {
+  unregisterSecretIpc?.();
+  const vault = new SecretVault({
+    safeStorage,
+    load: loadSecretVaultFile,
+    save: saveSecretVaultFile,
+  });
+  secretVault = vault;
+  unregisterSecretIpc = registerSecretIpc({
+    ipc: ipcMain,
+    vault,
+    trustedWebContentsId: () => (
+      mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.id : null
+    ),
+    deliverLease: deliverCredentialLease,
+  });
+  if (secretLeaseRefreshTimer) clearInterval(secretLeaseRefreshTimer);
+  secretLeaseRefreshTimer = setInterval(() => {
+    void refreshProviderCredentialLeases();
+  }, SECRET_LEASE_REFRESH_MS);
+}
 
 // ═══════════════════════════════════════════════════════════════
 // [v1.0 fix-cwd] cwd 错误 —— 后端 code=1 的真正根因
@@ -709,6 +846,7 @@ function buildBackendEnv(): NodeJS.ProcessEnv {
     KNOWE_HEALTH_PORT: String(HTTP_PORT),
     KNOWE_WS_PORT: String(WS_PORT),
     KNOWE_RUNTIME_TOKEN: runtimeToken,
+    KNOWE_SECRET_BROKER_TOKEN: secretBrokerToken,
     KNOWE_ATTACHMENT_KEY: getAttachmentSignKey(),
     KNOWE_AGENT: process.env.KNOWE_AGENT ?? 'deepseek',
   };
@@ -745,9 +883,13 @@ function buildBackendEnv(): NodeJS.ProcessEnv {
 function spawnBackend(): void {
   intentionalStop = false;
   runtimeToken = randomBytes(32).toString('hex');
+  do {
+    secretBrokerToken = randomBytes(32).toString('hex');
+  } while (secretBrokerToken === runtimeToken);
   logRing.length = 0; // 每次启动清空日志尾巴，别把上一条命的遗言混进来
 
   if (dataRootInitError) {
+    clearBackendProcessCredentials();
     setStatus('failed', `数据目录初始化失败：${dataRootInitError.message}`);
     if (relaunching) recordRelaunchFailure('数据目录初始化失败'); // [1.3]
     return;
@@ -758,17 +900,20 @@ function spawnBackend(): void {
   //           开发态维持检查随包 Python runtime。
   if (app.isPackaged) {
     if (!existsSync(BACKEND_EXE) || !existsSync(join(BACKEND_DIR, '_internal'))) {
+      clearBackendProcessCredentials();
       setStatus('failed', `后端可执行文件缺失：${BACKEND_EXE}，安装包可能损坏，请重新安装`);
       if (relaunching) recordRelaunchFailure('后端可执行文件缺失'); // [1.3]
       return;
     }
   } else if (!existsSync(PYTHON)) {
+    clearBackendProcessCredentials();
     setStatus('failed', `随包 Python runtime 缺失：${PYTHON}。请重新安装 StudyCrew。`);
     if (relaunching) recordRelaunchFailure('Python runtime 缺失'); // [1.3]
     return;
   }
   // ── 前置检查：后端目录在不在 ──
   if (!existsSync(BACKEND_DIR)) {
+    clearBackendProcessCredentials();
     setStatus('failed', `找不到后端目录：${BACKEND_DIR}`);
     if (relaunching) recordRelaunchFailure('后端目录缺失'); // [1.3]
     return;
@@ -800,6 +945,7 @@ function spawnBackend(): void {
       windowsHide: true,
     });
   } catch (err) {
+    clearBackendProcessCredentials();
     setStatus('failed', `启动后端失败：${(err as Error).message}`);
     if (relaunching) recordRelaunchFailure(`spawn 抛错：${(err as Error).message}`); // [1.3]
     return;
@@ -816,7 +962,7 @@ function spawnBackend(): void {
   proc.on('error', (err) => {
     clearHealthTimers();
     backendProc = null;
-    runtimeToken = '';
+    clearBackendProcessCredentials();
     setStatus('failed', `后端进程错误：${err.message}`);
     // [1.3] 重拉周期内的 spawn 失败也计一次重拉失败。
     //       Node 里 spawn 失败后 exit 可能还会再触发一次，recordRelaunchFailure 内有防重入。
@@ -827,7 +973,7 @@ function spawnBackend(): void {
   proc.on('exit', (code, signal) => {
     clearHealthTimers();
     backendProc = null;
-    runtimeToken = '';
+    clearBackendProcessCredentials();
 
     if (intentionalStop) {
       // 我们主动杀的（退出流程 / 手动重启 / 健康检查超时收尸）
@@ -893,7 +1039,7 @@ async function killBackend(): Promise<void> {
   const proc = backendProc;
   if (!proc || proc.exitCode !== null || proc.signalCode !== null) {
     backendProc = null;
-    runtimeToken = '';
+    clearBackendProcessCredentials();
     return;
   }
 
@@ -901,7 +1047,7 @@ async function killBackend(): Promise<void> {
   await requestBackendShutdown();
   if (proc.exitCode !== null || proc.signalCode !== null) {
     backendProc = null;
-    runtimeToken = '';
+    clearBackendProcessCredentials();
     return;
   }
   await new Promise<void>((resolve) => {
@@ -920,7 +1066,7 @@ async function killBackend(): Promise<void> {
     }, 3000);
   });
   backendProc = null;
-  runtimeToken = '';
+  clearBackendProcessCredentials();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1869,6 +2015,16 @@ if (!gotLock) {
     // [v1.0.25.4] 自动更新模块初始化（状态事件经 IPC.updateStatusChanged 推送渲染层）
     initAutoUpdater({ log: writeLog, onInstall: killBackend });
     createWindow();
+    try {
+      registerMainSecretBoundary();
+    } catch {
+      dialog.showErrorBox(
+        'StudyCrew 无法启动',
+        '系统凭据保险库无法安全加载；为避免覆盖已有凭据，应用已停止启动。',
+      );
+      app.quit();
+      return;
+    }
     // [v1.0.25.4] 升级后启动（安装器 --updated 拉起）：记日志 + 页面加载完成后通知渲染层
     //   （设置页 toast「已更新到最新版本」）。安装器 isUpdated 分支会传 --updated。
     if (process.argv.includes('--updated')) {
@@ -1914,6 +2070,11 @@ app.on('before-quit', (event) => {
   if (quitCleanupStarted) return;
   quitCleanupStarted = true;
   void killBackend().finally(() => {
+    unregisterSecretIpc?.();
+    unregisterSecretIpc = null;
+    secretVault = null;
+    if (secretLeaseRefreshTimer) clearInterval(secretLeaseRefreshTimer);
+    secretLeaseRefreshTimer = null;
     setTrayFlashing(false);
     destroyTrayCard(); // [v1.0.19.1] 卡片是独立 BrowserWindow，退出前一并收掉
     if (tray && !tray.isDestroyed()) { tray.destroy(); tray = null; }

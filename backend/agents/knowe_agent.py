@@ -128,6 +128,9 @@ class ProviderConfig:
         read_timeout_s: float | None = None,
         write_timeout_s: float | None = None,
         pool_timeout_s: float | None = None,
+        credential_provider: Callable[[], str] | None = None,
+        secret_ref: str = "",
+        credential_purpose: str = "",
     ) -> None:
         self.provider = provider
         self.model = model
@@ -152,6 +155,9 @@ class ProviderConfig:
         self.pool_timeout_s = (
             CONFIG.provider_pool_timeout_s if pool_timeout_s is None else pool_timeout_s
         )
+        self.credential_provider = credential_provider
+        self.secret_ref = str(secret_ref or "")
+        self.credential_purpose = str(credential_purpose or "")
 
 
 class KnoweAgent:
@@ -194,6 +200,7 @@ class KnoweAgent:
             max_retries=cfg.max_retries,
             client_factory=client_factory,
             provider=cfg.provider,
+            credential_provider=cfg.credential_provider,
         )
         self._tool_registry = tool_registry or ToolRegistry()
         # Only the Coordinator uses durable raw AgentLoop messages. Worker state is

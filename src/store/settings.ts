@@ -27,6 +27,10 @@ export interface ModelBinding {
   hasApiKey?: boolean;
   /** Explicit user intent; an empty apiKey alone always means "preserve the current key". */
   clearApiKey?: boolean;
+  /** Durable opaque handle owned by Electron safeStorage; never credential material. */
+  secretRef?: string;
+  /** Exact purpose accepted when Electron main issues a short Python lease. */
+  credentialPurpose?: string;
   /** [v1.0.36] 自定义端点接入点（provider='custom' 时用户填；固定提供商为空、从目录取）。 */
   baseUrl?: string;
   sealed: boolean;
@@ -125,6 +129,8 @@ export function effectiveAuxBinding(
       apiKey: main.apiKey,
       hasApiKey: main.hasApiKey,
       clearApiKey: false,
+      secretRef: main.secretRef,
+      credentialPurpose: main.credentialPurpose,
       sealed: true,
       derived: true,
     };
@@ -195,11 +201,110 @@ function bindingWire(b: ModelBinding | null | undefined): JsonObject | null {
     base_url: b.baseUrl ?? provider?.baseUrl ?? '',
     transport: provider?.transport ?? 'openai_chat',
   };
-  // A redacted binding deliberately sends no credential field at all.  The backend may preserve
-  // its existing key only for the exact provider/base/transport scope.  Newly typed credentials
-  // are transient and cross this boundary once, during test/apply.
-  if (b.apiKey) wire.api_key = b.apiKey;
+  if (b.secretRef) wire.secret_ref = b.secretRef;
+  if (b.credentialPurpose) wire.credential_purpose = b.credentialPurpose;
   if (b.clearApiKey === true) wire.clear_api_key = true;
+  return wire;
+}
+
+type SecretSettingsBridge = Pick<
+  NonNullable<Window['knowe']>,
+  'storeSecret' | 'deleteSecret' | 'leaseSecret'
+>;
+
+function secretSettingsBridge(): SecretSettingsBridge | undefined {
+  return (window as unknown as { knowe?: SecretSettingsBridge }).knowe;
+}
+
+// The renderer may run connection-test and apply concurrently for the same transient
+// input.  Cache only a SHA-256 identity -> in-flight/settled opaque ref, never plaintext.
+const credentialRefCache = new Map<string, Promise<string>>();
+
+async function credentialCacheKey(
+  binding: ModelBinding,
+  purpose: string,
+  value: string,
+): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) throw new Error('Secure credential hashing is unavailable');
+  const provider = providerOf(binding.provider);
+  const scope = credentialScope(
+    binding.provider,
+    binding.baseUrl ?? provider?.baseUrl ?? '',
+    provider?.transport ?? 'openai_chat',
+  );
+  const digest = await subtle.digest(
+    'SHA-256',
+    new TextEncoder().encode(`${purpose}\u0000${scope}\u0000${value}`),
+  );
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function forgetCachedSecretRef(secretRef: string): Promise<void> {
+  await Promise.all(Array.from(credentialRefCache.entries()).map(async ([key, pending]) => {
+    try {
+      if (await pending === secretRef) credentialRefCache.delete(key);
+    } catch {
+      credentialRefCache.delete(key);
+    }
+  }));
+}
+
+/**
+ * Seal transient renderer input through Electron main and prepare a handle-only binding.
+ * Python receives the lease value over main's private loopback route; this wire object
+ * contains only the durable SecretRef and its exact purpose.
+ */
+export async function prepareBindingWireForBackend(
+  b: ModelBinding | null | undefined,
+  purpose: string,
+  label: string,
+): Promise<JsonObject | null> {
+  const wire = bindingWire(b);
+  if (!wire || !b) return wire;
+  const bridge = secretSettingsBridge();
+  if (b.clearApiKey === true) {
+    if (b.secretRef) {
+      if (!bridge?.deleteSecret) {
+        throw new Error('Electron secret storage is unavailable');
+      }
+      await bridge.deleteSecret(b.secretRef);
+      await forgetCachedSecretRef(b.secretRef);
+    }
+    delete wire.secret_ref;
+    delete wire.credential_purpose;
+    return wire;
+  }
+  let secretRef = b.secretRef ?? '';
+  if (b.apiKey) {
+    if (!bridge?.storeSecret || !bridge.leaseSecret) {
+      throw new Error('Electron secret storage is unavailable');
+    }
+    const cacheKey = await credentialCacheKey(b, purpose, b.apiKey);
+    let pendingRef = credentialRefCache.get(cacheKey);
+    if (!pendingRef) {
+      pendingRef = bridge.storeSecret({
+        kind: 'provider_credential', label, purpose, value: b.apiKey,
+      }).then((stored) => stored.secret_ref);
+      credentialRefCache.set(cacheKey, pendingRef);
+    }
+    try {
+      secretRef = await pendingRef;
+    } catch (error) {
+      if (credentialRefCache.get(cacheKey) === pendingRef) {
+        credentialRefCache.delete(cacheKey);
+      }
+      throw error;
+    }
+  }
+  if (secretRef) {
+    if (!bridge?.leaseSecret) {
+      throw new Error('Electron secret storage is unavailable');
+    }
+    await bridge.leaseSecret({ secret_ref: secretRef, purpose, ttl_seconds: 300 });
+    wire.secret_ref = secretRef;
+    wire.credential_purpose = purpose;
+  }
   return wire;
 }
 
@@ -223,6 +328,8 @@ function bindingFromBackend(
     apiKey: transientKey,
     hasApiKey: backendHasKey,
     clearApiKey: false,
+    secretRef: stringValue(raw.secret_ref).trim(),
+    credentialPurpose: stringValue(raw.credential_purpose).trim(),
     baseUrl: stringValue(raw.base_url).trim(),
     sealed: true,
   };
@@ -233,12 +340,12 @@ function bindingSignature(binding: ModelBinding | null): string {
   return [
     credentialScope(binding.provider),
     binding.model.trim(),
-    binding.hasApiKey === true || Boolean(binding.apiKey) ? 'key' : 'no-key',
+    binding.hasApiKey === true || Boolean(binding.apiKey) || Boolean(binding.secretRef) ? 'key' : 'no-key',
   ].join('\u0000');
 }
 
 function bindingHasCredential(binding: ModelBinding | null | undefined): boolean {
-  return Boolean(binding && (binding.hasApiKey === true || binding.apiKey));
+  return Boolean(binding && (binding.hasApiKey === true || binding.apiKey || binding.secretRef));
 }
 
 function acknowledgedBinding(
@@ -295,6 +402,11 @@ function sealedBinding(
       ? false
       : (binding.hasApiKey === true || (sameScope && previous?.hasApiKey === true)),
     clearApiKey,
+    // Keep only the opaque old ref until the asynchronous clear POST reaches main;
+    // prepareBindingWireForBackend needs it to delete the durable ciphertext.
+    secretRef: binding.secretRef || (sameScope ? previous?.secretRef : '') || '',
+    credentialPurpose:
+      binding.credentialPurpose || (sameScope ? previous?.credentialPurpose : '') || '',
     sealed: true,
   };
 }
@@ -319,19 +431,34 @@ function acknowledgePersistedSecrets(body: JsonObject): void {
   });
 }
 
-function buildWirePayload(s: SettingsState): JsonObject {
+function purposeForAgent(key: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < key.length; index += 1) {
+    hash ^= key.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `provider:agent-${hash.toString(16).padStart(8, '0')}`;
+}
+
+async function buildWirePayload(s: SettingsState): Promise<JsonObject> {
   const agentModels: Record<string, unknown> = {};
   for (const [key, binding] of Object.entries(s.agentModels)) {
-    const wire = bindingWire(binding);
+    const wire = await prepareBindingWireForBackend(
+      binding, purposeForAgent(key), `Agent provider credential (${key.slice(0, 48)})`,
+    );
     if (wire) agentModels[key] = wire;
   }
   return {
     user_name: s.userName,
-    main_model: bindingWire(s.mainModel),
+    main_model: await prepareBindingWireForBackend(
+      s.mainModel, 'provider:main', 'Main provider credential',
+    ),
     // [v1.0.36] auxModel=null（跟随态）时发 null，不再把「派生便宜档」发给后端持久化——
     // 否则后端存了派生值，派活/对账都会把它当「显式设置」用，辅助模型就冻结在旧主模型的便宜档。
     // 后端 aux_effective 在 aux_model 为空时按主模型运行时派生（_CHEAP_TIER / custom 完整跟随）。
-    aux_model: bindingWire(s.auxModel),
+    aux_model: await prepareBindingWireForBackend(
+      s.auxModel, 'provider:aux', 'Auxiliary provider credential',
+    ),
     agent_models: agentModels,
     approval_timeout_s: s.approvalTimeoutS,
     group_approval_timeouts: { ...s.groupApprovalTimeouts },
@@ -426,7 +553,7 @@ async function postCurrentSettingsNow(
   silent = false,
 ): Promise<ModelApplyResult> {
   const state = useSettingsStore.getState();
-  const payload = buildWirePayload(state);
+  const payload = await buildWirePayload(state);
   if (expectedFingerprint) payload.expected_fingerprint = expectedFingerprint;
   if (state.settingsRevision > 0) payload.expected_revision = state.settingsRevision;
 
@@ -869,7 +996,10 @@ export interface TestResult {
  * 后端 /settings/test 接受 binding 整体，与 testModelConnection 同一条通道。
  */
 export async function testBinding(
-  b: { provider: string; model: string; apiKey: string; baseUrl?: string },
+  b: {
+    provider: string; model: string; apiKey: string; baseUrl?: string;
+    secretRef?: string; credentialPurpose?: string;
+  },
   target: 'main' | 'aux' = 'main',
 ): Promise<TestResult> {
   if (!b.provider || !b.model) {
@@ -886,13 +1016,19 @@ export async function testBinding(
     baseUrl: b.baseUrl?.trim(),
     hasApiKey: Boolean(b.apiKey.trim()),
     clearApiKey: false,
+    secretRef: b.secretRef,
+    credentialPurpose: b.credentialPurpose,
     sealed: true,
   };
   try {
+    const purpose = wire.credentialPurpose || `provider:${target}`;
+    const prepared = await prepareBindingWireForBackend(
+      wire, purpose, `${target === 'main' ? 'Main' : 'Auxiliary'} provider credential`,
+    );
     const response = await runtimeFetch(`${runtimeHttpBase()}/settings/test`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target, binding: bindingWire(wire) }),
+      body: JSON.stringify({ target, binding: prepared }),
     });
     const body = asObject(await response.json().catch(() => null));
     if (!response.ok || !body) {

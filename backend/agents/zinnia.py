@@ -445,10 +445,11 @@ class ZinniaAgent:
         #   而且构造期缓存意味着用户在设置面板配好模型也传不进来（知知是 server 启动时
         #   建的常驻实例，不像项目 Agent 会被退休重建）。现在 _run 每回合开头调
         #   _resolve_binding() 现取生效绑定，设置一改、下一句话就用新模型，无需重启。
-        self.api_key = CONFIG.deepseek_api_key
-        self.model = CONFIG.deepseek_model
-        self.base_url = CONFIG.deepseek_base_url.rstrip("/")
-        self.provider = "deepseek" if (self.api_key and self.base_url) else ""
+        self.api_key = ""
+        self.model = ""
+        self.base_url = ""
+        self.provider = ""
+        self._credential_binding: dict[str, str] | None = None
         #: 绑定解析失败时给用户的人话（None = 可用）。
         self._binding_issue: str | None = None
 
@@ -554,36 +555,41 @@ class ZinniaAgent:
           ① 知知的个性化绑定（"__platform__::zinnia"，通常没有） > 全局主模型
              ——但仅当 transport 是 OpenAI 兼容（openai_chat / codex_responses）；
           ② 主模型是 Anthropic 协议时 → 退而用辅助模型（若它是 OpenAI 兼容）；
-          ③ 都不行 → 遗留 .env（DEEPSEEK_*，齐全才算）；
-          ④ 还不行 → False + self._binding_issue 说明该怎么配。
+          ③ 都不行 → False + self._binding_issue 说明该怎么配。
 
         返回 True = 绑定可用。
         """
         self._binding_issue = None
+        self._credential_binding = None
 
         # An explicitly injected client factory is an authoritative test/embedding
         # boundary: it must not be disabled merely because the host has no persisted
         # provider binding.  Use a synthetic absolute origin so MockTransport/custom
         # clients still receive valid URLs without creating a hidden production
         # provider fallback.
-        if self._client_factory is not None and self.api_key:
+        if self._client_factory is not None:
             self.base_url = (self.base_url or "http://provider.invalid").rstrip("/")
             self.model = self.model or "injected-model"
             self.provider = self.provider or "injected"
             return True
 
         def _usable(b: dict[str, str] | None) -> bool:
-            return bool(b and b.get("api_key") and b.get("base_url")
+            return bool(b and b.get("secret_ref") and b.get("credential_purpose")
+                        and b.get("base_url")
                         and b.get("transport", "openai_chat") in self._OPENAI_COMPAT)
+
+        def _apply_leased(b: dict[str, str]) -> bool:
+            self.api_key = ""
+            self._credential_binding = dict(b)
+            self.model = b["model"]
+            self.base_url = b["base_url"].rstrip("/")
+            self.provider = b["provider"]
+            return True
 
         if feature_enabled(FeatureFlag.MODEL_READINESS_GATE_V1):
             ready, source, effective = runtime_settings.zinnia_binding_status()
             if ready and effective is not None:
-                self.api_key = effective["api_key"]
-                self.model = effective["model"]
-                self.base_url = effective["base_url"].rstrip("/")
-                self.provider = effective["provider"]
-                return True
+                return _apply_leased(effective)
             self._binding_issue = {
                 "unverified": msg("zinnia.049"),
                 "incompatible": msg("zinnia.050"),
@@ -594,34 +600,16 @@ class ZinniaAgent:
         main = runtime_settings.model_binding_for(PLATFORM_PROJECT_ID, ZINNIA)
         if _usable(main):
             assert main is not None
-            self.api_key = main["api_key"]
-            self.model = main["model"]
-            self.base_url = main["base_url"].rstrip("/")
-            self.provider = main["provider"]
-            return True
+            return _apply_leased(main)
 
         aux = runtime_settings.aux_effective()
         if main and not _usable(main) and _usable(aux):
             # 主模型是 Anthropic 协议（知知说不了）→ 辅助模型是 OpenAI 兼容 → 用它。
             assert aux is not None
-            self.api_key = aux["api_key"]
-            self.model = aux["model"]
-            self.base_url = aux["base_url"].rstrip("/")
-            self.provider = aux["provider"]
-            return True
-
-        # 只有用户**从未建立显式主模型绑定**时，才兼容遗留 DEEPSEEK_*。
-        # 一旦设置面板里已有 provider/model，哪怕绑定残缺，也不能偷偷打回旧厂商。
-        if main is None and CONFIG.deepseek_api_key and CONFIG.deepseek_base_url:
-            # 遗留 .env 档：key 和接入点都齐才算可用（v0.44.2 Bug1 同款判据）。
-            self.api_key = CONFIG.deepseek_api_key
-            self.model = CONFIG.deepseek_model
-            self.base_url = CONFIG.deepseek_base_url.rstrip("/")
-            self.provider = "deepseek"
-            return True
+            return _apply_leased(aux)
 
         if main and not _usable(main):
-            if not main.get("api_key") or not main.get("base_url"):
+            if not main.get("secret_ref") or not main.get("credential_purpose") or not main.get("base_url"):
                 self._binding_issue = (
                     f"{provider_target(main.get('provider'), main.get('base_url'), main.get('model'))} "
                     + msg("zinnia.053")
@@ -897,11 +885,12 @@ class ZinniaAgent:
         """
         del emit
         aux = runtime_settings.aux_effective()
-        if aux and aux.get("api_key") and aux.get("base_url"):
+        if (aux and aux.get("secret_ref") and aux.get("credential_purpose")
+                and aux.get("base_url")):
             try:
                 client = ProviderClient(
                     base_url=str(aux["base_url"]).rstrip("/"),
-                    api_key=aux["api_key"],
+                    api_key="",
                     model=aux.get("model") or "",
                     timeout=build_http_timeout(
                         connect=CONFIG.provider_connect_timeout_s,
@@ -911,6 +900,9 @@ class ZinniaAgent:
                     ),
                     max_retries=0,
                     provider=str(aux.get("provider") or ""),
+                    credential_provider=(
+                        lambda selected=dict(aux): runtime_settings.resolve_provider_credential(selected)
+                    ),
                 )
                 text = ""
                 async for event in client.chat_stream(
@@ -976,6 +968,18 @@ class ZinniaAgent:
         del emit
         name = (call.get("function") or {}).get("name", "")
         raw = (call.get("function") or {}).get("arguments") or "{}"
+
+        # Platform turns do not currently carry a durable Group/Task/Run identity.
+        # Gate cards and model-supplied arguments are not Task Runtime authority, so
+        # every legacy platform effect remains unavailable until it has a structured
+        # Tool Gateway adapter.  Keep the old implementations below for the migration,
+        # but make them unreachable from the production entry point.
+        if name in {
+            "read_harness_memory", "read_file", "list_dir", "web_search", "web_extract",
+            "browser_navigate", "browser_snapshot", "browser_click", "browser_scroll",
+            "browser_close", "create_project",
+        }:
+            return "error: blocked: legacy platform tool has no authoritative Task Runtime context"
 
         # [v0.11 C-1] read_harness_memory：只读，不弹卡，直接把公告栏全文回给模型。
         if name == "read_harness_memory":
@@ -1282,7 +1286,8 @@ class ZinniaAgent:
         return "", list(turn.tool_calls)
 
     def _make_client(self) -> ProviderClient | None:
-        if self._client_factory is None and not self.api_key:
+        binding = self._credential_binding
+        if self._client_factory is None and not self.api_key and binding is None:
             return None
         return ProviderClient(
             base_url=self.base_url,
@@ -1297,6 +1302,10 @@ class ZinniaAgent:
             max_retries=CONFIG.provider_max_retries,
             client_factory=self._client_factory,
             provider=self.provider,
+            credential_provider=(
+                (lambda selected=dict(binding): runtime_settings.resolve_provider_credential(selected))
+                if binding is not None else None
+            ),
         )
 
 

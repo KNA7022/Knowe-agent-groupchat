@@ -11,7 +11,8 @@ def binding(**changes: str) -> dict[str, str]:
     value = {
         "provider": "openai-api",
         "model": "gpt-test",
-        "api_key": "sk-secret-value",
+        "secret_ref": "secret_" + "a" * 32,
+        "credential_purpose": "provider:main",
         "base_url": "https://example.invalid/v1/",
         "transport": "openai_chat",
     }
@@ -31,11 +32,12 @@ class RuntimeSettingsReadinessTest(unittest.TestCase):
         fingerprint = runtime_settings.binding_fingerprint(base)
         self.assertIsNotNone(fingerprint)
         self.assertTrue(str(fingerprint).startswith("sha256:"))
-        self.assertNotIn(base["api_key"], str(fingerprint))
+        self.assertNotIn("sk-secret-value", str(fingerprint))
         for field, value in {
             "provider": "deepseek",
             "model": "another-model",
-            "api_key": "sk-another",
+            "secret_ref": "secret_" + "b" * 32,
+            "credential_purpose": "provider:alternate",
             "base_url": "https://other.invalid/api",
             "transport": "codex_responses",
         }.items():

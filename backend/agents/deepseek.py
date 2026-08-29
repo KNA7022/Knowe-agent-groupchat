@@ -41,6 +41,7 @@ from knowe_core.stream_assembler import StreamAssembler
 from ..context_compressor import project_messages
 from ..content_compress import compress_tool_result  # [v1.0.34] 工具结果流压缩
 from ..i18n_backend import msg
+from .. import runtime_settings
 
 from ..config import CONFIG
 from ..agent_identity import coordinator_identity, identity_for
@@ -212,9 +213,10 @@ class DeepSeekAgent:
     """对接 DeepSeek /chat/completions（stream=true + tools）。"""
 
     def __init__(self, client_factory: ClientFactory | None = None) -> None:
-        self.api_key = CONFIG.deepseek_api_key
-        self.model = CONFIG.deepseek_model
-        self.base_url = CONFIG.deepseek_base_url.rstrip("/")
+        self.api_key = ""
+        self.model = ""
+        self.base_url = ""
+        self._credential_binding: dict[str, str] | None = None
         self._client_factory = client_factory
         # 每个项目的花名册（propose_next 要校验目标在不在队里）
         self._members: dict[str, list[dict[str, str]]] = {}
@@ -524,9 +526,10 @@ class DeepSeekAgent:
         """
         del client                      # ProviderClient 自己管连接
 
+        binding = self._credential_binding
         provider = ProviderClient(
             base_url=self.base_url,
-            api_key=self.api_key,
+            api_key=self.api_key if binding is None else "",
             model=self.model,
             timeout=build_http_timeout(
                 connect=CONFIG.provider_connect_timeout_s,
@@ -536,6 +539,10 @@ class DeepSeekAgent:
             ),
             max_retries=CONFIG.provider_max_retries,
             client_factory=self._client_factory,
+            credential_provider=(
+                (lambda selected=dict(binding): runtime_settings.resolve_provider_credential(selected))
+                if binding is not None else None
+            ),
         )
 
         deltas: list[str] = []
@@ -601,8 +608,19 @@ class DeepSeekAgent:
         """
         if self._client_factory is not None:
             return self._client_factory
-        if not self.api_key:
+        binding = runtime_settings.model_binding_for("", COORDINATOR)
+        if not (
+            binding
+            and binding.get("secret_ref")
+            and binding.get("credential_purpose")
+            and binding.get("base_url")
+            and binding.get("model")
+        ):
             return None
+        self._credential_binding = dict(binding)
+        self.api_key = ""
+        self.model = binding["model"]
+        self.base_url = binding["base_url"].rstrip("/")
         return True
 
     def _why_unavailable(self) -> str:

@@ -28,7 +28,11 @@ from typing import Any, AsyncGenerator, Callable
 
 import httpx
 
-from knowe_core.provider_identity import http_status_error_message, provider_target
+from knowe_core.provider_identity import (
+    http_status_error_message,
+    provider_target,
+    redact_provider_diagnostics,
+)
 from knowe_core.errors import (
     ProviderAuthError,
     ProviderBadResponseError,
@@ -166,6 +170,7 @@ DEFAULT_KEEPALIVE_EXPIRY = 300.0
 
 #: Test/embedding injection point: return an httpx.AsyncClient (often MockTransport).
 ClientFactory = Callable[[], httpx.AsyncClient]
+CredentialProvider = Callable[[], str]
 
 
 def _should_retry(status_code: int) -> bool:
@@ -197,6 +202,7 @@ class ProviderClient:
         client_factory: ClientFactory | None = None,
         provider: str = "",
         backoff_base: float = DEFAULT_BACKOFF_BASE,
+        credential_provider: CredentialProvider | None = None,
     ):
         normalized_base = base_url.rstrip("/")
         # HTTPX requires an absolute URL even when MockTransport intercepts the request.
@@ -204,7 +210,11 @@ class ProviderClient:
         self.base_url = normalized_base or (
             "http://provider.invalid" if client_factory is not None else ""
         )
-        self.api_key = api_key
+        # Production supplies a short-lease resolver.  In that mode the client object
+        # never retains credential plaintext or an Authorization header between calls.
+        # ``api_key`` remains as a compatibility seam for isolated embedders/tests only.
+        self.api_key = api_key if credential_provider is None else ""
+        self._credential_provider = credential_provider
         self.model = model
         self.provider = provider
         self.timeout = timeout or DEFAULT_TIMEOUT
@@ -219,7 +229,7 @@ class ProviderClient:
             "Content-Type": "application/json",
             **(extra_headers or {}),
         }
-        if api_key:
+        if api_key and credential_provider is None:
             self._headers["Authorization"] = f"Bearer {api_key}"
 
         # Respect a version segment already present in the configured base URL.  The
@@ -229,6 +239,28 @@ class ProviderClient:
             self._endpoint = stripped
         else:
             self._endpoint = f"{stripped}/chat/completions"
+
+    def _request_headers(self) -> dict[str, str]:
+        """Build one request-local header map and resolve a lease only at egress."""
+
+        headers = dict(self._headers)
+        resolver = self._credential_provider
+        if resolver is None:
+            return headers
+        try:
+            credential = str(resolver() or "")
+        except Exception as exc:
+            raise ProviderAuthError(
+                "Provider credential lease is unavailable.",
+                retryable=False,
+                cause_type=type(exc).__name__,
+            ) from None
+        if not credential:
+            raise ProviderAuthError(
+                "Provider credential lease is unavailable.", retryable=False,
+            )
+        headers["Authorization"] = f"Bearer {credential}"
+        return headers
 
     # ── HTTP client lifecycle ──
 
@@ -345,7 +377,7 @@ class ProviderClient:
                 async with client.stream(
                     "POST",
                     self._endpoint,
-                    headers=self._headers,
+                    headers=self._request_headers(),
                     json=body,
                     timeout=self.timeout,
                 ) as response:
@@ -440,7 +472,7 @@ class ProviderClient:
                 client = self._get_client()
                 response = await client.post(
                     self._endpoint,
-                    headers=self._headers,
+                    headers=self._request_headers(),
                     json=body,
                     timeout=self.timeout,
                 )
@@ -574,7 +606,8 @@ class ProviderClient:
             # JSON decoder's StopIteration), so follow it only when the wrapper itself
             # is empty and would otherwise hide the transport cause.
             current = current.__cause__ or (current.__context__ if not text else None)
-        return "；由 ".join(chain) if chain else type(error).__name__
+        detail = "；由 ".join(chain) if chain else type(error).__name__
+        return redact_provider_diagnostics(detail)
 
     @staticmethod
     def _stream_started_error(
@@ -600,6 +633,7 @@ class ProviderClient:
             body = (await response.aread()).decode("utf-8", "replace")[:500]
         except Exception:
             pass
+        body = redact_provider_diagnostics(body)
 
         code = response.status_code
         message = http_status_error_message(

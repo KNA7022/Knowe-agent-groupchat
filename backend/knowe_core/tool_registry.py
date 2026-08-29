@@ -24,6 +24,7 @@ from knowe_core.errors import ToolExecutionError, ToolNotFoundError
 
 # Handler signature: handler(args: dict, **context) -> str | Awaitable[str]
 ToolHandler = Callable[..., Any]
+ToolExecutionBoundary = Callable[["ToolDef", dict[str, Any], dict[str, Any]], Any]
 
 
 class ToolDef:
@@ -85,6 +86,18 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, ToolDef] = {}
+        self._execution_boundary: ToolExecutionBoundary | None = None
+
+    def set_execution_boundary(self, boundary: ToolExecutionBoundary) -> None:
+        """Install the sole execution boundary for this registry.
+
+        Production registries bind the commercial Tool Gateway here.  Tests and pure
+        embedders that do not install a boundary retain the historical in-process seam.
+        """
+
+        if self._execution_boundary is not None:
+            raise ValueError("ToolRegistry execution boundary is already installed")
+        self._execution_boundary = boundary
 
     def register(
         self,
@@ -128,6 +141,11 @@ class ToolRegistry:
     async def execute(self, name: str, args: dict[str, Any], **context: Any) -> str:
         """按名字执行。找不到 → ToolNotFoundError。"""
         tool = self.get(name)
+        if self._execution_boundary is not None:
+            out = self._execution_boundary(tool, dict(args), dict(context))
+            if inspect.isawaitable(out):
+                out = await out
+            return str(out)
         return await tool.execute(args, **context)
 
     def is_gated(self, name: str) -> bool:

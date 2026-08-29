@@ -68,6 +68,9 @@ _ID_PATTERNS = {
     "approval_id": re.compile(r"^apr_[0-9a-f]{32}$"), "grant_id": re.compile(r"^grant_[0-9a-f]{32}$"),
     "invocation_id": re.compile(r"^tool_[0-9a-f]{32}$"), "checkpoint_id": re.compile(r"^ckp_[0-9a-f]{32}$"),
     "decision_id": re.compile(r"^vfd_[0-9a-f]{32}$"), "group_id": re.compile(r"^grp_[0-9a-f]{32}$"),
+    "server_id": re.compile(r"^mcp_[0-9a-f]{32}$"), "finding_id": re.compile(r"^pii_[0-9a-f]{32}$"),
+    "dlp_decision_id": re.compile(r"^dlp_[0-9a-f]{32}$"),
+    "secret_ref": re.compile(r"^secret_[0-9a-f]{32}$"),
 }
 
 
@@ -335,6 +338,24 @@ class RiskLevel(str, Enum):
     HIGH = "high"
 
 
+class PrivacyTier(str, Enum):
+    """Provider data-handling strength, ordered from least to most private."""
+
+    PUBLIC = "public"
+    STANDARD = "standard"
+    CONFIDENTIAL = "confidential"
+    LOCAL = "local"
+
+    @property
+    def protection_rank(self) -> int:
+        return {
+            self.PUBLIC: 0,
+            self.STANDARD: 1,
+            self.CONFIDENTIAL: 2,
+            self.LOCAL: 3,
+        }[self]
+
+
 class FailureType(str, Enum):
     PARAMETER_ERROR = "parameter_error"
     TRANSIENT_PROVIDER_FAILURE = "transient_provider_failure"
@@ -575,6 +596,9 @@ class PermissionGrant:
     operation_scope: dict[str, str] = field(default_factory=dict)
     purpose: str = ""
     expires_at: str | None = None
+    single_use: bool = True
+    consumed_by_invocation_id: str = ""
+    consumed_at: str | None = None
     created_at: str = field(default_factory=utc_now)
     schema_version: int = TASK_RUNTIME_SCHEMA_VERSION
 
@@ -585,6 +609,12 @@ class PermissionGrant:
         )
         if not self.purpose.strip():
             raise ValueError("grant purpose is required")
+        if self.consumed_by_invocation_id:
+            _validate_contract(
+                self.schema_version, invocation_id=self.consumed_by_invocation_id,
+            )
+            if self.consumed_at is None:
+                raise ValueError("a consumed grant requires consumed_at")
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -595,6 +625,7 @@ class ToolInvocation:
     invocation_id: str
     run_id: str
     group_id: str
+    task_id: str
     tool_name: str
     idempotency_key: str
     risk: RiskLevel
@@ -603,7 +634,9 @@ class ToolInvocation:
     public_summary: str = ""
     operation_scope: dict[str, str] = field(default_factory=dict)
     purpose: str = ""
+    grant_id: str = ""
     disposition: str = "created"
+    error_type: str = ""
     created_at: str = field(default_factory=utc_now)
     completed_at: str | None = None
     schema_version: int = TASK_RUNTIME_SCHEMA_VERSION
@@ -611,8 +644,10 @@ class ToolInvocation:
     def __post_init__(self) -> None:
         _validate_contract(
             self.schema_version, invocation_id=self.invocation_id,
-            run_id=self.run_id, group_id=self.group_id,
+            run_id=self.run_id, group_id=self.group_id, task_id=self.task_id,
         )
+        if self.grant_id:
+            _validate_contract(self.schema_version, grant_id=self.grant_id)
         if self.risk is RiskLevel.HIGH and self.replay_allowed:
             raise ValueError("high-risk invocations cannot be replayable")
         if not self.tool_name.strip() or not self.idempotency_key.strip() or not self.purpose.strip():
@@ -620,6 +655,142 @@ class ToolInvocation:
         if self.disposition not in {"created", "requires_new_approval", "recovered_blocked"}:
             raise ValueError("invalid tool disposition")
         assert_public_text(self.public_summary, field_name="ToolInvocation.public_summary")
+        if self.error_type and re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,79}", self.error_type) is None:
+            raise ValueError("tool error_type must be a typed identifier")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(self)
+
+
+@dataclass(frozen=True)
+class ToolDescriptor:
+    """Backend-authored maximum capability envelope for one tool.
+
+    Renderer or model input can request a subset of this descriptor but cannot widen it.
+    Paths are absolute canonical roots.  Empty allow-lists mean the capability is absent.
+    """
+
+    tool_name: str
+    kind: str
+    risk: RiskLevel
+    executable_allowlist: tuple[str, ...] = ()
+    cwd_roots: tuple[str, ...] = ()
+    read_roots: tuple[str, ...] = ()
+    write_roots: tuple[str, ...] = ()
+    network_hosts: tuple[str, ...] = ()
+    allow_child_processes: bool = False
+    destructive: bool = False
+    external_write: bool = False
+    schema_digest: str = ""
+    schema_version: int = TASK_RUNTIME_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_contract(self.schema_version)
+        if not self.tool_name.strip() or self.kind not in {"builtin", "shell", "mcp"}:
+            raise ValueError("tool descriptor name and supported kind are required")
+        if (
+            self.destructive or self.external_write or self.allow_child_processes
+        ) and self.risk is not RiskLevel.HIGH:
+            raise ValueError("destructive, external-write and child-process tools must be high risk")
+        if self.allow_child_processes and self.kind != "shell":
+            raise ValueError("only a Shell descriptor can authorize child processes")
+        if self.schema_digest and re.fullmatch(r"[0-9a-f]{64}", self.schema_digest) is None:
+            raise ValueError("tool schema digest must be SHA-256")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(self)
+
+
+@dataclass(frozen=True)
+class McpServerConfig:
+    server_id: str
+    name: str
+    transport: str
+    command: str = ""
+    args: tuple[str, ...] = ()
+    url: str = ""
+    allowed_hosts: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()
+    allowed_resources: tuple[str, ...] = ()
+    prompts_enabled: bool = False
+    schema_version: int = TASK_RUNTIME_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_contract(self.schema_version, server_id=self.server_id)
+        if not self.name.strip() or self.transport not in {"stdio", "streamable_http"}:
+            raise ValueError("MCP server name and supported transport are required")
+        if self.prompts_enabled:
+            raise ValueError("MCP prompts are disabled by policy")
+        if self.transport == "stdio" and (not self.command.strip() or self.url):
+            raise ValueError("stdio MCP requires a command and forbids a URL")
+        if self.transport == "streamable_http" and (not self.url.strip() or self.command):
+            raise ValueError("Streamable HTTP MCP requires a URL and forbids a command")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(self)
+
+
+@dataclass(frozen=True)
+class PiiFinding:
+    finding_id: str
+    kind: str
+    start: int
+    end: int
+    digest: str
+    confidence: float = 1.0
+    schema_version: int = TASK_RUNTIME_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_contract(self.schema_version, finding_id=self.finding_id)
+        if self.start < 0 or self.end <= self.start:
+            raise ValueError("PII finding range is invalid")
+        if re.fullmatch(r"[0-9a-f]{64}", self.digest) is None:
+            raise ValueError("PII finding digest must be SHA-256")
+        if not (0 <= float(self.confidence) <= 1):
+            raise ValueError("PII finding confidence is invalid")
+
+    def to_dict(self) -> dict[str, Any]:
+        return _jsonable(self)
+
+
+@dataclass(frozen=True)
+class DlpDecision:
+    decision_id: str
+    allowed: bool
+    requires_approval: bool
+    findings: tuple[PiiFinding, ...] = ()
+    reason: str = ""
+    schema_version: int = TASK_RUNTIME_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_contract(self.schema_version, dlp_decision_id=self.decision_id)
+        if self.allowed and self.requires_approval:
+            raise ValueError("an allowed DLP decision cannot still require approval")
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "decision_id": self.decision_id,
+            "allowed": self.allowed,
+            "requires_approval": self.requires_approval,
+            "finding_ids": [item.finding_id for item in self.findings],
+            "reason": self.reason,
+            "schema_version": self.schema_version,
+        }
+
+
+@dataclass(frozen=True)
+class SecretRef:
+    secret_ref: str
+    kind: str
+    label: str
+    purpose: str
+    created_at: str = field(default_factory=utc_now)
+    schema_version: int = TASK_RUNTIME_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        _validate_contract(self.schema_version, secret_ref=self.secret_ref)
+        if not self.kind.strip() or not self.label.strip() or not self.purpose.strip():
+            raise ValueError("secret reference metadata is required")
 
     def to_dict(self) -> dict[str, Any]:
         return _jsonable(self)
@@ -732,8 +903,9 @@ class TaskRun:
 __all__ = [
     "TASK_RUNTIME_SCHEMA_VERSION", "AgentPhase", "AgentRun", "ApprovalRequest",
     "BudgetLimits", "BudgetUsage", "Checkpoint", "EvidenceRef", "FailureType",
-    "PermissionGrant", "QueueClass", "RiskLevel", "RouteLabel", "RunEvent",
-    "RunKind", "TaskRun", "TaskStatus", "ToolInvocation", "assert_public_payload",
+    "DlpDecision", "McpServerConfig", "PermissionGrant", "PiiFinding", "PrivacyTier",
+    "QueueClass", "RiskLevel", "RouteLabel", "RunEvent", "RunKind", "SecretRef",
+    "TaskRun", "TaskStatus", "ToolDescriptor", "ToolInvocation", "assert_public_payload",
     "VerifierDecision", "assert_public_text", "classify_public_text", "safe_public_text",
     "normalize_legacy_public_payload", "opaque_id", "utc_now",
 ]

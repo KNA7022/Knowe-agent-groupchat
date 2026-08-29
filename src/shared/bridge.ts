@@ -34,6 +34,35 @@ export interface RuntimeEndpoints {
   readonly wsUrl: string;
 }
 
+export type SecretRef = Readonly<{
+  secret_ref: string;
+  kind: string;
+  label: string;
+  purpose: string;
+  created_at: string;
+  schema_version: 1;
+}>;
+
+export type SecretStoreRequest = Readonly<{
+  kind: 'provider_credential' | 'master_key';
+  label: string;
+  purpose: string;
+  value: string;
+}>;
+
+export type CredentialLeaseRequest = Readonly<{
+  secret_ref: string;
+  purpose: string;
+  ttl_seconds: number;
+}>;
+
+export type CredentialLeaseRef = Readonly<{
+  lease_id: string;
+  secret_ref: string;
+  purpose: string;
+  expires_at: string;
+}>;
+
 
 /**
  * [v1.0.19.4] 用户选/拖进来的一个本地文件。path 是绝对路径；sig 是主进程用
@@ -115,6 +144,13 @@ export interface KnoweBridge {
 
   /** 获取本次 Runtime 认证令牌（仅 Electron 内可用）。 */
   getRuntimeToken(): Promise<string>;
+  /** Store a credential through Electron main safeStorage; returns metadata only. */
+  storeSecret?(input: SecretStoreRequest): Promise<SecretRef>;
+  /** Read public metadata only. Durable ciphertext and plaintext never cross this bridge. */
+  getSecret?(secretRef: string): Promise<SecretRef | null>;
+  deleteSecret?(secretRef: string): Promise<boolean>;
+  /** Ask main to deliver a short lease directly to Python; returns opaque lease metadata. */
+  leaseSecret?(input: CredentialLeaseRequest): Promise<CredentialLeaseRef>;
   /** 请求独立预览窗口打开或激活一个文件标签。 */
   openPreview(payload: PreviewOpenPayload): Promise<void>;
   /** 独立预览 renderer 订阅主进程转发的打开请求。 */
@@ -294,6 +330,10 @@ export const IPC = {
   previewReady: 'knowe:preview:ready',
   /** 渲染进程 → 主进程：获取本次 Runtime 认证令牌。 */
   getToken: 'knowe:get-runtime-token',
+  secretStore: 'knowe:secrets:store',
+  secretGet: 'knowe:secrets:get',
+  secretDelete: 'knowe:secrets:delete',
+  secretLease: 'knowe:secrets:lease',
   /** [v1.0.19.4] 打开文件选择器（多选），返回带签名的附件列表。 */
   selectFiles: 'knowe:attachments:select',
   /** [v1.0.19.4] 给拖拽的本地路径补签名。 */

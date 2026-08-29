@@ -71,6 +71,7 @@ from .groups import (
     StaleDeletePreviewError,
 )
 from .task_runtime import RuntimeConflictError, RuntimeNotFoundError, TaskRuntimeService
+from .commercial_gateway import GatewayDenied, SecretLeaseBroker
 from .task_runtime.store import RecoveryDirtyBudgetError
 from .task_runtime.contracts import (
     AgentPhase,
@@ -430,6 +431,14 @@ class KnoweServer:
     TASK_RUNTIME_DELETION_RECONCILE_IDLE_MAX_SECONDS = 1.0
     TASK_RUNTIME_DELETION_ERROR_RETRY_BASE_SECONDS = 0.05
     TASK_RUNTIME_DELETION_ERROR_RETRY_MAX_SECONDS = 1.0
+    _SECRET_BROKER_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+    _SECRET_LEASE_PURPOSE_RE = re.compile(
+        r"^(?:provider|master-key):[a-z0-9][a-z0-9_.-]{0,63}$",
+    )
+    _SECRET_LEASE_FIELDS = frozenset({
+        "lease_id", "secret_ref", "purpose", "value", "expires_at",
+    })
+    _SECRET_LEASE_BODY_MAX_BYTES = 64 * 1024
 
     def __init__(self, data_dir: str | None = None) -> None:
         # [v0.4] 落盘。data_dir 为空串 → 纯内存（测试和「我就试试」模式用）
@@ -440,6 +449,18 @@ class KnoweServer:
         self.task_runtime: TaskRuntimeService | None = (
             TaskRuntimeService(self.data_root, self.groups) if self.groups is not None else None
         )
+        # This second process credential is deliberately independent from the renderer-visible
+        # runtime token.  An absent, malformed or accidentally reused value fails the private
+        # lease route closed without affecting ordinary CLI/test server construction.
+        raw_broker_token = os.environ.get("KNOWE_SECRET_BROKER_TOKEN", "").strip()
+        self._secret_broker_token = (
+            raw_broker_token
+            if self._SECRET_BROKER_TOKEN_RE.fullmatch(raw_broker_token)
+            and not hmac.compare_digest(raw_broker_token, CONFIG.runtime_token)
+            else ""
+        )
+        self.secret_leases = SecretLeaseBroker(max_ttl_seconds=300)
+        runtime_settings.set_secret_lease_broker(self.secret_leases)
         self.hub = Hub(store=self.store)
         self.hub.group_id_resolver = self._group_id_for_runtime_project
         # Initialize the cross-thread ingress before registering the synchronous
@@ -2996,6 +3017,15 @@ class KnoweServer:
         group_id = str(continuation.get("group_id") or "")
         run_id = str(continuation.get("run_id") or "")
         execution_key = str(continuation.get("execution_key") or "")
+        runtime_run = self.task_runtime.store.get_run(run_id)
+        runtime_authority = (
+            {
+                "group_id": runtime_run.group_id,
+                "run_id": runtime_run.run_id,
+                "task_id": runtime_run.task_id,
+            }
+            if runtime_run is not None and runtime_run.group_id == group_id else None
+        )
         private = continuation.get("private_request")
         if not isinstance(private, dict):
             await self._bridge_task_runtime_execution(
@@ -3049,6 +3079,7 @@ class KnoweServer:
                     eng.submit_dm(
                         agent_id, eng.rewrap_group_mention(llm_content, agent_id),
                         project_id, group_mention=True, attachments=attachment_parts,
+                        task_runtime_authority=runtime_authority,
                     )
                     for agent_id in mentions.worker_ids
                 ]
@@ -3059,7 +3090,18 @@ class KnoweServer:
                     if failure is not None else {"outcome": "succeeded"}
                 )
             elif hasattr(eng, "submit_tracked"):
-                completion = await eng.submit_tracked(llm_content, attachments=attachment_parts)
+                if isinstance(eng, ProjectEngine):
+                    completion = await eng.submit_tracked(
+                        llm_content,
+                        attachments=attachment_parts,
+                        task_runtime_authority=runtime_authority,
+                    )
+                else:
+                    # Compatibility/test engines have no commercial registry to
+                    # authorize.  Do not pass a forgeable mapping into such an engine.
+                    completion = await eng.submit_tracked(
+                        llm_content, attachments=attachment_parts,
+                    )
             else:
                 await eng.submit(llm_content, attachments=attachment_parts)
                 completion = {"outcome": "succeeded"}
@@ -3914,6 +3956,7 @@ class KnoweServer:
             backend_data_root=self.data_root,
             memory_manager=self.memory,
             knowledge_manager=self.knowledge,
+            task_runtime_service=self.task_runtime,
         )
         self.engines[PLATFORM_PROJECT_ID] = eng
         self.platform = eng
@@ -4150,6 +4193,7 @@ class KnoweServer:
                 knowledge_manager=self.knowledge,
                 activity_callback=self._on_project_activity,
                 project_name=project_name,   # [v1.0.23.3] 群聊名（初入群问候语用）
+                task_runtime_service=self.task_runtime,
             )
             # v0.16 migration runs before the engine starts emitting or reading handoff state.
             eng.ensure_internal_layout()
@@ -4500,6 +4544,7 @@ class KnoweServer:
             memory_manager=self.memory,
             knowledge_manager=self.knowledge,
             activity_callback=self._on_project_activity,
+            task_runtime_service=self.task_runtime,
         )
         # 崩溃恢复必须和首次启动走同一条布局/迁移路径；不能因重启退回旧目录语义。
         eng.ensure_internal_layout()
@@ -4913,9 +4958,11 @@ class KnoweServer:
             return msg("server.py.085")
         try:
             aux = runtime_settings.aux_effective()
-            aux_ok = bool(aux and aux.get("api_key") and aux.get("base_url"))
-            if not aux_ok and not CONFIG.deepseek_api_key:
+            aux_ok = bool(aux and aux.get("secret_ref") and aux.get("credential_purpose")
+                          and aux.get("base_url"))
+            if not aux_ok:
                 return text
+            aux_key = runtime_settings.resolve_provider_credential(aux)
             out = await asyncio.wait_for(
                 aux_client.chat(
                     [
@@ -4925,9 +4972,9 @@ class KnoweServer:
                         )},
                         {"role": "user", "content": text},
                     ],
-                    api_key=aux["api_key"] if aux_ok else CONFIG.deepseek_api_key,
-                    base_url=aux["base_url"] if aux_ok else CONFIG.deepseek_base_url,
-                    model=aux["model"] if aux_ok else CONFIG.deepseek_model,
+                    api_key=aux_key,
+                    base_url=aux["base_url"],
+                    model=aux["model"],
                     timeout_s=8.0, what=msg("server.py.088"),
                 ),
                 timeout=9.0,
@@ -5012,6 +5059,7 @@ class KnoweServer:
         # conversations and intentionally do not create or alter a Group TaskRun.
         group_id = self._group_id_for_runtime_project(project_id)
         runtime_run_id: str | None = None
+        runtime_task_id: str | None = None
         runtime_execution_key: str | None = None
         runtime_continuation_id: str | None = None
         if self.task_runtime is not None and group_id is not None:
@@ -5042,6 +5090,7 @@ class KnoweServer:
             run_payload = route_result.get("run")
             if isinstance(run_payload, dict) and isinstance(run_payload.get("run_id"), str):
                 runtime_run_id = str(run_payload["run_id"])
+                runtime_task_id = str(run_payload.get("task_id") or "") or None
             # Ambiguous, write-capable, or sensitive requests stop at the durable
             # approval gate.  The public RunEvent is already broadcast by the same
             # listener used for HTTP mutations and is replayable after reconnect.
@@ -5117,6 +5166,10 @@ class KnoweServer:
         #
         # 未知/歧义 @ 不报错、不猜人：没有 Worker 命中时自然回落项目经理，和老版本行为一致。
         mentions = eng.resolve_group_mentions(content)
+        runtime_authority = (
+            {"group_id": group_id, "run_id": runtime_run_id, "task_id": runtime_task_id}
+            if group_id and runtime_run_id and runtime_task_id else None
+        )
         if mentions.worker_ids:
             calls = [
                 eng.submit_dm(
@@ -5125,6 +5178,7 @@ class KnoweServer:
                     project_id,
                     group_mention=True,
                     attachments=att_parts,
+                    task_runtime_authority=runtime_authority,
                 )
                 for agent_id in mentions.worker_ids
             ]
@@ -5147,7 +5201,18 @@ class KnoweServer:
             return
         try:
             if group_id and runtime_run_id and runtime_execution_key and hasattr(eng, "submit_tracked"):
-                completion = await eng.submit_tracked(llm_content, attachments=att_parts)
+                if isinstance(eng, ProjectEngine):
+                    completion = await eng.submit_tracked(
+                        llm_content,
+                        attachments=att_parts,
+                        task_runtime_authority=runtime_authority,
+                    )
+                else:
+                    # Only ProjectEngine installs the authoritative Tool Gateway.
+                    # Legacy-compatible test/embed engines receive no authority hint.
+                    completion = await eng.submit_tracked(
+                        llm_content, attachments=att_parts,
+                    )
                 self._track_task_runtime_bridge(
                     self._bridge_task_runtime_execution(
                         group_id=group_id, run_id=runtime_run_id, project_id=project_id,
@@ -6462,6 +6527,27 @@ class KnoweServer:
                 await writer.drain()
                 return
 
+            # The renderer can obtain the ordinary runtime token for WebSocket/control-plane
+            # calls.  Credential material therefore crosses a separate main-process-only
+            # capability, accepted only as a header (never a URL/query parameter).
+            if path == "/internal/credential-lease" and method == "POST":
+                supplied_broker_token = headers.get("x-knowe-secret-broker-token", "")
+                if (
+                    not self._secret_broker_token
+                    or not hmac.compare_digest(
+                        supplied_broker_token, self._secret_broker_token,
+                    )
+                ):
+                    self._write_http(
+                        writer,
+                        b"403 Forbidden",
+                        b'{"ok":false,"code":"secret_broker_auth_required","error":"private credential broker authentication required"}',
+                        b"application/json",
+                        cors=False,
+                    )
+                    await writer.drain()
+                    return
+
             raw_length = headers.get("content-length", "0").strip()
             try:
                 content_length = int(raw_length)
@@ -6485,7 +6571,7 @@ class KnoweServer:
             allowed_origins = self._configured_renderer_origins()
             origin = headers.get("origin", "").strip()
             cors_token = None
-            if origin in allowed_origins:
+            if path != "/internal/credential-lease" and origin in allowed_origins:
                 cors_token = _HTTP_CORS_ORIGIN.set(origin)
 
             exact_route_methods: dict[str, set[str]] = {
@@ -6493,6 +6579,7 @@ class KnoweServer:
                 "/shutdown": {"POST"},
                 "/settings": {"GET", "POST"},
                 "/settings/test": {"POST"},
+                "/internal/credential-lease": {"POST"},
                 "/projects/menu-state": {"GET"},
                 "/projects/pin": {"POST"},
                 "/projects/mute": {"POST"},
@@ -6588,12 +6675,21 @@ class KnoweServer:
                         )
                         await writer.drain()
                         return
-                    if content_length > 1_000_000:
+                    body_limit = (
+                        self._SECRET_LEASE_BODY_MAX_BYTES
+                        if path == "/internal/credential-lease" else 1_000_000
+                    )
+                    if content_length > body_limit:
                         self._write_http(
                             writer,
                             b"413 Payload Too Large",
-                            b'{"error":"request body exceeds 1000000 bytes"}',
+                            (
+                                b'{"error":"request body exceeds route policy"}'
+                                if path == "/internal/credential-lease"
+                                else b'{"error":"request body exceeds 1000000 bytes"}'
+                            ),
                             b"application/json",
+                            cors=path != "/internal/credential-lease",
                         )
                         await writer.drain()
                         return
@@ -6617,6 +6713,11 @@ class KnoweServer:
                     )
                     await writer.drain()
                     self._shutdown_event.set()
+                    return
+
+                if path == "/internal/credential-lease" and method == "POST":
+                    self._serve_secret_lease_ingress(writer, body_bytes)
+                    await writer.drain()
                     return
 
                 if path.startswith("/api/knowledge"):
@@ -6836,6 +6937,73 @@ class KnoweServer:
         if not isinstance(payload, dict):
             raise ValueError(msg("server.py.128"))
         return payload
+
+    @classmethod
+    def _decode_secret_lease_payload(cls, body_bytes: bytes) -> dict[str, str]:
+        """Decode the main-process-only credential envelope without permissive JSON edges."""
+        if not body_bytes or len(body_bytes) > cls._SECRET_LEASE_BODY_MAX_BYTES:
+            raise ValueError("secret lease body size is invalid")
+
+        def reject_constant(value: str) -> None:
+            raise ValueError(f"non-finite JSON number is forbidden: {value}")
+
+        def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            result: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate secret lease field")
+                result[key] = value
+            return result
+
+        try:
+            payload = json.loads(
+                body_bytes.decode("utf-8"),
+                parse_constant=reject_constant,
+                object_pairs_hook=reject_duplicate_keys,
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            raise ValueError("secret lease JSON is invalid") from exc
+        if not isinstance(payload, dict) or frozenset(payload) != cls._SECRET_LEASE_FIELDS:
+            raise ValueError("secret lease schema is invalid")
+        if any(not isinstance(payload.get(field), str) for field in cls._SECRET_LEASE_FIELDS):
+            raise ValueError("secret lease fields must be strings")
+        typed = {field: str(payload[field]) for field in cls._SECRET_LEASE_FIELDS}
+        if (
+            not cls._SECRET_LEASE_PURPOSE_RE.fullmatch(typed["purpose"])
+            or not typed["value"]
+            or len(typed["value"].encode("utf-8")) > 32_768
+            or len(typed["expires_at"]) > 64
+        ):
+            raise ValueError("secret lease policy is invalid")
+        return typed
+
+    def _serve_secret_lease_ingress(
+        self, writer: asyncio.StreamWriter, body_bytes: bytes,
+    ) -> None:
+        try:
+            payload = self._decode_secret_lease_payload(body_bytes)
+            self.secret_leases.provision(**payload)
+        except (GatewayDenied, ValueError):
+            self._write_http(
+                writer,
+                b"400 Bad Request",
+                b'{"ok":false,"code":"invalid_secret_lease","error":"credential lease rejected"}',
+                b"application/json",
+                cors=False,
+            )
+            return
+        public_lease = {
+            "lease_id": payload["lease_id"],
+            "secret_ref": payload["secret_ref"],
+            "purpose": payload["purpose"],
+            "expires_at": payload["expires_at"],
+        }
+        body = json.dumps(
+            {"ok": True, "lease": public_lease}, separators=(",", ":"),
+        ).encode("utf-8")
+        self._write_http(
+            writer, b"202 Accepted", body, b"application/json", cors=False,
+        )
 
     def _menu_project_id(self, payload: dict[str, Any]) -> str:
         raw = payload.get("group_id") or payload.get("project_id")

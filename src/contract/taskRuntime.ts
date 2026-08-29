@@ -15,6 +15,7 @@ export const RunKindSchema = z.enum(['primary', 'side']);
 export const QueueClassSchema = z.enum(['foreground', 'index']);
 export const RouteLabelSchema = z.enum(['supplement_current', 'side_answer', 'queue_new']);
 export const RiskLevelSchema = z.enum(['low', 'medium', 'high']);
+export const PrivacyTierSchema = z.enum(['public', 'standard', 'confidential', 'local']);
 export const FailureTypeSchema = z.enum([
   'parameter_error', 'transient_provider_failure', 'permission_denied',
   'budget_exhausted', 'verification_failed', 'executor_failure', 'irreversible_side_effect',
@@ -220,6 +221,9 @@ export const PermissionGrantSchema = z.object({
   operation_scope: z.record(z.string()),
   purpose: z.string().min(1),
   expires_at: z.string().nullable(),
+  single_use: z.boolean(),
+  consumed_by_invocation_id: z.union([z.literal(''), z.string().regex(/^tool_[0-9a-f]{32}$/)]),
+  consumed_at: z.string().nullable(),
   created_at: z.string().min(1),
   schema_version: TaskRuntimeSchemaVersionSchema,
 }).strict();
@@ -228,6 +232,7 @@ export const ToolInvocationSchema = z.object({
   invocation_id: z.string().regex(/^tool_[0-9a-f]{32}$/),
   run_id: z.string().regex(/^run_[0-9a-f]{32}$/),
   group_id: GroupIdSchema,
+  task_id: z.string().regex(/^task_[0-9a-f]{32}$/),
   tool_name: z.string().min(1),
   idempotency_key: z.string().min(1),
   risk: RiskLevelSchema,
@@ -236,13 +241,93 @@ export const ToolInvocationSchema = z.object({
   public_summary: z.string(),
   operation_scope: z.record(z.string()),
   purpose: z.string().min(1),
+  grant_id: z.union([z.literal(''), z.string().regex(/^grant_[0-9a-f]{32}$/)]),
   disposition: z.enum(['created', 'requires_new_approval', 'recovered_blocked']),
+  error_type: z.string().regex(/^[A-Za-z][A-Za-z0-9_.-]{0,79}$/).or(z.literal('')),
   created_at: z.string().min(1),
   completed_at: z.string().nullable(),
   schema_version: TaskRuntimeSchemaVersionSchema,
 }).strict().refine((tool) => tool.risk !== 'high' || !tool.replay_allowed, {
   message: 'high-risk tools cannot be replayable',
 });
+
+export const ToolDescriptorSchema = z.object({
+  tool_name: z.string().min(1),
+  kind: z.enum(['builtin', 'shell', 'mcp']),
+  risk: RiskLevelSchema,
+  executable_allowlist: z.array(z.string()),
+  cwd_roots: z.array(z.string()),
+  read_roots: z.array(z.string()),
+  write_roots: z.array(z.string()),
+  network_hosts: z.array(z.string()),
+  allow_child_processes: z.boolean(),
+  destructive: z.boolean(),
+  external_write: z.boolean(),
+  schema_digest: z.union([z.literal(''), z.string().regex(/^[0-9a-f]{64}$/)]),
+  schema_version: TaskRuntimeSchemaVersionSchema,
+}).strict();
+
+export const McpServerConfigSchema = z.object({
+  server_id: z.string().regex(/^mcp_[0-9a-f]{32}$/),
+  name: z.string().min(1),
+  transport: z.enum(['stdio', 'streamable_http']),
+  command: z.string(),
+  args: z.array(z.string()),
+  url: z.string(),
+  allowed_hosts: z.array(z.string()),
+  allowed_tools: z.array(z.string()),
+  allowed_resources: z.array(z.string()),
+  prompts_enabled: z.literal(false),
+  schema_version: TaskRuntimeSchemaVersionSchema,
+}).strict().superRefine((config, context) => {
+  if (config.transport === 'stdio' && (!config.command || config.url)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'stdio MCP requires command only' });
+  }
+  if (config.transport === 'streamable_http' && (!config.url || config.command)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'HTTP MCP requires URL only' });
+  }
+});
+
+export const PiiFindingSchema = z.object({
+  finding_id: z.string().regex(/^pii_[0-9a-f]{32}$/),
+  kind: PublicClassificationSchema,
+  start: z.number().int().nonnegative(),
+  end: z.number().int().positive(),
+  digest: z.string().regex(/^[0-9a-f]{64}$/),
+  confidence: z.number().min(0).max(1),
+  schema_version: TaskRuntimeSchemaVersionSchema,
+}).strict().refine((finding) => finding.end > finding.start, {
+  message: 'PII finding range is invalid',
+});
+
+export const DlpDecisionSchema = z.object({
+  decision_id: z.string().regex(/^dlp_[0-9a-f]{32}$/),
+  allowed: z.boolean(),
+  requires_approval: z.boolean(),
+  finding_ids: z.array(z.string().regex(/^pii_[0-9a-f]{32}$/)),
+  reason: z.string().min(1),
+  schema_version: TaskRuntimeSchemaVersionSchema,
+}).strict().refine((decision) => !(decision.allowed && decision.requires_approval), {
+  message: 'allowed DLP decision cannot require approval',
+});
+
+export const SecretRefSchema = z.object({
+  secret_ref: z.string().regex(/^secret_[0-9a-f]{32}$/),
+  kind: z.string().min(1),
+  label: z.string().min(1),
+  purpose: z.string().min(1),
+  created_at: z.string().min(1),
+  schema_version: TaskRuntimeSchemaVersionSchema,
+}).strict();
+
+export const ModelCapabilitySchema = z.object({
+  provider_id: z.string().min(1),
+  models: z.array(z.string().min(1)).min(1),
+  capabilities: z.array(z.string().min(1)),
+  privacy: PrivacyTierSchema,
+  estimated_cost_usd: z.number().nonnegative(),
+  preauthorized: z.boolean(),
+}).strict();
 
 export const CheckpointSchema = z.object({
   checkpoint_id: z.string().regex(/^ckp_[0-9a-f]{32}$/),
@@ -368,6 +453,7 @@ export type RunKind = z.infer<typeof RunKindSchema>;
 export type QueueClass = z.infer<typeof QueueClassSchema>;
 export type RouteLabel = z.infer<typeof RouteLabelSchema>;
 export type RiskLevel = z.infer<typeof RiskLevelSchema>;
+export type PrivacyTier = z.infer<typeof PrivacyTierSchema>;
 export type BudgetLimits = z.infer<typeof BudgetLimitsSchema>;
 export type BudgetUsage = z.infer<typeof BudgetUsageSchema>;
 export type EvidenceRef = z.infer<typeof EvidenceRefSchema>;
@@ -377,6 +463,12 @@ export type RunEvent = z.infer<typeof RunEventSchema>;
 export type ApprovalRequest = z.infer<typeof ApprovalRequestSchema>;
 export type PermissionGrant = z.infer<typeof PermissionGrantSchema>;
 export type ToolInvocation = z.infer<typeof ToolInvocationSchema>;
+export type ToolDescriptor = z.infer<typeof ToolDescriptorSchema>;
+export type McpServerConfig = z.infer<typeof McpServerConfigSchema>;
+export type PiiFinding = z.infer<typeof PiiFindingSchema>;
+export type DlpDecision = z.infer<typeof DlpDecisionSchema>;
+export type SecretRef = z.infer<typeof SecretRefSchema>;
+export type ModelCapability = z.infer<typeof ModelCapabilitySchema>;
 export type Checkpoint = z.infer<typeof CheckpointSchema>;
 export type RuntimeReplay = z.infer<typeof RuntimeReplaySchema>;
 export type GroupRuntimeSnapshot = z.infer<typeof GroupRuntimeSnapshotSchema>;

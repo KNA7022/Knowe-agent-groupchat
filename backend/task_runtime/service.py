@@ -966,26 +966,45 @@ class TaskRuntimeService:
         self, group_id: str, run_id: str, *, tool_name: str,
         idempotency_key: str, risk: RiskLevel, public_summary: str,
         approval_id: str | None = None, operation_scope: Mapping[str, str] | None = None,
-        purpose: str = "execute_tool",
+        purpose: str = "execute_tool", task_id: str | None = None,
+        grant_id: str | None = None,
     ) -> ToolInvocation:
         run = self._owned_run(run_id, group_id)
+        if task_id is not None and task_id != run.task_id:
+            raise RuntimeConflictError("tool invocation task binding mismatch")
+        normalized_scope = self._normalize_operation_scope(operation_scope)
         existing = self.store.tool_by_key(run_id, idempotency_key)
         if existing is not None:
+            expected_grant_id = str(grant_id or "") if risk is RiskLevel.HIGH else ""
+            if (
+                existing.run_id != run.run_id
+                or existing.group_id != run.group_id
+                or existing.task_id != run.task_id
+                or existing.tool_name != tool_name
+                or existing.risk is not risk
+                or existing.operation_scope != normalized_scope
+                or existing.purpose != purpose
+                or existing.grant_id != expected_grant_id
+            ):
+                raise RuntimeConflictError("tool idempotency key changed authority scope")
             return existing
-        normalized_scope = self._normalize_operation_scope(operation_scope)
         if risk is RiskLevel.HIGH:
             approval = self.store.get_approval(str(approval_id or ""))
             grant = self.store.grant_for_approval(str(approval_id or ""))
             authorized = not (approval is None or approval.status != "approved"
                     or approval.run_id != run.run_id or approval.group_id != run.group_id
                     or grant is None or grant.run_id != run.run_id or grant.group_id != run.group_id
+                    or grant.task_id != run.task_id
+                    or not grant_id or grant.grant_id != grant_id
+                    or (grant.single_use and bool(grant.consumed_by_invocation_id))
                     or grant.tool_name != tool_name or tool_name not in grant.capabilities
                     or grant.operation_scope != normalized_scope or grant.purpose != purpose
                     or (grant.expires_at is not None and self._is_expired(grant.expires_at)))
             if not authorized:
                 blocked = ToolInvocation(
                     invocation_id=opaque_id("tool"), run_id=run.run_id, group_id=run.group_id,
-                    tool_name=tool_name, idempotency_key=idempotency_key, risk=risk,
+                    task_id=run.task_id, tool_name=tool_name,
+                    idempotency_key=idempotency_key, risk=risk,
                     status="requires_new_approval", replay_allowed=False,
                     public_summary="Purpose-specific approval is required",
                     operation_scope=normalized_scope, purpose=purpose,
@@ -1013,9 +1032,12 @@ class TaskRuntimeService:
                 return winner
         invocation = ToolInvocation(
             invocation_id=opaque_id("tool"), run_id=run.run_id, group_id=run.group_id,
-            tool_name=tool_name, idempotency_key=idempotency_key, risk=risk,
+            task_id=run.task_id, tool_name=tool_name,
+            idempotency_key=idempotency_key, risk=risk,
             replay_allowed=risk is not RiskLevel.HIGH, public_summary=public_summary,
-            operation_scope=normalized_scope, purpose=purpose, disposition="created",
+            operation_scope=normalized_scope, purpose=purpose,
+            grant_id=grant.grant_id if risk is RiskLevel.HIGH and grant is not None else "",
+            disposition="created",
         )
         result: dict[str, Any] = {}
 
@@ -1034,6 +1056,13 @@ class TaskRuntimeService:
             result["usage"] = usage
 
         def persist(conn: Any, _updated: TaskRun, _event: Any) -> None:
+            if risk is RiskLevel.HIGH:
+                if grant is None:
+                    raise RuntimeConflictError("high-risk tool grant disappeared")
+                self.store.consume_grant_in_transaction(
+                    conn, grant_id=grant.grant_id, invocation_id=invocation.invocation_id,
+                    expected=grant,
+                )
             self.store.insert_tool_in_transaction(conn, invocation)
 
         try:

@@ -774,19 +774,16 @@ class KnowledgeGraphManager:
         aux = runtime_settings.aux_effective()
         aux_ok = bool(
             aux
-            and aux.get("api_key")
+            and aux.get("secret_ref")
+            and aux.get("credential_purpose")
             and aux.get("base_url")
             and aux.get("model")
         )
-        api_key = str(
-            aux["api_key"] if aux_ok else getattr(CONFIG, "deepseek_api_key", "")
-        )
-        base = str(
-            aux["base_url"] if aux_ok else getattr(CONFIG, "deepseek_base_url", "")
-        ).rstrip("/")
-        model = str(
-            aux["model"] if aux_ok else getattr(CONFIG, "deepseek_model", "")
-        )
+        if not aux_ok:
+            return ""
+        api_key = str(runtime_settings.resolve_provider_credential(aux))
+        base = str(aux["base_url"]).rstrip("/")
+        model = str(aux["model"])
         if not (api_key and base and model):
             return ""
         try:

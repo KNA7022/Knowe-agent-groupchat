@@ -1273,6 +1273,7 @@ class WorkerRuntime:
                 self.registry.execute(
                     call.name,
                     call.arguments,
+                    tool_call_id=call.id,
                     task_run=run,
                     cancellation_event=self.cancellation_event,
                     attempt_process_registry=self.process_registry,

@@ -318,6 +318,19 @@ class WorkerRuntimeFactory:
             cancellation_event=cancellation_event,
             process_registry=processes,
         )
+        bind_gateway = getattr(engine, "bind_commercial_tool_registry", None)
+        if callable(bind_gateway):
+            raw_authority = metadata.get("task_runtime_authority")
+            canonicalize = getattr(engine, "_canonical_legacy_tool_authority", None)
+            authority = (
+                canonicalize(raw_authority)
+                if callable(canonicalize) and isinstance(raw_authority, Mapping)
+                else None
+            )
+            registry = bind_gateway(
+                registry,
+                authority_provider=lambda selected=authority: selected,
+            )
 
         timeout = metadata.get(
             "timeout_seconds", getattr(self.config, "runtime_wall_clock_seconds", None)

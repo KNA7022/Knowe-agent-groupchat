@@ -17,9 +17,13 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import {
   IPC,
   type BackendStatus,
+  type CredentialLeaseRequest,
+  type CredentialLeaseRef,
   type KnoweBridge,
   type PreviewOpenPayload,
   type RuntimeEndpoints,
+  type SecretRef,
+  type SecretStoreRequest,
   type UpdateStatus,
 } from '../src/shared/bridge';
 import { WINDOW_CONTROL_CHANNEL, type WindowControlAction } from '../src/shared/windowControl';
@@ -95,6 +99,18 @@ const api: KnoweBridge = {
 
   // ── 获取本次 Runtime 认证令牌（供 WebSocket 连接用）──
   getRuntimeToken: (): Promise<string> => ipcRenderer.invoke(IPC.getToken),
+  storeSecret: (input: SecretStoreRequest): Promise<SecretRef> => (
+    ipcRenderer.invoke(IPC.secretStore, input)
+  ),
+  getSecret: (secretRef: string): Promise<SecretRef | null> => (
+    ipcRenderer.invoke(IPC.secretGet, secretRef)
+  ),
+  deleteSecret: (secretRef: string): Promise<boolean> => (
+    ipcRenderer.invoke(IPC.secretDelete, secretRef)
+  ),
+  leaseSecret: (input: CredentialLeaseRequest): Promise<CredentialLeaseRef> => (
+    ipcRenderer.invoke(IPC.secretLease, input)
+  ),
 
   // ── 独立预览窗口：主窗口发请求，预览 renderer 收纯数据 ──
   openPreview: (payload: PreviewOpenPayload): Promise<void> => (

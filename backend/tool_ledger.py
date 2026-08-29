@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextvars
 from .i18n_backend import msg
+import hashlib
 import inspect
 import json
 import time
@@ -174,6 +175,16 @@ def _one_line(value: Any, limit: int = 180) -> str:
     return text[: limit - 1] + "…" if len(text) > limit else text
 
 
+def _audit_digest(value: Any) -> str:
+    try:
+        encoded = json.dumps(
+            value, ensure_ascii=True, sort_keys=True, separators=(",", ":"), default=str,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        encoded = str(type(value).__name__).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _ok(value: Any) -> tuple[bool, str]:
     parsed: Mapping[str, Any] | None = value if isinstance(value, Mapping) else None
     if parsed is None and isinstance(value, str):
@@ -245,22 +256,26 @@ def instrument(name: str, handler: Handler) -> Handler:
                 audit.actions.append(
                     {
                         "name": name,
-                        "args": dict(mapping) if isinstance(mapping, Mapping) else {},
+                        "args_digest": _audit_digest(
+                            dict(mapping) if isinstance(mapping, Mapping) else {}
+                        ),
                         "ok": False,
-                        "error": str(exc),
+                        "error_type": type(exc).__name__,
                         "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
                     }
                 )
             raise
-        ok, error = _ok(value)
+        ok, _error = _ok(value)
         if audit is not None:
             audit.actions.append(
                 {
                     "name": name,
-                    "args": dict(mapping) if isinstance(mapping, Mapping) else {},
+                    "args_digest": _audit_digest(
+                        dict(mapping) if isinstance(mapping, Mapping) else {}
+                    ),
                     "ok": ok,
-                    "error": error,
-                    "result": _one_line(value, 500),
+                    "error_type": "" if ok else "ToolReportedError",
+                    "result_digest": _audit_digest(value),
                     "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
                 }
             )

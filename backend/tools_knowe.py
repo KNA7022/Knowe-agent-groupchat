@@ -3723,12 +3723,15 @@ async def aux_client_chat(system: str, user: str) -> str:
     from . import aux_client
 
     aux = runtime_settings.aux_effective()
-    configured = bool(aux and aux.get("api_key") and aux.get("base_url") and aux.get("model"))
+    configured = bool(aux and aux.get("secret_ref") and aux.get("credential_purpose")
+                      and aux.get("base_url") and aux.get("model"))
+    if not configured:
+        raise RuntimeError("auxiliary provider credential lease is unavailable")
     return await aux_client.chat(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        api_key=aux["api_key"] if configured else CONFIG.deepseek_api_key,
-        base_url=aux["base_url"] if configured else CONFIG.deepseek_base_url,
-        model=aux["model"] if configured else CONFIG.deepseek_model,
+        api_key=runtime_settings.resolve_provider_credential(aux),
+        base_url=aux["base_url"],
+        model=aux["model"],
         timeout_s=CONFIG.web_timeout_s + 20,
         what="web summary",
     )

@@ -12,6 +12,7 @@ import json
 import logging
 import threading
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -671,6 +672,9 @@ class TaskRuntimeStore:
                 raw.setdefault("tool_name", "")
                 raw.setdefault("operation_scope", {})
                 raw.setdefault("purpose", "legacy_approved_operation")
+                raw.setdefault("single_use", True)
+                raw.setdefault("consumed_by_invocation_id", "")
+                raw.setdefault("consumed_at", None)
                 raw.setdefault("schema_version", 1)
                 conn.execute(
                     "UPDATE studycrew_permission_grants SET payload_json=? WHERE grant_id=?",
@@ -679,6 +683,14 @@ class TaskRuntimeStore:
 
             for row in conn.execute("SELECT * FROM studycrew_tool_invocations").fetchall():
                 raw = _loads(row["payload_json"])
+                owner = conn.execute(
+                    "SELECT payload_json FROM studycrew_task_runs WHERE run_id=?",
+                    (str(row["run_id"]),),
+                ).fetchone()
+                owner_raw = _loads(owner["payload_json"]) if owner is not None else {}
+                raw.setdefault("task_id", str(owner_raw.get("task_id") or ""))
+                raw.setdefault("grant_id", "")
+                raw.setdefault("error_type", "")
                 raw.setdefault("operation_scope", {})
                 raw.setdefault("purpose", "legacy_execute_tool")
                 raw.setdefault(
@@ -1073,6 +1085,18 @@ class TaskRuntimeStore:
         if row is None:
             return None
         raw = _loads(row["payload_json"])
+        return self._grant_from_raw(raw)
+
+    def grant_by_id(self, grant_id: str) -> PermissionGrant | None:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM studycrew_permission_grants WHERE grant_id=?",
+                (grant_id,),
+            ).fetchone()
+        return None if row is None else self._grant_from_raw(_loads(row["payload_json"]))
+
+    @staticmethod
+    def _grant_from_raw(raw: Mapping[str, Any]) -> PermissionGrant:
         return PermissionGrant(
             grant_id=str(raw["grant_id"]), approval_id=str(raw["approval_id"]),
             run_id=str(raw["run_id"]), group_id=str(raw["group_id"]), task_id=str(raw["task_id"]),
@@ -1081,6 +1105,9 @@ class TaskRuntimeStore:
             operation_scope={str(key): str(value) for key, value in dict(raw.get("operation_scope") or {}).items()},
             purpose=str(raw.get("purpose") or ""),
             expires_at=str(raw["expires_at"]) if raw.get("expires_at") else None,
+            single_use=bool(raw.get("single_use", True)),
+            consumed_by_invocation_id=str(raw.get("consumed_by_invocation_id") or ""),
+            consumed_at=str(raw["consumed_at"]) if raw.get("consumed_at") else None,
             created_at=str(raw.get("created_at") or utc_now()),
             schema_version=int(raw.get("schema_version", 1)),
         )
@@ -1102,6 +1129,64 @@ class TaskRuntimeStore:
             (grant.grant_id, grant.approval_id, grant.run_id, grant.group_id,
              _dumps(grant.to_dict()), grant.created_at),
         )
+
+    @classmethod
+    def consume_grant_in_transaction(
+        cls, conn: Any, *, grant_id: str, invocation_id: str,
+        expected: PermissionGrant,
+    ) -> PermissionGrant:
+        row = conn.execute(
+            "SELECT payload_json FROM studycrew_permission_grants WHERE grant_id=?",
+            (grant_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeStoreError("permission grant is unavailable")
+        grant = cls._grant_from_raw(_loads(row["payload_json"]))
+        if grant != expected or grant.grant_id != grant_id:
+            raise RuntimeStoreError("permission grant authority changed before consumption")
+        approval_row = conn.execute(
+            "SELECT status, payload_json FROM studycrew_approvals WHERE approval_id=?",
+            (grant.approval_id,),
+        ).fetchone()
+        if approval_row is None or str(approval_row["status"]) != "approved":
+            raise RuntimeStoreError("permission grant approval is no longer approved")
+        approval = _loads(approval_row["payload_json"])
+        if (
+            str(approval.get("run_id") or "") != grant.run_id
+            or str(approval.get("group_id") or "") != grant.group_id
+            or str(approval.get("tool_name") or "") != grant.tool_name
+            or str(approval.get("purpose") or "") != grant.purpose
+            or {
+                str(key): str(value)
+                for key, value in dict(approval.get("operation_scope") or {}).items()
+            } != grant.operation_scope
+        ):
+            raise RuntimeStoreError("permission grant no longer matches its approval")
+        if grant.expires_at:
+            try:
+                expiry = datetime.fromisoformat(grant.expires_at.replace("Z", "+00:00"))
+                if (
+                    expiry.tzinfo is None
+                    or expiry.utcoffset() is None
+                    or expiry.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+                ):
+                    raise ValueError
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise RuntimeStoreError("permission grant expired before consumption") from exc
+        if grant.single_use and grant.consumed_by_invocation_id:
+            raise RuntimeStoreError("permission grant was already consumed")
+        consumed = replace(
+            grant,
+            consumed_by_invocation_id=invocation_id,
+            consumed_at=utc_now(),
+        )
+        cursor = conn.execute(
+            "UPDATE studycrew_permission_grants SET payload_json=? WHERE grant_id=? AND payload_json=?",
+            (_dumps(consumed.to_dict()), grant_id, str(row["payload_json"])),
+        )
+        if cursor.rowcount != 1:
+            raise RuntimeStoreError("permission grant consumption lost an authority race")
+        return consumed
 
     def save_tool(self, invocation: ToolInvocation) -> tuple[ToolInvocation, bool]:
         with self.db.transaction() as conn:
@@ -1135,13 +1220,16 @@ class TaskRuntimeStore:
     def _tool_from_raw(raw: Mapping[str, Any]) -> ToolInvocation:
         return ToolInvocation(
             invocation_id=str(raw["invocation_id"]), run_id=str(raw["run_id"]),
-            group_id=str(raw["group_id"]), tool_name=str(raw["tool_name"]),
+            group_id=str(raw["group_id"]), task_id=str(raw["task_id"]),
+            tool_name=str(raw["tool_name"]),
             idempotency_key=str(raw["idempotency_key"]), risk=RiskLevel(str(raw["risk"])),
             status=str(raw.get("status") or "prepared"), replay_allowed=bool(raw.get("replay_allowed")),
             public_summary=str(raw.get("public_summary") or ""),
             operation_scope={str(key): str(value) for key, value in dict(raw.get("operation_scope") or {}).items()},
             purpose=str(raw.get("purpose") or ""),
+            grant_id=str(raw.get("grant_id") or ""),
             disposition=str(raw.get("disposition") or "created"),
+            error_type=str(raw.get("error_type") or ""),
             created_at=str(raw.get("created_at") or utc_now()), completed_at=raw.get("completed_at"),
             schema_version=int(raw.get("schema_version", 1)),
         )
@@ -1152,6 +1240,62 @@ class TaskRuntimeStore:
                 "SELECT payload_json FROM studycrew_tool_invocations WHERE status IN ('prepared','running')"
             ).fetchall()
         return tuple(self._tool_from_raw(_loads(row["payload_json"])) for row in rows)
+
+    def complete_tool(
+        self, invocation_id: str, *, status: str, error_type: str = "",
+    ) -> ToolInvocation:
+        if status not in {"completed", "failed"}:
+            raise ValueError("tool terminal status is invalid")
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM studycrew_tool_invocations WHERE invocation_id=?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeStoreError(f"tool invocation not found: {invocation_id}")
+            current = self._tool_from_raw(_loads(row["payload_json"]))
+            self._assert_group_mutable_in_transaction(conn, current.group_id)
+            if current.status in {"completed", "failed", "recovered_blocked"}:
+                return current
+            completed = replace(
+                current,
+                status=status,
+                error_type=error_type,
+                completed_at=utc_now(),
+            )
+            conn.execute(
+                "UPDATE studycrew_tool_invocations SET status=?, payload_json=? WHERE invocation_id=?",
+                (status, _dumps(completed.to_dict()), invocation_id),
+            )
+        return completed
+
+    def claim_tool_execution(self, invocation_id: str) -> tuple[ToolInvocation, bool]:
+        """Atomically move exactly one prepared invocation to the effect boundary."""
+        with self.db.transaction() as conn:
+            row = conn.execute(
+                "SELECT payload_json FROM studycrew_tool_invocations WHERE invocation_id=?",
+                (invocation_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeStoreError(f"tool invocation not found: {invocation_id}")
+            current = self._tool_from_raw(_loads(row["payload_json"]))
+            self._assert_group_mutable_in_transaction(conn, current.group_id)
+            if current.status != "prepared":
+                return current, False
+            running = replace(current, status="running")
+            cursor = conn.execute(
+                "UPDATE studycrew_tool_invocations SET status='running', payload_json=? "
+                "WHERE invocation_id=? AND status='prepared'",
+                (_dumps(running.to_dict()), invocation_id),
+            )
+            if cursor.rowcount != 1:
+                winner_row = conn.execute(
+                    "SELECT payload_json FROM studycrew_tool_invocations WHERE invocation_id=?",
+                    (invocation_id,),
+                ).fetchone()
+                winner = self._tool_from_raw(_loads(winner_row["payload_json"]))
+                return winner, False
+        return running, True
 
     @staticmethod
     def insert_tool_in_transaction(conn: Any, invocation: ToolInvocation) -> None:

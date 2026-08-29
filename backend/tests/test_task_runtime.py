@@ -23,6 +23,16 @@ from backend.task_runtime.contracts import (
 )
 
 
+def test_task_runtime_package_exports_commercial_security_contracts() -> None:
+    import backend.task_runtime as task_runtime
+
+    for name in (
+        "ToolDescriptor", "ToolInvocation", "PermissionGrant", "McpServerConfig",
+        "PiiFinding", "DlpDecision", "SecretRef", "PrivacyTier",
+    ):
+        assert hasattr(task_runtime, name), name
+
+
 @pytest.fixture
 def runtime(tmp_path: Path):
     groups = GroupRepository(tmp_path)
@@ -403,7 +413,7 @@ def test_approval_gates_ambiguous_sensitive_routing_and_high_risk_tool(runtime) 
         requested_capabilities=("external_send",), tool_name="external_send",
         operation_scope={"destination": "portal"}, purpose="send_result",
     )
-    service.resolve_approval(
+    _resolved, tool_grant, _owner = service.resolve_approval(
         group.group_id, tool_approval.approval_id, approved=True,
         capabilities=("external_send",), request_key="tool-approval-resolve",
     )
@@ -411,6 +421,7 @@ def test_approval_gates_ambiguous_sensitive_routing_and_high_risk_tool(runtime) 
         group.group_id, run.run_id, tool_name="external_send",
         idempotency_key="send-1", risk=RiskLevel.HIGH,
         public_summary="Send approved study result", approval_id=tool_approval.approval_id,
+        grant_id=tool_grant.grant_id,
         operation_scope={"destination": "portal"}, purpose="send_result",
     )
     assert invocation.replay_allowed is False
@@ -418,6 +429,7 @@ def test_approval_gates_ambiguous_sensitive_routing_and_high_risk_tool(runtime) 
         group.group_id, run.run_id, tool_name="external_send",
         idempotency_key="send-1", risk=RiskLevel.HIGH,
         public_summary="duplicate", approval_id=tool_approval.approval_id,
+        grant_id=tool_grant.grant_id,
         operation_scope={"destination": "portal"}, purpose="send_result",
     ).invocation_id == invocation.invocation_id
 
@@ -433,13 +445,14 @@ def test_restart_pauses_interrupted_runs_and_never_replays_high_risk(tmp_path: P
         risk=RiskLevel.HIGH, request_key="approval", requested_capabilities=("danger",),
         tool_name="danger", operation_scope={"target": "workspace"}, purpose="dangerous_test",
     )
-    first.resolve_approval(
+    _resolved, danger_grant, _owner = first.resolve_approval(
         group.group_id, approval.approval_id, approved=True, capabilities=("danger",),
         request_key="approval-resolve",
     )
     first.prepare_tool(
         group.group_id, run.run_id, tool_name="danger", idempotency_key="danger-1",
         risk=RiskLevel.HIGH, public_summary="Approved once", approval_id=approval.approval_id,
+        grant_id=danger_grant.grant_id,
         operation_scope={"target": "workspace"}, purpose="dangerous_test",
     )
     first.close()
@@ -499,13 +512,14 @@ def test_group_deletion_removes_runtime_events_approvals_tools_and_checkpoints(r
         requested_capabilities=("private-tool",), tool_name="private-tool",
         operation_scope={"target": "workspace"}, purpose="delete_test",
     )
-    service.resolve_approval(
+    _resolved, private_grant, _owner = service.resolve_approval(
         group.group_id, approval.approval_id, approved=True, capabilities=("private-tool",),
         request_key="delete-approve",
     )
     service.prepare_tool(
         group.group_id, run.run_id, tool_name="private-tool", idempotency_key="delete-tool",
         risk=RiskLevel.HIGH, public_summary="private operation", approval_id=approval.approval_id,
+        grant_id=private_grant.grant_id,
         operation_scope={"target": "workspace"}, purpose="delete_test",
     )
     service.suspend_group(group.group_id, reason="Delete")

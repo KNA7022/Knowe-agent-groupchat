@@ -74,20 +74,10 @@ class ProviderModelAdapter:
                 )
             return cls(client, config=config, **kwargs)
 
-        base_url = str(getattr(source, "base_url", "") or "")
-        if base_url:
-            from knowe_core.provider_client import ProviderClient
-
-            return cls(
-                ProviderClient(
-                    base_url=base_url,
-                    api_key=str(getattr(source, "api_key", "") or ""),
-                    model=str(getattr(source, "model", "") or ""),
-                    client_factory=getattr(source, "_client_factory", None),
-                ),
-                **kwargs,
-            )
-        raise TypeError("could not extract a provider client from legacy source")
+        # A legacy object exposing only base_url/api_key has no purpose-bound lease
+        # resolver.  Constructing a new client here would resurrect a plaintext provider
+        # bypass, so unsupported sources fail before network egress.
+        raise TypeError("legacy source has no governed provider client")
 
     async def step(
         self,

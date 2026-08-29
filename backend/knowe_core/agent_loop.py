@@ -276,6 +276,7 @@ class AgentLoop:
                     tool_result = await self._registry.execute(
                         tool_name,
                         args,
+                        tool_call_id=str(tool_call.get("id") or ""),
                         **self._tool_context,
                     )
                 except ToolExecutionError as exc:

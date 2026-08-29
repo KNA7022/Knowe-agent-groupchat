@@ -214,6 +214,12 @@ const AccountPane: React.FC = () => {
 
   return (
     <>
+      <div className="set-block" role="status" aria-label="提供方凭据安全状态">
+        <h4>凭据与隐私</h4>
+        <div className="set-note">
+          API Key 由操作系统加密金库保存；页面和后端配置只保留不透明引用。模型调用使用用途绑定、最长五分钟的内存租约，租约不可用于诊断或其他用途。
+        </div>
+      </div>
       <div className="set-block">
         <h4>{t('global.search.04')}</h4>
         <div className="set-item">

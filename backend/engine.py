@@ -77,6 +77,12 @@ from .agents.base import AgentPort, Turn
 from .agents.fake import FakeAgent
 from .agents.knowe_agent import KnoweAgent, ProviderConfig
 from .config import CONFIG
+from .commercial_gateway import (
+    LegacyToolAuthority,
+    LegacyToolBoundary,
+    current_legacy_tool_authority,
+    legacy_tool_authority_context,
+)
 from . import runtime_settings   # [v0.44 设置] 模型绑定 / 审批超时 / 称呼的运行时权威
 from . import prompt_resolver    # [v1.0.21.3] 按语言选提示词模板
 from .gate import ApprovalCancelled, Gate
@@ -122,39 +128,10 @@ def _unique_strings(value: Any) -> tuple[str, ...]:
 
 
 def _auto_external_roots(objective: str) -> tuple[str, ...]:
-    r"""[v1.0.23.8-A] 从任务目标文本提取 Windows 绝对路径，返回其根目录。
+    """Compatibility shim: natural-language paths never grant filesystem authority."""
 
-    coordinator 在 goal 里写「用 copy_external_file 复制 D:/a/b/c.md」时，
-    引擎自动把 D:/a/b 加入 authorized_external_roots，让外部复制工具可用。
-
-    规则（最小权限）：
-      - 只认盘符绝对路径（如 D:/xxx 或 D:/xxx/file.md）
-      - 文件路径取其所在目录；目录路径取其自身
-      - 根目录自身（如 D:/）不授权（太宽）
-      - 项目工作区内部路径不授权（本来就能用项目工具）
-    """
-    if not objective:
-        return ()
-    # 归一化反斜杠（JSON 转义的双反斜杠 → 单反斜杠）
-    text = objective.replace("\\\\", "\\")
-    pattern = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]:[\\/][^\s\"'`|<>]+)", re.IGNORECASE)
-    roots: list[str] = []
-    for match in pattern.finditer(text):
-        raw = match.group(1).strip().rstrip(".,;:)]}")
-        if not raw or len(raw) < 4:
-            continue
-        path = Path(raw)
-        if not path.is_absolute():
-            continue
-        candidate: Path
-        if path.suffix:
-            candidate = path.parent  # 文件 → 所在目录
-        else:
-            candidate = path  # 目录 → 自身
-        if candidate == candidate.anchor:
-            continue  # 盘符根太宽，不授权
-        roots.append(str(candidate))
-    return _unique_strings(roots)
+    del objective
+    return ()
 
 
 def _normalize_project_path(value: Any) -> str:
@@ -1511,6 +1488,7 @@ class ProjectEngine:
         activity_callback: Callable[[str, str], None] | None = None,
         worker_runtime_factory: Any | None = None,
         project_name: str | None = None,
+        task_runtime_service: Any | None = None,
     ) -> None:
         self.hub = hub
         self.project_id = project_id
@@ -1520,6 +1498,7 @@ class ProjectEngine:
         # [v1.0.23.3] 已发过初入群问候的 worker —— 幂等闸，防审批重试/恢复路径重复问候。
         self._welcomed: set[str] = set()
         self._worker_runtime_factory = worker_runtime_factory or DEFAULT_WORKER_RUNTIME_FACTORY
+        self._task_runtime_service = task_runtime_service
         # [v0.44.8] 群聊列表偏好由 server 持久化、由 Harness 镜像到每个存活引擎。
         # 它们不改变记忆/执行语义，只决定客户端如何呈现通知与排序；保留在引擎上，
         # 让重建、热换绑和诊断都能读到同一份全局状态，而不是各窗口自说自话。
@@ -1745,7 +1724,9 @@ class ProjectEngine:
         # [v0.37.1 → v0.44.5] 直达时对方正忙 → 暂存，等他忙完自动补发。
         #   agent_id → [(content, reply_channel, group_mention), …]。
         #   暂存消息**不写任何 memory**（还没送到他嘴里，不算对话）。
-        self._dm_pending: dict[str, list[tuple[str, str, bool]]] = {}
+        self._dm_pending: dict[
+            str, list[tuple[str, str, bool, dict[str, Any] | None]]
+        ] = {}
 
         # Hub 是最终出站口；即使 Gate 或其他调用方绕过 engine.emit，也会经过这个守卫。
         # Lightweight compatibility/test hubs may intentionally omit the optional
@@ -2515,6 +2496,7 @@ class ProjectEngine:
         *,
         _completion_future: asyncio.Future[dict[str, Any]] | None = None,
         _governed_scope_id: str | None = None,
+        _task_runtime_authority: Mapping[str, Any] | None = None,
     ) -> None:
         if getattr(self, "_stopping", False) or getattr(self, "_stopped", False):
             raise RuntimeError(msg("engine.095"))
@@ -2541,10 +2523,15 @@ class ProjectEngine:
             envelope["_turn_completion_future"] = _completion_future
         if _governed_scope_id:
             envelope["_governed_scope_id"] = _governed_scope_id
+        if _task_runtime_authority:
+            # This private field is populated only by the server after Task Runtime
+            # routing.  It is never copied from the renderer payload or model context.
+            envelope["_task_runtime_authority"] = dict(_task_runtime_authority)
         await self.inbox.put(envelope)
 
     async def submit_tracked(
-        self, content: str, attachments: list[dict[str, Any]] | None = None,
+        self, content: str, attachments: list[dict[str, Any]] | None = None, *,
+        task_runtime_authority: Mapping[str, Any] | None = None,
     ) -> asyncio.Future[dict[str, Any]]:
         """Queue a normal turn and return its trusted Engine lifecycle future."""
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -2556,6 +2543,7 @@ class ProjectEngine:
         }
         await self.submit(
             content, attachments=attachments, _governed_scope_id=scope_id,
+            _task_runtime_authority=task_runtime_authority,
         )
 
         def cancelled(done: asyncio.Future[dict[str, Any]]) -> None:
@@ -4254,6 +4242,7 @@ class ProjectEngine:
     async def submit_dm(
         self, agent_id: str, content: str, dm_channel: str, *, group_mention: bool = False,
         attachments: list[dict[str, Any]] | None = None,
+        task_runtime_authority: Mapping[str, Any] | None = None,
     ) -> None:
         """把一条用户直达消息交给某个成员。
 
@@ -4270,7 +4259,10 @@ class ProjectEngine:
 
         # ── 需求 3：对方正在群里（或另一条私聊里）忙 → 暂存，不调 LLM ──
         if agent_id != COORDINATOR and self.worker_is_busy(agent_id):
-            self._dm_pending.setdefault(agent_id, []).append((content, dm_channel, group_mention))
+            self._dm_pending.setdefault(agent_id, []).append((
+                content, dm_channel, group_mention,
+                dict(task_runtime_authority) if task_runtime_authority else None,
+            ))
             name = self.member_name(agent_id) or agent_id
             try:
                 await self.emit(
@@ -4305,9 +4297,17 @@ class ProjectEngine:
                         self.project_id, agent_id,
                         len(self._workers_with_open_activity), len(self._dm_busy))
 
+        authority = self._canonical_legacy_tool_authority(task_runtime_authority)
+
+        async def run_governed_dm() -> None:
+            with legacy_tool_authority_context(authority):
+                await self._run_dm_turn(
+                    agent_id, content, dm_channel, group_mention=group_mention,
+                    attachments=attachments,
+                )
+
         task = asyncio.create_task(
-            self._run_dm_turn(agent_id, content, dm_channel, group_mention=group_mention,
-                              attachments=attachments),
+            run_governed_dm(),
             name=(f"mention:{self.project_id}:{agent_id}" if group_mention else f"dm:{dm_channel}"),
         )
         self._dm_tasks.add(task)
@@ -4455,12 +4455,15 @@ class ProjectEngine:
         # 他还在忙（又接了群活）→ 先不补，等下一次 idle。
         if agent_id != COORDINATOR and self.worker_is_busy(agent_id):
             return
-        content, dm_channel, group_mention = queue.pop(0)
+        content, dm_channel, group_mention, task_runtime_authority = queue.pop(0)
         if not queue:
             self._dm_pending.pop(agent_id, None)
         log.info("[%s] %s 空闲，补发暂存的私聊消息", self.project_id, agent_id)
         task = asyncio.create_task(
-            self.submit_dm(agent_id, content, dm_channel, group_mention=group_mention),
+            self.submit_dm(
+                agent_id, content, dm_channel, group_mention=group_mention,
+                task_runtime_authority=task_runtime_authority,
+            ),
             name=f"dm-flush:{dm_channel}",
         )
         self._dm_tasks.add(task)
@@ -4762,10 +4765,13 @@ class ProjectEngine:
         failure_reason: str | None = None
         new = ""
         try:
-            # [v0.44 设置 §2.2] 辅助通道（摘要/翻译/蒸馏/指令调整）走「辅助模型」绑定：
-            #   显式辅助 > 主模型便宜档（runtime_settings 派生） > CONFIG.deepseek_*（老默认）。
+            # 辅助通道只接受 safeStorage 对应的 purpose-bound lease。
             aux = runtime_settings.aux_effective()
-            aux_ok = bool(aux and aux.get("api_key") and aux.get("base_url"))
+            aux_ok = bool(aux and aux.get("secret_ref") and aux.get("credential_purpose")
+                          and aux.get("base_url"))
+            if not aux_ok:
+                raise RuntimeError("auxiliary provider credential lease is unavailable")
+            aux_key = runtime_settings.resolve_provider_credential(aux)
             new = await aux_client.chat(
                 [
                     {"role": "system", "content": self.ADJUST_SYSTEM},
@@ -4775,9 +4781,9 @@ class ProjectEngine:
                         + msg("engine.185")
                     )},
                 ],
-                api_key=aux["api_key"] if aux_ok else CONFIG.deepseek_api_key,
-                base_url=aux["base_url"] if aux_ok else CONFIG.deepseek_base_url,
-                model=aux["model"] if aux_ok else CONFIG.deepseek_model,
+                api_key=aux_key,
+                base_url=aux["base_url"],
+                model=aux["model"],
                 timeout_s=CONFIG.adjust_timeout_s,
                 what=msg("engine.186"),
             )
@@ -4986,10 +4992,21 @@ class ProjectEngine:
                         turn_outcome = "failed"
                         turn_error = "executor_precondition_failed"
 
+            turn_authority = self._canonical_legacy_tool_authority(
+                envelope.get("_task_runtime_authority")
+                if isinstance(envelope.get("_task_runtime_authority"), Mapping) else None
+            )
+
+            async def execute_governed_turn() -> None:
+                # None is intentional for DM/platform/legacy ingress: installed
+                # registries then fail closed rather than inheriting an old turn.
+                with legacy_tool_authority_context(turn_authority):
+                    await execute_turn()
+
             try:
                 if governed_scope_id:
                     governed_turn_task = asyncio.create_task(
-                        execute_turn(),
+                        execute_governed_turn(),
                         name=f"governed-root:{self.project_id}:{governed_scope_id}",
                     )
                     state = self._governed_task_scopes.get(governed_scope_id)
@@ -4997,7 +5014,7 @@ class ProjectEngine:
                         state.setdefault("turn_tasks", set()).add(governed_turn_task)
                     await governed_turn_task
                 else:
-                    await execute_turn()
+                    await execute_governed_turn()
             except ApprovalCancelled:
                 turn_outcome = "cancelled"
                 turn_error = "approval_cancelled"
@@ -5099,19 +5116,13 @@ class ProjectEngine:
         #   现在模型的唯一配置入口是「设置 → 模型与提供方」（硬编码的 DeepSeek 默认已移除）：
         #   用户在设置里配了主模型、但机器上没有 DEEPSEEK_API_KEY 环境变量，是**正常且应当能跑**
         #   的情形——老判据会把这种用户误拦。这里改问 runtime_settings 要项目经理的生效绑定
-        #   （个性化 > 全局主模型），拿得到 key+base_url 就放行；只有遗留 .env 档保留兜底。
+        #   （个性化 > 全局主模型），拿得到 purpose-bound lease+base_url 才放行。
         coord_binding = runtime_settings.model_binding_for(self.project_id, COORDINATOR)
         has_binding = bool(coord_binding
-                           and coord_binding.get("api_key")
+                           and coord_binding.get("secret_ref")
+                           and coord_binding.get("credential_purpose")
                            and coord_binding.get("base_url"))
-        # [v0.44.2 Bug1] 遗留 .env 兜底也必须**接入点齐全**才算可用：v0.44.1 抹掉了硬编码的
-        #   deepseek base_url，只剩 DEEPSEEK_API_KEY、base_url 为空的机器若放行，_new_agent 会
-        #   造出空 base_url 的 client → 请求时报「missing http://」。这种残缺配置一律按「还没配
-        #   模型」处理，给下面那句人话，而不是把底层 URL 错误抛给用户。
-        legacy_env_ok = bool(CONFIG.deepseek_api_key and CONFIG.deepseek_base_url)
-        # [v0.44.5 模型切换] 只要设置面板已经存在显式绑定，就绝不能再静默回落到
-        # DEEPSEEK_*。否则新绑定一旦缺字段/同步到一半，请求会偷偷打回旧厂商，正好制造
-        # “明明选了 GLM，却还在报 DeepSeek”的真路由歧义。显式绑定不完整就当场说明。
+        # 显式绑定不完整就当场说明；没有兼容明文凭据旁路。
         if coord_binding is not None and not has_binding:
             await self.emit({
                 "type": "error",
@@ -5122,7 +5133,7 @@ class ProjectEngine:
                 ),
             })
             return False
-        if coord_binding is None and not legacy_env_ok:
+        if coord_binding is None:
             await self.emit({
                 "type": "error",
                 "agent_id": COORDINATOR,
@@ -6204,23 +6215,26 @@ class ProjectEngine:
     async def _knowledge_distill_call(self, system: str, user: str) -> str:
         """
         蒸馏/合并的 LLM 通道。
-        [v0.44 设置 §2.2] 模型解析：KNOWE_KG_DISTILL_MODEL 环境变量仍是最高优先
-        （运维口径不变）；其后是设置面板的「辅助模型」绑定；都没有 → 老 CONFIG 默认。
+        KNOWE_KG_DISTILL_MODEL may override only the model name.  Credential and
+        endpoint authority always come from the leased auxiliary binding.
         """
         aux = runtime_settings.aux_effective()
-        aux_ok = bool(aux and aux.get("api_key") and aux.get("base_url"))
+        aux_ok = bool(aux and aux.get("secret_ref") and aux.get("credential_purpose")
+                      and aux.get("base_url"))
+        if not aux_ok:
+            raise RuntimeError("auxiliary provider credential lease is unavailable")
+        aux_key = runtime_settings.resolve_provider_credential(aux)
         model = (
             CONFIG.knowledge_distill_model
-            or (aux["model"] if aux_ok else "")
-            or CONFIG.deepseek_model
+            or aux["model"]
         )
         return await aux_client.chat(
             [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            api_key=aux["api_key"] if aux_ok else CONFIG.deepseek_api_key,
-            base_url=aux["base_url"] if aux_ok else CONFIG.deepseek_base_url,
+            api_key=aux_key,
+            base_url=aux["base_url"],
             model=model,
             timeout_s=max(5.0, float(CONFIG.knowledge_distill_timeout_s)),
             what=msg("engine.218"),
@@ -7388,7 +7402,9 @@ class ProjectEngine:
         a = self._agents.get(COORDINATOR)
         if a is None:
             a = self._new_agent(COORDINATOR, COORDINATOR_ROLE, CONFIG.coordinator_temperature)
-            a._tool_registry = build_coordinator_registry(self)   # 项目经理的工具箱
+            a._tool_registry = self.bind_commercial_tool_registry(
+                build_coordinator_registry(self),
+            )   # 项目经理的工具箱
             self._agents[COORDINATOR] = a
             self._persist_member(COORDINATOR, COORDINATOR_ROLE)   # [v0.8a A-1]
             log.info("[%s] 项目经理上线", self.project_id)
@@ -8224,22 +8240,72 @@ class ProjectEngine:
         """
         返回 ``_new_agent`` 这一刻真正会使用的完整绑定。
 
-        设置面板绑定齐全时按「Agent 个性化 > 全局主模型」；否则仅为兼容老部署，
-        回落到显式配置的 ``DEEPSEEK_*``。provider 也必须跟着返回——它不仅用于展示，
+        设置面板绑定齐全时按「Agent 个性化 > 全局主模型」；没有绑定则返回
+        空的 fail-closed 绑定。provider 也必须跟着返回——它不仅用于展示，
         还是冻结 client 的一部分；否则 URL 已切到 Z.AI，错误层仍会保留旧厂商身份。
         """
         binding = runtime_settings.model_binding_for(self.project_id, agent_id)
         # 显式设置一旦存在，就是权威；字段不完整也原样返回，让上层报当前 provider 的
-        # 配置问题。只有“从未配置过”才允许兼容老部署的 DEEPSEEK_*。
+        # 配置问题。环境变量明文凭据不再是 provider authority。
         if binding is not None:
             return dict(binding)
         return {
-            "provider": "deepseek" if (CONFIG.deepseek_api_key or CONFIG.deepseek_base_url) else "",
-            "model": CONFIG.deepseek_model,
-            "api_key": CONFIG.deepseek_api_key,
-            "base_url": CONFIG.deepseek_base_url,
+            "provider": "",
+            "model": "",
+            "base_url": "",
             "transport": "openai_chat",
+            "secret_ref": "",
+            "credential_purpose": "",
         }
+
+    def _canonical_legacy_tool_authority(
+        self, raw: Mapping[str, Any] | None,
+    ) -> LegacyToolAuthority | None:
+        """Resolve a private routing hint back through the Task Runtime store.
+
+        A mapping is never authority by itself.  This lookup binds all three IDs to
+        the durable backend run, so copied renderer/model fields cannot mint a scope.
+        """
+
+        if self._task_runtime_service is None or not isinstance(raw, Mapping):
+            return None
+        group_id = str(raw.get("group_id") or "")
+        run_id = str(raw.get("run_id") or "")
+        task_id = str(raw.get("task_id") or "")
+        if not group_id or not run_id or not task_id:
+            return None
+        try:
+            run = self._task_runtime_service.store.get_run(run_id)
+        except Exception:
+            return None
+        if run is None or run.group_id != group_id or run.task_id != task_id:
+            return None
+        return LegacyToolAuthority(group_id=group_id, run_id=run_id, task_id=task_id)
+
+    def bind_commercial_tool_registry(
+        self,
+        registry: Any,
+        *,
+        authority_provider: Callable[[], LegacyToolAuthority | None] | None = None,
+    ) -> Any:
+        """Put a legacy ToolRegistry behind the commercial Tool Gateway.
+
+        The only migrated legacy effects are project-local reads.  Everything else
+        fails before its handler until it has a structured exact-capability adapter.
+        """
+
+        if self._task_runtime_service is None:
+            return registry
+        provider = authority_provider or current_legacy_tool_authority
+        registry.set_execution_boundary(LegacyToolBoundary(
+            self._task_runtime_service,
+            authority_provider=provider,
+            read_only_tools=frozenset({
+                "safe_read_file", "safe_list_dir", "safe_search_files",
+                "read_harness_memory",
+            }),
+        ))
+        return registry
 
     async def _aux_translate_error(self, raw: str) -> str:
         """把机器报错译成一句友好中文（DESIGN §三#8）。best-effort、短超时、
@@ -8249,9 +8315,11 @@ class ProjectEngine:
             return msg("engine.269")
         try:
             aux = runtime_settings.aux_effective()
-            aux_ok = bool(aux and aux.get("api_key") and aux.get("base_url"))
-            if not aux_ok and not CONFIG.deepseek_api_key:
+            aux_ok = bool(aux and aux.get("secret_ref") and aux.get("credential_purpose")
+                          and aux.get("base_url"))
+            if not aux_ok:
                 return text
+            aux_key = runtime_settings.resolve_provider_credential(aux)
             out = await asyncio.wait_for(
                 aux_client.chat(
                     [
@@ -8261,9 +8329,9 @@ class ProjectEngine:
                         )},
                         {"role": "user", "content": text},
                     ],
-                    api_key=aux["api_key"] if aux_ok else CONFIG.deepseek_api_key,
-                    base_url=aux["base_url"] if aux_ok else CONFIG.deepseek_base_url,
-                    model=aux["model"] if aux_ok else CONFIG.deepseek_model,
+                    api_key=aux_key,
+                    base_url=aux["base_url"],
+                    model=aux["model"],
                     timeout_s=8.0, what=msg("engine.272"),
                 ),
                 timeout=9.0,
@@ -8303,10 +8371,15 @@ class ProjectEngine:
     def _new_agent(self, agent_id: str, role: str, temperature: float) -> KnoweAgent:
         """Create a Coordinator loop adapter or a Worker Provider holder."""
         binding = self._effective_provider_binding(agent_id)
+        uses_lease = bool(binding.get("secret_ref") and binding.get("credential_purpose"))
+        credential_provider = (
+            (lambda selected=dict(binding): runtime_settings.resolve_provider_credential(selected))
+            if uses_lease else None
+        )
         pc = ProviderConfig(
             provider=binding["provider"],
             model=binding["model"],
-            api_key=binding["api_key"],
+            api_key="",
             base_url=self._core_base_url(binding["base_url"]),
             temperature=temperature,
             max_retries=CONFIG.provider_max_retries,
@@ -8314,6 +8387,9 @@ class ProjectEngine:
             read_timeout_s=CONFIG.provider_read_timeout_s,
             write_timeout_s=CONFIG.provider_write_timeout_s,
             pool_timeout_s=CONFIG.provider_pool_timeout_s,
+            credential_provider=credential_provider,
+            secret_ref=binding.get("secret_ref", ""),
+            credential_purpose=binding.get("credential_purpose", ""),
         )
         agent = KnoweAgent(
             agent_id=agent_id,
@@ -8321,7 +8397,10 @@ class ProjectEngine:
             provider_config=pc,
             client_factory=self._client_factory,
         )
-        agent._bound_sig = (pc.provider, pc.base_url, pc.model, pc.api_key)
+        agent._bound_sig = (
+            pc.provider, pc.base_url, pc.model,
+            pc.secret_ref,
+        )
         if agent_id == COORDINATOR:
             agent.stream_delta_callback = lambda text: self._fire({
                 "type": "stream_delta", "agent_id": agent_id, "content": text,
@@ -8354,7 +8433,7 @@ class ProjectEngine:
             binding["provider"],
             self._core_base_url(binding["base_url"]),
             binding["model"],
-            binding["api_key"],
+            binding.get("secret_ref", ""),
         )
 
     def apply_model_settings(self) -> int:
@@ -8447,7 +8526,11 @@ class ProjectEngine:
             if not system:
                 return
             aux = runtime_settings.aux_effective()
-            aux_ok = bool(aux and aux.get("api_key") and aux.get("base_url"))
+            aux_ok = bool(aux and aux.get("secret_ref") and aux.get("credential_purpose")
+                          and aux.get("base_url"))
+            if not aux_ok:
+                return
+            aux_key = runtime_settings.resolve_provider_credential(aux)
             user_content = text
             if context:
                 user_content = (
@@ -8458,9 +8541,9 @@ class ProjectEngine:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_content},
                 ],
-                api_key=aux["api_key"] if aux_ok else CONFIG.deepseek_api_key,
-                base_url=aux["base_url"] if aux_ok else CONFIG.deepseek_base_url,
-                model=aux["model"] if aux_ok else CONFIG.deepseek_model,
+                api_key=aux_key,
+                base_url=aux["base_url"],
+                model=aux["model"],
                 max_tokens=800,
                 timeout_s=CONFIG.adjust_timeout_s,
                 what=msg("engine.170"),
@@ -9009,16 +9092,15 @@ class ProjectEngine:
             extension_metadata.pop("external_roots", ()),
         )
         authorized_external_roots = _unique_strings(roots_value)
-        # [v1.0.23.8-A] 显式授权为空时：从 goal/objective 文本自动提取外部
-        #   绝对路径（如 D:\xxx\file.md），取其根目录加入授权——coordinator
-        #   派活时无需显式声明 external roots，copy_external_file 不再被
-        #   「no external root is authorized」拦截。仅当显式为空时才自动补，
-        #   显式授权永远优先（最小权限原则）。
-        if not authorized_external_roots:
-            auto_roots = _auto_external_roots(objective_text)
-            if auto_roots:
-                authorized_external_roots = _unique_strings(auto_roots)
-
+        runtime_authority = current_legacy_tool_authority()
+        runtime_authority_metadata = (
+            {
+                "group_id": runtime_authority.group_id,
+                "run_id": runtime_authority.run_id,
+                "task_id": runtime_authority.task_id,
+            }
+            if runtime_authority is not None else None
+        )
         metadata = {
             "engine_boundary": "ProjectEngine",
             "instruction_delivery": "verbatim",
@@ -9062,10 +9144,10 @@ class ProjectEngine:
             "attempt_ordinal": 1,
             **({"coordinator_context": coordinator_context} if coordinator_context else {}),
             **extension_metadata,
-            # Runtime consumes only these narrow, explicit safety inputs.
-            # [v1.0.23.5] delete_intent 恒 True：删除安全门已移除（见 _create_task_envelope 注释）。
-            "delete_intent": True,
+            # Runtime consumes only explicit, backend-authored safety inputs.
             "authorized_external_roots": list(authorized_external_roots),
+            **({"task_runtime_authority": runtime_authority_metadata}
+               if runtime_authority_metadata is not None else {}),
         }
         delivery = DeliveryTarget(
             audience=DeliveryAudience.USER,
