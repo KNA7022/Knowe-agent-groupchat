@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import threading
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
 from backend.groups import GroupRepository
-from backend.knowledge_assets import KnowledgeAssetManager
+from backend.knowledge_assets import KnowledgeAssetManager, ProfileBundle
 from backend.knowledge_api import (
     dispatch_knowledge_http,
     register_project,
@@ -20,6 +21,7 @@ class _Assets:
     def __init__(self, project_id: str, rows: list[dict[str, object]]) -> None:
         self.project_id = project_id
         self.rows = rows
+        self.profile_body = f"profile:{project_id}"
 
     def snapshot(self, project_id: str, _workspace: Path) -> dict[str, object]:
         assert project_id == self.project_id
@@ -33,18 +35,40 @@ class _Assets:
         return {"found": bool(row), "asset": row} if row else {"found": False, "asset_id": asset_id}
 
     def profile_text(self, _workspace: Path) -> str:
-        return f"profile:{self.project_id}"
+        return self.profile_body
+
+    async def profile_bundle(self, project_id: str, workspace: Path) -> ProfileBundle:
+        snapshot = self.snapshot(project_id, workspace)
+        source_ids = tuple(str(value) for value in snapshot.get("profile_source_ids") or [])
+        course_ids = tuple(str(value) for value in snapshot.get("profile_course_ids") or [])
+        body = self.profile_text(workspace)
+        revision = int(snapshot.get("revision") or 0)
+        return ProfileBundle(
+            project_id=project_id,
+            revision=revision,
+            exists=bool(snapshot.get("profile_exists")),
+            body=body,
+            source_ids=source_ids,
+            course_ids=course_ids,
+            locked=False,
+            generation_token=f"{revision}:{body}:{source_ids}:{course_ids}",
+        )
 
     async def profile_snapshot(self, project_id: str, workspace: Path) -> dict[str, object]:
-        snapshot = self.snapshot(project_id, workspace)
-        return {
-            "project_id": project_id,
-            "revision": snapshot.get("revision", 0),
-            "profile_exists": bool(snapshot.get("profile_exists")),
-            "profile_text": self.profile_text(workspace),
-            "profile_source_ids": list(snapshot.get("profile_source_ids") or []),
-            "profile_course_ids": list(snapshot.get("profile_course_ids") or []),
-        }
+        return (await self.profile_bundle(project_id, workspace)).as_snapshot()
+
+    async def set_profile_authorized(
+        self,
+        project_id: str,
+        workspace: Path,
+        text: str,
+        authorize: Callable[[ProfileBundle], bool],
+    ) -> dict[str, object]:
+        bundle = await self.profile_bundle(project_id, workspace)
+        if not authorize(bundle):
+            return {"ok": False, "reason": "profile_not_authorized"}
+        self.profile_body = text.strip() + "\n"
+        return {"ok": True}
 
     def list_skillpacks(self, project_id: str, _workspace: Path) -> dict[str, object]:
         source_ids = sorted({
@@ -634,16 +658,16 @@ async def test_real_manager_profile_detail_body_and_contributors_share_one_gener
 
     captured = threading.Event()
     release = threading.Event()
-    original_snapshot = assets.snapshot
+    original_profile_text = assets.profile_text
 
-    def pause_after_allowed_snapshot(*args: object, **kwargs: object) -> dict[str, object]:
-        result = original_snapshot(*args, **kwargs)
+    def pause_after_allowed_body(internal_workspace: Path | str) -> str:
+        result = original_profile_text(internal_workspace)
         captured.set()
         if not release.wait(timeout=5):
             raise AssertionError("profile request did not resume")
         return result
 
-    monkeypatch.setattr(assets, "snapshot", pause_after_allowed_snapshot)
+    monkeypatch.setattr(assets, "profile_text", pause_after_allowed_body)
     try:
         register_project(
             project_id, manager=graph_manager, assets=assets,

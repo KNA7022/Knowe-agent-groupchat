@@ -52,6 +52,7 @@ import re
 import shutil
 import sys
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -95,6 +96,75 @@ SKILLPACK_STATUSES = ("active", "pending", "retired")
 _PROJECT_SKILL_LOCKS_GUARD = threading.Lock()
 _PROJECT_SKILL_LOCKS: dict[str, threading.Lock] = {}
 _THIRD_PARTY_SKILL_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class ProfileBundle:
+    """One lock-bound Profile generation used for authorization and rendering."""
+
+    project_id: str
+    revision: int
+    exists: bool
+    body: str
+    source_ids: tuple[str, ...]
+    course_ids: tuple[str, ...]
+    locked: bool
+    generation_token: str
+
+    @property
+    def available(self) -> bool:
+        return self.exists
+
+    @property
+    def availability(self) -> bool:
+        return self.exists
+
+    @property
+    def contributors(self) -> dict[str, tuple[str, ...]]:
+        return {"source_ids": self.source_ids, "course_ids": self.course_ids}
+
+    @property
+    def generation(self) -> str:
+        return self.generation_token
+
+    @property
+    def profile_exists(self) -> bool:
+        return self.exists
+
+    @property
+    def profile_text(self) -> str:
+        return self.body
+
+    @property
+    def profile_source_ids(self) -> tuple[str, ...]:
+        return self.source_ids
+
+    @property
+    def profile_course_ids(self) -> tuple[str, ...]:
+        return self.course_ids
+
+    @property
+    def profile_locked(self) -> bool:
+        return self.locked
+
+    @property
+    def profile_generation(self) -> str:
+        return self.generation_token
+
+    def as_snapshot(self) -> dict[str, Any]:
+        """Keep the established Profile snapshot keys for API and caller compatibility."""
+        return {
+            "project_id": self.project_id,
+            "revision": self.revision,
+            "profile_exists": self.exists,
+            "profile_text": self.body,
+            "profile_source_ids": list(self.source_ids),
+            "profile_course_ids": list(self.course_ids),
+            "profile_locked": self.locked,
+            "profile_generation": self.generation_token,
+            "generation_token": self.generation_token,
+        }
+
 
 # ── 五类资产（报告 §三 表格）与 id 前缀 ──
 ASSET_CLASSES = ("preference", "playbook", "pitfall", "fact", "decision")
@@ -1161,55 +1231,163 @@ class KnowledgeAssetManager:
             pass
         return ""
 
-    async def profile_snapshot(
+    @staticmethod
+    def _profile_generation_token(
+        *,
+        revision: int,
+        exists: bool,
+        body: str,
+        source_ids: tuple[str, ...],
+        course_ids: tuple[str, ...],
+        locked: bool,
+    ) -> str:
+        payload = json.dumps(
+            {
+                "revision": revision,
+                "exists": exists,
+                "body": body,
+                "source_ids": source_ids,
+                "course_ids": course_ids,
+                "locked": locked,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _profile_bundle_sync(
         self, project_id: str, internal_workspace: Path | str,
-    ) -> dict[str, Any]:
-        """Read one indivisible Profile body/proof while fencing every manager writer."""
+    ) -> ProfileBundle:
+        """Build a Profile generation; callers must hold ``root_lock``."""
+        root = KnowledgeGraphManager.knowledge_dir(internal_workspace)
+        graph = self._graph.load_graph(project_id, root)
+        revision = int(graph.get("revision") or 0)
+        locked = bool(graph.get("profile_locked"))
+        exists = self.profile_path(internal_workspace).is_file()
+        body = self.profile_text(internal_workspace) if exists else ""
+        source_ids, course_ids = (
+            self._profile_contributor_ids(
+                graph,
+                internal_workspace,
+                sources=graph.get("sources") or {},
+                profile_text=body,
+            )
+            if exists
+            else ([], [])
+        )
+        source_tuple = tuple(source_ids)
+        course_tuple = tuple(course_ids)
+        return ProfileBundle(
+            project_id=project_id,
+            revision=revision,
+            exists=exists,
+            body=body,
+            source_ids=source_tuple,
+            course_ids=course_tuple,
+            locked=locked,
+            generation_token=self._profile_generation_token(
+                revision=revision,
+                exists=exists,
+                body=body,
+                source_ids=source_tuple,
+                course_ids=course_tuple,
+                locked=locked,
+            ),
+        )
+
+    async def profile_bundle(
+        self, project_id: str, internal_workspace: Path | str,
+    ) -> ProfileBundle:
+        """Read body, availability, proof, lock state and token under one root lock."""
         try:
             async with self._graph.root_lock(internal_workspace):
                 return await asyncio.to_thread(
-                    self._profile_snapshot_sync, project_id, internal_workspace,
+                    self._profile_bundle_sync, project_id, internal_workspace,
                 )
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            log.exception("[%s] profile snapshot 失败（回落为空）", project_id)
-            return {
-                "project_id": project_id, "revision": 0, "profile_exists": False,
-                "profile_text": "", "profile_source_ids": [], "profile_course_ids": [],
-            }
+            log.exception("[%s] profile bundle 失败（回落为空）", project_id)
+            source_ids: tuple[str, ...] = ()
+            course_ids: tuple[str, ...] = ()
+            return ProfileBundle(
+                project_id=project_id,
+                revision=0,
+                exists=False,
+                body="",
+                source_ids=source_ids,
+                course_ids=course_ids,
+                locked=False,
+                generation_token=self._profile_generation_token(
+                    revision=0,
+                    exists=False,
+                    body="",
+                    source_ids=source_ids,
+                    course_ids=course_ids,
+                    locked=False,
+                ),
+            )
 
-    def _profile_snapshot_sync(
+    async def profile_snapshot(
         self, project_id: str, internal_workspace: Path | str,
     ) -> dict[str, Any]:
-        snapshot = self.snapshot(project_id, internal_workspace)
-        return {
-            "project_id": project_id,
-            "revision": snapshot.get("revision", 0),
-            "profile_exists": bool(snapshot.get("profile_exists")),
-            "profile_text": self.profile_text(internal_workspace),
-            "profile_source_ids": list(snapshot.get("profile_source_ids") or []),
-            "profile_course_ids": list(snapshot.get("profile_course_ids") or []),
-        }
+        """Compatibility projection of the lock-bound ``ProfileBundle``."""
+        return (await self.profile_bundle(project_id, internal_workspace)).as_snapshot()
+
+    def _set_profile_sync(
+        self, project_id: str, internal_workspace: Path | str, text: str,
+    ) -> dict[str, Any]:
+        """Mutate a Profile while the caller holds ``root_lock``."""
+        root = KnowledgeGraphManager.knowledge_dir(internal_workspace)
+        graph = self._graph.load_graph(project_id, root)
+        max_lines = _bounded(CONFIG.knowledge_profile_max_lines, 10, 80)
+        lines = [ln.rstrip() for ln in str(text or "").splitlines()][:max_lines]
+        _atomic_write(self.profile_path(internal_workspace), "\n".join(lines).strip() + "\n")
+        graph["profile_locked"] = True
+        graph["updated_at"] = _now_iso()
+        self._graph.save_graph(root, graph)
+        self._graph.append_event(root, {
+            "type": "profile_user_edited", "project_id": project_id,
+            "at": _now_iso(),
+        })
+        return {"ok": True}
+
+    async def set_profile_authorized(
+        self,
+        project_id: str,
+        internal_workspace: Path | str,
+        text: str,
+        authorize: Callable[[ProfileBundle], bool],
+    ) -> dict[str, Any]:
+        """Authorize and CAS one Profile generation inside a single root-lock boundary."""
+        try:
+            async with self._graph.root_lock(internal_workspace):
+                authorized = await asyncio.to_thread(
+                    self._profile_bundle_sync, project_id, internal_workspace,
+                )
+                if not authorize(authorized):
+                    return {"ok": False, "reason": "profile_not_authorized"}
+                expected_generation = authorized.generation_token
+                current = await asyncio.to_thread(
+                    self._profile_bundle_sync, project_id, internal_workspace,
+                )
+                if current.generation_token != expected_generation:
+                    return {"ok": False, "reason": "stale_profile_generation"}
+                return self._set_profile_sync(project_id, internal_workspace, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception(msg("knowledge_assets.py.043"), project_id)
+            return {"ok": False, "reason": type(exc).__name__}
 
     async def set_profile(
         self, project_id: str, internal_workspace: Path | str, text: str,
     ) -> dict[str, Any]:
         """用户直改画像（视图入口）：改完即锁定，编译器不再覆盖（用户话语权最高）。"""
-        root = KnowledgeGraphManager.knowledge_dir(internal_workspace)
         try:
             async with self._graph.root_lock(internal_workspace):
-                graph = self._graph.load_graph(project_id, root)
-                max_lines = _bounded(CONFIG.knowledge_profile_max_lines, 10, 80)
-                lines = [ln.rstrip() for ln in str(text or "").splitlines()][:max_lines]
-                _atomic_write(self.profile_path(internal_workspace),
-                              "\n".join(lines).strip() + "\n")
-                graph["profile_locked"] = True
-                graph["updated_at"] = _now_iso()
-                self._graph.save_graph(root, graph)
-                self._graph.append_event(root, {
-                    "type": "profile_user_edited", "project_id": project_id,
-                    "at": _now_iso(),
-                })
-                return {"ok": True}
+                return self._set_profile_sync(project_id, internal_workspace, text)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2308,7 +2486,7 @@ def _skill_status_zh(status: str) -> str:
 
 
 __all__ = [
-    "KnowledgeAssetManager", "DistillCall", "ASSET_CLASSES", "CATEGORIES",
+    "KnowledgeAssetManager", "ProfileBundle", "DistillCall", "ASSET_CLASSES", "CATEGORIES",
     "ASSET_SCHEMA_VERSION", "SKILLPACK_SCHEMA_VERSION", "SKILLPACK_KINDS",
     "SKILLPACK_STATUSES",
 ]
