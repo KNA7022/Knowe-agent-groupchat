@@ -202,3 +202,41 @@ DONE
   and `git diff --check` pass. Node is `v24.19.0`; Python is `3.12.10`.
 - Full renderer typecheck retains only the documented historical baseline; filtering its output
   for every round-2 production/test file returns zero diagnostics.
+
+## Independent review fix round 3/5
+
+### Status
+
+DONE
+
+### Positive contributor proof for narrow Knowledge scope
+
+- `scopedKnowledgeObjectAllowed` now requires a non-empty, matching contributor set in every
+  active narrow dimension: source-scoped requests require one allowed source and no foreign
+  source; course-scoped requests require the exact course and no foreign course. This makes an
+  ownerless Profile, Asset, or SkillPack fail closed before any detail or mutation request.
+- The same gate is now applied to Asset and SkillPack list responses, and Profile availability is
+  suppressed for a narrow request because an aggregate profile has no row-level contributor proof.
+  Detail responses are re-authorized from their returned Asset/SkillPack metadata before a body
+  can be exposed, closing a malformed or stale response path.
+- A broad Group scope deliberately remains unchanged for an explicitly user-approved,
+  validated/core, live global Asset with no private contributor: it remains readable.
+
+### Regression and acceptance matrix
+
+- Preserved and extended the untracked `src/store/task4aRound2Adversarial.test.ts` rather than
+  replacing it. Before the production change, its original reproduction failed `2/3`: ownerless
+  Profile/Asset/SkillPack detail requests exposed private bodies, and all six ownerless writes
+  returned `true`. After the change, it passes and retains the no-dispatch assertions.
+- The added route matrix proves narrow Asset/SkillPack lists retain only fully matching rows,
+  suppresses narrow Profile availability and dispatch, accepts matching Asset/SkillPack details,
+  rejects ownerless/foreign entries, and preserves broad clean approved-global Asset detail.
+
+### Verification evidence
+
+- Exact Task 4A renderer set: `7 files / 46 tests passed`.
+- Knowledge authorization backend matrix: `3/3 passed`.
+- Task Runtime backend matrix: `214/214 passed in 71.28s`.
+- Full frontend regression: `46 files / 543 tests passed`.
+- `npm run lint`, Electron TypeScript compilation, Node foundation tests `2/2` plus runtime
+  contract verification, Python `compileall`, and `git diff --check` passed.

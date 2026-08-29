@@ -447,10 +447,21 @@ function scopedKnowledgeObjectAllowed(
     return false;
   }
   if (!isApprovedGlobalObject(value)) return false;
-  if (scope.sourceIds.length && value.sourceIds?.some((id) => !scope.sourceIds.includes(id))) {
-    return false;
+  // A narrow source/course request is an exact disclosure boundary.  The object passed to a
+  // detail or mutation route must positively prove ownership in every narrowed dimension;
+  // treating absent metadata as harmless would let an unstructured body/profile escape the
+  // boundary.  Broad Group scope intentionally retains clean approved global objects that
+  // have no private contributors.
+  if (scope.sourceIds.length) {
+    const sourceIds = value.sourceIds ?? [];
+    if (!sourceIds.length || !sourceIds.some((id) => scope.sourceIds.includes(id))
+      || sourceIds.some((id) => !scope.sourceIds.includes(id))) return false;
   }
-  if (scope.courseId && value.courseIds?.some((id) => id !== scope.courseId)) return false;
+  if (scope.courseId) {
+    const courseIds = value.courseIds ?? [];
+    if (!courseIds.length || !courseIds.includes(scope.courseId)
+      || courseIds.some((id) => id !== scope.courseId)) return false;
+  }
   return true;
 }
 
@@ -472,6 +483,10 @@ function copyKnowledgeScope(scope: KnowledgeQueryScope | null): KnowledgeQuerySc
     groupIds: [...scope.groupIds], projectIds: [...scope.projectIds],
     sourceIds: [...scope.sourceIds], courseId: scope.courseId,
   } : undefined;
+}
+
+function scopeIsNarrow(scope: KnowledgeQueryScope | null | undefined): boolean {
+  return !!scope && (scope.sourceIds.length > 0 || scope.courseId !== null);
 }
 
 export const KN_PREVIEW_MIN = 320;
@@ -525,11 +540,12 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
       }>(`/assets${knowledgeScopeQuery(requestedScope)}`);
       const cards = (data.assets || [])
         .map(toCard)
-        .filter((c): c is KnowCard => c !== null);
-      const profileProjects = (data.projects || [])
+        .filter((c): c is KnowCard => c !== null)
+        .filter((card) => !requestedScope || scopedKnowledgeObjectAllowed(requestedScope, card));
+      const profileProjects = (scopeIsNarrow(requestedScope) ? [] : (data.projects || []))
         .filter((p) => p.profile_exists)
         .map((p) => String(p.project_id || ''))
-        .filter(Boolean);
+        .filter((projectId) => !!projectId && (!requestedScope || requestedScope.projectIds.includes(projectId)));
       if (get().activeScopeKey !== requestIdentity || knowledgeScopeEpoch !== requestEpoch
         || !knowledgeCommitAllowed(deletionFence)) return;
       set({ cards, profileProjects, loading: false, loadedAt: Date.now(), error: null });
@@ -563,11 +579,14 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
       set({
         skillpacks: {
           systemBuiltin: (data.system_builtin || [])
-            .map(toSkillPack).filter((p): p is SkillPack => p !== null),
+            .map(toSkillPack).filter((p): p is SkillPack => p !== null)
+            .filter((pack) => !requestedScope || scopedKnowledgeObjectAllowed(requestedScope, pack)),
           projectExperience: (data.project_experience || [])
-            .map(toSkillPack).filter((p): p is SkillPack => p !== null),
+            .map(toSkillPack).filter((p): p is SkillPack => p !== null)
+            .filter((pack) => !requestedScope || scopedKnowledgeObjectAllowed(requestedScope, pack)),
           thirdParty: (data.third_party || [])
-            .map(toSkillPack).filter((p): p is SkillPack => p !== null),
+            .map(toSkillPack).filter((p): p is SkillPack => p !== null)
+            .filter((pack) => !requestedScope || scopedKnowledgeObjectAllowed(requestedScope, pack)),
         },
       });
     } catch {
@@ -677,7 +696,8 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
         || !knowledgeCommitAllowed(deletionFence)
         || !data.found || !data.pack) return null;
       const fresh = toSkillPack(data.pack);
-      return { pack: fresh ?? pack, bodyMd: String(data.body_md || '') };
+      if (!fresh || !scopedKnowledgeObjectAllowed(requestedScope, fresh)) return null;
+      return { pack: fresh, bodyMd: String(data.body_md || '') };
     } catch {
       return null;
     }
@@ -797,8 +817,9 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
         || !knowledgeCommitAllowed(deletionFence)
         || !data.found || !data.asset) return null;
       const fresh = toCard({ ...data.asset, project_id: card.projectId });
+      if (!fresh || !scopedKnowledgeObjectAllowed(requestedScope, fresh)) return null;
       return {
-        card: fresh ?? card,
+        card: fresh,
         bodyMd: String(data.asset.body_md || ''),
         usage: (data.asset.usage_events || []).map((e) => ({
           kind: String(e.kind || ''),
