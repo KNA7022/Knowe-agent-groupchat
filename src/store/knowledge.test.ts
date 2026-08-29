@@ -14,7 +14,7 @@ function asset(projectId: string, assetId: string): Record<string, unknown> {
   return {
     project_id: projectId, asset_id: assetId, class: 'fact', category: '清单', title: assetId,
     status: 'validated', view_state: 'ok', scope: 'project', scope_set_by: 'system',
-    evidence: [], source_ids: [], course_ids: [],
+    evidence: [], source_ids: [`source-${projectId}`], course_ids: [`course-${projectId}`],
   };
 }
 
@@ -22,6 +22,7 @@ describe('Knowledge request identity and preview boundary', () => {
   beforeEach(() => {
     useKnowledgeStore.setState({
       loading: false, loadedAt: 0, error: null, cards: [], profileProjects: [],
+      profileContributors: {},
       activeScope: null, activeScopeKey: 'legacy:all', preview: null,
       skillpacks: { systemBuiltin: [], projectExperience: [], thirdParty: [] },
     });
@@ -34,7 +35,14 @@ describe('Knowledge request identity and preview boundary', () => {
       pending.push({ url: String(input), resolve });
     })));
     useKnowledgeStore.getState().setScope(scopeA);
+    useKnowledgeStore.setState({
+      profileProjects: ['project-a'],
+      profileContributors: {
+        'project-a': { sourceIds: ['source-project-a'], courseIds: ['course-project-a'] },
+      },
+    });
     useKnowledgeStore.getState().openPreview({ kind: 'profile', card: null, projectId: 'project-a' } as KnowPreviewState);
+    expect(useKnowledgeStore.getState().preview?.projectId).toBe('project-a');
     const loadA = useKnowledgeStore.getState().load({ scope: scopeA });
     await vi.waitFor(() => expect(pending).toHaveLength(1));
 
@@ -69,11 +77,13 @@ describe('Knowledge request identity and preview boundary', () => {
     const pack: SkillPack = {
       packId: 'pack-a', name: 'A', description: '', kind: 'project_experience', source: '',
       projectId: 'project-a', assetId: '', scope: 'project', status: 'active', st: 'ok',
-      immutable: false, createdAt: null, updatedAt: null,
+      immutable: false, sourceIds: ['source-project-a'], courseIds: ['course-project-a'],
+      createdAt: null, updatedAt: null,
     };
     const card = {
       id: 'project-a:asset-a', assetId: 'asset-a', projectId: 'project-a',
-      sourceIds: [], courseIds: [], scope: 'project', status: 'validated', st: 'ok',
+      sourceIds: ['source-project-a'], courseIds: ['course-project-a'],
+      scope: 'project', status: 'validated', st: 'ok',
       scopeSetBy: 'system',
     } as unknown as KnowCard;
     expect(await useKnowledgeStore.getState().fetchDetail(card)).toBeNull();
@@ -126,7 +136,8 @@ describe('Knowledge request identity and preview boundary', () => {
     useKnowledgeStore.getState().setScope(scopeA);
     const card = {
       id: 'project-a:asset-a', assetId: 'asset-a', projectId: 'project-a',
-      sourceIds: [], courseIds: [], scope: 'project', scopeSetBy: 'system',
+      sourceIds: ['source-project-a'], courseIds: ['course-project-a'],
+      scope: 'project', scopeSetBy: 'system',
       status: 'validated', st: 'ok',
     } as unknown as KnowCard;
     const detail = useKnowledgeStore.getState().fetchDetail(card);

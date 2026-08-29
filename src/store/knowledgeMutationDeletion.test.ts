@@ -10,6 +10,23 @@ function response(body: unknown): Response {
   });
 }
 
+function projectPack(projectId: string, packId = 'pack'): SkillPack {
+  return {
+    packId, projectId, assetId: 'asset', name: packId, description: '', source: '',
+    kind: 'project_experience', scope: 'project', status: 'active', st: 'ok', immutable: false,
+    sourceIds: [`source:${projectId}`], courseIds: [`course:${projectId}`],
+    createdAt: null, updatedAt: null,
+  };
+}
+
+function projectCard(projectId: string, assetId = 'asset'): KnowCard {
+  return {
+    id: `${projectId}:${assetId}`, assetId, projectId,
+    scope: 'project', scopeSetBy: 'system', status: 'validated', st: 'ok',
+    sourceIds: [`source:${projectId}`], courseIds: [`course:${projectId}`],
+  } as unknown as KnowCard;
+}
+
 describe('Knowledge mutations retain their original deletion fence', () => {
   beforeEach(() => useKnowledgeStore.setState({
     loading: false, loadedAt: 0, error: null, cards: [], profileProjects: [], preview: null,
@@ -43,12 +60,8 @@ describe('Knowledge mutations retain their original deletion fence', () => {
     });
     const fetchSpy = vi.fn();
     vi.stubGlobal('fetch', fetchSpy);
-    const pack = { packId: 'pack-a', projectId: 'project-a', name: 'pack-a' } as SkillPack;
-    const card = {
-      id: 'project-a:asset-a', assetId: 'asset-a', projectId: 'project-a',
-      sourceIds: [], courseIds: [], scope: 'project', status: 'validated', st: 'ok',
-      scopeSetBy: 'system',
-    } as unknown as KnowCard;
+    const pack = projectPack('project-a', 'pack-a');
+    const card = projectCard('project-a', 'asset-a');
     expect(await invoke(pack, card)).toBe(false);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
@@ -72,7 +85,7 @@ describe('Knowledge mutations retain their original deletion fence', () => {
       if (requests.length === 1) return Promise.resolve(response({ ok: true }));
       return new Promise<Response>((resolve) => { resolveReload = resolve; });
     }));
-    const operation = invoke({ packId: 'pack', projectId: legacyId, name: 'pack' } as SkillPack);
+    const operation = invoke(projectPack(legacyId));
     await vi.waitFor(() => expect(requests).toHaveLength(2));
     teardownGroup(groupId, legacyId);
     resolveReload(response({ ok: true, project_experience: [] }));
@@ -120,7 +133,7 @@ describe('Knowledge mutations retain their original deletion fence', () => {
       if (requestCount === 1) return Promise.resolve(response({ ok: true }));
       return new Promise<Response>((_resolve, reject) => { rejectReload = reject; });
     }));
-    const operation = invoke({ packId: 'pack', projectId: legacyId, name: 'pack' } as SkillPack);
+    const operation = invoke(projectPack(legacyId));
     await vi.waitFor(() => expect(requestCount).toBe(2));
     const otherGroup = `grp_${(caseSequence + 100).toString(16).padStart(32, '0')}`;
     useKnowledgeStore.getState().setScope({
@@ -150,7 +163,7 @@ describe('Knowledge mutations retain their original deletion fence', () => {
       if (requestCount === 1) return Promise.reject(new Error('mutation failed'));
       return new Promise<Response>((resolve) => { resolveReload = resolve; });
     }));
-    const operation = invoke({ packId: 'pack', projectId: legacyId, name: 'pack' } as SkillPack);
+    const operation = invoke(projectPack(legacyId));
     await vi.waitFor(() => expect(requestCount).toBe(2));
     teardownGroup(groupId, legacyId);
     resolveReload(response({ ok: true, project_experience: [{
@@ -183,8 +196,8 @@ async function runCase(
       rejectOriginal = reject;
     });
   }));
-  const pack = { packId: 'pack', projectId: legacyId, name: 'pack' } as SkillPack;
-  const card = { id: `${legacyId}:asset`, assetId: 'asset', projectId: legacyId } as KnowCard;
+  const pack = projectPack(legacyId);
+  const card = projectCard(legacyId);
   const operation = invoke(pack, card);
   await vi.waitFor(() => expect(knowledgeRequests).toHaveLength(1));
   teardownGroup(groupId, legacyId);

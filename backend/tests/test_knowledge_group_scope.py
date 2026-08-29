@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from backend.groups import GroupRepository
+from backend.knowledge_assets import KnowledgeAssetManager
 from backend.knowledge_api import (
     dispatch_knowledge_http,
     register_project,
@@ -32,11 +33,18 @@ class _Assets:
         return f"profile:{self.project_id}"
 
     def list_skillpacks(self, project_id: str, _workspace: Path) -> dict[str, object]:
+        source_ids = sorted({
+            str(value) for row in self.rows for value in row.get("source_ids", [])
+        })
+        course_ids = sorted({
+            str(value) for row in self.rows for value in row.get("course_ids", [])
+        })
         return {
             "system_builtin": [],
             "project_experience": [{
                 "pack_id": f"pack-{project_id}", "name": project_id, "kind": "project_experience",
                 "project_id": project_id, "scope": "project", "status": "active",
+                "source_ids": source_ids, "course_ids": course_ids,
             }],
             "third_party": [],
         }
@@ -47,10 +55,10 @@ class _Assets:
         del active_only
         if pack_id != f"pack-{project_id}":
             return {"found": False, "pack_id": pack_id}
-        return {"found": True, "pack": {
-            "pack_id": pack_id, "name": project_id, "kind": "project_experience",
-            "project_id": project_id, "scope": "project", "status": "active",
-        }, "body_md": "# pack"}
+        packs = self.list_skillpacks(project_id, _workspace)
+        rows = packs["project_experience"]
+        assert isinstance(rows, list) and isinstance(rows[0], dict)
+        return {"found": True, "pack": dict(rows[0]), "body_md": "# pack"}
 
 
 class _Manager:
@@ -384,3 +392,189 @@ async def test_mixed_indivisible_objects_fail_closed_across_read_and_write_matri
         assert pending_write.status == 403
     finally:
         unregister_project("mixed-project")
+
+
+@pytest.mark.asyncio
+async def test_broad_ownerless_objects_fail_closed_except_strict_clean_global(tmp_path: Path) -> None:
+    repo = GroupRepository(tmp_path / "data")
+    group = repo.create_group("broad", legacy_project_id="broad-project")
+    repo.bind_course(group.group_id, "course-broad")
+    source_id = repo.link_source(group.group_id).source_id
+    matching_asset = {
+        "asset_id": "asset-matching", "scope": "project", "scope_set_by": "system",
+        "status": "validated", "view_state": "ok",
+        "source_ids": [source_id], "course_ids": ["course-broad"],
+    }
+    ownerless_asset = {
+        "asset_id": "asset-ownerless", "scope": "project", "scope_set_by": "system",
+        "status": "validated", "view_state": "ok", "source_ids": [], "course_ids": [],
+    }
+    clean_global_asset = {
+        "asset_id": "asset-global-clean", "scope": "global", "scope_set_by": "user",
+        "status": "core", "view_state": "ok", "source_ids": [], "course_ids": [],
+    }
+
+    class _BroadAssets(_Assets):
+        profile_source_ids: list[str] = []
+        profile_course_ids: list[str] = []
+
+        def snapshot(self, project_id: str, workspace: Path) -> dict[str, object]:
+            result = super().snapshot(project_id, workspace)
+            result["profile_source_ids"] = list(self.profile_source_ids)
+            result["profile_course_ids"] = list(self.profile_course_ids)
+            return result
+
+        def list_skillpacks(self, project_id: str, _workspace: Path) -> dict[str, object]:
+            common = {"project_id": project_id, "status": "active", "view_state": "ok"}
+            return {
+                "project_experience": [
+                    {
+                        **common, "pack_id": "pack-matching", "name": "matching",
+                        "kind": "project_experience", "scope": "project",
+                        "source_ids": [source_id], "course_ids": ["course-broad"],
+                    },
+                    {
+                        **common, "pack_id": "pack-ownerless", "name": "ownerless",
+                        "kind": "project_experience", "scope": "project",
+                        "source_ids": [], "course_ids": [],
+                    },
+                    {
+                        **common, "pack_id": "pack-global-unapproved", "name": "unapproved",
+                        "kind": "project_experience", "scope": "global",
+                        "source_ids": [], "course_ids": [],
+                    },
+                    {
+                        **common, "pack_id": "pack-global-clean", "name": "clean",
+                        "kind": "project_experience", "scope": "global",
+                        "scope_set_by": "user", "approval_status": "core",
+                        "source_ids": [], "course_ids": [],
+                    },
+                ],
+                "system_builtin": [{
+                    "pack_id": "pack-system", "name": "system", "kind": "system_builtin",
+                    "project_id": "", "scope": "global", "status": "active",
+                    "view_state": "ok", "immutable": True, "source_ids": [], "course_ids": [],
+                }],
+                "third_party": [],
+            }
+
+        def read_skillpack(
+            self, project_id: str, workspace: Path, pack_id: str, *, active_only: bool = False,
+        ) -> dict[str, object]:
+            del active_only
+            for bucket in ("system_builtin", "project_experience", "third_party"):
+                rows = self.list_skillpacks(project_id, workspace)[bucket]
+                assert isinstance(rows, list)
+                for row in rows:
+                    if isinstance(row, dict) and row.get("pack_id") == pack_id:
+                        return {"found": True, "pack": row, "body_md": f"# {pack_id}"}
+            return {"found": False, "pack_id": pack_id}
+
+    assets = _BroadAssets(
+        "broad-project", [matching_asset, ownerless_asset, clean_global_asset],
+    )
+    try:
+        register_project(
+            "broad-project", manager=_Manager(), assets=assets, workspace_provider=lambda: tmp_path,
+        )
+        broad = f"group_id={group.group_id}&legacy_project_id=broad-project"
+
+        asset_list = await dispatch_knowledge_http("GET", "/api/knowledge/assets", broad, b"", repo)
+        assert {row["asset_id"] for row in asset_list.body["assets"]} == {
+            "asset-matching", "asset-global-clean",
+        }
+        project_row = asset_list.body["projects"][0]
+        assert project_row["profile_exists"] is False
+        assert project_row["profile_source_ids"] == []
+        assert project_row["profile_course_ids"] == []
+        ownerless_asset_detail = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/broad-project/assets/asset-ownerless", broad, b"", repo,
+        )
+        assert ownerless_asset_detail.status == 403
+
+        pack_list = await dispatch_knowledge_http("GET", "/api/knowledge/skillpacks", broad, b"", repo)
+        assert {row["pack_id"] for row in pack_list.body["project_experience"]} == {
+            "pack-matching", "pack-global-clean",
+        }
+        assert pack_list.body["system_builtin"] == []
+        ownerless_pack_detail = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/skillpacks/pack-ownerless", broad, b"", repo,
+        )
+        assert ownerless_pack_detail.status == 404
+        clean_pack_detail = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/skillpacks/pack-global-clean", broad, b"", repo,
+        )
+        assert clean_pack_detail.status == 200
+
+        ownerless_profile = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/broad-project/profile", broad, b"", repo,
+        )
+        assert ownerless_profile.status == 403
+        assets.profile_source_ids = [source_id]
+        assets.profile_course_ids = ["course-broad"]
+        matching_profile_list = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/assets", broad, b"", repo,
+        )
+        matching_project_row = matching_profile_list.body["projects"][0]
+        assert matching_project_row["profile_exists"] is True
+        assert matching_project_row["profile_source_ids"] == [source_id]
+        assert matching_project_row["profile_course_ids"] == ["course-broad"]
+        matching_profile = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/broad-project/profile", broad, b"", repo,
+        )
+        assert matching_profile.status == 200
+        assert matching_profile.body["source_ids"] == [source_id]
+        assert matching_profile.body["course_ids"] == ["course-broad"]
+    finally:
+        unregister_project("broad-project")
+
+
+def test_real_profile_and_project_skill_rows_preserve_contributor_proof(tmp_path: Path) -> None:
+    source_id = "src_" + "a" * 32
+    graph: dict[str, object] = {
+        "revision": 1,
+        "updated_at": "2026-08-29T00:00:00Z",
+        "sources": {},
+        "assets": {
+            "P-01": {
+                "id": "P-01", "class": "preference", "title": "Preference",
+                "one_liner": "Use the proved source", "applies_when": "always",
+                "body_md": "Follow the proved source.", "status": "core",
+                "scope": "project", "scope_set_by": "system", "needs_review": False,
+                "source_ids": [source_id], "course_ids": ["course-real"],
+                "evidence": [], "usage_events": [], "metrics": {},
+                "created_at": "2026-08-29T00:00:00Z",
+                "updated_at": "2026-08-29T00:00:00Z",
+            },
+        },
+    }
+
+    class _GraphStub:
+        def load_graph(self, project_id: str, _root: Path) -> dict[str, object]:
+            assert project_id == "real-project"
+            return graph
+
+    manager = KnowledgeAssetManager(_GraphStub())  # type: ignore[arg-type]
+    profile_path = manager.profile_path(tmp_path)
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text("# Profile\n\n- [P-01] Use the proved source\n", encoding="utf-8")
+
+    snapshot = manager.snapshot("real-project", tmp_path)
+    assert snapshot["profile_exists"] is True
+    assert snapshot["profile_source_ids"] == [source_id]
+    assert snapshot["profile_course_ids"] == ["course-real"]
+    assert snapshot["assets"][0]["source_ids"] == [source_id]
+    assert snapshot["assets"][0]["course_ids"] == ["course-real"]
+
+    packs = manager._sync_project_experience_skills("real-project", tmp_path, graph)  # noqa: SLF001
+    assert len(packs) == 1
+    assert packs[0]["source_ids"] == [source_id]
+    assert packs[0]["course_ids"] == ["course-real"]
+    assert packs[0]["approval_status"] == "core"
+    assert packs[0]["scope_set_by"] == "system"
+
+    graph["profile_locked"] = True
+    locked = manager.snapshot("real-project", tmp_path)
+    assert locked["profile_exists"] is True
+    assert locked["profile_source_ids"] == []
+    assert locked["profile_course_ids"] == []

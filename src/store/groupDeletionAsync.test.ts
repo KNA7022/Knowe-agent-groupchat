@@ -27,6 +27,7 @@ describe('durable deletion generation fence', () => {
   beforeEach(() => {
     useKnowledgeStore.setState({
       loading: false, loadedAt: 0, error: null, cards: [], profileProjects: [], preview: null,
+      profileContributors: {},
       activeScope: null, activeScopeKey: 'legacy:all',
       skillpacks: { systemBuiltin: [], projectExperience: [], thirdParty: [] },
     });
@@ -45,6 +46,12 @@ describe('durable deletion generation fence', () => {
 
     const scope = { groupIds: [groupId], projectIds: [legacyId], sourceIds: [], courseId: null };
     useKnowledgeStore.getState().setScope(scope);
+    useKnowledgeStore.setState({
+      profileProjects: [legacyId],
+      profileContributors: {
+        [legacyId]: { sourceIds: ['source-task4a'], courseIds: ['course-task4a'] },
+      },
+    });
     useKnoweStore.getState().ensureProject(legacyId, 'Deleted');
 
     const history = useRecordsStore.getState().load(legacyId);
@@ -59,9 +66,11 @@ describe('durable deletion generation fence', () => {
 
     const card = {
       id: `${legacyId}:asset`, assetId: 'asset', projectId: legacyId, title: marker,
+      scope: 'project', sourceIds: ['source-task4a'], courseIds: ['course-task4a'],
     } as KnowCard;
     const pack = {
       packId: 'pack', projectId: legacyId, name: marker, kind: 'project_experience',
+      scope: 'project', sourceIds: ['source-task4a'], courseIds: ['course-task4a'],
     } as SkillPack;
     const detail = useKnowledgeStore.getState().fetchDetail(card);
     const profile = useKnowledgeStore.getState().fetchProfile(legacyId);
@@ -135,6 +144,12 @@ describe('durable deletion generation fence', () => {
     const uniqueLegacy = 'legacy-task4a-stress';
     const scope = { groupIds: [uniqueGroup], projectIds: [uniqueLegacy], sourceIds: [], courseId: null };
     useKnowledgeStore.getState().setScope(scope);
+    useKnowledgeStore.setState({
+      profileProjects: [uniqueLegacy],
+      profileContributors: {
+        [uniqueLegacy]: { sourceIds: ['source-stress'], courseIds: ['course-stress'] },
+      },
+    });
     const requests = Array.from({ length: 1000 }, () => (
       useKnowledgeStore.getState().fetchProfile(uniqueLegacy)
     ));

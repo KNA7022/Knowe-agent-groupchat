@@ -120,6 +120,9 @@ export interface SkillPack {
   status: SkillPackStatus;
   st: KnowSt;
   immutable: boolean;
+  scopeSetBy?: 'system' | 'user';
+  approvalStatus?: AssetStatus;
+  needsReview?: boolean;
   sourceIds?: string[];
   courseIds?: string[];
   createdAt: string | null;
@@ -156,6 +159,7 @@ interface RawSkillPack {
   kind?: string; source_kind?: string; source?: string;
   project_id?: string; asset_id?: string; scope?: string;
   status?: string; view_state?: string; immutable?: boolean;
+  scope_set_by?: string; approval_status?: string; needs_review?: boolean;
   source_ids?: string[]; course_ids?: string[];
   created_at?: string | null; updated_at?: string | null;
 }
@@ -237,6 +241,11 @@ function toSkillPack(raw: RawSkillPack): SkillPack | null {
   const statusRaw = String(raw.status || (kind === 'project_experience' ? 'pending' : 'active'));
   const status: SkillPackStatus = statusRaw === 'active'
     ? 'active' : statusRaw === 'retired' ? 'retired' : 'pending';
+  const st: KnowSt = raw.view_state === 'ok'
+    ? 'ok' : raw.view_state === 'retired' ? 'retired' : 'pending';
+  const approvalRaw = String(raw.approval_status || '');
+  const approvalStatus = (['seed', 'candidate', 'validated', 'core', 'retired'] as const)
+    .includes(approvalRaw as AssetStatus) ? approvalRaw as AssetStatus : undefined;
   return {
     packId,
     name: String(raw.name || i18n.t('knowledge.06')),
@@ -247,8 +256,12 @@ function toSkillPack(raw: RawSkillPack): SkillPack | null {
     assetId: String(raw.asset_id || ''),
     scope: raw.scope === 'project' ? 'project' : 'global',
     status,
-    st: status === 'active' ? 'ok' : status,
+    // Global exception eligibility requires explicit live proof; `active` alone is insufficient.
+    st,
     immutable: kind === 'system_builtin' || !!raw.immutable,
+    scopeSetBy: raw.scope_set_by === 'user' ? 'user' : 'system',
+    approvalStatus,
+    needsReview: !!raw.needs_review,
     sourceIds: (raw.source_ids || []).map(String),
     courseIds: (raw.course_ids || []).map(String),
     createdAt: raw.created_at ?? null,
@@ -348,6 +361,8 @@ interface KnowledgeStore {
   };
   /** 全局知识存在画像文件的项目（「偏好画像」入口据此点亮） */
   profileProjects: string[];
+  /** Profile 是不可拆分聚合体；请求前必须保留服务端给出的完整贡献者证明。 */
+  profileContributors: Record<string, { sourceIds: string[]; courseIds: string[] }>;
   activeScope: KnowledgeQueryScope | null;
   activeScopeKey: string;
 
@@ -423,16 +438,15 @@ type ScopedKnowledgeObject = {
   needsReview?: boolean;
   kind?: SkillPackKind;
   immutable?: boolean;
+  approvalStatus?: AssetStatus;
 };
 
 function isApprovedGlobalObject(value: ScopedKnowledgeObject): boolean {
-  if (value.scope !== 'global') return true;
-  if (value.kind === 'system_builtin') {
-    return value.immutable === true && value.status === 'active' && value.st === 'ok';
-  }
-  if (value.kind) return value.status === 'active' && value.st === 'ok';
+  if (value.scope !== 'global') return false;
+  const approvalStatus = value.kind ? value.approvalStatus : value.status;
   return value.scopeSetBy === 'user'
-    && (value.status === 'validated' || value.status === 'core')
+    && (approvalStatus === 'validated' || approvalStatus === 'core')
+    && (!value.kind || value.status === 'active')
     && value.st === 'ok'
     && value.needsReview !== true;
 }
@@ -441,24 +455,25 @@ function scopedKnowledgeObjectAllowed(
   scope: KnowledgeQueryScope | null | undefined, value: ScopedKnowledgeObject,
 ): boolean {
   if (!scope || scope.groupIds.length !== 1) return false;
-  const approvedSystemGlobal = value.scope === 'global' && value.kind === 'system_builtin'
-    && isApprovedGlobalObject(value);
-  if (!approvedSystemGlobal && (!value.projectId || !scope.projectIds.includes(value.projectId))) {
+  const approvedCleanGlobal = isApprovedGlobalObject(value);
+  if (value.scope === 'global') {
+    if (!approvedCleanGlobal) return false;
+  } else if (!value.projectId || !scope.projectIds.includes(value.projectId)) {
     return false;
   }
-  if (!isApprovedGlobalObject(value)) return false;
-  // A narrow source/course request is an exact disclosure boundary.  The object passed to a
-  // detail or mutation route must positively prove ownership in every narrowed dimension;
-  // treating absent metadata as harmless would let an unstructured body/profile escape the
-  // boundary.  Broad Group scope intentionally retains clean approved global objects that
-  // have no private contributors.
+  const sourceIds = value.sourceIds ?? [];
+  const courseIds = value.courseIds ?? [];
+  // Every indivisible Project object needs positive contributor proof even in broad Group scope.
+  // The sole empty-set exception is a user-approved validated/core live global under a broad
+  // request.  In particular, immutable/system and merely-active SkillPacks are not exceptions.
+  if (!sourceIds.length && !courseIds.length) {
+    return !scope.sourceIds.length && !scope.courseId && approvedCleanGlobal;
+  }
   if (scope.sourceIds.length) {
-    const sourceIds = value.sourceIds ?? [];
     if (!sourceIds.length || !sourceIds.some((id) => scope.sourceIds.includes(id))
       || sourceIds.some((id) => !scope.sourceIds.includes(id))) return false;
   }
   if (scope.courseId) {
-    const courseIds = value.courseIds ?? [];
     if (!courseIds.length || !courseIds.includes(scope.courseId)
       || courseIds.some((id) => id !== scope.courseId)) return false;
   }
@@ -485,8 +500,16 @@ function copyKnowledgeScope(scope: KnowledgeQueryScope | null): KnowledgeQuerySc
   } : undefined;
 }
 
-function scopeIsNarrow(scope: KnowledgeQueryScope | null | undefined): boolean {
-  return !!scope && (scope.sourceIds.length > 0 || scope.courseId !== null);
+function profileKnowledgeObject(
+  projectId: string,
+  contributors?: { sourceIds: string[]; courseIds: string[] },
+): ScopedKnowledgeObject {
+  return {
+    projectId,
+    scope: 'project',
+    sourceIds: contributors?.sourceIds ?? [],
+    courseIds: contributors?.courseIds ?? [],
+  };
 }
 
 export const KN_PREVIEW_MIN = 320;
@@ -503,6 +526,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   cards: [],
   skillpacks: { systemBuiltin: [], projectExperience: [], thirdParty: [] },
   profileProjects: [],
+  profileContributors: {},
   activeScope: null,
   activeScopeKey: 'legacy:all',
   preview: null,
@@ -518,7 +542,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     if (activeScopeKey === get().activeScopeKey) return;
     knowledgeScopeEpoch += 1;
     set({
-      activeScope, activeScopeKey, cards: [], profileProjects: [],
+      activeScope, activeScopeKey, cards: [], profileProjects: [], profileContributors: {},
       skillpacks: { systemBuiltin: [], projectExperience: [], thirdParty: [] },
       preview: null, loadedAt: 0, error: null,
     });
@@ -536,19 +560,34 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     try {
       const data = await apiFetch<{
         assets: RawAsset[];
-        projects: { project_id?: string; profile_exists?: boolean }[];
+        projects: {
+          project_id?: string; profile_exists?: boolean;
+          profile_source_ids?: string[]; profile_course_ids?: string[];
+        }[];
       }>(`/assets${knowledgeScopeQuery(requestedScope)}`);
       const cards = (data.assets || [])
         .map(toCard)
         .filter((c): c is KnowCard => c !== null)
         .filter((card) => !requestedScope || scopedKnowledgeObjectAllowed(requestedScope, card));
-      const profileProjects = (scopeIsNarrow(requestedScope) ? [] : (data.projects || []))
+      const profileObjects = (data.projects || [])
         .filter((p) => p.profile_exists)
-        .map((p) => String(p.project_id || ''))
-        .filter((projectId) => !!projectId && (!requestedScope || requestedScope.projectIds.includes(projectId)));
+        .map((p) => profileKnowledgeObject(String(p.project_id || ''), {
+          sourceIds: (p.profile_source_ids || []).map(String),
+          courseIds: (p.profile_course_ids || []).map(String),
+        }))
+        .filter((profile) => !!profile.projectId && !!requestedScope
+          && scopedKnowledgeObjectAllowed(requestedScope, profile));
+      const profileProjects = profileObjects.map((profile) => profile.projectId);
+      const profileContributors = Object.fromEntries(profileObjects.map((profile) => [
+        profile.projectId,
+        { sourceIds: profile.sourceIds ?? [], courseIds: profile.courseIds ?? [] },
+      ]));
       if (get().activeScopeKey !== requestIdentity || knowledgeScopeEpoch !== requestEpoch
         || !knowledgeCommitAllowed(deletionFence)) return;
-      set({ cards, profileProjects, loading: false, loadedAt: Date.now(), error: null });
+      set({
+        cards, profileProjects, profileContributors,
+        loading: false, loadedAt: Date.now(), error: null,
+      });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       // 静默刷新失败：留着旧数据继续用，别把界面打回错误态。
@@ -836,14 +875,21 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     const requestedScope = copyKnowledgeScope(get().activeScope);
     const requestIdentity = knowledgeScopeKey(requestedScope);
     const requestEpoch = knowledgeScopeEpoch;
-    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, { projectId });
+    const profile = profileKnowledgeObject(projectId, get().profileContributors[projectId]);
+    const deletionFence = beginScopedKnowledgeObjectRequest(requestedScope, profile);
     if (!knowledgeCommitAllowed(deletionFence)) return null;
     try {
-      const data = await apiFetch<{ text: string }>(
+      const data = await apiFetch<{
+        text: string; project_id?: string; source_ids?: string[]; course_ids?: string[];
+      }>(
         `/${encodeURIComponent(projectId)}/profile${knowledgeScopeQuery(requestedScope)}`,
       );
+      const fresh = profileKnowledgeObject(String(data.project_id || projectId), {
+        sourceIds: (data.source_ids || []).map(String),
+        courseIds: (data.course_ids || []).map(String),
+      });
       return get().activeScopeKey === requestIdentity && knowledgeScopeEpoch === requestEpoch
-        && knowledgeCommitAllowed(deletionFence)
+        && knowledgeCommitAllowed(deletionFence) && scopedKnowledgeObjectAllowed(requestedScope, fresh)
         ? String(data.text || '') : null;
     } catch {
       return null;
@@ -851,7 +897,9 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
   },
 
   openPreview(p) {
-    const object = p.kind === 'skill' && p.pack ? p.pack : p.card ?? { projectId: p.projectId };
+    const object = p.kind === 'skill' && p.pack
+      ? p.pack
+      : p.card ?? profileKnowledgeObject(p.projectId, get().profileContributors[p.projectId]);
     if (!knowledgeCommitAllowed(beginScopedKnowledgeObjectRequest(get().activeScope, object))) return;
     set({ preview: p });
   },
@@ -865,6 +913,7 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
       knowledgeScopeEpoch += 1;
       set({
         activeScope: null, activeScopeKey: 'legacy:all', cards: [], profileProjects: [],
+        profileContributors: {},
         skillpacks: { systemBuiltin: [], projectExperience: [], thirdParty: [] },
         preview: null, loadedAt: 0, error: null,
       });
@@ -874,6 +923,8 @@ export const useKnowledgeStore = create<KnowledgeStore>()((set, get) => ({
     set((state) => ({
       cards: state.cards.filter((card) => card.projectId !== projectId),
       profileProjects: state.profileProjects.filter((id) => id !== projectId),
+      profileContributors: Object.fromEntries(Object.entries(state.profileContributors)
+        .filter(([id]) => id !== projectId)),
       skillpacks: {
         systemBuiltin: state.skillpacks.systemBuiltin,
         projectExperience: state.skillpacks.projectExperience.filter((pack) => pack.projectId !== projectId),

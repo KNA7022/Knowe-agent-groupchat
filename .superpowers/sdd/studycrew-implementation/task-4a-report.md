@@ -240,3 +240,149 @@ DONE
 - Full frontend regression: `46 files / 543 tests passed`.
 - `npm run lint`, Electron TypeScript compilation, Node foundation tests `2/2` plus runtime
   contract verification, Python `compileall`, and `git diff --check` passed.
+
+## Independent review fix round 4/5
+
+### Status
+
+DONE
+
+### Fail-closed contributor authorization
+
+- Broad and narrow Group scopes now require positive source/course contributor proof for every
+  indivisible Project Profile, Asset and SkillPack. The only empty-contributor exception is an
+  explicitly user-approved, validated/core, live global object with no private contributors.
+  Immutable/system SkillPacks, merely active packs and ordinary Project-owned objects are not
+  exceptions. An explicitly approved but `view_state=pending` pack is also denied.
+- The renderer applies this rule before Profile/Asset/SkillPack detail or preview dispatch, while
+  filtering Profile availability and Asset/SkillPack list rows. The same pre-dispatch gate covers
+  Asset override/review/purge and SkillPack review/status/purge. Detail responses are authorized
+  again from their returned contributor metadata before their bodies are exposed.
+- The backend uses the same strict exception and contributor predicate for merged lists, Profile
+  availability/detail/update, Asset detail/writes and SkillPack list/detail/writes. Broad scope no
+  longer treats an empty contributor set as harmless.
+
+### Contributor data-model closure
+
+- Profile was previously represented only as a Project ID/string and could not prove ownership.
+  Asset snapshots now derive the exact source/course union of an auto-compiled Profile, return it
+  with availability/detail responses, and the renderer caches it per Project. A locked/free-form
+  Profile has no trustworthy row-level provenance and intentionally remains ownerless.
+- SkillPack transport previously discarded approval and contributor fields. Project-experience
+  registry rows now inherit real source/course IDs, scope setter, source-asset approval state and
+  review state; public rows and the renderer mapping preserve those fields. System/third-party
+  packs do not acquire synthetic contributors.
+- Existing positive fixtures were corrected instead of weakening assertions:
+  `knowledge.test.ts` uses contributor-backed Project Assets/packs and Profile preview metadata;
+  `groupDeletionAsync.test.ts` gives all deferred/stress Profile, Asset and pack requests real
+  contributors; `knowledgeMutationDeletion.test.ts` uses full contributor-backed objects across
+  all six mutation continuations; the backend base fixture derives pack contributors from its
+  source rows. Matching narrow Profile/Asset/SkillPack paths remain positively covered.
+
+### Red-first evidence
+
+- Before the production change:
+
+  `npx vitest run src/store/task4aRound2Adversarial.test.ts --reporter=verbose`
+
+  ```text
+  Test Files  1 failed (1)
+       Tests  2 failed | 4 passed (6)
+  ```
+
+  The broad ownerless Project case returned an ownerless Asset, and the global/system case
+  returned an immutable ownerless system pack.
+- The strict live-state follow-up was also demonstrated red before its mapping fix:
+
+  ```text
+  Test Files  1 failed (1)
+       Tests  1 failed | 5 passed (6)
+  AssertionError: expected [ { …(18) } ] to deeply equal []
+  ```
+
+  The unexpected row was an approved `status=active`, `view_state=pending` global pack whose
+  renderer `st` had incorrectly been inferred as `ok`.
+- Direct backend reproduction before its production change:
+
+  `py -3.12 -m pytest backend/tests/test_knowledge_group_scope.py::test_broad_ownerless_objects_fail_closed_except_strict_clean_global -q`
+
+  ```text
+  1 failed
+  ```
+
+  The broad Asset list still contained the ownerless Project row. The same command passed after
+  the fix.
+
+### Adversarial and regression verification
+
+- Broad/narrow adversarial route matrix after the final live-state fix:
+
+  `npx vitest run src/store/task4aRound2Adversarial.test.ts --reporter=verbose`
+
+  ```text
+  Test Files  1 passed (1)
+       Tests  6 passed (6)
+  Duration  1.43s
+  ```
+
+- Exact Task 4A renderer set:
+
+  `npx vitest run src/store/groupDeletionAsync.test.ts src/store/groupDeletionFence.test.ts src/store/groupTeardown.test.ts src/store/knowledge.test.ts src/store/knowledgeMutationDeletion.test.ts src/store/skeletonCache.test.ts src/store/task4aRound2Adversarial.test.ts --reporter=dot`
+
+  ```text
+  Test Files  7 passed (7)
+       Tests  54 passed (54)
+  Duration  3.04s
+  ```
+
+- Knowledge backend authorization/graph set:
+
+  `py -3.12 -m pytest backend/tests/test_knowledge_group_scope.py backend/tests/test_knowledge_graph.py -q`
+
+  ```text
+  16 passed in 1.87s
+  ```
+
+  The real-manager contributor projection test alone also returned `1 passed in 0.20s`.
+- Related ordinary backend partition:
+
+  `py -3.12 -m pytest -q backend/tests/test_groups.py backend/tests/test_group_http.py backend/tests/test_knowledge_graph.py backend/tests/test_knowledge_group_scope.py backend/tests/test_task_runtime.py backend/tests/test_task_runtime_review_fixes.py backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_rereview_round3.py backend/tests/test_task_runtime_rereview_round4.py backend/tests/test_task_runtime_rereview_round5.py backend/tests/test_task_runtime_live_event_bridge.py backend/tests/test_task_runtime_recovery_ack.py backend/tests/test_task_runtime_recovery_ownership.py backend/tests/test_task_runtime_deletion_authorization.py`
+
+  ```text
+  186 passed in 44.39s
+  ```
+
+  `py -3.12 -m pytest backend/tests/test_task_runtime_quarantine_isolation.py -q`
+
+  ```text
+  68 passed in 31.56s
+  ```
+
+- Full frontend regression after the final production/test changes:
+
+  `npm test -- --reporter=dot`
+
+  ```text
+  Test Files  46 passed (46)
+       Tests  545 passed (545)
+  Duration  24.02s
+  ```
+
+### Static, runtime and baseline evidence
+
+- `npm run lint`: exit `0`, zero warnings.
+- `npx tsc --noEmit -p electron/tsconfig.json`: exit `0`, no output.
+- `npm run test:foundation`: Node tests `2` passed / `0` failed, followed by
+  `✅ StudyCrew runtime and Windows packaging contract verified`.
+- `py -3.12 -m compileall -q backend`: exit `0`, no output.
+- Node is `v24.19.0`; Python is `3.12.10`.
+- Full renderer `npx tsc --noEmit` retains the documented historical baseline:
+  `renderer_tsc_exit=2`, `renderer_tsc_diagnostic_lines=68`,
+  `task4a_changed_file_diagnostics=0`.
+- Full backend aggregation `py -3.12 -m pytest backend/tests -q` stops during collection on the
+  pre-existing Task 9 baseline: four modules (`test_v10182_runtime_ui.py`,
+  `test_v22_dispatch_reliability.py`, `test_v27_weld.py`, `test_v28_weld.py`) cannot import
+  `ACTION_CONTRACT` from `backend.engine` (`4 errors in 1.83s`). The scoped partitions above are
+  fully green.
+- `git diff --check` passes after the report update. The pre-existing untracked `skills/`
+  directory was neither read, modified, staged nor committed.

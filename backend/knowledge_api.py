@@ -175,11 +175,19 @@ def _structured_ids(row: dict[str, Any], key: str) -> frozenset[str]:
 
 
 def _approved_global(row: dict[str, Any]) -> bool:
+    is_skillpack = bool(row.get("pack_id"))
+    approval_status = row.get("approval_status") if is_skillpack else row.get("status")
+    live = (
+        row.get("status") == "active" and row.get("view_state") == "ok"
+        if is_skillpack
+        else row.get("view_state") == "ok"
+    )
     return (
         row.get("scope") == "global"
         and row.get("scope_set_by") == "user"
-        and row.get("status") in {"validated", "core"}
-        and row.get("view_state") not in {"pending", "retired"}
+        and approval_status in {"validated", "core"}
+        and live
+        and row.get("needs_review") is not True
     )
 
 
@@ -215,7 +223,9 @@ def _ownership_ids(value: Any) -> tuple[frozenset[str], frozenset[str]]:
     return frozenset(sources), frozenset(courses)
 
 
-def _contributors_allowed(value: Any, scope: _KnowledgeScope) -> bool:
+def _contributors_allowed(
+    value: Any, scope: _KnowledgeScope, *, allow_ownerless_global: bool = False,
+) -> bool:
     sources, courses = _ownership_ids(value)
     effective_sources = scope.source_ids or scope.allowed_source_ids
     effective_courses = frozenset({scope.course_id}) if scope.course_id else scope.allowed_course_ids
@@ -226,6 +236,10 @@ def _contributors_allowed(value: Any, scope: _KnowledgeScope) -> bool:
         return False
     if scope.course_id and (not courses or not courses.issubset(effective_courses)):
         return False
+    # Broad scope also requires positive proof.  Only the strict approved-global caller may
+    # authorize a completely contributor-free object, and never under a narrow request.
+    if not sources and not courses:
+        return allow_ownerless_global and not scope.source_ids and scope.course_id is None
     # Broad Group access still must reject private contributors from other Groups.
     if sources and not sources.issubset(effective_sources):
         return False
@@ -235,11 +249,12 @@ def _contributors_allowed(value: Any, scope: _KnowledgeScope) -> bool:
 
 
 def _row_allowed(row: dict[str, Any], project_id: str, scope: _KnowledgeScope) -> bool:
-    if row.get("scope") == "global" and not _approved_global(row):
+    approved_global = _approved_global(row)
+    if row.get("scope") == "global" and not approved_global:
         return False
     if project_id not in scope.project_ids and row.get("scope") != "global":
         return False
-    return _contributors_allowed(row, scope)
+    return _contributors_allowed(row, scope, allow_ownerless_global=approved_global)
 
 
 def _sanitize_scoped_row(row: dict[str, Any], scope: _KnowledgeScope) -> dict[str, Any]:
@@ -351,12 +366,23 @@ def _merged_assets(only_project: str | None, scope: _KnowledgeScope | None = Non
             log.exception("[%s] 资产合并快照失败（跳过该项目）", reg.project_id)
             continue
         if scope is None or reg.project_id in scope.project_ids:
+            profile_row = {
+                "project_id": reg.project_id,
+                "scope": "project",
+                "source_ids": list(snap.get("profile_source_ids") or []),
+                "course_ids": list(snap.get("profile_course_ids") or []),
+            }
+            profile_allowed = bool(snap.get("profile_exists")) and (
+                scope is None or _row_allowed(profile_row, reg.project_id, scope)
+            )
             projects.append({
                 "project_id": reg.project_id,
                 "revision": snap.get("revision", 0),
                 "updated_at": snap.get("updated_at"),
                 "counts": snap.get("counts") or {},
-                "profile_exists": bool(snap.get("profile_exists")),
+                "profile_exists": profile_allowed,
+                "profile_source_ids": profile_row["source_ids"] if profile_allowed else [],
+                "profile_course_ids": profile_row["course_ids"] if profile_allowed else [],
             })
         for raw in snap.get("assets") or []:
             if isinstance(raw, dict):
@@ -432,7 +458,9 @@ def _find_skillpack(
             continue
         pack = result.get("pack") if isinstance(result.get("pack"), dict) else result
         if (result.get("found") and _row_allowed(pack, reg.project_id, scope)
-                and _contributors_allowed(result, scope)):
+                and _contributors_allowed(
+                    result, scope, allow_ownerless_global=_approved_global(pack),
+                )):
             return reg, result
     return None
 
@@ -491,10 +519,25 @@ def _dispatch_get_sync(
             return _fail(404, "unknown_project", project_id=rest[0])
         if reg.assets is None:
             return _fail(503, "assets_unavailable", project_id=rest[0])
-        if scope.source_ids or scope.course_id:
-            return _fail(403, "profile_outside_narrow_group_scope", project_id=rest[0])
+        snap = reg.assets.snapshot(reg.project_id, reg.workspace_provider())
+        profile_row = {
+            "project_id": reg.project_id,
+            "scope": "project",
+            "source_ids": list(snap.get("profile_source_ids") or []),
+            "course_ids": list(snap.get("profile_course_ids") or []),
+        }
+        if not snap.get("profile_exists") or not _row_allowed(profile_row, reg.project_id, scope):
+            reason = (
+                "profile_outside_narrow_group_scope"
+                if scope.source_ids or scope.course_id else "profile_outside_group_scope"
+            )
+            return _fail(403, reason, project_id=rest[0])
         text = reg.assets.profile_text(reg.workspace_provider())
-        return _ok({"ok": True, "project_id": reg.project_id, "text": text})
+        return _ok({
+            "ok": True, "project_id": reg.project_id, "text": text,
+            "source_ids": profile_row["source_ids"],
+            "course_ids": profile_row["course_ids"],
+        })
     if len(rest) == 2 and rest[1] == "nodes":
         reg = _registration(rest[0])
         if reg is not None and reg.project_id not in scope.project_ids:
@@ -663,8 +706,19 @@ async def _dispatch_post(
     if len(parts) == 4 and parts[3] == "profile":
         if reg.assets is None:
             return _fail(503, "assets_unavailable", project_id=project_id)
-        if scope.source_ids or scope.course_id:
-            return _fail(403, "profile_outside_narrow_group_scope", project_id=project_id)
+        snap = await asyncio.to_thread(reg.assets.snapshot, reg.project_id, reg.workspace_provider())
+        profile_row = {
+            "project_id": reg.project_id,
+            "scope": "project",
+            "source_ids": list(snap.get("profile_source_ids") or []),
+            "course_ids": list(snap.get("profile_course_ids") or []),
+        }
+        if not snap.get("profile_exists") or not _row_allowed(profile_row, reg.project_id, scope):
+            reason = (
+                "profile_outside_narrow_group_scope"
+                if scope.source_ids or scope.course_id else "profile_outside_group_scope"
+            )
+            return _fail(403, reason, project_id=project_id)
         return await _run_override(
             reg,
             reg.assets.set_profile(

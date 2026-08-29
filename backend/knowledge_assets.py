@@ -954,6 +954,10 @@ class KnowledgeAssetManager:
                 counts[st] += 1
             for asset in assets[:_bounded(limit, 1, 2000)]:
                 rows.append(self._public_asset(graph, asset, sources=sources))
+            profile_exists = self.profile_path(internal_workspace).is_file()
+            profile_source_ids, profile_course_ids = self._profile_contributor_ids(
+                graph, internal_workspace, sources=sources,
+            )
             return {
                 "project_id": project_id,
                 "revision": graph.get("revision", 0),
@@ -961,13 +965,16 @@ class KnowledgeAssetManager:
                 "generated_at": _now_iso(),
                 "counts": counts,
                 "assets": rows,
-                "profile_exists": self.profile_path(internal_workspace).is_file(),
+                "profile_exists": profile_exists,
+                "profile_source_ids": profile_source_ids,
+                "profile_course_ids": profile_course_ids,
             }
         except Exception:
             log.exception("[%s] assets snapshot 失败（回落为空）", project_id)
             return {"project_id": project_id, "revision": 0, "updated_at": None,
                     "generated_at": _now_iso(), "counts": dict(empty),
-                    "assets": [], "profile_exists": False}
+                    "assets": [], "profile_exists": False,
+                    "profile_source_ids": [], "profile_course_ids": []}
 
     def read_asset(
         self, project_id: str, internal_workspace: Path | str, asset_id: str,
@@ -1112,6 +1119,35 @@ class KnowledgeAssetManager:
     # ------------------------------------------------------------------
     # 画像层 PROFILE.md（报告 §4.1：偏好不是搜出来的，是须臾不可离身的）
     # ------------------------------------------------------------------
+    def _profile_contributor_ids(
+        self, graph: dict[str, Any], internal_workspace: Path | str,
+        *, sources: dict[str, Any] | None = None,
+    ) -> tuple[list[str], list[str]]:
+        """Return the contributors of the exact auto-compiled Profile body.
+
+        A user-edited/locked Profile is free-form aggregate text with no trustworthy row-level
+        provenance, so it intentionally remains ownerless and is denied by scoped routes.
+        """
+        path = self.profile_path(internal_workspace)
+        if graph.get("profile_locked") or not path.is_file():
+            return [], []
+        try:
+            text = path.read_text("utf-8", errors="replace")
+        except OSError:
+            return [], []
+        asset_ids = re.findall(r"^- \[([^\]\r\n]+)\]", text, flags=re.MULTILINE)
+        source_ids: set[str] = set()
+        course_ids: set[str] = set()
+        assets = graph.get("assets") or {}
+        for asset_id in asset_ids:
+            asset = assets.get(asset_id)
+            if not isinstance(asset, dict):
+                return [], []
+            row = self._public_asset(graph, asset, sources=sources)
+            source_ids.update(str(value) for value in row.get("source_ids") or [] if value)
+            course_ids.update(str(value) for value in row.get("course_ids") or [] if value)
+        return sorted(source_ids), sorted(course_ids)
+
     def profile_text(self, internal_workspace: Path | str) -> str:
         try:
             path = self.profile_path(internal_workspace)
@@ -1336,11 +1372,20 @@ class KnowledgeAssetManager:
                     status = "pending"
                 created_at = str(row.get("created_at") or now)
                 source_updated = str(asset.get("updated_at") or now)
+                public_asset = self._public_asset(
+                    graph, asset, sources=graph.get("sources") or {},
+                )
+                source_ids = list(public_asset.get("source_ids") or [])
+                course_ids = list(public_asset.get("course_ids") or [])
                 metadata_changed = any((
                     str(row.get("name") or "") != str(asset.get("title") or asset_id),
                     str(row.get("description") or "") != str(asset.get("one_liner") or ""),
                     str(row.get("scope") or "") != str(asset.get("scope") or "project"),
                     str(row.get("source_updated_at") or "") != source_updated,
+                    list(row.get("source_ids") or []) != source_ids,
+                    list(row.get("course_ids") or []) != course_ids,
+                    str(row.get("scope_set_by") or "") != str(asset.get("scope_set_by") or "system"),
+                    str(row.get("approval_status") or "") != str(asset.get("status") or ""),
                 ))
                 row.update({
                     "pack_id": pack_id,
@@ -1353,6 +1398,11 @@ class KnowledgeAssetManager:
                     "asset_id": asset_id,
                     "relative_path": asset_id,
                     "source": "knowledge_asset",
+                    "source_ids": source_ids,
+                    "course_ids": course_ids,
+                    "scope_set_by": "user" if asset.get("scope_set_by") == "user" else "system",
+                    "approval_status": str(asset.get("status") or ""),
+                    "needs_review": bool(asset.get("needs_review")),
                     "created_at": created_at,
                     "updated_at": now if (is_new or metadata_changed) else str(row.get("updated_at") or now),
                     "source_updated_at": source_updated,
@@ -1808,6 +1858,15 @@ class KnowledgeAssetManager:
             "status": status,
             "view_state": "ok" if status == "active" else status,
             "immutable": kind == "system_builtin" or bool(row.get("immutable")),
+            "scope_set_by": "user" if row.get("scope_set_by") == "user" else "system",
+            "approval_status": str(row.get("approval_status") or ""),
+            "needs_review": bool(row.get("needs_review")),
+            "source_ids": _unique_strings([
+                str(value) for value in row.get("source_ids") or [] if value
+            ]),
+            "course_ids": _unique_strings([
+                str(value) for value in row.get("course_ids") or [] if value
+            ]),
             "created_at": row.get("created_at"),
             "updated_at": row.get("updated_at"),
         }
@@ -1842,8 +1901,12 @@ class KnowledgeAssetManager:
             if isinstance(src, dict) and src.get("ref"):
                 ref_to_meta[str(src["ref"])] = src
         evidence_rows: list[dict[str, Any]] = []
-        source_ids: set[str] = set()
-        course_ids: set[str] = set()
+        source_ids = {
+            str(value) for value in asset.get("source_ids") or [] if value
+        }
+        course_ids = {
+            str(value) for value in asset.get("course_ids") or [] if value
+        }
         for ev in (asset.get("evidence") or [])[:10]:
             if not isinstance(ev, dict):
                 continue
