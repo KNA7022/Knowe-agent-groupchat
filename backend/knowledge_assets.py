@@ -955,8 +955,11 @@ class KnowledgeAssetManager:
             for asset in assets[:_bounded(limit, 1, 2000)]:
                 rows.append(self._public_asset(graph, asset, sources=sources))
             profile_exists = self.profile_path(internal_workspace).is_file()
-            profile_source_ids, profile_course_ids = self._profile_contributor_ids(
-                graph, internal_workspace, sources=sources,
+            profile_text = self.profile_text(internal_workspace) if profile_exists else ""
+            profile_source_ids, profile_course_ids = (
+                self._profile_contributor_ids(
+                    graph, internal_workspace, sources=sources, profile_text=profile_text,
+                ) if profile_exists else ([], [])
             )
             return {
                 "project_id": project_id,
@@ -1121,7 +1124,7 @@ class KnowledgeAssetManager:
     # ------------------------------------------------------------------
     def _profile_contributor_ids(
         self, graph: dict[str, Any], internal_workspace: Path | str,
-        *, sources: dict[str, Any] | None = None,
+        *, sources: dict[str, Any] | None = None, profile_text: str | None = None,
     ) -> tuple[list[str], list[str]]:
         """Return the contributors of the exact auto-compiled Profile body.
 
@@ -1131,11 +1134,12 @@ class KnowledgeAssetManager:
         path = self.profile_path(internal_workspace)
         if graph.get("profile_locked") or not path.is_file():
             return [], []
-        try:
-            text = path.read_text("utf-8", errors="replace")
-        except OSError:
-            return [], []
-        asset_ids = re.findall(r"^- \[([^\]\r\n]+)\]", text, flags=re.MULTILINE)
+        if profile_text is None:
+            try:
+                profile_text = path.read_text("utf-8", errors="replace")
+            except OSError:
+                return [], []
+        asset_ids = re.findall(r"^- \[([^\]\r\n]+)\]", profile_text, flags=re.MULTILINE)
         source_ids: set[str] = set()
         course_ids: set[str] = set()
         assets = graph.get("assets") or {}
@@ -1156,6 +1160,35 @@ class KnowledgeAssetManager:
         except OSError:
             pass
         return ""
+
+    async def profile_snapshot(
+        self, project_id: str, internal_workspace: Path | str,
+    ) -> dict[str, Any]:
+        """Read one indivisible Profile body/proof while fencing every manager writer."""
+        try:
+            async with self._graph.root_lock(internal_workspace):
+                return await asyncio.to_thread(
+                    self._profile_snapshot_sync, project_id, internal_workspace,
+                )
+        except Exception:
+            log.exception("[%s] profile snapshot 失败（回落为空）", project_id)
+            return {
+                "project_id": project_id, "revision": 0, "profile_exists": False,
+                "profile_text": "", "profile_source_ids": [], "profile_course_ids": [],
+            }
+
+    def _profile_snapshot_sync(
+        self, project_id: str, internal_workspace: Path | str,
+    ) -> dict[str, Any]:
+        snapshot = self.snapshot(project_id, internal_workspace)
+        return {
+            "project_id": project_id,
+            "revision": snapshot.get("revision", 0),
+            "profile_exists": bool(snapshot.get("profile_exists")),
+            "profile_text": self.profile_text(internal_workspace),
+            "profile_source_ids": list(snapshot.get("profile_source_ids") or []),
+            "profile_course_ids": list(snapshot.get("profile_course_ids") or []),
+        }
 
     async def set_profile(
         self, project_id: str, internal_workspace: Path | str, text: str,

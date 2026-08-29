@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,7 @@ from backend.knowledge_api import (
     register_project,
     unregister_project,
 )
+from backend.knowledge_graph import KnowledgeGraphManager
 
 
 class _Assets:
@@ -31,6 +34,17 @@ class _Assets:
 
     def profile_text(self, _workspace: Path) -> str:
         return f"profile:{self.project_id}"
+
+    async def profile_snapshot(self, project_id: str, workspace: Path) -> dict[str, object]:
+        snapshot = self.snapshot(project_id, workspace)
+        return {
+            "project_id": project_id,
+            "revision": snapshot.get("revision", 0),
+            "profile_exists": bool(snapshot.get("profile_exists")),
+            "profile_text": self.profile_text(workspace),
+            "profile_source_ids": list(snapshot.get("profile_source_ids") or []),
+            "profile_course_ids": list(snapshot.get("profile_course_ids") or []),
+        }
 
     def list_skillpacks(self, project_id: str, _workspace: Path) -> dict[str, object]:
         source_ids = sorted({
@@ -527,6 +541,148 @@ async def test_broad_ownerless_objects_fail_closed_except_strict_clean_global(tm
         assert matching_profile.body["course_ids"] == ["course-broad"]
     finally:
         unregister_project("broad-project")
+
+
+@pytest.mark.asyncio
+async def test_project_assets_route_sanitizes_denied_profile_metadata(tmp_path: Path) -> None:
+    repo = GroupRepository(tmp_path / "data")
+    group = repo.create_group("profile-route", legacy_project_id="profile-route-project")
+    repo.bind_course(group.group_id, "course-own")
+    own_source = repo.link_source(group.group_id).source_id
+    foreign_source = "src_" + "f" * 32
+
+    class _ForeignProfileAssets(_Assets):
+        profile_source_ids = [foreign_source]
+        profile_course_ids = ["course-foreign"]
+
+        def snapshot(self, project_id: str, workspace: Path) -> dict[str, object]:
+            result = super().snapshot(project_id, workspace)
+            result["profile_source_ids"] = list(self.profile_source_ids)
+            result["profile_course_ids"] = list(self.profile_course_ids)
+            result["profile_private_marker"] = "FOREIGN-PROFILE-MARKER"
+            return result
+
+    assets = _ForeignProfileAssets("profile-route-project", [])
+    try:
+        register_project(
+            "profile-route-project", manager=_Manager(), assets=assets,
+            workspace_provider=lambda: tmp_path,
+        )
+        query = f"group_id={group.group_id}&legacy_project_id=profile-route-project"
+
+        merged = await dispatch_knowledge_http("GET", "/api/knowledge/assets", query, b"", repo)
+        direct = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/profile-route-project/assets", query, b"", repo,
+        )
+
+        assert merged.status == 200
+        assert merged.body["projects"][0]["profile_exists"] is False
+        assert direct.status == 200
+        assert direct.body["profile_exists"] is False
+        assert direct.body["profile_source_ids"] == []
+        assert direct.body["profile_course_ids"] == []
+        assert foreign_source not in str(direct.body)
+        assert "course-foreign" not in str(direct.body)
+        assert "FOREIGN-PROFILE-MARKER" not in str(direct.body)
+
+        assets.profile_source_ids = [own_source]
+        assets.profile_course_ids = ["course-own"]
+        allowed = await dispatch_knowledge_http(
+            "GET", "/api/knowledge/profile-route-project/assets", query, b"", repo,
+        )
+        assert allowed.status == 200
+        assert allowed.body["profile_exists"] is True
+        assert allowed.body["profile_source_ids"] == [own_source]
+        assert allowed.body["profile_course_ids"] == ["course-own"]
+        assert "FOREIGN-PROFILE-MARKER" not in str(allowed.body)
+    finally:
+        unregister_project("profile-route-project")
+
+
+@pytest.mark.asyncio
+async def test_real_manager_profile_detail_body_and_contributors_share_one_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = GroupRepository(tmp_path / "groups")
+    project_id = "atomic-profile-project"
+    group = repo.create_group("atomic-profile", legacy_project_id=project_id)
+    repo.bind_course(group.group_id, "course-atomic")
+    source_id = repo.link_source(group.group_id).source_id
+    workspace = tmp_path / "workspace"
+    graph_manager = KnowledgeGraphManager(tmp_path / "manager-data")
+    graph_manager.ensure_project_graph(project_id, workspace)
+    root = KnowledgeGraphManager.knowledge_dir(workspace)
+    graph = graph_manager.load_graph(project_id, root)
+    graph["revision"] = 1
+    graph["updated_at"] = "2026-08-29T00:00:00Z"
+    graph["assets"] = {
+        "P-01": {
+            "id": "P-01", "class": "preference", "title": "Atomic preference",
+            "one_liner": "Use the allowed contributor", "applies_when": "always",
+            "body_md": "Allowed preference body.", "status": "core",
+            "scope": "project", "scope_set_by": "system", "needs_review": False,
+            "source_ids": [source_id], "course_ids": ["course-atomic"],
+            "evidence": [], "usage_events": [], "metrics": {},
+            "created_at": "2026-08-29T00:00:00Z",
+            "updated_at": "2026-08-29T00:00:00Z",
+        },
+    }
+    graph_manager.save_graph(root, graph)
+    assets = KnowledgeAssetManager(graph_manager)
+    original_body = "# Profile\n\n- [P-01] Use the allowed contributor\n"
+    assets.profile_path(workspace).write_text(original_body, encoding="utf-8")
+
+    captured = threading.Event()
+    release = threading.Event()
+    original_snapshot = assets.snapshot
+
+    def pause_after_allowed_snapshot(*args: object, **kwargs: object) -> dict[str, object]:
+        result = original_snapshot(*args, **kwargs)
+        captured.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("profile request did not resume")
+        return result
+
+    monkeypatch.setattr(assets, "snapshot", pause_after_allowed_snapshot)
+    try:
+        register_project(
+            project_id, manager=graph_manager, assets=assets,
+            workspace_provider=lambda: workspace,
+        )
+        query = (
+            f"group_id={group.group_id}&legacy_project_id={project_id}"
+            f"&source_id={source_id}&course_id=course-atomic"
+        )
+        request = asyncio.create_task(dispatch_knowledge_http(
+            "GET", f"/api/knowledge/{project_id}/profile", query, b"", repo,
+        ))
+        assert await asyncio.to_thread(captured.wait, 5)
+
+        writer = asyncio.create_task(
+            assets.set_profile(project_id, workspace, "PRIVATE OWNERLESS PROFILE"),
+        )
+        await asyncio.sleep(0)
+        writer_was_blocked = not writer.done()
+        release.set()
+        response = await request
+        updated = await writer
+
+        assert writer_was_blocked
+        assert updated == {"ok": True}
+        assert "PRIVATE OWNERLESS PROFILE" not in str(response.body)
+        assert response.status == 200
+        assert response.body["text"] == original_body
+        assert response.body["source_ids"] == [source_id]
+        assert response.body["course_ids"] == ["course-atomic"]
+
+        after_swap = await dispatch_knowledge_http(
+            "GET", f"/api/knowledge/{project_id}/profile", query, b"", repo,
+        )
+        assert after_swap.status == 403
+        assert "PRIVATE OWNERLESS PROFILE" not in str(after_swap.body)
+    finally:
+        release.set()
+        unregister_project(project_id)
 
 
 def test_real_profile_and_project_skill_rows_preserve_contributor_proof(tmp_path: Path) -> None:

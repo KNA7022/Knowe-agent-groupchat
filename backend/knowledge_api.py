@@ -257,6 +257,26 @@ def _row_allowed(row: dict[str, Any], project_id: str, scope: _KnowledgeScope) -
     return _contributors_allowed(row, scope, allow_ownerless_global=approved_global)
 
 
+def _profile_row(snapshot: dict[str, Any], project_id: str) -> dict[str, Any]:
+    """Build the one Profile authorization row shared by list/detail routes."""
+    return {
+        "project_id": project_id,
+        "scope": "project",
+        "source_ids": list(snapshot.get("profile_source_ids") or []),
+        "course_ids": list(snapshot.get("profile_course_ids") or []),
+    }
+
+
+def _profile_authorization(
+    snapshot: dict[str, Any], project_id: str, scope: _KnowledgeScope | None,
+) -> tuple[dict[str, Any], bool]:
+    row = _profile_row(snapshot, project_id)
+    allowed = bool(snapshot.get("profile_exists")) and (
+        scope is None or _row_allowed(row, project_id, scope)
+    )
+    return row, allowed
+
+
 def _sanitize_scoped_row(row: dict[str, Any], scope: _KnowledgeScope) -> dict[str, Any]:
     """Remove ownership labels and nested evidence outside a requested narrow scope."""
     sanitized = dict(row)
@@ -366,14 +386,8 @@ def _merged_assets(only_project: str | None, scope: _KnowledgeScope | None = Non
             log.exception("[%s] 资产合并快照失败（跳过该项目）", reg.project_id)
             continue
         if scope is None or reg.project_id in scope.project_ids:
-            profile_row = {
-                "project_id": reg.project_id,
-                "scope": "project",
-                "source_ids": list(snap.get("profile_source_ids") or []),
-                "course_ids": list(snap.get("profile_course_ids") or []),
-            }
-            profile_allowed = bool(snap.get("profile_exists")) and (
-                scope is None or _row_allowed(profile_row, reg.project_id, scope)
+            profile_row, profile_allowed = _profile_authorization(
+                snap, reg.project_id, scope,
             )
             projects.append({
                 "project_id": reg.project_id,
@@ -499,7 +513,19 @@ def _dispatch_get_sync(
         snap = reg.assets.snapshot(reg.project_id, reg.workspace_provider())
         assets = [_sanitize_scoped_row(dict(row), scope) for row in snap.get("assets") or []
                   if isinstance(row, dict) and _row_allowed(row, reg.project_id, scope)]
-        return _ok({"ok": True, **snap, "assets": assets})
+        profile_row, profile_allowed = _profile_authorization(snap, reg.project_id, scope)
+        return _ok({
+            "ok": True,
+            "project_id": str(snap.get("project_id") or reg.project_id),
+            "revision": snap.get("revision", 0),
+            "updated_at": snap.get("updated_at"),
+            "generated_at": snap.get("generated_at"),
+            "counts": snap.get("counts") or {},
+            "assets": assets,
+            "profile_exists": profile_allowed,
+            "profile_source_ids": profile_row["source_ids"] if profile_allowed else [],
+            "profile_course_ids": profile_row["course_ids"] if profile_allowed else [],
+        })
     if len(rest) == 3 and rest[1] == "assets":
         reg = _registration(rest[0])
         if reg is None:
@@ -511,33 +537,6 @@ def _dispatch_get_sync(
         if result.get("found") and not _row_allowed(row, reg.project_id, scope):
             return _fail(403, "asset_outside_group_scope", asset_id=rest[2])
         return _ok({"ok": True, **_sanitize_result_row(result, "asset", scope)})
-    if len(rest) == 2 and rest[1] == "profile":
-        reg = _registration(rest[0])
-        if scope is not None and reg is not None and reg.project_id not in scope.project_ids:
-            return _fail(403, "profile_outside_group_scope", project_id=rest[0])
-        if reg is None:
-            return _fail(404, "unknown_project", project_id=rest[0])
-        if reg.assets is None:
-            return _fail(503, "assets_unavailable", project_id=rest[0])
-        snap = reg.assets.snapshot(reg.project_id, reg.workspace_provider())
-        profile_row = {
-            "project_id": reg.project_id,
-            "scope": "project",
-            "source_ids": list(snap.get("profile_source_ids") or []),
-            "course_ids": list(snap.get("profile_course_ids") or []),
-        }
-        if not snap.get("profile_exists") or not _row_allowed(profile_row, reg.project_id, scope):
-            reason = (
-                "profile_outside_narrow_group_scope"
-                if scope.source_ids or scope.course_id else "profile_outside_group_scope"
-            )
-            return _fail(403, reason, project_id=rest[0])
-        text = reg.assets.profile_text(reg.workspace_provider())
-        return _ok({
-            "ok": True, "project_id": reg.project_id, "text": text,
-            "source_ids": profile_row["source_ids"],
-            "course_ids": profile_row["course_ids"],
-        })
     if len(rest) == 2 and rest[1] == "nodes":
         reg = _registration(rest[0])
         if reg is not None and reg.project_id not in scope.project_ids:
@@ -575,6 +574,44 @@ def _dispatch_get_sync(
             return _fail(403, "node_outside_group_scope", ref=ref)
         return _ok({"ok": True, **_sanitize_result_row(result, "node", scope)})
     return _fail(404, "not_found")
+
+
+async def _dispatch_profile_get(
+    parts: list[str], query: dict[str, list[str]], groups: GroupRepository | None,
+) -> KnowledgeHttpResponse:
+    project_id = parts[2]
+    scope = _resolve_scope(query, groups)
+    reg = _registration(project_id)
+    if reg is not None and reg.project_id not in scope.project_ids:
+        return _fail(403, "profile_outside_group_scope", project_id=project_id)
+    if reg is None:
+        return _fail(404, "unknown_project", project_id=project_id)
+    if reg.assets is None:
+        return _fail(503, "assets_unavailable", project_id=project_id)
+    current = asyncio.get_running_loop()
+    if reg.loop is not None and (reg.loop.is_closed() or reg.loop is not current):
+        return _fail(503, "engine_loop_unavailable", project_id=project_id)
+    try:
+        snapshot = await asyncio.wait_for(
+            reg.assets.profile_snapshot(reg.project_id, reg.workspace_provider()),
+            timeout=_OVERRIDE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        return _fail(504, "profile_snapshot_timeout", project_id=project_id)
+    profile_row, profile_allowed = _profile_authorization(snapshot, reg.project_id, scope)
+    if not profile_allowed:
+        reason = (
+            "profile_outside_narrow_group_scope"
+            if scope.source_ids or scope.course_id else "profile_outside_group_scope"
+        )
+        return _fail(403, reason, project_id=project_id)
+    return _ok({
+        "ok": True,
+        "project_id": reg.project_id,
+        "text": str(snapshot.get("profile_text") or ""),
+        "source_ids": profile_row["source_ids"],
+        "course_ids": profile_row["course_ids"],
+    })
 
 
 async def _run_override(
@@ -707,13 +744,8 @@ async def _dispatch_post(
         if reg.assets is None:
             return _fail(503, "assets_unavailable", project_id=project_id)
         snap = await asyncio.to_thread(reg.assets.snapshot, reg.project_id, reg.workspace_provider())
-        profile_row = {
-            "project_id": reg.project_id,
-            "scope": "project",
-            "source_ids": list(snap.get("profile_source_ids") or []),
-            "course_ids": list(snap.get("profile_course_ids") or []),
-        }
-        if not snap.get("profile_exists") or not _row_allowed(profile_row, reg.project_id, scope):
+        _profile, profile_allowed = _profile_authorization(snap, reg.project_id, scope)
+        if not profile_allowed:
             reason = (
                 "profile_outside_narrow_group_scope"
                 if scope.source_ids or scope.course_id else "profile_outside_group_scope"
@@ -743,7 +775,10 @@ async def dispatch_knowledge_http(
             return _fail(404, "not_found")
         verb = method.upper()
         if verb == "GET":
-            return await asyncio.to_thread(_dispatch_get_sync, parts, parse_qs(query), groups)
+            parsed_query = parse_qs(query)
+            if len(parts) == 4 and parts[3] == "profile":
+                return await _dispatch_profile_get(parts, parsed_query, groups)
+            return await asyncio.to_thread(_dispatch_get_sync, parts, parsed_query, groups)
         if verb == "POST":
             if len(body) > _MAX_BODY_BYTES:
                 return _fail(413, "body_too_large")

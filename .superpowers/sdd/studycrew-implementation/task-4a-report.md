@@ -386,3 +386,141 @@ DONE
   fully green.
 - `git diff --check` passes after the report update. The pre-existing untracked `skills/`
   directory was neither read, modified, staged nor committed.
+
+## Independent review fix round 5/5
+
+### Status
+
+DONE
+
+### Project-specific Profile availability authorization
+
+- `GET /api/knowledge/{project}/assets` no longer spreads the manager's raw snapshot into the
+  scoped HTTP response. It emits an explicit response field set and therefore cannot accidentally
+  transport a private Profile marker or a future unreviewed snapshot field.
+- The merged and project-specific Asset routes now call the same `_profile_authorization` helper.
+  That helper constructs one canonical Profile row and applies `_row_allowed`; a denied Profile is
+  represented only as `profile_exists=false` with empty source/course arrays.
+- The formal route test proves a foreign-only Profile is hidden by both list forms, its exact
+  source/course IDs and a synthetic private marker are absent from the direct serialized response,
+  and a subsequently matching same-Group Profile remains positively visible with its real IDs.
+
+### Atomic Profile body and contributor generation
+
+- `KnowledgeAssetManager.profile_snapshot` is a single manager operation guarded by the existing
+  per-root `KnowledgeGraphManager.root_lock`, the same lock already held by `set_profile` and every
+  `_after_write` Profile compilation. While that lock is held, its synchronous worker reads the
+  Profile availability/contributor snapshot and body as one coupled result.
+- Profile GET now uses a dedicated async HTTP branch, awaits only that coupled result, then applies
+  the shared Profile row authorization. It never performs the former post-authorization
+  `profile_text` read. Engine-loop identity and a bounded snapshot timeout remain fail closed.
+- The deterministic real-manager concurrency test pauses after the allowed contributor snapshot,
+  starts a real `set_profile` replacement with `PRIVATE OWNERLESS PROFILE`, and proves the writer
+  remains blocked on the same root lock. The first response contains only the old allowed body and
+  matching IDs; after the writer completes, a second request returns 403 and no private marker.
+
+### Red-first evidence
+
+Before the production change, both permanent attack tests failed with the exact disclosures:
+
+`py -3.12 -m pytest backend/tests/test_knowledge_group_scope.py::test_project_assets_route_sanitizes_denied_profile_metadata backend/tests/test_knowledge_group_scope.py::test_real_manager_profile_detail_body_and_contributors_share_one_generation -q`
+
+```text
+FF                                                                       [100%]
+FAILED ...test_project_assets_route_sanitizes_denied_profile_metadata
+E assert True is False
+FAILED ...test_real_manager_profile_detail_body_and_contributors_share_one_generation
+E 'PRIVATE OWNERLESS PROFILE' is contained here:
+E 'text': 'PRIVATE OWNERLESS PROFILE\n', 'source_ids': [...],
+E 'course_ids': ['course-atomic']
+2 failed in 0.73s
+```
+
+The same two-test command after the fix returned:
+
+```text
+..                                                                       [100%]
+2 passed in 0.51s
+```
+
+The final strengthened real-manager test (including writer-blocked and post-swap 403 assertions)
+returned:
+
+```text
+.                                                                        [100%]
+1 passed in 0.51s
+```
+
+### Backend verification
+
+- Complete Knowledge Group scope, including broad/narrow Profile, Asset and SkillPack positives,
+  ownerless rejection and the strict clean-global exception:
+
+  `py -3.12 -m pytest backend/tests/test_knowledge_group_scope.py -q`
+
+  ```text
+  .......                                                                  [100%]
+  7 passed in 0.77s
+  ```
+
+- Related ordinary Group/Knowledge/Task Runtime partition:
+
+  `py -3.12 -m pytest -q backend/tests/test_groups.py backend/tests/test_group_http.py backend/tests/test_knowledge_graph.py backend/tests/test_knowledge_group_scope.py backend/tests/test_task_runtime.py backend/tests/test_task_runtime_review_fixes.py backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_rereview_round3.py backend/tests/test_task_runtime_rereview_round4.py backend/tests/test_task_runtime_rereview_round5.py backend/tests/test_task_runtime_live_event_bridge.py backend/tests/test_task_runtime_recovery_ack.py backend/tests/test_task_runtime_recovery_ownership.py backend/tests/test_task_runtime_deletion_authorization.py`
+
+  ```text
+  188 passed in 48.08s
+  ```
+
+- Task Runtime quarantine first run hit the existing Windows retry-timing flake, outside all
+  Profile paths:
+
+  `py -3.12 -m pytest backend/tests/test_task_runtime_quarantine_isolation.py -q`
+
+  ```text
+  FAILED ...::test_limit_two_overflow_never_starves_valid_confirmed_deletion
+  E AssertionError: condition was not satisfied before timeout
+  1 failed, 67 passed in 34.04s
+  ```
+
+  Its exact immediate rerun returned `1 passed in 0.71s`; the complete clean isolation rerun
+  returned `68 passed in 31.88s`.
+
+### Frontend and static verification
+
+- Exact Task 4A renderer set:
+
+  `npx vitest run src/store/groupDeletionAsync.test.ts src/store/groupDeletionFence.test.ts src/store/groupTeardown.test.ts src/store/knowledge.test.ts src/store/knowledgeMutationDeletion.test.ts src/store/skeletonCache.test.ts src/store/task4aRound2Adversarial.test.ts --reporter=dot`
+
+  ```text
+  Test Files  7 passed (7)
+       Tests  54 passed (54)
+  Duration  3.30s
+  ```
+
+- Full frontend regression, `npm test -- --reporter=dot`:
+
+  ```text
+  Test Files  46 passed (46)
+       Tests  545 passed (545)
+  Duration  27.15s
+  ```
+
+- `npm run lint`: exit `0`, zero warnings.
+- `npx tsc --noEmit -p electron/tsconfig.json`: exit `0`, no output.
+- `npm run test:foundation`: Node tests `2` passed / `0` failed, followed by
+  `✅ StudyCrew runtime and Windows packaging contract verified`.
+- `py -3.12 -m compileall -q backend`: exit `0`, no output.
+- Node is `v24.19.0`; Python is `3.12.10`.
+- `git diff --check`: exit `0` (only Git's configured LF→CRLF working-copy notices).
+
+### Recorded historical baselines
+
+- Full backend aggregation, `py -3.12 -m pytest backend/tests -q`, remains stopped only by the
+  pre-existing Task 9 collection baseline: four modules (`test_v10182_runtime_ui.py`,
+  `test_v22_dispatch_reliability.py`, `test_v27_weld.py`, `test_v28_weld.py`) cannot import
+  `ACTION_CONTRACT` from `backend.engine` (`4 errors in 1.50s`). This round does not expand into
+  that unrelated contract restoration.
+- Full renderer `npx tsc --noEmit` retains the disclosed historical baseline: process exit `1`,
+  `68` non-empty output lines containing `54` TypeScript diagnostics, and zero diagnostics for
+  this round's changed files (all changed production/test files are Python).
+- The pre-existing untracked `skills/` directory was not read, modified, staged or committed.
