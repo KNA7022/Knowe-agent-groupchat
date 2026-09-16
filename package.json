@@ -27,11 +27,12 @@
     "build:manifest": "node scripts/write-build-manifest.mjs",
     "electron:build:clean": "node scripts/clean-electron-build.mjs && npm run electron:build",
     "backend:build": "node scripts/backend-build.mjs",
+    "check:artifact": "node scripts/check-backend-artifact.mjs",
     "build:resources": "node scripts/make-build-resources.mjs",
     "icon:ico": "node scripts/make-icon-ico.mjs",
     "icon:icns": "node scripts/make-icon-icns.mjs",
     "copy:chromium": "node scripts/copy-chromium.mjs",
-    "dist:win": "node scripts/clean-electron-build.mjs && npm run build:resources && npm run icon:ico && npm run backend:build && npm run copy:chromium && npm run electron:build && electron-builder --win nsis",
+    "dist:win": "node scripts/clean-electron-build.mjs && npm run build:resources && npm run icon:ico && npm run backend:build && npm run copy:chromium && npm run check:artifact && npm run electron:build && electron-builder --win nsis",
     "dist:win:app": "npm run electron:build && electron-builder --win nsis",
     "test:packaging": "node --test scripts/packaging-contract.test.mjs scripts/spec-check.test.mjs"
   },

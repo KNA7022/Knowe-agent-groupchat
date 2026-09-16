@@ -274,3 +274,18 @@ writeFileSync(
 );
 
 console.log(`✅ backend:build 完成：${relative(ROOT, EXE)}`);
+
+// ⚠ PyInstaller 用 --noconfirm 整体替换 COLLECT 目录，会把先前 copy:chromium 拷入的
+//   Playwright 浏览器内核（约 267 MiB）删掉。单独跑 `dist:win:app` 会因此静默产出
+//   缺少内核的安装包（与"版本资源静默失败"同类）。这里主动提示，避免踩坑。
+const chromiumRoot = join(DIST, 'ms-playwright');
+const hasChromium =
+  existsSync(chromiumRoot) &&
+  readdirSync(chromiumRoot).some((name) => name.startsWith('chromium_headless_shell-'));
+if (!hasChromium) {
+  console.warn(
+    '[backend:build] ⚠ 浏览器内核不在产物内（本次重建替换了整个 COLLECT 目录）。' +
+      '打包前请跑 `npm run copy:chromium`，或直接用 `npm run dist:win` 走完整链；' +
+      '`npm run check:artifact` 可校验产物完整性。',
+  );
+}

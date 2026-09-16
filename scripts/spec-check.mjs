@@ -32,7 +32,7 @@ if (!existsSync(specPath)) {
 }
 
 const PY = `
-import ast, json, os, subprocess, sys, textwrap
+import ast, json, operator, os, subprocess, sys, textwrap
 
 spec_path = sys.argv[1]
 src = open(spec_path, encoding="utf-8").read()
@@ -54,17 +54,15 @@ if len(analysis_calls) != 1:
 if len(exe_calls) != 1:
     problems.append("spec 应恰好有 1 个 EXE(...) 调用，实际 %d 个（decoy 调用可让 version= 接线检查失效）" % len(exe_calls))
 
-# ── 2. hiddenimports 必须是可静态求值的常量列表 ──
+# ── 2. hiddenimports 必须是可静态求值的**列表** ──
+#
+# ⚠ 必须恰好是 list：PyInstaller 的 build_main.py 会对它调用 .extend()，
+#   set/tuple 会在构建时抛 AttributeError（'set' object has no attribute 'extend'）。
+#   所以 set/tuple 属于"会让构建崩"的写法，必须拒绝；列表拼接（list + list）
+#   是 PyInstaller 接受的，应当求值后校验内容。
 class ListFolder(ast.NodeVisitor):
     def visit_List(self, node):
         return [self.visit(e) for e in node.elts]
-    def visit_Tuple(self, node):
-        return tuple(self.visit(e) for e in node.elts)
-    def visit_Constant(self, node):
-        return node.value
-    def visit_Set(self, node):
-        # 不能用集合推导式：它本身也是 ast.Set，会无限递归。
-        return set(self.visit(e) for e in node.elts)
     def visit_BinOp(self, node):
         left, right = self.visit(node.left), self.visit(node.right)
         if left is UNRESOLVED or right is UNRESOLVED:
@@ -75,11 +73,20 @@ class ListFolder(ast.NodeVisitor):
             return operator.add(left, right) if isinstance(node.op, ast.Add) else None
         except TypeError:
             return UNRESOLVED
+    def visit_Constant(self, node):
+        return node.value
     def visit_Name(self, node):
         return UNRESOLVED
     def generic_visit(self, node):
+        # Tuple/Set 等都会落到这里：返回特殊标记以便区分"非列表"。
+        if isinstance(node, (ast.Tuple, ast.Set)):
+            return NOT_A_LIST
         return None
 
+class _NotAList:
+    pass
+
+NOT_A_LIST = _NotAList()
 UNRESOLVED = object()
 if analysis_calls:
     kw = {k.arg: k.value for k in analysis_calls[0].keywords if k.arg}
@@ -87,15 +94,23 @@ if analysis_calls:
         problems.append("Analysis(...) 缺少 hiddenimports 关键字")
         findings["hiddenimports"] = None
     else:
-        value = ListFolder().visit(kw["hiddenimports"])
-        if value is UNRESOLVED or value is None:
-            problems.append("hiddenimports 不是可静态求值的常量列表（含变量/拼接/set），无法确认生效值")
+        node = kw["hiddenimports"]
+        if isinstance(node, (ast.Tuple, ast.Set)):
+            problems.append(
+                "hiddenimports 是 %s —— PyInstaller 会对它调用 .extend()，"
+                "set/tuple 会在构建时抛 AttributeError，必须是列表" % type(node).__name__.lower()
+            )
             findings["hiddenimports"] = None
         else:
-            findings["hiddenimports"] = list(value)
-            for required in ("playwright", "yaml"):
-                if required not in findings["hiddenimports"]:
-                    problems.append("hiddenimports 生效值缺少 " + required)
+            value = ListFolder().visit(node)
+            if value is UNRESOLVED or value is None or isinstance(value, _NotAList):
+                problems.append("hiddenimports 不是可静态求值的常量列表（含变量/拼接/非列表）")
+                findings["hiddenimports"] = None
+            else:
+                findings["hiddenimports"] = list(value)
+                for required in ("playwright", "yaml"):
+                    if required not in findings["hiddenimports"]:
+                        problems.append("hiddenimports 生效值缺少 " + required)
 
 # ── 3. 版本块不得有任何 except（失败必须响，不能静默） ──
 #
@@ -109,7 +124,6 @@ for line in except_handlers:
         "spec 第 %s 行存在 except —— 版本块不应捕获任何异常（写错类名必须让构建崩，而不是静默产出没有版本信息的 exe）"
         % line
     )
-
 # ── 4. _VERSION 赋值：只认直接赋值；动态写入视为不可证明 ──
 assign_lines = []
 bad_forms = []
@@ -172,16 +186,23 @@ version_assigns = [
 ]
 version_assigns.sort(key=lambda n: n.lineno)
 
-# 与版本相关的顶层语句：import、含 _VERSION 赋值的 If/IfExp、无条件 _VERSION 赋值。
+# 与版本相关的顶层语句：import、含 _VERSION 赋值的 If/For/While/With、
+# 顶层 helper 定义（版本对象常在函数里构造）、无条件 _VERSION 赋值。
+# 白名单只收 If 会漏掉 for/with 里的覆写（复审实测：探针说没问题、产物真的没版本资源）。
+def contains_version_assign(node):
+    return any(
+        isinstance(sub, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "_VERSION" for t in sub.targets)
+        for sub in ast.walk(node)
+    )
+
 probe_stmts = []
 for node in tree.body:
-    if isinstance(node, (ast.Import, ast.ImportFrom)):
+    if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
         probe_stmts.append(node)
         continue
-    if isinstance(node, ast.If):
-        if any(isinstance(sub, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "_VERSION" for t in sub.targets
-        ) for sub in ast.walk(node)):
+    if isinstance(node, (ast.If, ast.For, ast.While, ast.With, ast.AsyncWith)):
+        if contains_version_assign(node):
             probe_stmts.append(node)
         continue
     if isinstance(node, ast.Assign) and any(
@@ -222,11 +243,18 @@ if code is not None:
     )
     findings["probe_returncode"] = run.returncode
     if run.returncode != 0:
-        # ImportError/异常别名 catch 都会走到这里：这正说明版本块会静默失败。
-        problems.append(
-            "版本块执行求值失败（说明它会静默失败或写法异常）：%s"
-            % (run.stderr.strip().splitlines()[-1] if run.stderr.strip() else "unknown")
-        )
+        # ⚠ 这是**警告**而不是问题：执行失败可能只是探针没有提供构建期上下文
+        #   （例如版本对象由 helper 函数构造、该函数还引用了 SPECPATH 之类）。
+        #   那种写法在真 PyInstaller 里是能正常产出带版本资源的 exe 的，报成问题
+        #   就是误拦（复审实测过一个这样的合法 spec）。
+        #   真正的"静默失败"防线不在这里，而是：spec 的版本块没有可吞的异常
+        #   （硬保障 1）+ 产物级断言（硬保障 2）。
+        detail = run.stderr.strip().splitlines()[-1] if run.stderr.strip() else "unknown"
+        findings["probe_warning"] = "执行求值失败（可能只是探针缺上下文）：%s" % detail
+        if "ImportError" in detail or "ModuleNotFoundError" in detail:
+            # 版本块需要 PyInstaller 的 versioninfo 模块；import 不上说明类名/模块名
+            # 写错 —— 这会让构建直接崩（硬保障 1），是最该在这里喊出来的情况。
+            problems.append("版本块 import 失败（类名/模块名可能写错）：%s" % detail)
     else:
         try:
             result = json.loads(run.stdout.strip().splitlines()[-1])

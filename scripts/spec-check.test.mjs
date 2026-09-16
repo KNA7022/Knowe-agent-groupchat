@@ -62,18 +62,24 @@ test('真实 spec 必须通过 AST 检查', () => {
 const mutants = [
   [
     '裸 except 吞掉版本资源（上游根因原型）',
-    real.replace('if sys.platform == "win32":', 'try:').replace(/else:[\s\S]*?\n(?=\n)/, 'except:\n    _VERSION = None\n'),
-    ['except'],
+    real
+      .replace('if sys.platform == "win32":', 'try:')
+      .replace(/else:[\s\S]*?\n(?=\n)/, 'except:\n    _VERSION = None\n'),
+    ['存在 except'],
   ],
   [
     'except (ImportError, Exception) 元组',
-    real.replace('if os.name == "nt":', 'try:').replace(/else:[\s\S]*?\n(?=\n)/, 'except (ImportError, Exception):\n    _VERSION = None\n'),
-    ['ImportError'],
+    real
+      .replace('if sys.platform == "win32":', 'try:')
+      .replace(/else:[\s\S]*?\n(?=\n)/, 'except (ImportError, Exception):\n    _VERSION = None\n'),
+    ['存在 except'],
   ],
   [
     'except BaseException',
-    real.replace('if os.name == "nt":', 'try:').replace(/else:[\s\S]*?\n(?=\n)/, 'except BaseException:\n    _VERSION = None\n'),
-    ['BaseException'],
+    real
+      .replace('if sys.platform == "win32":', 'try:')
+      .replace(/else:[\s\S]*?\n(?=\n)/, 'except BaseException:\n    _VERSION = None\n'),
+    ['存在 except'],
   ],
   [
     'hiddenimports 用变量拼接偷掉 playwright',
@@ -154,19 +160,7 @@ const mutants = [
 
 /**
  * 合法写法必须被接受（避免"检查器把好代码也拦了"这种反向缺陷）。
- * set 字面量是 PyInstaller 接受的 hiddenimports 形式之一。
  */
-test('应接受：hiddenimports 用 set 字面量（合法写法）', () => {
-  const mutated = real.replace(
-    /hiddenimports=\[[\s\S]*?\],/,
-    'hiddenimports={"playwright", "playwright.async_api", "playwright._impl._driver", "yaml"},',
-  );
-  assert.notEqual(mutated, real, '变异未生效');
-  const r = runChecker(mutated);
-  assert.equal(r.ok, true, `合法写法被误拦：${(r.problems ?? []).join(' | ')}`);
-});
-
-/** 合法写法：先置 None 再用平台分支覆盖（比原 spec 更保守的写法）。 */
 test('应接受：先置 _VERSION = None 再由 win32 分支覆盖（安全序）', () => {
   const mutated = real.replace(
     /if sys\.platform == "win32":/,
@@ -175,6 +169,91 @@ test('应接受：先置 _VERSION = None 再由 win32 分支覆盖（安全序�
   assert.notEqual(mutated, real, '变异未生效');
   const r = runChecker(mutated);
   assert.equal(r.ok, true, `安全序被误拦：${(r.problems ?? []).join(' | ')}`);
+});
+
+/** 合法写法：hiddenimports 用列表拼接（PyInstaller 接受 list + list）。 */
+test('应接受：hiddenimports 用列表拼接（合法写法）', () => {
+  const mutated = real.replace(
+    /hiddenimports=\[[\s\S]*?\],/,
+    'hiddenimports=["playwright", "playwright.async_api", "playwright._impl._driver"] + ["yaml"],',
+  );
+  assert.notEqual(mutated, real, '变异未生效');
+  const r = runChecker(mutated);
+  assert.equal(r.ok, true, `合法的列表拼接被误拦：${(r.problems ?? []).join(' | ')}`);
+});
+
+/**
+ * 反向缺陷防护：set/tuple 不是合法写法。
+ * PyInstaller 的 build_main.py 对 hiddenimports 调用 .extend()，set/tuple 会抛
+ * AttributeError（'set' object has no attribute 'extend'）——构建直接崩。
+ * 第一版检查器把 set 当合法值接受，方向正好反了。
+ */
+test('必须拒绝：hiddenimports 用 set 字面量（PyInstaller 会崩）', () => {
+  const mutated = real.replace(
+    /hiddenimports=\[[\s\S]*?\],/,
+    'hiddenimports={"playwright", "playwright.async_api", "playwright._impl._driver", "yaml"},',
+  );
+  assert.notEqual(mutated, real, '变异未生效');
+  const r = runChecker(mutated);
+  assert.equal(r.ok, false, 'set 会让 PyInstaller 抛 AttributeError，检查器必须拒绝');
+  assert.ok(
+    r.problems.join(' | ').includes('hiddenimports'),
+    `拒绝理由应提到 hiddenimports：${r.problems.join(' | ')}`,
+  );
+});
+
+test('必须拒绝：hiddenimports 用 tuple 字面量（PyInstaller 会崩）', () => {
+  const mutated = real.replace(
+    /hiddenimports=\[[\s\S]*?\],/,
+    'hiddenimports=("playwright", "playwright.async_api", "playwright._impl._driver", "yaml"),',
+  );
+  assert.notEqual(mutated, real, '变异未生效');
+  const r = runChecker(mutated);
+  assert.equal(r.ok, false, 'tuple 会让 PyInstaller 抛 AttributeError，检查器必须拒绝');
+});
+
+/**
+ * 探针盲区防护（复审实测过）：`for`/`with` 里的覆写。
+ * 第一版探针只重放 import / 顶层 If / 顶层 Assign，于是这两种写法的
+ * `_VERSION = None` 完全没被执行，lint 说没问题而产物真的没有版本资源。
+ */
+test('必须拒绝：for 循环里覆写 _VERSION = None', () => {
+  const mutated = real.replace(
+    /(    _VERSION = VSVersionInfo\([\s\S]*?\n    \)\n)/,
+    '$1for _i in range(2):\n    _VERSION = None\n',
+  );
+  assert.notEqual(mutated, real, '变异未生效');
+  const r = runChecker(mutated);
+  assert.equal(r.ok, false, 'for 循环里的覆写必须被执行求值抓到');
+});
+
+/**
+ * 反向缺陷防护：版本对象由顶层 helper 函数构造是常见写法，
+ * 探针缺上下文时不应把它误判为"没有版本资源"。
+ */
+test('应接受：版本对象由顶层 helper 函数构造', () => {
+  const helper = [
+    'def _make_version():',
+    '    return VSVersionInfo(',
+    '        ffi=FixedFileInfo(filevers=(1, 0, 36, 0), prodvers=(1, 0, 36, 0)),',
+    '        kids=[StringFileInfo([StringTable("040904B0", [',
+    '            StringStruct("CompanyName", "StudyCrew"),',
+    '            StringStruct("FileVersion", "1.0.36.0"),',
+    '            StringStruct("ProductVersion", "1.0.36.0"),',
+    '        ])]), VarFileInfo([VarStruct("Translation", [0x0409, 1200])])],',
+    '    )',
+    '',
+  ].join('\n');
+  const mutated = real
+    .replace('import os  # noqa: E402', `import os  # noqa: E402\n${helper}`)
+    .replace(/    _VERSION = VSVersionInfo\([\s\S]*?\n    \)\n/, '    _VERSION = _make_version()\n');
+  assert.notEqual(mutated, real, '变异未生效');
+  const r = runChecker(mutated);
+  assert.equal(
+    r.ok,
+    true,
+    `helper 函数写法被误拒（探针缺上下文不应算问题）：${(r.problems ?? []).join(' | ')}`,
+  );
 });
 
 

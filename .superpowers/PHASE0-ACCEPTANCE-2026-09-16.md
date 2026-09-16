@@ -355,6 +355,10 @@ Get-ChildItem .\release\StudyCrew-Setup-1.0.36.exe
 15. **`backend-build.mjs` 的依赖指纹不完整**：只覆盖 `pyinstaller`/`playwright`/`PyYAML`/`ddgs`/`duckduckgo-search` 五个包，而 backend 真正会被冻结的还有 `httpx`、`websockets`——`pip install -U httpx` 不会触发重建，会静默沿用旧 exe（与"版本资源静默失败"同类）。反过来 `package.json`/`electron-builder.yml` 被纳入指纹却是纯粹的过度重建成本（它们与 PyInstaller 产物无关）。**未修**。
 16. **AST 检查器不是完备契约**：它已被三轮复审击穿，第四版把它降级为 lint 并明确写进文件头。真正的硬保障只有"版本块没有可吞的异常" + "产物级断言读真实 exe"。**不要**再基于"检查器全绿"推断产物正确。
 17. **Python 探测仍硬编码 `py -3.12`**：`packaging-contract.test.mjs` 与 `spec-check.mjs` 都直接用 `py -3.12`，没有走 `scripts/python-command.mjs` 的候选序；在无 `py` launcher 的机器上会给出误导性失败（报成"hiddenimports 不可解析"）。`backend-build.mjs` 与 `copy-chromium.mjs` 已统一，测试侧**未统一**。
+18. **`dist/` 的浏览器内核会被 `backend:build` 清掉**：PyInstaller 用 `--noconfirm` 整体替换 COLLECT 目录。`npm run dist:win` 完整链会重跑 `copy:chromium` 所以安全；但单独跑 `npm run dist:win:app` 会静默产出缺内核的包。已加 `npm run check:artifact`（接入 `dist:win`）与 `backend:build` 结束时的警告来兜住，**但独立的 `dist:win:app` 仍不会自动校验**。
+19. **NSIS 保留集断言是文本级**：能拦直连的 `RMDir`/`Delete` 写法，拦不住间接写法（`StrCpy` 中转、`nsExec::Exec` 调 `rmdir`）。
+20. **产物级断言的标题与实际不同**：`packaging-contract.test.mjs` 里"（含 filevers/prodvers 数字字段）"这条只读 4 个字符串字段；数字字段断言作用于 spec 对象而非产物。
+21. **探针不校验 spec 的 `else:` 分支**：它无条件把 `sys.platform` 设为 `win32`（只发 Windows，可接受）。
 
 ---
 
@@ -486,6 +490,49 @@ Get-ChildItem .\release\StudyCrew-Setup-1.0.36.exe
 | `npm run test:foundation` | 13 / 21 | **29**（2 + 27）+ verify:runtime |
 | playwright / yaml 被自动收集的模块数 | 52 / 15 | 复审独立复现为 **55 / 17**（机制结论不变：删与不删 hiddenimports 产物一致）|
 
-**仍未修（诚实列出）**：`backend-build.mjs` 的依赖指纹只覆盖 5 个包（`httpx`/`websockets` 升级不触发重建），
-却把 `package.json`/`electron-builder.yml` 纳入（属纯粹的过度重建成本）；AST 检查器仍可能被更巧妙的
-写法绕过——这正是把它定位为 lint 而非契约的原因。这两条已列入 §7 的已知限制。
+**仍未修（诚实列出）**：AST 检查器仍可能被更巧妙的写法绕过——这正是把它定位为 lint 而非契约的原因。
+
+---
+
+## 13. 第五轮独立复审（对第四版）
+
+对第四版的独立复审判定 **PASS**——**两条硬保障成立、产物版本资源正确**，判定标准是"硬保障 + 产物正确 → 只剩 lint/测试/文档层问题不阻塞收敛"。
+
+### 它对两条硬保障的独立验证
+
+| 命题 | 复审结论 | 证据 |
+|---|---|---|
+| 保障 1：厂商级错误让构建**崩**而非静默出空版本 exe | **成立**（在它声称的范围内）| `%TEMP%` 内最小 spec 真跑 PyInstaller：类名写错 → `NameError` exit 1 无 exe；模块改名 → `ModuleNotFoundError` exit 1；删赋值 → `NameError` exit 1。**边界**：把守卫改成恒假条件（`sys.platform == "linux"`）**不崩**、静默产出空版本，由 lint + 保障 2 兜住 |
+| 保障 2：产物级断言能抓"版本资源没嵌入" | **成立** | 用 `UpdateResource(RT_VERSION)` 删掉真 exe 副本的版本资源后，真实断言失败：`产物 FileVersion=，期望 1.0.36.0`；`dist/` 缺失时为 `t.skip()`、`skipped` 计数如实 |
+| 当前产物版本资源正确 | **成立** | 7/7 字符串字段 + 数字 `filevers/prodvers = 1.0.36.0` |
+
+### 处置（本轮修复）
+
+| 发现 | 内容 | 处置 |
+|---|---|---|
+| I-1 | 两条 `except` 变异的锚点用了**已不存在的** `os.name == "nt"` → 空操作，变异体是语法错误，测试靠 SyntaxError 回显关键词蒙混通过（等于不测任何东西）| ✅ 锚点改为 `sys.platform == "win32"`，关键词收紧为"存在 except" |
+| I-2 | **方向反了**：检查器把 `set` 字面量当**合法**值接受，而 PyInstaller 会对 `hiddenimports` 调 `.extend()`，set/tuple 直接抛 `AttributeError` 崩构建 | ✅ set/tuple 改为**必须拒绝**（各加一条测试）；合法的 list 拼接改为"应接受" |
+| I-3 | 检查器用了**未 import 的 `operator`** → 遇到合法的 list 拼接就 `NameError` 崩掉，错误信息还误导成"spec 解析失败" | ✅ 补 `import operator` |
+| I-4 | §4.1 表的 v3 列与 §12 I2 自相矛盾（那 5 行只有本版才成立）；footnote ³ 把 a41f8a0 的反向启发式错记为 v2 | ✅ 表头改为"v4"并注明 v3 的实测结果；footnote 归属修正 |
+| I-5 | **真实静默降级**：`backend:build` 用 `--noconfirm` 整体替换 COLLECT 目录，把 `copy:chromium` 拷入的 **267 MiB 浏览器内核删掉**；单独跑 `dist:win:app` 会静默产出缺内核的包 | ✅ 新增 `scripts/check-backend-artifact.mjs` + `npm run check:artifact`，接入 `dist:win`（在 `copy:chromium` 之后、`electron-builder` 之前）；`backend:build` 结束时主动警告。实测：当前 `dist/` 缺内核时该检查**正确失败**并给出补救命令 |
+| M-1 | 探针只重放 import/顶层 If/顶层 Assign → `for`/`with` 里的 `_VERSION = None` 是盲区（lint 说没问题、产物真的没版本资源）| ✅ 收集范围扩到 `If/For/While/With/FunctionDef/ClassDef`；加 for 覆写测试 |
+| M-2 | 合法写法被误拒：版本对象由顶层 helper 函数构造时探针 `NameError` 报问题，而该 spec 真跑 PyInstaller 是好的 | ✅ "执行求值失败"降级为**警告**（`findings.probe_warning`），只有 `ImportError`/`ModuleNotFoundError` 才是问题（那正是硬保障 1 会崩的情况）；加 helper 接受测试 |
+| M-4/M-5 | 报告正文计数与描述过期（仍写 9/13/10 条、"恰好一次赋值"等已删的启发式）| ✅ 见下方"现行数字" |
+
+### 现行数字（本节为准，覆盖前文任何旧值）
+
+| 项 | 值 |
+|---|---|
+| `scripts/packaging-contract.test.mjs` | 10 tests |
+| `scripts/spec-check.test.mjs` | **21** tests（1 真实 spec + 16 拒绝 + 4 接受）|
+| `npm run test:packaging` | **31** |
+| `npm run test:foundation` | **33** |
+| `scripts/spec-check.mjs` 定位 | **lint**（不是契约；硬保障见 §4.1 末）|
+
+### 复审指出但本轮**未修**的
+
+- **M-3**：`packaging-contract.test.mjs` 中"已构建的后端产物…（含 filevers/prodvers 数字字段）"这条**标题对产物不成立**——它只读 4 个字符串字段；数字字段断言只作用于 spec 对象。硬保障未破，但标题夸大。
+- **M-6**：NSIS 反向断言能拦住直连写法（`RMDir /r "$INSTDIR\data"`、大写 `RMDIR`、行尾注释、`Delete "$INSTDIR\Logs\*.*"`、删 `$INSTDIR` 本体），但拦不住间接写法（`StrCpy $0 "$INSTDIR\data"` + `RMDir /r "$0"`、`nsExec::Exec 'rmdir /s /q …'`）。仍是文本级而非语义级。
+- **M-7**：`packaging-contract.test.mjs` 仍用 `execFileSync`（提取块失败会抛异常而非可读断言），且测试侧仍硬编码 `py -3.12`。
+- **M-8**：探针无条件把 `sys.platform` 设为 `win32`，因此 spec 的 `else:` 分支从不被执行校验（只发 Windows，可接受，但已记入 §7）。
+- **M-1 的剩余部分**：`with` 语句若依赖构建期上下文仍可能无法求值——已降级为警告，不再误报。

@@ -148,6 +148,20 @@ test('dist:win 必须先生成 NSIS 构建资源与后端产物', () => {
     'build:resources 必须在 electron-builder 之前执行',
   );
   assert.ok(distWin.includes('backend:build'), 'dist:win 未调用 backend:build');
+  // backend:build 用 --noconfirm 整体替换 COLLECT 目录，会删掉 copy:chromium 拷入的
+  // 浏览器内核；若不校验完整性，dist:win:app 会静默产出缺内核的包。
+  assert.ok(
+    distWin.includes('check:artifact'),
+    'dist:win 未调用 check:artifact：无法发现产物缺少浏览器内核',
+  );
+  assert.ok(
+    distWin.indexOf('copy:chromium') < distWin.indexOf('check:artifact'),
+    'check:artifact 必须在 copy:chromium 之后执行（否则核心理应还没拷入）',
+  );
+  assert.ok(
+    distWin.indexOf('check:artifact') < distWin.indexOf('electron-builder'),
+    'check:artifact 必须在 electron-builder 之前执行，才能拦住不完整的包',
+  );
 });
 
 test('全量门禁必须包含打包契约', () => {
