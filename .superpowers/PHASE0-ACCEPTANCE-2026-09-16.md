@@ -138,29 +138,51 @@ spec 写的是 `FixedFileVersion`，而 PyInstaller 6.13.0 **不存在**这个�
 `KnoweBackend`），另 2 条校验 `electron-builder.yml` 的 `from: dist/StudyCrewBackend` 与
 `main.ts` 的 `StudyCrewBackend.exe`。
 
-### 4.1 断言加固史：为什么最终改用 AST
+### 4.1 断言加固史：为什么最终改为 AST
 
-独立复审**两轮**击穿了文本正则版断言：
+独立复审**三轮**击穿了前三版断言。**每一格都单独实测过**（用 `git show <rev>:scripts/packaging-contract.test.mjs` 取出该版本真实测试文件驱动变异）：
 
-| 绕过写法 | 文本正则版 | AST 版 |
-|---|---|---|
-| `hiddenimports` 清空 | 空转通过 | ✅ 拦住 |
-| `hiddenimports` 改单引号 | 空转通过 | ✅ 拦住 |
-| `hiddenimports=["yaml"] + _X`（列表拼接） | 全通过 | ✅ 拦住 |
-| `filevers/prodvers` 清零 | 全通过 | ✅ 拦住 |
-| 删掉 `EXE(version=_VERSION)` 接线 | 全通过 | ✅ 拦住 |
-| 裸 `except:` | 全通过 | ✅ 拦住 |
-| `except (ImportError, Exception):` | 全通过 | ✅ 拦住 |
-| `except BaseException:` | 全通过 | ✅ 拦住 |
-| `EXE` 之前/之后插入 `_VERSION = None` | 全通过 | ✅ 拦住 |
-| 行尾注释伪造字段名 | 全通过 | ✅ 拦住 |
-| 生成器里写 `RMDir /r "$INSTDIR"` | 全通过 | ✅ 拦住 |
-| 版本号滞后一版 | 全通过 | ✅ 拦住 |
+| 绕过写法 | v1 文本正则 (`0d89903`) | v2 启发式 AST (`fca1eda`) | v3 AST+执行求值 (`a41f8a0` 起) |
+|---|---|---|---|
+| `hiddenimports` 清空 | 绕过 | 拦住 | **拦住** |
+| `hiddenimports` 单引号 | 绕过 | 绕过¹ | **接受（合法写法）** |
+| `hiddenimports=["yaml"] + _X` | 绕过 | 绕过 | **拦住** |
+| `filevers`/`prodvers` 清零 | 绕过 | 拦住 | **拦住**（数字字段单独断言）|
+| 删 `version=_VERSION` 接线 | 绕过 | 拦住 | **拦住** |
+| 裸 `except:` | 绕过 | 绕过 | **拦住**（禁止任何 except）|
+| `except (ImportError, Exception):` | 绕过 | 绕过 | **拦住** |
+| `except BaseException:` | 绕过 | 拦住 | **拦住** |
+| `EXE` 前插 `_VERSION = None` | 绕过 | 绕过 | **拦住**（执行求值）|
+| `EXE` 后插 `_VERSION = None` | 绕过 | 绕过 | **拦住** |
+| 行尾注释伪造字段名 | 绕过 | 绕过² | **拦住**（按对象结构取字段）|
+| 版本号滞后一版 | 拦住 | 拦住 | **拦住** |
+| 生成器里 `RMDir /r "$INSTDIR"` | 绕过 | 绕过 | **拦住** |
+| `globals()["_VERSION"] = None` | 绕过 | 绕过 | **拦住** |
+| `exec("_VERSION = None")` | 绕过 | 绕过 | **拦住** |
+| 有效赋值后补 `_VERSION = None` | 绕过 | 绕过³ | **拦住** |
+| 异常别名 `_ALIAS = Exception` + 旧类名 | 绕过 | 绕过 | **拦住** |
+| 假 `Analysis` / 假 `EXE` decoy | 绕过 | 绕过 | **拦住**（要求唯一）|
 
-**自证方式也已更正**：第二版用 `.tools/bypass-probe.mjs` 自证，但它**复刻了一份断言逻辑**
-（循环论证），且复刻的那份带着同一个裸 `except` 正则洞。该文件已删除；现在由
-`scripts/spec-check.test.mjs` 对真实 spec 施加 8 种畸形变异并**调用真实检查器**，
-断言逻辑只有一份，无法自欺。
+¹ 单引号只是另一种引号写法，**本就该被接受**，把"能否拦住它"当作强度指标是错的。
+² v2 已能识别**整行**注释，仅**行尾**注释能骗过它。
+³ v2 的覆写判定规则方向反了：它放过了"有效在前、None 在后"（唯一危险的顺序），
+反而误拦"None 置顶、分支覆盖"（更安全的写法）。这是复审的关键发现，v3 已用**执行求值**取代该启发式。
+
+> **更正（第四版）**：第三版这张表把 v1/v2 的结果混成一列并笼统写成"文本正则版 12 种全部通过"，
+> 该总结**不成立**——上表有 4 行只在 v1 成立，且"版本号滞后一版"在 v1/v2 都被拦住。
+> 第三版 §11 里"文本层那 12 种写法现已全部被拦"同样不成立（`filevers` 行当时未拦住；单引号行不是缺陷）。
+
+**第四版的关键转变**：不再试图"用启发式堵住所有写法"。复审的结论是对的——启发式永远堵不完。
+现在只有两件事被当作硬保障：
+
+1. **失败无法静默**：spec 的版本块**没有任何 `try/except`**（检查器也禁止出现 except）。
+   为此把守卫从 `if os.name == "nt":` 改成 `if sys.platform == "win32":` —— 因为在普通
+   Python 进程里 `os.name` 恒为 `"nt"`，检查器无法用设置 `sys.platform` 的方式模拟两种平台。
+   类名写错或模块改名都会直接让 PyInstaller 崩，而不是产出没有版本信息的 exe。
+2. **断言产物**：`packaging-contract.test.mjs` 读真实 exe 的 `FileVersionInfo`，并额外执行 spec
+   的版本块、按**对象结构**取出 7 个字段与 `ffi` 数字版本——这是唯一能证明"版本资源真的嵌入了"的证据。
+
+AST 检查器降级为 **lint**（在构建前把明显错误喊出来），不再声称是完备契约。
 
 ---
 
@@ -330,6 +352,9 @@ Get-ChildItem .\release\StudyCrew-Setup-1.0.36.exe
 12. **发布坐标未核实**：`electron-builder.yml` 的 `publish.owner=StudyCrew` 指向的仓库是否存在、是否为目标源，未验证。
 13. **`skills/` 未被 ignore 且不提交**：按计划约束不得改动/提交；"基线可信"仅指已提交内容。
 14. **`M3` 未修**：NSIS 根文件按扩展名白名单删，未来 Electron 新增非白名单后缀会在卸载后残留（实测当前 Electron 43 的 19 个根文件 100% 被覆盖，故为低风险卫生问题）。
+15. **`backend-build.mjs` 的依赖指纹不完整**：只覆盖 `pyinstaller`/`playwright`/`PyYAML`/`ddgs`/`duckduckgo-search` 五个包，而 backend 真正会被冻结的还有 `httpx`、`websockets`——`pip install -U httpx` 不会触发重建，会静默沿用旧 exe（与"版本资源静默失败"同类）。反过来 `package.json`/`electron-builder.yml` 被纳入指纹却是纯粹的过度重建成本（它们与 PyInstaller 产物无关）。**未修**。
+16. **AST 检查器不是完备契约**：它已被三轮复审击穿，第四版把它降级为 lint 并明确写进文件头。真正的硬保障只有"版本块没有可吞的异常" + "产物级断言读真实 exe"。**不要**再基于"检查器全绿"推断产物正确。
+17. **Python 探测仍硬编码 `py -3.12`**：`packaging-contract.test.mjs` 与 `spec-check.mjs` 都直接用 `py -3.12`，没有走 `scripts/python-command.mjs` 的候选序；在无 `py` launcher 的机器上会给出误导性失败（报成"hiddenimports 不可解析"）。`backend-build.mjs` 与 `copy-chromium.mjs` 已统一，测试侧**未统一**。
 
 ---
 
@@ -417,3 +442,50 @@ Get-ChildItem .\release\StudyCrew-Setup-1.0.36.exe
 
 **复审对我方法的批评是正确的**：第二版用自写探针"自证"加固有效，而该探针复刻了一份断言逻辑——
 断言逻辑有两份时，测其中一份不能证明另一份。这个错误比它抓到的代码缺陷更值得记住。
+
+---
+
+## 12. 第四轮独立复审（对第三版）与其处置
+
+对第三版的独立复审**再次判定 FAIL（0 Critical / 8 Important / 7 Minor）**。它做了三件很有价值的事：
+
+1. **击穿了我的"AST 加固"**：用真实测试文件驱动 6 种新写法，19 条断言全绿，而运行期 `_VERSION` 确实是 `None`。
+2. **指出我的判定规则方向反了**：`_VERSION` 覆写规则放过了唯一危险的顺序（有效→None，且在 `EXE` 前），反而误拦更安全的写法（None 置顶 + 分支覆盖）。
+3. **给出了正确的方向**：*"AST 检查器只能当 lint，不能当契约"*——真正兜底的是"让失败无法静默" + "断言产物"，不是再加规则。
+
+### 处置
+
+| 发现 | 内容 | 处置 |
+|---|---|---|
+| I1 | `_VERSION` 覆写判定方向颠倒（漏危险序、误拦安全序）；`EXE` 之后覆写其实无害（`EXE.__init__` 调用时已取走引用）| ✅ 删掉该启发式，改为**执行求值**：抽出赋值/条件块真跑一遍，直接看 `_VERSION` 是不是 `None` |
+| I2 | 6 种写法全绿（`globals()[...]`、`exec`、危险序、异常别名、decoy `Analysis`/`EXE`）| ✅ 全部拦住（见 §4.1 表）；新增 7 条变异测试 |
+| I3 | `spec-check` 报问题时 `execFileSync` 抛异常 → 整份测试文件崩、后续断言成死代码；中文输出 mojibake | ✅ `runJson` 改 `spawnSync` 容忍非 0 退出码；Python 子进程加 `PYTHONIOENCODING=utf-8` |
+| I4 | `filevers`/`prodvers` 数字字段无守护（只读字符串版本看不出来）| ✅ 在版本对象断言里解析 `ffi` 的 `fileVersionMS/LS`、`productVersionMS/LS` 并比对四段版本 |
+| I5 | NSIS "保留 data/Logs" 只是字符串出现性检查；`RMDir /r "$INSTDIR\data"`、大写 `RMDIR`、行尾注释都能过 | ✅ 改为**反向断言**：任何 `RMDir`/`Delete` 目标不得位于 `data\`/`Logs\` 之下，不得删 `$INSTDIR` 本体；大小写不敏感、剥行尾注释 |
+| I6 | spec 注释自相矛盾（一处说"需要显式声明"，一处说"其实会被自动收集"）| ✅ 统一为实测结论 |
+| R1 | §4.1 表把 v1/v2 结果混为一列，"12 种全部被拦"不实 | ✅ 已重写为 v1/v2/v3 三列并逐格标注（§4.1）|
+| R2 | 交叉引用指向不存在的条目；测试计数停留在上一版 | ✅ 见下方"计数更正"，并把 httpx/websockets、`py -3.12` 探测真正写进 §7 |
+
+### 采纳的方向性改变
+
+第三版仍在"加规则"。第四版承认**启发式堵不完**，改为两条硬保障（详见 §4.1 末）：
+
+- spec 的版本块**没有任何 `try/except`**（检查器一并禁止 except），失败直接崩构建；
+- **产物级断言**读真实 exe，并执行 spec 的版本块按对象结构校验 7 个字段 + `ffi` 数字版本。
+
+同时把守卫从 `os.name == "nt"` 改为 `sys.platform == "win32"`：前者在普通 Python 进程里恒为真，
+检查器无法模拟非 Windows 分支；后者可被设置，探针才能真正区分两种平台。
+
+### 计数更正（覆盖前文散落数字）
+
+| 项 | 本文早期数字 | 实测 |
+|---|---|---|
+| `packaging-contract.test.mjs` | "10 个断言"（正文只列 9 条）| 10 个 test（spec 结构 1 + hiddenimports 1 + dotenv 1 + buildVersion 1 + 资源生成者 1 + NSIS 1 + dist:win 1 + verify:all 1 + 产物级 1 + 版本对象 1）|
+| `spec-check.test.mjs` | — | 17 个 test（真实 spec 1 + 拒绝 14 + 接受 2）|
+| `npm run test:packaging` | 19 | **27**（10 + 17）|
+| `npm run test:foundation` | 13 / 21 | **29**（2 + 27）+ verify:runtime |
+| playwright / yaml 被自动收集的模块数 | 52 / 15 | 复审独立复现为 **55 / 17**（机制结论不变：删与不删 hiddenimports 产物一致）|
+
+**仍未修（诚实列出）**：`backend-build.mjs` 的依赖指纹只覆盖 5 个包（`httpx`/`websockets` 升级不触发重建），
+却把 `package.json`/`electron-builder.yml` 纳入（属纯粹的过度重建成本）；AST 检查器仍可能被更巧妙的
+写法绕过——这正是把它定位为 lint 而非契约的原因。这两条已列入 §7 的已知限制。

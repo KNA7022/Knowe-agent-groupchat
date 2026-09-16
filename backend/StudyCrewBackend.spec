@@ -27,17 +27,23 @@
 #      真正的前提是：**构建机必须装好这些包**（见 scripts/backend-build.mjs）。
 
 import os  # noqa: E402
+import sys  # noqa: E402
 
-# 版本资源仅 Windows 构建机可用。
+# ── 版本资源：让失败无法静默 ───────────────────────────────────────────────
 #
 # ⚠ 修复记录（阶段 0）：上游代码写的是 `FixedFileVersion`——PyInstaller 里
-#   **不存在**这个类（正确名是 `FixedFileInfo`），于是 import 抛 ImportError，
-#   又被 `except Exception: _VERSION = None` 静默吞掉，结果产物 exe 的
-#   CompanyName/FileVersion 等全部为空。错误的类名 + 宽泛的 except 是这次
-#   "静默失败"的两个原因，现分别修正为正确类名与只捕获 ImportError。
-if os.name == "nt":
-    # 导入失败即让构建失败：宁可不打包，也不产出没有版本资源的 exe。
-    from PyInstaller.utils.win32.versioninfo import (  # noqa: F401
+#   **不存在**这个类（正确名是 `FixedFileInfo`）。那次 import 抛 ImportError，
+#   又被 `except Exception: _VERSION = None` 吞掉，于是产物 exe 的
+#   CompanyName/FileVersion 等全部为空：构建成功、测试全绿、没人发现。
+#
+#   因此这里**故意不写任何 try/except**：类名写错、模块改名都会直接让
+#   PyInstaller 崩掉，而不是产出一个没有版本信息的 exe。这是"失败无法静默"
+#   这条原则的具体落实——静态检查（scripts/spec-check.mjs）只是补充 lint，
+#   真正兜底的是"没有可吞的异常" + "产物级断言读真实 exe"。
+#
+#   非 Windows 构建机（v1 只发布 Windows x64）走 else 分支。
+if sys.platform == "win32":
+    from PyInstaller.utils.win32.versioninfo import (
         FixedFileInfo,
         StringFileInfo,
         StringStruct,
@@ -49,7 +55,8 @@ if os.name == "nt":
 
     # 版本单一来源 = package.json 的 version（三段）+ Windows 惯例第四段 build。
     # 每次发版必须同步：scripts/packaging-contract.test.mjs 会断言此处与
-    # package.json 同源，滞后会让 exe 文件属性显示错误版本。
+    # package.json 同源（含 filevers/prodvers 数字字段），滞后会让 exe 文件属性
+    # 显示错误版本。
     _VERSION = VSVersionInfo(
         ffi=FixedFileInfo(
             filevers=(1, 0, 36, 0),
@@ -75,7 +82,7 @@ if os.name == "nt":
             VarFileInfo([VarStruct("Translation", [0x0409, 1200])]),
         ],
     )
-else:  # pragma: no cover - 非 Windows 构建机（v1 只发布 Windows x64）
+else:  # pragma: no cover - 非 Windows 构建机
     _VERSION = None
 
 # icon 在 <工作副本>/build/icon.ico（spec 上一级目录）。PyInstaller 把相对路径
