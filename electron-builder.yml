@@ -6,7 +6,7 @@
 #   2. extraResources 把 PyInstaller 产物整体拷为 resources/backend/
 #      （main.ts:99-101 BACKEND_DIR=resourcesPath/backend，BACKEND_EXE 在其下）
 #      —— 不再要 runtime/ 与 backend/ 源码（阶段 1.5 后为死路径）
-#   3. ms-playwright/ 由 copy-chromium.mjs 预先拷入 dist/KnoweBackend/，
+#   3. ms-playwright/ 由 copy-chromium.mjs 预先拷入 dist/StudyCrewBackend/，
 #      随 extraResources 一起进 resources/backend/ms-playwright（main.ts:629 预期位置）
 #   4. NSIS：per-user 安装（不请求管理员）、允许改目录、卸载保留数据（installer.nsh）
 #   5. 输出到 release/（dist/ 是 PyInstaller 产物目录，不能混）
@@ -40,7 +40,7 @@ files:
 
 # 后端（PyInstaller onedir 产物，214MB + ms-playwright 271MB）整体进 resources/backend
 extraResources:
-  - from: dist/KnoweBackend
+  - from: dist/StudyCrewBackend
     to: backend
     filter:
       - "**/*"

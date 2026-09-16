@@ -60,6 +60,11 @@ const checks = [
   ['migration backup can be created and copied without an existing parent', verifyMigrationBackupCreation()],
   ['locale values contain no legacy visible brand', localeValues.every((value) => typeof value !== 'string' || !value.includes('Knowe'))],
   ['visible components contain no legacy brand literal', visibleBrandSources.every((source) => !source.includes("'Knowe'") && !source.includes('>Knowe<'))],
+  // 打包产物标识符也必须完成品牌迁移：spec/electron-builder/main.ts/copy-chromium 四处必须同源。
+  ['PyInstaller spec carries no legacy backend name', !readFileSync(resolve(root, 'backend/StudyCrewBackend.spec'), 'utf8').includes('KnoweBackend')],
+  ['electron-builder bundles the StudyCrew backend artifact', /from: dist\/StudyCrewBackend\b/.test(builder) && !/dist\/KnoweBackend\b/.test(builder)],
+  ['main resolves the StudyCrew backend executable', mainSource.includes("'StudyCrewBackend.exe'")],
+  ['copy-chromium targets the StudyCrew backend artifact', !readFileSync(resolve(root, 'scripts/copy-chromium.mjs'), 'utf8').includes('KnoweBackend')],
 ];
 
 const failures = checks.filter(([, passed]) => !passed).map(([name]) => name);

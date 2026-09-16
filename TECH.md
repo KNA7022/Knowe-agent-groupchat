@@ -68,26 +68,46 @@ Configuration is read from environment variables (see `backend/config.py`). Key 
 | `KNOWE_AGENT` | Agent mode: `fake` (offline, no LLM) or `deepseek` |
 | `KNOWE_DATA_DIR` | Override data directory |
 
-A `.env` file is supported (via python-dotenv) — never commit it.
+A `.env` file is **not** read by the backend. Credentials are never sourced from
+environment variables or plaintext files: the Electron main process stores provider
+keys through OS `safeStorage`, and the Python side can only redeem short-lived,
+purpose-bound leases. Use the in-app Settings page to configure a provider; set the
+non-secret variables above (e.g. `KNOWE_AGENT`, `KNOWE_DATA_DIR`) in the environment
+if you need to override them.
 
 ## Building the Windows installer
 
 The full build pipeline produces an NSIS installer via electron-builder, with the Python backend bundled by PyInstaller.
 
+Prerequisites: Node.js 24.x (`npm run preflight` enforces this) and Python 3.12 with
+`pip install pyinstaller playwright ddgs` — the last two are optional but must be
+installed *before* packaging if you want browser automation and web search in the
+shipped app, because PyInstaller only bundles what is importable at build time.
+
 ```bash
-# 1. build the Python backend (PyInstaller) — from backend/
-python -m PyInstaller --noconfirm --clean KnoweBackend.spec
-
-# 2. prepare Chromium for browser automation
-npm run copy:chromium
-
-# 3. build the full installer (electron-vite build + electron-builder NSIS)
+# One command does everything (icon → PyInstaller → chromium → electron-builder NSIS):
 npm run dist:win
 ```
 
-Output lands in `release/` as `Knowe Setup <version>.exe`.
+Or the individual steps:
 
-> **Note**: after changing backend code, you MUST re-run step 1 (PyInstaller) — electron-builder only assembles the frontend and does not rebuild the backend. Verify the bundled `KnoweBackend.exe` timestamp is fresh after packaging.
+```bash
+# 1. generate build icon (build/ is gitignored, so it must be regenerated per checkout)
+npm run icon:ico
+
+# 2. build the Python backend (PyInstaller) — runs from backend/
+npm run backend:build
+
+# 3. prepare Chromium for browser automation
+npm run copy:chromium
+
+# 4. build the full installer (electron-vite build + electron-builder NSIS)
+npm run dist:win:app
+```
+
+Output lands in `release/` as `StudyCrew-Setup-<version>.exe`.
+
+> **Note**: after changing backend code, you MUST re-run step 2 (PyInstaller) — electron-builder only assembles the frontend and does not rebuild the backend. Verify the bundled `StudyCrewBackend.exe` timestamp is fresh after packaging.
 
 ## Data & privacy
 

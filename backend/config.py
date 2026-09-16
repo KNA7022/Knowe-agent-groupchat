@@ -95,7 +95,7 @@ def _install_root_default() -> str:
     优先级：
       1. env KNOWE_INSTALL_ROOT（Electron 流程显式注入，最权威）；
       2. PyInstaller 冻结态（sys._MEIPASS 存在）：取 _MEIPASS 的父目录——
-         直接跑 KnoweBackend.exe 时 _MEIPASS = <安装根>/_internal，
+         直接跑 StudyCrewBackend.exe 时 _MEIPASS = <安装根>/_internal，
          父目录即安装根；
       3. 开发态：从包位置往上推两级 = 项目根（原语义，保持不变）。
     """

@@ -68,26 +68,43 @@ npm run test        # Vitest（前端）
 | `KNOWE_AGENT` | Agent 模式：`fake`（离线，不调 LLM）或 `deepseek` |
 | `KNOWE_DATA_DIR` | 覆盖数据目录 |
 
-支持 `.env` 文件（python-dotenv）——**切勿提交到仓库**。
+后端**不读** `.env` 文件。凭据不走环境变量、也不走明文文件：Provider Key 由 Electron
+主进程经系统 `safeStorage` 保存，Python 侧只能兑换 purpose-bound 的短租。请在应用内
+设置界面配置模型服务；上表中的非密钥变量（如 `KNOWE_AGENT`、`KNOWE_DATA_DIR`）如需
+覆盖，直接设在环境里。
 
 ## 构建 Windows 安装包
 
 完整构建管线：PyInstaller 打包后端 + electron-builder 产出 NSIS 安装包。
 
+前置：Node.js 24.x（`npm run preflight` 会强制检查）、Python 3.12，并
+`pip install pyinstaller playwright ddgs` —— 后两个是可选的，但**必须在打包前**装好，
+否则产物里不会带浏览器自动化与网络搜索，因为 PyInstaller 只会打包构建时可导入的东西。
+
 ```bash
-# 1. 构建 Python 后端（PyInstaller）—— 在 backend/ 下执行
-python -m PyInstaller --noconfirm --clean KnoweBackend.spec
-
-# 2. 准备浏览器自动化所需的 Chromium
-npm run copy:chromium
-
-# 3. 构建完整安装包（electron-vite build + electron-builder NSIS）
+# 一条命令全流程（图标 → PyInstaller → Chromium → electron-builder NSIS）：
 npm run dist:win
 ```
 
-产物输出到 `release/`，命名 `Knowe Setup <版本号>.exe`。
+或分步执行：
 
-> **注意**：修改后端代码后，**必须重新执行第 1 步（PyInstaller）**——electron-builder 只组装前端、不会重编后端。打包后请验证进包的 `KnoweBackend.exe` 时间戳是新生成的。
+```bash
+# 1. 生成构建图标（build/ 被 .gitignore 忽略，每个检出都要重新生成）
+npm run icon:ico
+
+# 2. 构建 Python 后端（PyInstaller）—— 在 backend/ 下执行
+npm run backend:build
+
+# 3. 准备浏览器自动化所需的 Chromium
+npm run copy:chromium
+
+# 4. 构建完整安装包（electron-vite build + electron-builder NSIS）
+npm run dist:win:app
+```
+
+产物输出到 `release/`，命名 `StudyCrew-Setup-<版本号>.exe`。
+
+> **注意**：修改后端代码后，**必须重新执行第 2 步（PyInstaller）**——electron-builder 只组装前端、不会重编后端。打包后请验证进包的 `StudyCrewBackend.exe` 时间戳是新生成的。
 
 ## 数据与隐私
 

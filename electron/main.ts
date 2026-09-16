@@ -127,10 +127,10 @@ const BACKEND_DIR = app.isPackaged
   ? join(process.resourcesPath, 'backend')
   : join(PROJECT_ROOT, 'backend');
 // [阶段1.5] 打包版后端 = PyInstaller 产物（随 resources/backend 一起分发）。
-//   [macOS R1] 产物名按平台区分：win32 → KnoweBackend.exe，darwin → KnoweBackend（无后缀 mach-o）。
+//   [macOS R1] 产物名按平台区分：win32 → StudyCrewBackend.exe，darwin → StudyCrewBackend（无后缀 mach-o）。
 const BACKEND_EXE = join(
   BACKEND_DIR,
-  process.platform === 'win32' ? 'KnoweBackend.exe' : 'KnoweBackend',
+  process.platform === 'win32' ? 'StudyCrewBackend.exe' : 'StudyCrewBackend',
 );
 const BUNDLED_RUNTIME_ROOT = app.isPackaged
   ? join(process.resourcesPath, 'runtime')
@@ -983,7 +983,7 @@ function buildBackendEnv(): NodeJS.ProcessEnv {
 }
 
 /**
- * 启动后端子进程：打包版执行 KnoweBackend（PyInstaller 产物，win32 为 .exe），
+ * 启动后端子进程：打包版执行 StudyCrewBackend（PyInstaller 产物，win32 为 .exe），
  * 开发态 `python -m backend`（cwd=PROJECT_ROOT，归一后单层包解析前提；
  * knowe_* 由 PYTHONPATH=BACKEND_DIR 兜底）。
  *   前置检查放在这里——可执行文件或 backend/ 不在，直接判 failed，
@@ -1047,7 +1047,7 @@ function spawnBackend(): void {
       //   server.py 的 `from knowe_provenance import ...` 依赖 PYTHONPATH=BACKEND_DIR 兜底。
       //   [v1.0.24.7 结构归一] backend 上提为单层实现包，`python -m backend` 必须从
       //   PROJECT_ROOT 启动才能解析 backend 包；knowe_* 顶层包仍由 PYTHONPATH=BACKEND_DIR 兜底。
-      //   [阶段1.5] 打包态：KnoweBackend（win32 为 .exe）以 BACKEND_DIR 为 cwd，_internal/ 依赖按相对路径解析。
+      //   [阶段1.5] 打包态：StudyCrewBackend（win32 为 .exe）以 BACKEND_DIR 为 cwd，_internal/ 依赖按相对路径解析。
       cwd: app.isPackaged ? BACKEND_DIR : PROJECT_ROOT,
       // 固定打包运行时 + UTF-8 stdio + 唯一后端数据根（见 buildBackendEnv）。
       env: backendEnv,

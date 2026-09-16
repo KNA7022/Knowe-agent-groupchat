@@ -51,3 +51,6 @@ Thumbs.db
 *.7z
 build/
 assets/videos/compressed/
+
+# [阶段0] 本地固定版本工具链（Node 24）——按需下载，不进版本库；见 .tools/node24.ps1
+.tools/

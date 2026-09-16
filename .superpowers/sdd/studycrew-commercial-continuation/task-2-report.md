@@ -1,5 +1,28 @@
 # Task 2 交付报告：Provider / Tool / MCP / PII / Secret Gateway
 
+## 0. 失实声明更正（2026-09-16，阶段 0 补录）
+
+`task-2-rereview.md`（独立复审，结论 FAIL / 2 Critical / 8 Important）之后，另有独立只读审计
+对本文的三处自我声明做了逐行核对，**结论是它们与代码不符**。此处按"保留原表述 + 就地更正"
+的原则补录，不改写历史声称。
+
+| 位置 | 原文声称 | 代码事实 | 对应发现 |
+|---|---|---|---|
+| §2.2 末（原第 69 行） | "底层 `ProviderClient` 的真实网络模式离开 Gateway 会确定性拒绝，只有显式注入 `MockTransport` 的 test seam 可独立运行。" | **不成立**。`backend/knowe_core/provider_client.py:228` 把"存在任意 `client_factory`"直接判定为 `_gateway_managed`，并不校验它是否是不可联网的 fake。实测 `ProviderClient(base_url="https://api.deepseek.com", client_factory=lambda: httpx.AsyncClient())`（真实 client、无 MockTransport）**通过** `_assert_gateway_managed`。既有测试只覆盖了"不传 factory 时抛 PermissionError"这一半。 | **C-R1** |
+| §10 第 5 条（原第 304 行） | "`master_key` 已受 SecretVault 合同保护，但本范围内没有上层 master-key consumer。" | **不成立**。`electron/secretVault.ts:17-30` 的 `kind`/`audience` 是写死的单值（`'provider_credential'` / `'provider_gateway'`），`src/shared/bridge.ts:37-75` 同样没有 master-key 分支，**main 侧不存在 master-key 类型、校验或存储路径**。反向的 Python broker 分支（`backend/commercial_gateway.py:2230,2250-2256`）保留着 `kind="master_key"` 却无任何调用者。准确表述是：**master-key 类型合同未实现**（有消费者、无生产者）。 | **I-R3** |
+| §5 I4 行（原第 130 行） | "Electron spawn 过滤 secret-looking env" | **不足以支撑该表结论**。`electron/main.ts:940-948` 是 `{...process.env}` 全量复制 + 7 类**后缀** denylist（`API_KEY\|ACCESS_TOKEN\|REFRESH_TOKEN\|AUTH_TOKEN\|MASTER_KEY\|SECRET_KEY\|PASSWORD`）。实测未删除：`AZURE_OPENAI_KEY`、`OPENAI_API_TOKEN`、`AWS_SECRET_ACCESS_KEY`、`AWS_ACCESS_KEY_ID`、`AZURE_CLIENT_SECRET`、`GOOGLE_APPLICATION_CREDENTIALS`、`AWS_SHARED_CREDENTIALS_FILE`、`HF_TOKEN`、`GITHUB_TOKEN`、`OPENAI_API_KEY_FILE`。 | **I-R6** |
+
+**同时更正本文 §5 C1 行的措辞**："真实底层 `ProviderClient` 离开 Gateway 拒绝"应改为
+"真实底层 `ProviderClient` 在缺少 purpose-bound lease 时于网络前拒绝，但经 `client_factory`
+注入的真实网络 client 会被误判为受管 transport"（这正是 C-R1 的缺口）。
+
+**并说明 §8.1 验证集的覆盖边界**：该聚焦集（76 passed）**不覆盖** `runtime_settings` 的
+Provider probe。`backend/tests` 全仓 grep `_probe_once|test_binding|governed Provider probe unavailable`
+**无任何匹配**，即 I-R8 所描述的"Settings 连接测试必然失败"既无红测也无绿测，把该文件计入
+"settings 已接网关"的证据属于名不副实。
+
+> 未修改的正文声称保持原样以便追溯；凡与上表冲突者，**以上表为准**。
+
 ## 1. 结论与范围
 
 Task 2 已在 `feature/studycrew-foundation` 上完成。实现以既有 Task Runtime 为唯一授权与审计权威，没有新建第二套 approval/grant 状态机。Renderer 和模型输入都只能提出请求，不能自行扩权。

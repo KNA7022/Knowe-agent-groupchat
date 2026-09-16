@@ -4,8 +4,8 @@
  *
  * 背景（对应 00-审计与架构报告 v2 第 7 节，和洲已拍板带 headless_shell）：
  *   - main.ts:629 打包版注入 PLAYWRIGHT_BROWSERS_PATH = resources/backend/ms-playwright
- *   - electron-builder extraResources 把 dist/KnoweBackend/ 整体拷为 resources/backend/
- *   - 所以把内核拷到 dist/KnoweBackend/ms-playwright/ 即可随包到位
+ *   - electron-builder extraResources 把 dist/StudyCrewBackend/ 整体拷为 resources/backend/
+ *   - 所以把内核拷到 dist/StudyCrewBackend/ms-playwright/ 即可随包到位
  *
  * 版本匹配（硬约束）：随包内核必须匹配**后端 Python playwright**（浏览器工具是
  *   browser_tools.py 调的，PyInstaller 冻结的就是 conda 环境的 playwright）。
@@ -23,9 +23,10 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { parsePythonCommand } from './python-command.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const DIST_BACKEND = join(ROOT, 'dist', 'KnoweBackend');
+const DIST_BACKEND = join(ROOT, 'dist', 'StudyCrewBackend');
 
 /** 开发机 playwright 浏览器缓存根（playwright 库原生定位路径）。 */
 //   [macOS R4] 按平台：win32 = %USERPROFILE%\AppData\Local\ms-playwright，darwin = ~/Library/Caches/ms-playwright。
@@ -35,7 +36,15 @@ const MS_PLAYWRIGHT_ROOT = process.platform === 'win32'
 
 function backendExpectedRevision() {
   // 用后端 Python 读 playwright 的期望浏览器 revision（单一事实源）。
-  const candidates = [process.env.KNOWE_DEV_PYTHON, 'python', 'python3'].filter(Boolean);
+  // 候选顺序与 preflight.mjs / backend-build.mjs 保持一致：显式覆盖 → py -3.12 → python。
+  // 曾用裸 `python`/`python3`，在装了多个解释器的机器上会读到**另一个** playwright 的
+  // revision，从而拷入错误版本的内核（playwright 会拒绝启动）。
+  const candidates = [
+    process.env.STUDYCREW_DEV_PYTHON,
+    process.env.KNOWE_DEV_PYTHON,
+    process.platform === 'win32' ? 'py -3.12' : 'python3.12',
+    process.platform === 'win32' ? 'python' : 'python3',
+  ].filter((value, index, all) => value && all.indexOf(value) === index);
   const probe = `
 import json, pathlib
 try:
@@ -51,12 +60,16 @@ for b in d["browsers"]:
 else:
     raise SystemExit("browsers.json 里找不到 chromium-headless-shell")
 `;
-  for (const executable of candidates) {
-    const r = spawnSync(executable, ['-c', probe], { encoding: 'utf8' });
+  for (const candidate of candidates) {
+    const { command, args } = parsePythonCommand(candidate);
+    const r = spawnSync(command, [...args, '-c', probe], { encoding: 'utf8' });
     if (r.error?.code === 'ENOENT') continue;
     if (r.status === 0) {
       const rev = r.stdout.trim();
-      if (/^\d+$/.test(rev)) return rev;
+      if (/^\d+$/.test(rev)) {
+        console.log(`[copy-chromium] 期望 revision 取自：${candidate} → ${rev}`);
+        return rev;
+      }
     }
   }
   throw new Error('无法从后端 Python 读取 playwright 期望 revision（需要 playwright 已安装）');
@@ -90,7 +103,8 @@ async function main() {
   const src = join(MS_PLAYWRIGHT_ROOT, `chromium_headless_shell-${rev}`);
   if (!existsSync(src)) {
     console.error(`[copy-chromium] 开发机缓存缺 chromium_headless_shell-${rev}：${src}`);
-    console.error('运行：python -m playwright install chromium-headless-shell');
+    console.error(`运行（用打包后端的同一个解释器）：py -3.12 -m playwright install chromium-headless-shell`);
+    console.error('或用 STUDYCREW_DEV_PYTHON 指定该解释器后重跑本脚本。');
     process.exit(1);
   }
 
