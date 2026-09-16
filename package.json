@@ -10,7 +10,7 @@
   "scripts": {
     "verify": "npm run typecheck && npm run lint && npm run test",
     "verify:runtime": "node scripts/verify-runtime.mjs",
-    "test:foundation": "node --test scripts/python-command.test.mjs scripts/packaging-contract.test.mjs && npm run verify:runtime",
+    "test:foundation": "node --test scripts/python-command.test.mjs scripts/packaging-contract.test.mjs scripts/spec-check.test.mjs && npm run verify:runtime",
     "test:backend": "py -3.12 -m pytest backend/tests",
     "verify:all": "npm run preflight && npm run test:foundation && npm run verify && npm run test:backend && npm run electron:build",
     "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json",
@@ -33,7 +33,7 @@
     "copy:chromium": "node scripts/copy-chromium.mjs",
     "dist:win": "node scripts/clean-electron-build.mjs && npm run build:resources && npm run icon:ico && npm run backend:build && npm run copy:chromium && npm run electron:build && electron-builder --win nsis",
     "dist:win:app": "npm run electron:build && electron-builder --win nsis",
-    "test:packaging": "node --test scripts/packaging-contract.test.mjs"
+    "test:packaging": "node --test scripts/packaging-contract.test.mjs scripts/spec-check.test.mjs"
   },
   "dependencies": {
     "i18next": "^26.3.6",

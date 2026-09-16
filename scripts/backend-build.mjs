@@ -13,9 +13,20 @@
  *
  * 可选依赖说明：web_tools.py / browser_tools.py / file_ops.py 对
  *   ddgs、playwright、yaml 都是 **延迟导入**，缺失时降级为可读提示。
- *   但 playwright 与 yaml 在 spec 的 hiddenimports 里：PyInstaller 6.x 对
- *   缺失的 hiddenimport 只打 ERROR 并继续（退出码仍是 0），因此产物会**静默
- *   缺少该能力**。所以这里对这两个包做硬前置检查，避免"构建成功但功能没了"。
+ *   PyInstaller 只打包**构建时可导入**的东西，所以构建机装了什么，产物就带什么。
+ *
+ *   ⚠ 更正一处曾被写错的因果：spec 的 hiddenimports 里有没有这两个名字，
+ *   **并不决定它们是否进产物**——`playwright` 与 `yaml` 的导入在字节码里静态可见
+ *   （browser_tools.py 的 `from playwright import async_api`、file_ops.py 的
+ *   `import yaml`），PyInstaller 会自动收集；playwright 还自带 PyInstaller 钩子。
+ *   把它们写进 hiddenimports 只是为了"显式声明"，不是唯一来源。
+ *   真正的约束是：**构建机必须能 import 它们**。
+ *
+ *   因此这里的检查按依赖性质分级：
+ *     - playwright：应用的核心浏览器能力，缺失即硬失败（避免产出残废包）；
+ *     - yaml：file_ops.py 里明确标注的"可选依赖：装了就查，没装就跳过"
+ *       （见该文件 _check_yaml），缺失只 warn，不为一个可选校验能力阻断整条构建链；
+ *     - ddgs / duckduckgo_search：网络搜索后端，缺失只 warn。
  *
  * 幂等：不只是"产物比 backend 源码新"。打包输入还包括 spec 本身、图标、
  *   package.json、electron-builder.yml，以及 Python 解释器与关键依赖的指纹。
@@ -38,10 +49,10 @@ const EXE = join(DIST, process.platform === 'win32' ? 'StudyCrewBackend.exe' : '
 const STAMP = join(ROOT, 'build', 'pyinstaller-backend-build.json');
 const force = process.argv.includes('--force');
 
-/** spec 的 hiddenimports 里声明的、必须是硬前置的可选依赖。 */
-const REQUIRED_OPTIONAL = ['playwright', 'yaml'];
-/** 只 warn 的真可选依赖。 */
-const SOFT_OPTIONAL = ['ddgs', 'duckduckgo_search'];
+/** 缺失即硬失败：应用的核心能力，缺了产物是残废的。 */
+const REQUIRED_OPTIONAL = ['playwright'];
+/** 缺失只警告：真可选（file_ops 的 yaml 校验、web_tools 的 ddgs 搜索后端）。 */
+const SOFT_OPTIONAL = ['yaml', 'ddgs', 'duckduckgo_search'];
 
 /** Python 候选，与 preflight.mjs 同顺序（显式覆盖优先）。 */
 const PYTHON_CANDIDATES = [
@@ -172,19 +183,20 @@ if (!python.available.includes('PyInstaller')) {
   process.exit(1);
 }
 
-// spec 的 hiddenimports 需要它们；缺了 PyInstaller 只会打 ERROR 然后继续，
-// 产物会静默少掉浏览器自动化 / YAML 严格校验，所以这里硬失败。
+// playwright 是应用的核心浏览器能力。PyInstaller 只打包构建时可导入的东西，
+// 构建机上没有它就一定不会进产物，因此这里硬失败而不是产出残废包。
 const missingRequired = REQUIRED_OPTIONAL.filter((name) => !python.available.includes(name));
 if (missingRequired.length) {
-  console.error(`❌ backend:build 缺少 spec 声明的必需可选依赖：${missingRequired.join(', ')}`);
+  console.error(`❌ backend:build 缺少必需依赖：${missingRequired.join(', ')}`);
   console.error(`   → 执行：pip install ${missingRequired.join(' ')}`);
-  console.error('   （它们位于 spec 的 hiddenimports；缺失会被 PyInstaller 静默跳过，产物将缺少对应能力）');
+  console.error('   （PyInstaller 只收集构建时可导入的模块，缺了它产物不会带该能力）');
   process.exit(1);
 }
 for (const optional of SOFT_OPTIONAL) {
   if (!python.available.includes(optional)) {
     console.warn(
-      `[backend:build] ⚠ ${optional} 未安装 → 网络搜索能力不会进入产物（应用内会给出安装提示）`,
+      `[backend:build] ⚠ ${optional} 未安装 → 该可选能力不会进入产物（应用内会给出提示；` +
+        `yaml 影响文件严格校验，ddgs 影响网络搜索）`,
     );
   }
 }

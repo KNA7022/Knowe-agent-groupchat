@@ -78,10 +78,14 @@ npm run test        # Vitest（前端）
 完整构建管线：PyInstaller 打包后端 + electron-builder 产出 NSIS 安装包。
 
 前置：Node.js 24.x（`npm run preflight` 会强制检查）、Python 3.12，并
-`pip install pyinstaller playwright ddgs` —— 后两个是可选的，但**必须在打包前**装好，
-否则产物里不会带浏览器自动化与网络搜索，因为 PyInstaller 只会打包构建时可导入的东西。
-其中 `playwright` 与 `yaml` 写在 spec 的 `hiddenimports` 里，所以缺了它们
-`npm run backend:build` 会**直接失败**，而不是产出一个静默缺少该能力的应用。
+`pip install pyinstaller playwright pyyaml ddgs`。PyInstaller 只打包构建时可导入的东西，
+所以构建机上缺什么，产物里就缺什么：
+
+- `pyinstaller` —— 必需。
+- `playwright` —— 必需；缺了 `npm run backend:build` 会**直接失败**，而不是产出一个
+  浏览器自动化能力静默缺失的应用。
+- `pyyaml` 与 `ddgs` —— 可选；`backend:build` 只给警告。`pyyaml` 用于 `file_ops.py`
+  里那个明确标注为可选的 YAML 严格校验，`ddgs` 提供网络搜索。想要这两项能力就装上。
 
 全新检出还需要先下载一次 Electron 二进制（npm install 若跳过二进制下载则不存在）：
 

@@ -79,13 +79,17 @@ if you need to override them.
 
 The full build pipeline produces an NSIS installer via electron-builder, with the Python backend bundled by PyInstaller.
 
-Prerequisites: Node.js 24.x (`npm run preflight` enforces this), Python 3.12 with
-`pip install pyinstaller playwright ddgs` — the last two are optional but must be
-installed *before* packaging if you want browser automation and web search in the
-shipped app, because PyInstaller only bundles what is importable at build time.
-`playwright` and `yaml` are declared in the spec's `hiddenimports`, so
-`npm run backend:build` **fails loudly** if they are missing rather than shipping an
-app with the capability silently absent.
+Prerequisites: Node.js 24.x (`npm run preflight` enforces this) and Python 3.12 with
+`pip install pyinstaller playwright pyyaml ddgs`. PyInstaller only bundles what is
+importable at build time, so anything missing on the build machine is missing from the
+shipped app:
+
+- `pyinstaller` — required.
+- `playwright` — required; `npm run backend:build` **fails loudly** without it rather
+  than shipping an app whose browser automation is silently absent.
+- `pyyaml` and `ddgs` — optional; `backend:build` only warns. `pyyaml` enables the
+  stricter YAML check in `file_ops.py` (that module documents it as optional), and
+  `ddgs` powers web search. Add them if you want those capabilities in the artifact.
 
 On a fresh checkout you must also fetch the Electron binary once (it is not part of
 the npm install when binary download was skipped):

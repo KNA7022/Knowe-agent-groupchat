@@ -18,11 +18,13 @@
 #      electron-builder.yml 的 extraResources、scripts/copy-chromium.mjs 的
 #      DIST_BACKEND 三处必须与 EXE/COLLECT 的 name 一致，否则打包后启动不到后端。
 #      该一致性由 scripts/packaging-contract.test.mjs 与 scripts/verify-runtime.mjs 守卫。
-#   5. hiddenimports 只列**运行时真实存在**的可选依赖。PyInstaller 对
-#      hiddenimports 中缺失的模块会报错，因此 web 搜索（ddgs / duckduckgo_search）
-#      这类"装了才生效"的可选后端**不能**写死在这里——它们由运行时
-#      web_tools.py / browser_tools.py 自己 try-import，缺失时降级为可读提示。
-#      打包机应先 `pip install ddgs` 再用本 spec，才能把该可选能力带进产物。
+#   5. hiddenimports 只列**必须显式声明**的延迟导入项。
+#      PyInstaller 只打包构建时可导入的东西；playwright 与 yaml 的导入在字节码里
+#      静态可见（browser_tools.py 的 `from playwright import async_api`、
+#      file_ops.py 的 `import yaml`），其实会被自动收集——写在这里是"显式声明"，
+#      不是它们进产物的唯一来源。web 搜索后端（ddgs / duckduckgo_search）是运行时
+#      才决定的，缺失时由 web_tools.py 自己降级为可读提示，故不列入。
+#      真正的前提是：**构建机必须装好这些包**（见 scripts/backend-build.mjs）。
 
 import os  # noqa: E402
 
