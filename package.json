@@ -12,7 +12,7 @@
     "verify:runtime": "node scripts/verify-runtime.mjs",
     "test:foundation": "node --test scripts/python-command.test.mjs scripts/packaging-contract.test.mjs && npm run verify:runtime",
     "test:backend": "py -3.12 -m pytest backend/tests",
-    "verify:all": "npm run preflight && npm run verify:runtime && npm run verify && npm run test:backend && npm run electron:build",
+    "verify:all": "npm run preflight && npm run test:foundation && npm run verify && npm run test:backend && npm run electron:build",
     "typecheck": "tsc --noEmit && tsc --noEmit -p electron/tsconfig.json",
     "lint": "eslint src/ electron/ --ext .ts,.tsx --max-warnings 0",
     "test": "vitest run",

@@ -13,7 +13,9 @@
  *   node_modules 的 playwright-core（两者可能不同版本！实测前端 1.62.0→rev1234，
  *   后端 1.61.0→rev1228，用错会导致 playwright 拒绝启动）。
  *
- * Python 探测：KNOWE_DEV_PYTHON → python → python3（与 preflight.mjs 同模式）。
+ * Python 探测：STUDYCREW_DEV_PYTHON → KNOWE_DEV_PYTHON → py -3.12 → python
+ *   （与 preflight.mjs / backend-build.mjs 同序，且**强制 3.12 闸门**：
+ *    非 3.12 的解释器会被 probe 拒绝并打印原因，避免用错解释器读到错误 revision）。
  *
  * 幂等：目标已存在且完整时跳过。
  */
@@ -46,7 +48,9 @@ function backendExpectedRevision() {
     process.platform === 'win32' ? 'python' : 'python3',
   ].filter((value, index, all) => value && all.indexOf(value) === index);
   const probe = `
-import json, pathlib
+import json, pathlib, sys
+if sys.version_info[:2] != (3, 12):
+    raise SystemExit(f"这个解释器是 {sys.version_info.major}.{sys.version_info.minor}，不是 3.12")
 try:
     import playwright
 except ImportError:
@@ -60,6 +64,7 @@ for b in d["browsers"]:
 else:
     raise SystemExit("browsers.json 里找不到 chromium-headless-shell")
 `;
+  const problems = [];
   for (const candidate of candidates) {
     const { command, args } = parsePythonCommand(candidate);
     const r = spawnSync(command, [...args, '-c', probe], { encoding: 'utf8' });
@@ -70,9 +75,18 @@ else:
         console.log(`[copy-chromium] 期望 revision 取自：${candidate} → ${rev}`);
         return rev;
       }
+      continue;
     }
+    // 版本闸门：probe 现在会拒绝非 3.12 的解释器。必须把原因说出来，否则
+    // "静默回落到另一个解释器"正是我们要消除的那个 bug。
+    const reason = (r.stderr || '').trim().split('\n').filter(Boolean).pop() ?? `退出码 ${r.status}`;
+    problems.push(`${candidate}: ${reason}`);
   }
-  throw new Error('无法从后端 Python 读取 playwright 期望 revision（需要 playwright 已安装）');
+  for (const problem of problems) console.error(`[copy-chromium] ${problem}`);
+  throw new Error(
+    '无法从后端 Python(3.12) 读取 playwright 期望 revision；' +
+      '确认该解释器装了 playwright（py -3.12 -m pip install playwright），或用 STUDYCREW_DEV_PYTHON 指定。',
+  );
 }
 
 function dirSize(dir) {

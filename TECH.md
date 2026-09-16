@@ -9,7 +9,7 @@ A quick technical guide for developers who want to run, build, or extend Knowe. 
 ![Knowe architecture](./docs/assets/TECH-architecture-en.png)
 
 - **Frontend**: Electron + React 18 + TypeScript, built with electron-vite
-- **Backend**: Python 3.11 (FastAPI-style async server), packaged with PyInstaller
+- **Backend**: Python 3.12 (FastAPI-style async server), packaged with PyInstaller
 - **Communication**: local WebSocket (127.0.0.1:8080) + health endpoint (127.0.0.1:8081)
 - **Data**: stored locally — see [Data & privacy](#data--privacy)
 
@@ -33,7 +33,7 @@ The Harness (`backend/knowe_harness/`, ~4,300 lines) is the mechanism layer that
 
 ## Development
 
-Requirements: Node.js 20+, Python 3.11, and a model API key (e.g. DeepSeek).
+Requirements: Node.js 24+, Python 3.12, and a model API key (e.g. DeepSeek).
 
 ```bash
 # install frontend dependencies
@@ -79,21 +79,35 @@ if you need to override them.
 
 The full build pipeline produces an NSIS installer via electron-builder, with the Python backend bundled by PyInstaller.
 
-Prerequisites: Node.js 24.x (`npm run preflight` enforces this) and Python 3.12 with
+Prerequisites: Node.js 24.x (`npm run preflight` enforces this), Python 3.12 with
 `pip install pyinstaller playwright ddgs` — the last two are optional but must be
 installed *before* packaging if you want browser automation and web search in the
 shipped app, because PyInstaller only bundles what is importable at build time.
+`playwright` and `yaml` are declared in the spec's `hiddenimports`, so
+`npm run backend:build` **fails loudly** if they are missing rather than shipping an
+app with the capability silently absent.
+
+On a fresh checkout you must also fetch the Electron binary once (it is not part of
+the npm install when binary download was skipped):
 
 ```bash
-# One command does everything (icon → PyInstaller → chromium → electron-builder NSIS):
+cd node_modules/electron && node install.js
+```
+
+`electron-builder.yml` pins `electronDist: node_modules/electron/dist`, so packaging
+fails with a clear error if that directory is missing.
+
+```bash
+# One command does everything (NSIS resources → icon → PyInstaller → chromium → electron-builder NSIS):
 npm run dist:win
 ```
 
 Or the individual steps:
 
 ```bash
-# 1. generate build icon (build/ is gitignored, so it must be regenerated per checkout)
-npm run icon:ico
+# 1. generate build/ resources (build/ is gitignored, so both must be regenerated per checkout)
+npm run build:resources   # build/installer.nsh — referenced by electron-builder.yml nsis.include
+npm run icon:ico          # build/icon.ico
 
 # 2. build the Python backend (PyInstaller) — runs from backend/
 npm run backend:build

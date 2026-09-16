@@ -65,7 +65,8 @@ nsis:
   # 图标：安装器/卸载器/快捷方式共用多帧 icon.ico（和洲拍板：四类共用）
   installerIcon: build/icon.ico
   uninstallerIcon: build/icon.ico
-  # 自定义 NSIS 脚本：卸载页「保留聊天记录与项目数据」默认勾选 + 卸载跳过 data/Logs
+  # 自定义 NSIS 脚本：卸载时保留安装目录下的 data/（用户数据）与 Logs/（诊断日志），
+  # 只删除程序文件。该文件由 scripts/make-build-resources.mjs 生成（build/ 被 gitignore）。
   include: build/installer.nsh
   # electron-builder 的 appData 清理开关（默认 false）——我们的数据在安装目录 data/，
   # 由 installer.nsh 的 customRemoveFiles 控制，这里保持默认

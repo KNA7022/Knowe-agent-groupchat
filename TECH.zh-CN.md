@@ -9,7 +9,7 @@
 ![Knowe 架构图](./docs/assets/TECH-architecture-zh.png)
 
 - **前端**：Electron + React 18 + TypeScript，electron-vite 构建
-- **后端**：Python 3.11（异步服务），PyInstaller 打包
+- **后端**：Python 3.12（异步服务），PyInstaller 打包
 - **通信**：本机 WebSocket（127.0.0.1:8080）+ 健康检查（127.0.0.1:8081）
 - **数据**：全部本地存储——见下文「数据与隐私」
 
@@ -33,7 +33,7 @@ Harness（`backend/knowe_harness/`，约 4300 行）是掌管每个任务完整�
 
 ## 本地开发
 
-环境要求：Node.js 20+、Python 3.11、模型 API Key（如 DeepSeek）。
+环境要求：Node.js 24+、Python 3.12、模型 API Key（如 DeepSeek）。
 
 ```bash
 # 安装前端依赖
@@ -80,17 +80,29 @@ npm run test        # Vitest（前端）
 前置：Node.js 24.x（`npm run preflight` 会强制检查）、Python 3.12，并
 `pip install pyinstaller playwright ddgs` —— 后两个是可选的，但**必须在打包前**装好，
 否则产物里不会带浏览器自动化与网络搜索，因为 PyInstaller 只会打包构建时可导入的东西。
+其中 `playwright` 与 `yaml` 写在 spec 的 `hiddenimports` 里，所以缺了它们
+`npm run backend:build` 会**直接失败**，而不是产出一个静默缺少该能力的应用。
+
+全新检出还需要先下载一次 Electron 二进制（npm install 若跳过二进制下载则不存在）：
 
 ```bash
-# 一条命令全流程（图标 → PyInstaller → Chromium → electron-builder NSIS）：
+cd node_modules/electron && node install.js
+```
+
+`electron-builder.yml` 固定了 `electronDist: node_modules/electron/dist`，
+该目录缺失时打包会明确报错。
+
+```bash
+# 一条命令全流程（NSIS 资源 → 图标 → PyInstaller → Chromium → electron-builder NSIS）：
 npm run dist:win
 ```
 
 或分步执行：
 
 ```bash
-# 1. 生成构建图标（build/ 被 .gitignore 忽略，每个检出都要重新生成）
-npm run icon:ico
+# 1. 生成 build/ 资源（build/ 被 .gitignore 忽略，二者每个检出都要重新生成）
+npm run build:resources   # build/installer.nsh —— 被 electron-builder.yml 的 nsis.include 硬引用
+npm run icon:ico          # build/icon.ico
 
 # 2. 构建 Python 后端（PyInstaller）—— 在 backend/ 下执行
 npm run backend:build

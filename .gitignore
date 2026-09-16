@@ -52,5 +52,8 @@ Thumbs.db
 build/
 assets/videos/compressed/
 
-# [阶段0] 本地固定版本工具链（Node 24）——按需下载，不进版本库；见 .tools/node24.ps1
-.tools/
+# [阶段0] 本地固定版本工具链（Node 24）——按需下载，不进版本库。
+#   只忽略下载下来的运行时与压缩包；.tools/*.ps1 这类环境脚本要进库，
+#   否则全新检出无法复现 Node 24（这正是它被创建的原因）。
+.tools/node-v*/
+.tools/*.zip
