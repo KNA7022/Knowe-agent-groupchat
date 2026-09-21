@@ -77,8 +77,13 @@ _PUBLIC_EVENT_FIELDS: dict[str, frozenset[str]] = {
         "status", "invocation_id", "tool_name", "purpose", "risk", "started_at",
         "completed_at", "duration_ms", "usage", "error_type",
     }),
+    # `provider_egress` 同时承载 effect 前的 `authorized` 与 effect 后的终态
+    # （`completed`/`failed`）。I-R5：普通（非敏感）请求此前**只有** authorized、
+    # 没有终态，于是公开审计无法证明请求是否执行、耗时多久、实际用了多少 token。
+    # 终态 payload 只放 opaque 与度量字段，不放 body/凭据/PII。
     "provider_egress": frozenset({
         "status", "capability_digest", "privacy", "usage", "approval_required",
+        "duration_ms", "error_type", "actual_tokens", "settled",
     }),
     "verifier_decision": frozenset({"status", "decision_id", "outcome", "approved", "evidence_count"}),
 }

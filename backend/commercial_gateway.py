@@ -2209,6 +2209,10 @@ class _ProviderAuthorization:
     #: 其中用于**输入**估算的那部分：结算时输入维度不退（估算保守），
     #: 只把输出预留按实际上限退回。
     estimated_input_tokens: int = 0
+    #: 授权时刻（单调时钟），用于终态的 duration_ms（I-R5）。
+    started_at: float = 0.0
+    #: 授权时的 capability 摘要，终态事件要带上以便与 authorized 配对（I-R5）。
+    capability_digest: str = ""
 
 
 #: `max_tokens` 未显式给出时施加的 backend 输出上限。
@@ -2539,6 +2543,8 @@ class ProviderGatewayClient:
                 cost_usd=capability.estimated_cost_usd * self._max_attempts(),
             ),
             estimated_input_tokens=estimated_input_tokens,
+            started_at=time.monotonic(),
+            capability_digest=capability_digest,
         )
 
     def _max_attempts(self) -> int:
@@ -2637,19 +2643,52 @@ class ProviderGatewayClient:
         authorization: "_ProviderAuthorization | None",
         *,
         error: BaseException | None,
+        actual_tokens: int | None = None,
     ) -> None:
-        """把 effect 的终态写回 Task Runtime（`_trusted_test_transport` 下无授权，跳过）。"""
+        """把 effect 的终态写回 Task Runtime。
+
+        I-R5：旧实现只对**需要审批**的请求写 `complete_tool` 终态；普通请求
+        （`invocation_id` 为空）直接 return，于是公开审计里只有 effect 前的
+        `authorized`，**无法证明请求是否执行、何时结束、耗时多久、实际用了多少 token**。
+        现在普通请求也会写一条 `provider_egress` 终态事件。
+
+        终态 payload 只含 opaque id 与度量：status / capability_digest / privacy /
+        duration_ms / actual_tokens / typed error——没有 body、凭据或 PII。
+        """
 
         if authorization is None or authorization.runtime is None:
             return
-        if not authorization.invocation_id:
-            # 非敏感请求不会创建 invocation（只有需要审批的才有），此时没有终态要写。
-            return
-        authorization.runtime.store.complete_tool(
-            authorization.invocation_id,
-            status="failed" if error is not None else "completed",
-            error_type=type(error).__name__ if error is not None else "",
+        status = "failed" if error is not None else "completed"
+        if authorization.invocation_id:
+            authorization.runtime.store.complete_tool(
+                authorization.invocation_id,
+                status=status,
+                error_type=type(error).__name__ if error is not None else "",
+            )
+        duration_ms = max(
+            0, int((time.monotonic() - (authorization.started_at or time.monotonic())) * 1000),
         )
+        payload: dict[str, Any] = {
+            "status": status,
+            "capability_digest": authorization.capability_digest,
+            "privacy": authorization.capability.privacy.value,
+            "duration_ms": duration_ms,
+            "approval_required": bool(authorization.invocation_id),
+        }
+        if error is not None:
+            payload["error_type"] = type(error).__name__
+        if actual_tokens is not None and actual_tokens >= 0:
+            payload["actual_tokens"] = int(actual_tokens)
+        try:
+            authorization.runtime.store.change_run(
+                authorization.run_id,
+                event_type="provider_egress",
+                public_payload=payload,
+                idempotency_key=f"provider-terminal:{uuid.uuid4().hex}",
+            )
+        except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+            # 终态审计失败不能把一次已完成的调用变成失败。
+            return
 
     async def chat(
         self,
@@ -2672,7 +2711,11 @@ class ProviderGatewayClient:
             raise
         # I-R1：预留是上界估计，effect 之后按 provider 上报的 usage 补差。
         self._reconcile_provider_usage(authorization, result)
-        self._complete_authorized_effect(authorization, error=None)
+        # I-R5：终态审计带上本次实际用量（拿不到就是 None）。
+        self._complete_authorized_effect(
+            authorization, error=None,
+            actual_tokens=_provider_reported_total_tokens(result),
+        )
         return result
 
     async def chat_stream(

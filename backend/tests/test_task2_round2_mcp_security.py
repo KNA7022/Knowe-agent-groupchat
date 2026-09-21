@@ -439,6 +439,86 @@ def test_seal_check_detects_a_swapped_stdio_executable() -> None:
         registry._seal_target(config.server_id)
 
 
+def test_ordinary_provider_request_writes_a_terminal_audit_event(tmp_path: Any) -> None:
+    """I-R5：普通（非敏感）Provider 请求也必须有终态公开审计。
+
+    旧实现只对**需要审批**的请求写 `complete_tool`；普通请求直接返回，于是公开事件流里
+    只有 effect 前的 `provider_egress: authorized`，**无法证明请求是否执行、何时结束、
+    耗时多久、实际用了多少 token**。
+    """
+
+    from backend.commercial_gateway import (
+        LegacyToolAuthority,
+        ProviderGatewayClient,
+        legacy_tool_authority_context,
+    )
+    from backend.groups import GroupRepository
+    from backend.knowe_core.provider_client import ProviderClient
+    from backend.task_runtime.contracts import TaskStatus
+    from backend.task_runtime.service import TaskRuntimeService
+
+    groups = GroupRepository(tmp_path)
+    runtime = TaskRuntimeService(tmp_path, groups)
+    group = groups.create_group("audit")
+    run = runtime.submit(group.group_id, title="terminal", request_key="t1")
+    run = runtime.schedule()[0]
+    assert run.status is TaskStatus.RUNNING
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 4},
+            },
+        )
+
+    authorization = LegacyToolAuthority(
+        group_id=group.group_id, task_id=run.task_id, run_id=run.run_id, runtime=runtime,
+    )
+    # ⚠ 这里**不能**用 `_trusted_test_transport`：那条通道跳过整个授权（包括审计），
+    #   于是本来就不写任何 provider_egress 事件。要验证 I-R5 必须走真实授权路径，
+    #   只在最底层把发送通道换成 MockTransport。
+    client = ProviderGatewayClient(
+        base_url="https://api.openai.com/v1",
+        api_key="k",
+        model="m",
+        provider="openai-api",
+    )
+    object.__setattr__(
+        client,
+        "_transport",
+        ProviderClient(
+            base_url="https://api.openai.com/v1",
+            api_key="k",
+            model="m",
+            client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            _gateway_managed=True,
+        ),
+    )
+
+    async def call() -> None:
+        with legacy_tool_authority_context(authorization):
+            await client.chat([{"role": "user", "content": "hi"}])
+
+    asyncio.run(call())
+
+    events = [
+        event for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "provider_egress"
+    ]
+    statuses = [event.public_payload.get("status") for event in events]
+    # 既要有 effect 前的 authorized，也要有 effect 后的终态。
+    assert "authorized" in statuses
+    assert "completed" in statuses, statuses
+    terminal = next(e for e in events if e.public_payload.get("status") == "completed")
+    # 终态必须带上时长与实际用量，且不含 body/凭据。
+    assert "duration_ms" in terminal.public_payload
+    assert terminal.public_payload.get("actual_tokens") == 15
+    assert not ({"messages", "body", "arguments"} & set(terminal.public_payload))
+    runtime.close()
+
+
 # ── I-R1：预算结算（退回预留下的差额）───────────────────────────────────────
 
 
