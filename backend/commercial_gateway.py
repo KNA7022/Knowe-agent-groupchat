@@ -2231,6 +2231,15 @@ def production_model_capability_registry() -> ModelCapabilityRegistry:
             models=("*",),
             capabilities=frozenset(capabilities),
             privacy=PrivacyTier.STANDARD,
+            # 预留用的**单位成本**（每次 provider 调用），不是账单。0.01 是对所有 provider
+            # 统一的粗略值，它的偏差方向是实测过的、也是已知的：拿本仓 `token_pricing.py`
+            # 的真实价格，按一次典型调用（10k 输入 + 2k 输出）折算这一次修订时的成本——
+            # `deepseek-v4-flash` ≈ $0.0035、`deepseek-v4-pro` ≈ $0.0106、`gpt-5` ≈ $0.0325、
+            # `gpt-4o` ≈ $0.045。也就是说这个常数对便宜 provider 高估 3 倍左右（保守），
+            # 对昂贵 provider **低估 3–4.5 倍**（偏松）——cost 维度上的预算约束因此比它看起来
+            # 弱。要收紧得先定下"典型调用"这个产品参数，或者按 provider 取最贵模型折算；
+            # 两种都会让便宜 provider 的预算被过快消耗。所以这里是 I-R1 同一缺口的另一面
+            # （另一面见上面的 `models` 注释），记录偏差方向而不是假装这个数是准的。
             estimated_cost_usd=0.01,
             preauthorized=True,
             endpoint_authorities=endpoints,
