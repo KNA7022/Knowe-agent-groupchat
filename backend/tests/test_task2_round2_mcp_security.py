@@ -590,8 +590,8 @@ def test_registry_rejects_a_capability_the_provider_did_not_declare() -> None:
 
 
 def test_extra_body_cannot_override_the_authorized_model() -> None:
-    """I-R1（部分）：Gateway 按 `self.model` 校验 capability，所以最终请求里的
-    `model` 必须就是它——否则"授权时看到的模型"与"实际调用的模型"脱节。
+    """I-R1：Gateway 按 `self.model` 校验 capability，所以最终请求里的 `model`
+    必须就是它——否则"授权时看到的模型"与"实际调用的模型"脱节。
 
     复审实测过旧行为：`extra_body={"model": "attacker"}` 会覆盖 body["model"]，
     而 registry 仍然只校验原模型。
@@ -614,6 +614,64 @@ def test_extra_body_cannot_override_the_authorized_model() -> None:
     )
     assert body["model"] == "authorized-model"
     assert body["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_extra_body_cannot_widen_the_output_budget_or_tool_scope() -> None:
+    """I2：只锁 `model`/`messages` 不够——`max_tokens` 与 `tools` 同样能被覆盖。
+
+    复审实测：`extra_body={"max_tokens": 250000}` 会真的发出 250000，而账上只按预留
+    ~4120 计——于是"预算耗尽会拦住调用"对输出维度不成立。`tools` 被覆盖还会让
+    `required_capabilities` 校验的对象与真正发送的对象不是同一个。
+    """
+
+    from backend.knowe_core.provider_client import ProviderClient
+
+    client = ProviderClient(
+        base_url="https://provider.example/v1",
+        api_key="k",
+        model="authorized-model",
+    )
+    body = client._build_body(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        temperature=None,
+        max_tokens=64,
+        stream=False,
+        extra_body={"max_tokens": 250_000, "tools": [{"type": "function"}], "stream": True},
+    )
+    # 输出上限只能来自权威参数：extra_body 不能把它放大。
+    assert body.get("max_tokens") == 64, body.get("max_tokens")
+    # 未声明 tools 时不得由 extra_body 引入工具面。
+    assert "tools" not in body
+    # stream 由调用路径决定，不能被 extra_body 改写。
+    assert body["stream"] is False
+
+
+def test_extra_body_may_still_add_non_authorization_parameters() -> None:
+    """反向：`tool_choice` / `stream_options` 这类**附加**参数必须继续可用。
+
+    生产里 `deepseek.py` 就用 `extra_body={"tool_choice": "auto"}`，一刀切禁掉
+    extra_body 会打断它。
+    """
+
+    from backend.knowe_core.provider_client import ProviderClient
+
+    client = ProviderClient(
+        base_url="https://provider.example/v1",
+        api_key="k",
+        model="authorized-model",
+    )
+    body = client._build_body(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"type": "function", "function": {"name": "t"}}],
+        temperature=None,
+        max_tokens=None,
+        stream=False,
+        extra_body={"tool_choice": "auto", "reasoning_effort": "low"},
+    )
+    assert body["tool_choice"] == "auto"
+    assert body["reasoning_effort"] == "low"
+    assert body["tools"] == [{"type": "function", "function": {"name": "t"}}]
 
 
 @pytest.mark.asyncio
