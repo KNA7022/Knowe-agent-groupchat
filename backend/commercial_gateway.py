@@ -2193,6 +2193,20 @@ def production_model_capability_registry() -> ModelCapabilityRegistry:
             capabilities.add("rerank")
         registry.register(ProviderCapability(
             provider_id=provider_id,
+            # I-R1 的**剩余部分**，写在这里以免下一个人以为它是随手写的通配符：
+            # `authorize()` 只在 `"*" not in capability.models` 时才核对模型名，所以这
+            # 一行等于"这个 provider 的任何模型名都通过"，于是 `privacy` 与
+            # `estimated_cost_usd` 实际上都是**按 provider**声明、不按模型。
+            #
+            # 为什么不收紧：项目里确实有一份带来源 URL 的逐模型价格表
+            # (`backend/token_pricing.py`)，但它 (a) 对 `copilot` / `gmi` /
+            # `huggingface` / `kimi-coding` / `kimi-coding-cn` 五个 provider 一条都没有，
+            # 收紧会让这五个的模型集为空（fail closed，直接不可用），且会拒绝用户配置
+            # 的任何新模型；(b) **完全不含隐私数据**——"逐模型隐私"根本推不出来。
+            #
+            # 所以这是一个产品取舍，不是遗漏：要么 fail closed 于一份经过核实的清单，
+            # 要么保持通配符并明说隐私/价格是按 provider 的。现在是后者。台账里有完整的
+            # 实测依据与建议（隐私才是该逐模型化的那一项，价格可以留在 provider 级）。
             models=("*",),
             capabilities=frozenset(capabilities),
             privacy=PrivacyTier.STANDARD,

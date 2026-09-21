@@ -1582,6 +1582,36 @@ def test_a_duck_typed_runtime_is_rejected_before_any_approval_work() -> None:
     )
 
 
+def test_the_model_wildcard_is_a_recorded_limitation_not_an_oversight() -> None:
+    """I-R1 剩余部分的**行为锁**：privacy 与价格目前按 provider 声明，不按模型。
+
+    这不是一条"要求"，而是故意钉住**当前已知限制仍在**：一旦有人把 `models=("*",)`
+    收紧成显式清单，这条测试会失败，从而被迫同步更新
+    `production_model_capability_registry` 的注释、台账与前端，而不是让文档悄悄过期。
+
+    收紧本身是个产品取舍，不是遗漏 —— 台账里有实测依据：项目那份带来源的价格表对
+    `copilot` / `gmi` / `huggingface` / `kimi-coding` / `kimi-coding-cn` 五个 provider
+    一条都没有（收紧会让它们不可用），而且完全不含隐私数据。
+    """
+
+    from backend.commercial_gateway import production_model_capability_registry
+    from backend.task_runtime.contracts import PrivacyTier
+
+    capability = production_model_capability_registry().authorize(
+        "deepseek",
+        model="a-model-name-that-does-not-exist-2026",
+        endpoint="https://api.deepseek.com",
+        transport="openai_chat",
+        required_capabilities={"chat"},
+    )
+    assert capability.models == ("*",), (
+        "the wildcard was tightened: update the registry comment, the ledger and the "
+        "frontend mirror together, then update this test"
+    )
+    assert capability.privacy is PrivacyTier.STANDARD
+    assert capability.estimated_cost_usd == 0.01
+
+
 @pytest.mark.parametrize("abort", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
 def test_aborted_chat_is_audited_as_cancelled_not_failed(
     tmp_path: Any, abort: type[BaseException],
