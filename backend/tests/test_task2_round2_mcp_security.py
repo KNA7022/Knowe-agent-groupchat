@@ -347,13 +347,15 @@ def test_expired_lease_cannot_be_redeemed() -> None:
 # ── C-R1（复审后补齐）：后门的两条真实绕过路径 ────────────────────────────────
 
 
-def test_gateway_does_not_expose_its_underlying_transport() -> None:
-    """C2：`gateway._transport` 曾可直通，绕过全部 Provider 策略。
+def test_gateway_does_not_proxy_unknown_attributes() -> None:
+    """C2（部分）：`__getattr__` 只放行元数据，不再全量代理到底层 transport。
 
-    复审实测：只改 `__getattr__` 无效——`_transport` 是真实存在的实例属性，属性查找
-    根本不落到 `__getattr__`，于是 `gateway._transport.chat(...)` 与
-    `gateway._transport._request(任意 body)` 都能直接出网，且
-    `_gateway_managed=True` 是在 Gateway 构造时设置的，所以断言一律放行。
+    ⚠ 诚实边界（第四轮复审实测）：**这不是安全边界**。`_transport` 是普通实例属性，
+    `gateway.__dict__["_transport"]` / `vars()` / `object.__getattribute__` 都能取到，
+    取到后即可直接出网。曾有 `__getattribute__` + `_sealed_transport()` 的"补丁"，
+    实测既挡不住 `__dict__`、又被访问器自己交出对象，属于虚假安全感，已删除。
+
+    这条测试只锁定"不存在的属性不会被意外代理"这一可读性契约。
     """
 
     from backend.commercial_gateway import ProviderGatewayClient
@@ -364,12 +366,15 @@ def test_gateway_does_not_expose_its_underlying_transport() -> None:
         model="m",
         provider="openai-api",
     )
-    for name in ("_transport", "_request", "_build_body"):
+    # 这两个名字在 ProviderGatewayClient 上**不存在**，曾经会被全量代理到底层。
+    for name in ("_request", "_build_body"):
         with pytest.raises(AttributeError):
             getattr(client, name)
-    # 白名单只读属性仍可用；类内部仍能取到密封 transport。
+    # 白名单元数据仍可读。
     assert client.base_url == "https://provider.example/v1"
-    assert client._sealed_transport() is not None
+    # 公开能力仍可用。
+    assert callable(client.chat)
+    assert callable(client.aclose)
 
 
 def test_test_seam_refuses_a_client_that_can_reach_the_network() -> None:

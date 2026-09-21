@@ -1082,13 +1082,15 @@ class McpRegistry:
         if _canonical_mcp_endpoint(sealed_config) != _canonical_mcp_endpoint(config):
             raise GatewayDenied("MCP sealed transport target changed after registration")
         # 顺带核对 server_id 与 transport 类型，避免"同 endpoint 但换了 peer 类型"。
+        # 用 isinstance 而不是比较 `type().__name__`（复审实测后者双向不可靠：
+        # 合法子类会被误拒，而伪造 `__name__` 的任意对象能通过）。
         if sealed_config.server_id != config.server_id:
             raise GatewayDenied("MCP sealed transport is bound to a different server")
         expected_type = (
-            "McpStreamableHttpTransport" if config.transport == "streamable_http"
-            else "McpStdioTransport"
+            McpStreamableHttpTransport if config.transport == "streamable_http"
+            else McpStdioTransport
         )
-        if type(transport).__name__ != expected_type:
+        if not isinstance(transport, expected_type):
             raise GatewayDenied("MCP sealed transport type does not match its config")
         return config, transport
 
@@ -2355,23 +2357,26 @@ class ProviderGatewayClient:
 
     #: 这些名字**不允许**从实例上取到。
     #:
-    #: ⚠ 复审实测：只改 `__getattr__` 是无效的——`_transport` 是真实存在的实例属性，
-    #: 属性查找根本不会落到 `__getattr__`，于是 `gateway._transport.chat(...)` 与
-    #: `gateway._transport._request(任意 body)` 都能直接出网，绕过 authority、
-    #: registry、DLP、预算与审计。这里用 `__getattribute__` 明确挡住它们；
-    #: 类内部通过 `object.__getattribute__(self, "_transport")` 访问，不受影响。
-    _HIDDEN_FROM_OUTSIDE = frozenset({"_transport"})
-
-    def __getattribute__(self, name: str) -> Any:
-        if name in ProviderGatewayClient._HIDDEN_FROM_OUTSIDE:
-            raise AttributeError(
-                f"{type(self).__name__!r} does not expose {name!r}; "
-                "provider egress goes through ProviderGatewayClient.chat/chat_stream only"
-            )
-        return object.__getattribute__(self, name)
+    #: 允许从底层 transport 读取的**只读**元数据。
+    _DELEGATED_READS = ("base_url", "model", "provider", "timeout", "max_retries")
 
     def __getattr__(self, name: str) -> Any:
-        # 只有**不存在的**属性会走到这里（真实属性已被上面的 __getattribute__ 处理）。
+        """只放行元数据读取；其余一律 AttributeError。
+
+        ⚠ **这不是安全边界，别把它当边界**（第四轮复审实测）：底层对象 `_transport`
+        是普通实例属性，`gateway.__dict__["_transport"]`、`vars(gateway)`、
+        `object.__getattribute__` 都能取到它，取到后 `.chat()` / `._request()` 就能
+        直接出网。曾试图用 `__getattribute__` 只挡 `_transport` 这一个字面名，结果
+        既挡不住 `__dict__`，又因为配套的 `_sealed_transport()` 访问器把同一个对象
+        交了出去而完全失效——**那种"补一层"的做法只是虚假的安全感**，已删除。
+
+        这里的价值仅在于：让 `gateway._request` / `gateway._build_body` 这类**不存在
+        的属性**不会意外代理到底层，从而让"这个类对外能做什么"一眼可读。
+
+        真正的边界只能是"不把 transport 放在这个对象上"（例如放在模块级闭包或
+        `WeakKeyDictionary` 里）。当前未做，已登记为遗留。
+        """
+
         if name in ProviderGatewayClient._DELEGATED_READS:
             transport = object.__getattribute__(self, "_transport")
             return getattr(transport, name)
@@ -2383,12 +2388,8 @@ class ProviderGatewayClient:
     async def aclose(self) -> None:
         """关闭底层 transport（只关闭连接，不绕过任何策略）。"""
 
-        await self._sealed_transport().aclose()
-
-    def _sealed_transport(self) -> Any:
-        """取出底层 transport，仅供**类内部**使用（见 `_HIDDEN_FROM_OUTSIDE`）。"""
-
-        return object.__getattribute__(self, "_transport")
+        transport = object.__getattribute__(self, "_transport")
+        await transport.aclose()
 
     @staticmethod
     def _serialized_request(
@@ -2703,7 +2704,7 @@ class ProviderGatewayClient:
             max_tokens=max_tokens, stream=False,
         )
         try:
-            result = await self._sealed_transport().chat(
+            result = await object.__getattribute__(self, "_transport").chat(
                 messages, tools, temperature, max_tokens, extra_body,
             )
         except BaseException as exc:
@@ -2731,7 +2732,7 @@ class ProviderGatewayClient:
             max_tokens=max_tokens, stream=True,
         )
         try:
-            async for event in self._sealed_transport().chat_stream(
+            async for event in object.__getattribute__(self, "_transport").chat_stream(
                 messages, tools, temperature, max_tokens, extra_body,
             ):
                 yield event
