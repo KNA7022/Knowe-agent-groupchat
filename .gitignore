@@ -57,3 +57,9 @@ assets/videos/compressed/
 #   否则全新检出无法复现 Node 24（这正是它被创建的原因）。
 .tools/node-v*/
 .tools/*.zip
+
+# 运行时生成的第三方技能注册表（backend/knowledge_assets.py 的 _SKILL_REGISTRY）。
+# 它记录的是**这台机器上装了哪些技能**，属于运行时状态而非源码；一直以未跟踪状态
+# 出现在 `git status` 里，会干扰"工作树必须干净"这类检查。
+# 只忽略这一个文件，不忽略整个 skills/ —— 将来若在那下面放源码，不该被吞掉。
+skills/third_party/.registry.json
