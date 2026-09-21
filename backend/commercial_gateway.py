@@ -472,6 +472,25 @@ _PROMPT_INJECTION = re.compile(
 )
 
 
+def _is_textual_mime(mime_type: Any) -> bool:
+    """MCP resource 的这段内容是否应当按文本过 prompt/DLP 策略。
+
+    旧实现只看"有没有 `text` 字段"，于是 `mimeType: text/plain` + `blob`（base64）
+    的注入文本完全绕过了策略——复审实测过。这里改成按 MIME 判定文本性：
+    `text/*`、JSON、XML（含 `+json` / `+xml`）都算文本，解码后一律扫描。
+    """
+
+    if not isinstance(mime_type, str) or not mime_type:
+        # 没声明类型时保守按文本处理：宁可多扫一次，也不要漏掉注入内容。
+        return True
+    normalized = mime_type.split(";", 1)[0].strip().casefold()
+    if normalized.startswith("text/"):
+        return True
+    return normalized in {"application/json", "application/xml"} or normalized.endswith(
+        ("+json", "+xml")
+    )
+
+
 class McpTransport(Protocol):
     async def initialize(self) -> Mapping[str, Any]: ...
     async def discover(self) -> Mapping[str, Any]: ...
@@ -1477,7 +1496,12 @@ class McpRegistry:
             ).encode("utf-8")).hexdigest(),
         }
         self._discovery[server_id] = accepted
-        return accepted
+        # I-R4：返回**深拷贝**而不是内部对象。旧实现 `return accepted` 把内部
+        # records（含 schema 与 identity）直接交给调用方，于是
+        # `accepted["tool_records"][name]["schema"]` 被改写后，后续参数校验用的是
+        # 被改过的 schema，而 `identity.digest` 一字未变——授权校验照样通过。
+        # 深拷贝让"调用方看到的"与"registry 依赖的"彻底分离。
+        return copy.deepcopy(accepted)
 
     async def handshake(self, server_id: str) -> dict[str, Any]:
         """握手：transport 由 registry 按 config 自建，不接受外部实例。"""
@@ -1682,17 +1706,25 @@ class McpRegistry:
             assert isinstance(body, str)
             if isinstance(text, str):
                 body_bytes = text.encode("utf-8")
+                textual = text
             else:
                 try:
                     body_bytes = base64.b64decode(blob, validate=True)
                 except (binascii.Error, ValueError) as exc:
                     raise GatewayDenied("MCP resource blob encoding is invalid") from exc
+                # 旧实现只对 `text` 分支做 prompt/DLP 检查，于是
+                # `mimeType: text/plain` + base64 的注入文本可以绕过（复审实测：
+                # "ignore all previous instructions…" 被原样接受）。现在按 MIME 判定：
+                # 文本类内容一律解码后过同一套策略。
+                textual = body_bytes.decode("utf-8", errors="replace") if _is_textual_mime(
+                    mime_type,
+                ) else None
             total += len(body_bytes)
             if total > 1_048_576:
                 raise GatewayDenied("MCP resource contents exceed the size limit")
-            if isinstance(text, str) and (
-                _PROMPT_INJECTION.search(text)
-                or PiiDlpGateway().decide_outbound(text, approved=False).requires_approval
+            if textual is not None and (
+                _PROMPT_INJECTION.search(textual)
+                or PiiDlpGateway().decide_outbound(textual, approved=False).requires_approval
             ):
                 raise GatewayDenied("MCP resource content violates prompt/DLP policy")
         return value
