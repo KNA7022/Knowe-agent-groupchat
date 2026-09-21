@@ -217,6 +217,35 @@ class ToolExecutionRequest:
 ToolEffect = Callable[[ToolExecutionRequest], Any]
 
 
+class ShellSandboxAttestation:
+    """Shell executor 的 sandbox 证明（I-R2）。
+
+    `trusted_sandbox=True` 曾只是把**工具名**放进集合，而 `invoke_with_effect` 之后
+    仍可用任意 effect 替换已注册的 executor —— 于是"授权 metadata 里写着受信 sandbox"
+    与"真正执行的进程"可以不是同一个东西。
+
+    现在注册 Shell 必须显式给出这份证明，它同时约束：
+      · `marker` —— 部署方提供的、非空的 attestation 标识（例如 sandbox 机制名）；
+      · `executor` —— **与 descriptor/effect 绑定的那一个** executor 对象。
+    运行时不再接受任何 effect override（见 ToolGateway._invoke），因此"换个 effect"
+    这条路在 API 层面就消失了。
+    """
+
+    __slots__ = ("marker", "executor")
+
+    def __init__(self, marker: str, executor: Any) -> None:
+        text = str(marker or "").strip()
+        if not text or len(text) > 128:
+            raise ValueError("shell sandbox attestation requires a bounded non-empty marker")
+        if executor is None:
+            raise ValueError("shell sandbox attestation requires the bound executor")
+        self.marker = text
+        self.executor = executor
+
+    def __repr__(self) -> str:  # pragma: no cover - 诊断用
+        return f"ShellSandboxAttestation(marker={self.marker!r})"
+
+
 class ToolGateway:
     """One policy/effect boundary shared by built-ins, Shell and MCP."""
 
@@ -225,23 +254,28 @@ class ToolGateway:
         self.dlp = dlp or PiiDlpGateway()
         self._descriptors: dict[str, ToolDescriptor] = {}
         self._effects: dict[str, ToolEffect] = {}
-        self._trusted_sandbox_tools: set[str] = set()
+        self._shell_attestations: dict[str, ShellSandboxAttestation] = {}
 
     def register(
         self,
         descriptor: ToolDescriptor,
         effect: ToolEffect,
         *,
-        trusted_sandbox: bool = False,
+        attestation: ShellSandboxAttestation | None = None,
     ) -> None:
         if descriptor.tool_name in self._descriptors:
             raise ValueError(f"duplicate Tool Gateway descriptor: {descriptor.tool_name}")
+        if attestation is not None:
+            if descriptor.kind != "shell":
+                raise ValueError("shell sandbox attestations are valid only for Shell descriptors")
+            # 证明必须绑定**这一个** executor：换 effect 就是换进程边界。
+            if attestation.executor is not effect:
+                raise ValueError(
+                    "shell sandbox attestation must be bound to the registered effect executor"
+                )
+            self._shell_attestations[descriptor.tool_name] = attestation
         self._descriptors[descriptor.tool_name] = descriptor
         self._effects[descriptor.tool_name] = effect
-        if trusted_sandbox:
-            if descriptor.kind != "shell":
-                raise ValueError("trusted sandbox markers are valid only for Shell descriptors")
-            self._trusted_sandbox_tools.add(descriptor.tool_name)
 
     def descriptor(self, tool_name: str) -> ToolDescriptor:
         try:
@@ -307,14 +341,16 @@ class ToolGateway:
     ) -> Any:
         descriptor = self.descriptor(request.tool_name)
         self._validate_capability_subset(descriptor, request)
-        if (
-            descriptor.kind == "shell"
-            and descriptor.tool_name not in self._trusted_sandbox_tools
-        ):
+        if descriptor.kind == "shell" and descriptor.tool_name not in self._shell_attestations:
             # Declared argv/path/network scopes are authorization metadata, not an OS
-            # sandbox.  Until a verifiable Windows sandbox executor is injected, no
-            # production Shell or MCP-stdio process may reach its effect boundary.
+            # sandbox.  Until a verifiable Windows sandbox executor is registered with an
+            # explicit attestation, no production Shell or MCP-stdio process may reach
+            # its effect boundary.
             raise GatewayDenied("Shell effect requires an explicitly trusted sandbox executor")
+        if effect_override is not None and descriptor.kind == "shell":
+            # I-R2：Shell 的 effect 不可替换。attestation 绑定的是**某一个** executor，
+            # 允许 override 就等于允许在通过 marker 之后换掉进程边界。
+            raise GatewayDenied("Shell effects cannot be replaced after registration")
         dlp = self.dlp.decide_outbound(
             request.governed_outbound_text(descriptor), approved=False,
         )

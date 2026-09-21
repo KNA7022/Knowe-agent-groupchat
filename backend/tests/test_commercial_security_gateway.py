@@ -14,6 +14,7 @@ from backend.commercial_gateway import (
     PiiDlpGateway,
     ProviderCapability,
     SecretLeaseBroker,
+    ShellSandboxAttestation,
     ToolExecutionRequest,
     ToolGateway,
     derive_provider_credential_purpose,
@@ -130,6 +131,11 @@ async def test_forged_scope_cross_tool_and_reused_grant_fail_closed(tmp_path: Pa
     approval_id, grant_id = _approved_shell_grant(service, group_id, run, scope)
     launches: list[str] = []
     gateway = ToolGateway(service)
+
+    def shell_executor(request: ToolExecutionRequest) -> str:
+        launches.append(request.executable)
+        return "ok"
+
     gateway.register(
         ToolDescriptor(
             tool_name="shell",
@@ -140,8 +146,9 @@ async def test_forged_scope_cross_tool_and_reused_grant_fail_closed(tmp_path: Pa
             read_roots=(str(workspace),),
             write_roots=(str(workspace),),
         ),
-        lambda request: launches.append(request.executable) or "ok",
-        trusted_sandbox=True,
+        shell_executor,
+        # I-R2：Shell 必须给出绑定到**这一个** executor 的 sandbox 证明。
+        attestation=ShellSandboxAttestation("test-sandbox", shell_executor),
     )
     request = ToolExecutionRequest(
         group_id=group_id,

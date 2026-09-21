@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -102,6 +103,244 @@ def test_binary_mime_blob_is_not_forced_through_text_policy() -> None:
     }
     # 不应抛错：二进制内容只受大小/编码约束。
     assert McpRegistry._validate_resource_result("course://catalog", value) == value
+
+
+# ── I-R2：shell sandbox 证明必须绑定 exact executor ────────────────────────────
+
+
+def _shell_descriptor() -> Any:
+    from backend.task_runtime.contracts import ToolDescriptor
+
+    return ToolDescriptor(
+        tool_name="shell",
+        kind="shell",
+        risk=RiskLevel.HIGH,
+        executable_allowlist=("C:/python/python.exe",),
+        cwd_roots=("C:/work",),
+        read_roots=("C:/work",),
+    )
+
+
+def test_shell_attestation_must_be_bound_to_the_registered_executor() -> None:
+    """I-R2：attestation 与 executor 必须成对注册。
+
+    旧实现 `trusted_sandbox=True` 只把**工具名**放进集合；如果证明可以配给 A 却
+    实际注册 B，那么"授权里写着受信 sandbox"与"真正执行的进程"就不是同一个东西。
+    """
+
+    from backend.commercial_gateway import (
+        ShellSandboxAttestation,
+        ToolDescriptor,
+        ToolGateway,
+    )
+
+    def executor_a(_request: Any) -> str:
+        return "a"
+
+    def executor_b(_request: Any) -> str:
+        return "b"
+
+    gateway = ToolGateway.__new__(ToolGateway)  # 只测注册绑定，不需要 runtime
+    gateway._descriptors = {}
+    gateway._effects = {}
+    gateway._shell_attestations = {}
+
+    # 证明绑定 A，却注册 B —— 必须被拒绝。
+    with pytest.raises(ValueError, match="bound to the registered effect"):
+        gateway.register(
+            _shell_descriptor(),
+            executor_b,
+            attestation=ShellSandboxAttestation("sandbox-a", executor_a),
+        )
+
+    # 绑定一致时才接受。
+    gateway.register(
+        _shell_descriptor(),
+        executor_a,
+        attestation=ShellSandboxAttestation("sandbox-a", executor_a),
+    )
+    assert "shell" in gateway._shell_attestations
+
+
+def test_shell_attestation_requires_a_real_marker_and_executor() -> None:
+    from backend.commercial_gateway import ShellSandboxAttestation
+
+    with pytest.raises(ValueError, match="marker"):
+        ShellSandboxAttestation("   ", lambda _request: None)
+    with pytest.raises(ValueError, match="executor"):
+        ShellSandboxAttestation("sandbox", None)
+
+
+@pytest.mark.asyncio
+async def test_shell_effect_cannot_be_replaced_by_invoke_with_effect() -> None:
+    """I-R2 的核心不变量：注册之后不能再用 override 换掉 shell 的 executor。
+
+    旧实现允许在通过 `trusted_sandbox` marker 之后用任意 effect 替换已注册 executor，
+    于是"受信 sandbox"这句话就失去了约束力。
+    """
+
+    from backend.commercial_gateway import (
+        GatewayDenied,
+        ShellSandboxAttestation,
+        ToolExecutionRequest,
+        ToolGateway,
+    )
+
+    gateway = ToolGateway.__new__(ToolGateway)
+    gateway._descriptors = {}
+    gateway._effects = {}
+    gateway._shell_attestations = {}
+    gateway._validate_capability_subset = lambda *_a, **_k: None  # type: ignore[method-assign]
+
+    def trusted(_request: Any) -> str:
+        return "trusted"
+
+    def attacker(_request: Any) -> str:
+        return "attacker"
+
+    gateway.register(
+        _shell_descriptor(), trusted,
+        attestation=ShellSandboxAttestation("sandbox", trusted),
+    )
+
+    request = ToolExecutionRequest(
+        group_id="group_" + "1" * 32,
+        task_id="task_" + "2" * 32,
+        run_id="run_" + "3" * 32,
+        tool_name="shell",
+        idempotency_key="swap",
+        purpose="run_shell",
+        executable="C:/python/python.exe",
+        cwd="C:/work",
+        read_paths=("C:/work",),
+    )
+    with pytest.raises(GatewayDenied, match="cannot be replaced"):
+        await gateway.invoke_with_effect(request, attacker)
+
+
+# ── I-R3b / I-R7：已知限制的锁定断言 ──────────────────────────────────────────
+#
+# 这两条**没有**被修掉，而是降级为"已记录的限制 + 断言锁定当前行为"：
+#   I-R3b：Electron main 侧仍缺封闭 slot catalog（renderer 自报 provider/endpoint/
+#          transport，main 再规范化）。不修的理由：Python 兑换 lease 时逐字段核验
+#          （见下），跨 endpoint/transport 复用凭据已经不可行，缺的是"main 派生
+#          kind/audience"这层纵深防御。
+#   I-R7：secret 替换后的撤销是 eventual（240s reconcile），不是原子；但上界受
+#          300s lease TTL 约束，且 inactive ref 只留磁盘密文、lease 不会续租。
+# 断言的目的：一旦将来有人改了这些**已经生效的**防御，测试要立刻失败。
+
+
+def _provision_lease(
+    broker: Any, *, secret_ref: str, expires_at: datetime, now: datetime, **overrides: Any,
+) -> None:
+    from backend.commercial_gateway import derive_provider_credential_purpose
+
+    slot = overrides.pop("slot", "main")
+    provider_id = overrides.pop("provider_id", "deepseek")
+    endpoint = overrides.pop("endpoint", "https://api.deepseek.com")
+    transport = overrides.pop("transport", "openai_chat")
+    payload: dict[str, Any] = {
+        "lease_id": "lease_" + "c" * 32,
+        "secret_ref": secret_ref,
+        "slot": slot,
+        "kind": "provider_credential",
+        # purpose 必须与 main 侧派生规则一致，否则 provision 自己就会拒绝。
+        "purpose": derive_provider_credential_purpose(
+            slot=slot, provider_id=provider_id, endpoint=endpoint, transport=transport,
+        ),
+        "audience": "provider_gateway",
+        "provider_id": provider_id,
+        "endpoint": endpoint,
+        "transport": transport,
+        "value": "sk-test-value",
+        "expires_at": expires_at.isoformat(),
+    }
+    payload.update(overrides)
+    broker.provision(**payload, now=now)
+
+
+def test_provider_lease_redemption_binds_every_security_field() -> None:
+    """I-R3b 的实际防线：兑换时逐字段核验，任一不符即拒绝。"""
+
+    from backend.commercial_gateway import (
+        SecretLeaseBroker,
+        derive_provider_credential_purpose,
+    )
+
+    broker = SecretLeaseBroker(sweep_interval_seconds=0)
+    secret_ref = "secret_" + "a" * 32
+    now = datetime.now(timezone.utc)
+    _provision_lease(
+        broker, secret_ref=secret_ref, now=now,
+        expires_at=now + timedelta(seconds=300),
+    )
+
+    purpose = derive_provider_credential_purpose(
+        slot="main",
+        provider_id="deepseek",
+        endpoint="https://api.deepseek.com",
+        transport="openai_chat",
+    )
+    kwargs: dict[str, Any] = {
+        "slot": "main",
+        "provider_id": "deepseek",
+        "endpoint": "https://api.deepseek.com",
+        "transport": "openai_chat",
+        "expected_purpose": purpose,
+    }
+
+    # 正确绑定可以兑换。
+    assert broker.redeem_provider_credential(secret_ref, **kwargs) == "sk-test-value"
+
+    # 任一字段被换掉都必须拒绝（这就是"跨 endpoint/transport 复用"的拦阻点）。
+    for field, value in [
+        ("slot", "aux"),
+        ("provider_id", "openai"),
+        ("endpoint", "https://evil.example"),
+        ("transport", "anthropic_messages"),
+        ("expected_purpose", purpose + ":other"),
+    ]:
+        mutated = dict(kwargs)
+        mutated[field] = value
+        with pytest.raises(GatewayDenied, match="binding mismatch"):
+            broker.redeem_provider_credential(secret_ref, **mutated)
+
+    broker.close()
+
+
+def test_expired_lease_cannot_be_redeemed() -> None:
+    """I-R7 的上界：lease 自身有 TTL，过期即不可兑换（与 240s 撤销窗口独立）。"""
+
+    from backend.commercial_gateway import (
+        SecretLeaseBroker,
+        derive_provider_credential_purpose,
+    )
+
+    broker = SecretLeaseBroker(sweep_interval_seconds=0)
+    secret_ref = "secret_" + "b" * 32
+    now = datetime.now(timezone.utc)
+    # 合法存入（TTL 在允许范围内），再用一个更晚的 "now" 去兑换 —— 那时它已过期。
+    _provision_lease(
+        broker, secret_ref=secret_ref, now=now,
+        expires_at=now + timedelta(seconds=60),
+    )
+    later = now + timedelta(seconds=120)
+    with pytest.raises(GatewayDenied):
+        broker.redeem_provider_credential(
+            secret_ref,
+            slot="main",
+            provider_id="deepseek",
+            endpoint="https://api.deepseek.com",
+            transport="openai_chat",
+            expected_purpose=derive_provider_credential_purpose(
+                slot="main",
+                provider_id="deepseek",
+                endpoint="https://api.deepseek.com",
+                transport="openai_chat",
+            ),
+            now=later,
+        )
+    broker.close()
 
 
 @pytest.mark.asyncio
