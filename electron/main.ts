@@ -1002,13 +1002,20 @@ const PASSTHROUGH_ENV = ['KNOWE_AGENT', 'KNOWE_DATA_DIR'] as const;
 /** spawn 后端用的环境变量：显式 allowlist + 固定运行参数 + UTF-8 stdio。 */
 export function buildBackendEnv(): NodeJS.ProcessEnv {
   const inherited: NodeJS.ProcessEnv = {};
-  const allowed = new Set<string>([
-    ...BACKEND_ENV_ALLOWLIST,
-    ...(app.isPackaged ? [] : DEV_EXTRA_ENV_ALLOWLIST),
-    ...PASSTHROUGH_ENV,
-  ]);
+  // ⚠ 比较必须**大小写不敏感**（I6 残余）：Windows 的变量名是混合大小写
+  // （`ComSpec` / `ProgramData` / `ProgramFiles` / `ProgramFiles(x86)`），而
+  // allowlist 里写的是全大写。旧实现用 `allowed.has(name)` 精确匹配，实测这四个
+  // 变量**一个都没传出去**——配置文件写对了却静默失效，比漏写更难发现。
+  // 保留宿主原本的拼写（键名原样），只把匹配归一化。
+  const allowed = new Set<string>(
+    [
+      ...BACKEND_ENV_ALLOWLIST,
+      ...(app.isPackaged ? [] : DEV_EXTRA_ENV_ALLOWLIST),
+      ...PASSTHROUGH_ENV,
+    ].map((name) => name.toLowerCase()),
+  );
   for (const [name, value] of Object.entries(process.env)) {
-    if (value !== undefined && allowed.has(name)) inherited[name] = value;
+    if (value !== undefined && allowed.has(name.toLowerCase())) inherited[name] = value;
   }
 
   const runtime: NodeJS.ProcessEnv = {

@@ -527,12 +527,19 @@ class ProviderClient:
         body["model"] = self.model
         body["messages"] = messages
         body["stream"] = bool(stream)
+        # I2 残余：**按字段集合**处理输出上限，而不是逐个 pin。
+        # 复审实测：只锁 `max_tokens` 时，`extra_body={"max_completion_tokens": 250000}`
+        # 照样上线生效（真发出 250000 而账上只按约 4100 预留）。`max_completion_tokens`
+        # 是 OpenAI o 系列/gpt-5 的替代名，`max_output_tokens` 是 Responses 的写法，
+        # `n`/`best_of` 会成倍放大输出——它们都是"输出规模"字段，必须一起按权威值处理。
+        output_limit_fields = (
+            "max_tokens", "max_completion_tokens", "max_output_tokens",
+            "n", "best_of",
+        )
+        for field_name in output_limit_fields:
+            body.pop(field_name, None)
         if max_tokens is not None and int(max_tokens) > 0:
             body["max_tokens"] = int(max_tokens)
-        else:
-            # 调用方没给上限：删掉 extra_body 塞进来的值，让 provider 自己决定，
-            # 而不是让 peer 通过 extra_body 把输出预算放大。
-            body.pop("max_tokens", None)
         if tools:
             body["tools"] = tools
         else:

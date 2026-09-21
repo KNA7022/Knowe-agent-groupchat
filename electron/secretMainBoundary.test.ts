@@ -70,6 +70,21 @@ describe('main-only OS credential boundary', () => {
     }
   });
 
+  it('matches the allowlist case-insensitively so Windows names survive', () => {
+    const main = source('electron/main.ts');
+
+    // I6 残余：Windows 的变量名是混合大小写（ComSpec / ProgramData / ProgramFiles /
+    // ProgramFiles(x86)），而 allowlist 里写的是全大写。复审实测：精确匹配让这四个
+    // 变量**一个都没传出去** —— 配置文件写对了却静默失效。
+    //
+    // ⚠ 局限说明：`buildBackendEnv` 在模块顶层依赖 electron 的 `app`，无法在
+    // vitest 里直接导入执行（导入 main.ts 会跑整个主进程入口）。所以这里只做静态
+    // 守卫；理想做法是把该函数抽到不依赖 electron 的独立模块再真实执行，已登记为遗留。
+    // （不做 `not.toContain('allowed.has(name)')` 这类反向断言：该字面量在文件其他位置
+    //   也会出现，反向断言会误报。）
+    expect(main).toContain('allowed.has(name.toLowerCase())');
+  });
+
   it('refuses to inherit long-lived cloud credentials even though the names vary', () => {
     const main = source('electron/main.ts');
 

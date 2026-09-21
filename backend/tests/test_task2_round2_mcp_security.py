@@ -896,6 +896,39 @@ def test_extra_body_cannot_widen_the_output_budget_or_tool_scope() -> None:
     assert body["stream"] is False
 
 
+def test_extra_body_cannot_widen_output_under_an_alias() -> None:
+    """I2 残余：只锁 `max_tokens` 是不够的——换字段名即可绕过。
+
+    复审实测：`extra_body={"max_completion_tokens": 250000}` 会上线生效
+    （真发出 250000 而账上只按约 4100 预留）。`max_completion_tokens` /
+    `max_output_tokens` 是不同厂商对同一个概念的名字，`n` / `best_of` 会成倍放大输出。
+    """
+
+    from backend.knowe_core.provider_client import ProviderClient
+
+    client = ProviderClient(
+        base_url="https://provider.example/v1",
+        api_key="k",
+        model="authorized-model",
+    )
+    body = client._build_body(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        temperature=None,
+        max_tokens=64,
+        stream=False,
+        extra_body={
+            "max_completion_tokens": 250_000,
+            "max_output_tokens": 250_000,
+            "n": 8,
+            "best_of": 8,
+        },
+    )
+    for fake in ("max_completion_tokens", "max_output_tokens", "n", "best_of"):
+        assert fake not in body, f"{fake} 不应出现在最终请求体里"
+    assert body["max_tokens"] == 64
+
+
 def test_extra_body_may_still_add_non_authorization_parameters() -> None:
     """反向：`tool_choice` / `stream_options` 这类**附加**参数必须继续可用。
 
