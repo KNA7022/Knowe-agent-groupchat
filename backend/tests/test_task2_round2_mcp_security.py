@@ -533,6 +533,32 @@ def test_provider_reported_usage_is_parsed_strictly() -> None:
     assert _provider_reported_total_tokens("not-a-mapping") is None
 
 
+def test_usage_parsing_understands_non_openai_dialects() -> None:
+    """I3：`anthropic_messages` 与 Responses 形状必须也能对账。
+
+    复审实测过旧解析的后果：`{"usage": {"input_tokens": 10, "output_tokens": 5}}`
+    返回 None，于是 minimax/anthropic/openai-api(codex_responses) 这些
+    transport 的用量**静默不对账**。现在复用 `normalize_usage_buckets`。
+    """
+
+    from backend.commercial_gateway import _provider_reported_total_tokens
+
+    # Anthropic / Responses 风格
+    assert _provider_reported_total_tokens(
+        {"usage": {"input_tokens": 10, "output_tokens": 5}}
+    ) == 15
+    # 多层 envelope（data -> response -> usage）
+    assert _provider_reported_total_tokens(
+        {"data": {"response": {"usage": {"input_tokens": 7, "output_tokens": 3}}}}
+    ) == 10
+    # Gemini 的 usageMetadata
+    assert _provider_reported_total_tokens(
+        {"usageMetadata": {"promptTokenCount": 8, "candidatesTokenCount": 4}}
+    ) == 12
+    # 仍然拒绝畸形输入
+    assert _provider_reported_total_tokens({"usage": {"input_tokens": True}}) is None
+
+
 def test_production_registry_declares_rag_capabilities() -> None:
     """I-R1 / Task 3 前置：RAG 需要 embedding / vision OCR / rerank 的注册槽位。
 

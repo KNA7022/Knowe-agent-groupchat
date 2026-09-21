@@ -2208,28 +2208,38 @@ _DEFAULT_OUTPUT_TOKEN_CAP = 4096
 def _provider_reported_total_tokens(response: Any) -> int | None:
     """从 provider 响应里取本次使用的 token 总数（拿不到就返回 None）。
 
-    只接受非负整数且拒绝 bool——usage 是不可信输入，不能让 `True` 之类的东西混进来。
+    I3：**优先复用 `knowe_core.provider_client.normalize_usage_buckets`**，而不是自己
+    再写一套窄解析。复审实测过窄解析的后果：`anthropic_messages` 与 Codex/Responses
+    形状（`{"usage": {"input_tokens": …, "output_tokens": …}}`）全部返回 None，于是
+    那些 provider **静默不对账** —— 而 registry 里 minimax/anthropic/openai-api 正是
+    这些 transport。`normalize_usage_buckets` 已经处理 OpenAI / DeepSeek / Anthropic /
+    Gemini 以及多层 envelope 展开。
+
+    保留 `total_tokens` 回退：少数兼容实现只报这一个字段。
+    usage 是不可信输入，所以只接受非负整数并显式拒绝 bool。
     """
 
     if not isinstance(response, Mapping):
         return None
+    try:
+        from knowe_core.provider_client import normalize_usage_buckets
+    except ImportError:  # pragma: no cover - 仅打包异常时
+        normalize_usage_buckets = None  # type: ignore[assignment]
+    if normalize_usage_buckets is not None:
+        buckets = normalize_usage_buckets(response)
+        if buckets:
+            total = sum(int(value) for value in buckets.values() if isinstance(value, int))
+            if total > 0:
+                return total
     usage = response.get("usage")
     if not isinstance(usage, Mapping):
         return None
     total = usage.get("total_tokens")
-    if total is not None:
-        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-            return None
-        return total
-    prompt = usage.get("prompt_tokens")
-    completion = usage.get("completion_tokens")
-    if isinstance(prompt, bool) or isinstance(completion, bool):
+    if total is None:
         return None
-    if not isinstance(prompt, int) or not isinstance(completion, int):
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
         return None
-    if prompt < 0 or completion < 0:
-        return None
-    return prompt + completion
+    return total
 
 
 class ProviderGatewayClient:
@@ -2505,13 +2515,23 @@ class ProviderGatewayClient:
             run_id=authority.run_id,
             group_id=authority.group_id,
             # 结算时按维度退回差额，所以要把本次预留的完整明细带上。
+            # ⚠ 按**最大尝试次数**预留模型轮次（I3）：`max_retries`（生产默认 2）意味着
+            #   一次授权最多 3 次 provider 网络调用，而旧实现只预留 1 轮——重试消耗完全
+            #   不入账。按 `attempts` 预留、effect 后按实际结算退回，两侧都不漏。
             reserved_usage=BudgetUsage(
-                model_turns=1,
+                model_turns=self._max_attempts(),
                 tokens=estimated_input_tokens + reserved_output_tokens,
-                cost_usd=capability.estimated_cost_usd,
+                cost_usd=capability.estimated_cost_usd * self._max_attempts(),
             ),
             estimated_input_tokens=estimated_input_tokens,
         )
+
+    def _max_attempts(self) -> int:
+        """一次授权可能触发的 provider 调用次数（1 + 重试）。"""
+
+        transport = object.__getattribute__(self, "_transport")
+        retries = int(getattr(transport, "max_retries", 0) or 0)
+        return max(1, retries + 1)
 
     @staticmethod
     def _effective_output_limit(
