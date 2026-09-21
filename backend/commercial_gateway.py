@@ -2189,6 +2189,11 @@ class _ProviderAuthorization:
     capability: ProviderCapability
     run_id: str
     group_id: str
+    #: 预留的完整明细（结算时按维度退回差额）。
+    reserved_usage: BudgetUsage = None  # type: ignore[assignment]
+    #: 其中用于**输入**估算的那部分：结算时输入维度不退（估算保守），
+    #: 只把输出预留按实际上限退回。
+    estimated_input_tokens: int = 0
 
 
 #: `max_tokens` 未显式给出时施加的 backend 输出上限。
@@ -2499,6 +2504,13 @@ class ProviderGatewayClient:
             capability=capability,
             run_id=authority.run_id,
             group_id=authority.group_id,
+            # 结算时按维度退回差额，所以要把本次预留的完整明细带上。
+            reserved_usage=BudgetUsage(
+                model_turns=1,
+                tokens=estimated_input_tokens + reserved_output_tokens,
+                cost_usd=capability.estimated_cost_usd,
+            ),
+            estimated_input_tokens=estimated_input_tokens,
         )
 
     @staticmethod
@@ -2530,12 +2542,16 @@ class ProviderGatewayClient:
     ) -> None:
         """按 provider 上报的 usage 对账（I-R1）。
 
-        预留是**上界估计**（输入按字符数/4 估、输出按上限估）。这里只补差额：
-        实际用量高于预留时补扣，低于预留时不动（预留已扣，缺一个释放 API，
-        保守多扣比漏扣安全）。usage 是不可信输入，所以：
-          · 只接受非负整数（见 `_provider_reported_total_tokens`）；
-          · 补扣量以本次预留为上限——否则一个乱报 usage 的 provider 可以一下把预算
-            扣穿，反而成了拒绝服务的手段。
+        预留是**上界估计**（输入按字符数/4 估、输出按上限估），所以两个方向都要处理：
+
+        · 实际 **高于**预留 → 补扣差额（估算偏低）。
+        · 实际 **低于**预留 → 通过 `settle_budget` 把差额退回。**这一步是复审要求补的**：
+          旧实现只补不退，复审实测每次调用永久多扣约 3.3 倍（真实 1300 vs 预留 4615），
+          22 次后 run 被判 BUDGET_EXHAUSTED 而实际只用了 27%，`BudgetLimits(tokens=100000)`
+          的实际语义变成约 27000 —— "预算"这个数字不再可信。
+
+        usage 是不可信输入：只接受非负整数（见 `_provider_reported_total_tokens`），
+        且补扣量以本次预留为上限，否则一个乱报用量的 provider 可以一次把预算扣穿。
         """
 
         if authorization is None or authorization.runtime is None:
@@ -2543,23 +2559,42 @@ class ProviderGatewayClient:
         actual = _provider_reported_total_tokens(response)
         if actual is None:
             return
-        delta = actual - authorization.reserved_tokens
-        if delta <= 0:
+        reserved = authorization.reserved_tokens
+        delta = actual - reserved
+        if delta > 0:
+            # 估算偏低：补扣，但以本次预留为上限（防 peer 用假 usage 扣穿预算）。
+            top_up = min(delta, max(0, reserved))
+            if top_up <= 0:
+                return
+            try:
+                authorization.runtime.consume_budget(
+                    authorization.group_id,
+                    authorization.run_id,
+                    BudgetUsage(tokens=top_up),
+                    request_key=f"provider-usage:{uuid.uuid4().hex}",
+                )
+            except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+                # 对账失败不能把一次已成功的调用变成失败；下一次调用会重新校验余额。
+                return
             return
-        # 补扣量以本次预留为上限：usage 来自 peer，不设上限就成了"peer 可扣穿预算"。
-        delta = min(delta, max(0, authorization.reserved_tokens))
-        if delta <= 0:
+        # 估算偏高：退回差额（只退 token 维度；模型轮次/成本是精确的，无需调整）。
+        surplus = -delta
+        if surplus <= 0:
             return
         try:
-            authorization.runtime.consume_budget(
+            authorization.runtime.settle_budget(
                 authorization.group_id,
                 authorization.run_id,
-                BudgetUsage(tokens=delta),
-                request_key=f"provider-usage:{uuid.uuid4().hex}",
+                actual=BudgetUsage(
+                    tokens=max(0, reserved - surplus),
+                    model_turns=authorization.reserved_usage.model_turns,
+                    cost_usd=authorization.reserved_usage.cost_usd,
+                    wall_clock_seconds=authorization.reserved_usage.wall_clock_seconds,
+                ),
+                reserved=authorization.reserved_usage,
+                request_key=f"provider-settle:{uuid.uuid4().hex}",
             )
         except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
-            # 对账失败不能把一次已成功的调用变成失败：预留已扣，最坏是少扣一点。
-            # 下一次调用会重新校验余额，所以这里不需要（也不应该）改状态。
             return
 
     @staticmethod

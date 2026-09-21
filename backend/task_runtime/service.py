@@ -530,6 +530,72 @@ class TaskRuntimeService:
             ),
         )
 
+    def settle_budget(
+        self,
+        group_id: str,
+        run_id: str,
+        *,
+        actual: BudgetUsage,
+        reserved: BudgetUsage,
+        request_key: str,
+    ) -> TaskRun:
+        """按**实际用量**结算一次预留（I-R1）。
+
+        为什么需要它：`consume_budget` 只能加不能减（`BudgetUsage` 拒绝负值），于是
+        effect 前的预留一旦偏高就**永久**算在头上。复审实测过后果：provider 每次真实
+        消耗 1300 token，而预留约 4615，22 次调用后 run 被判 `BUDGET_EXHAUSTED`——
+        实际只用了 27,300，账上却扣了 100,519，偏差 3.68×。`BudgetLimits(tokens=100_000)`
+        的实际语义因此变成约 27,000，"预算"这个数字不再可信。
+
+        这里把预留替换为实际：在同一 `change_run` 事务内直接把 `budget_usage` 减去
+        `reserved - actual` 的差额，所以不存在"先加后减"的中间态被其他读者看到。
+
+        只接受 `actual <= reserved`：用量高于预留说明估算过低，那种情况应由调用方先
+        通过 `consume_budget` 补差（见 `ProviderGatewayClient._reconcile_provider_usage`），
+        在这里做加法会让"结算"变成第二条隐式加账路径。
+        """
+
+        for name in ("tokens", "model_turns", "tool_calls", "cost_usd", "wall_clock_seconds"):
+            if float(getattr(actual, name)) > float(getattr(reserved, name)):
+                raise RuntimeConflictError(
+                    f"actual {name} exceeds the reservation; top up before settling"
+                )
+        current = self._owned_run(run_id, group_id)
+        result: dict[str, Any] = {}
+
+        def mutate(run: TaskRun) -> None:
+            if run.group_id != current.group_id or run.status.terminal:
+                raise RuntimeConflictError("terminal or cross-group run cannot settle budget")
+            usage = run.budget_usage
+            settled = BudgetUsage(
+                wall_clock_seconds=max(
+                    0.0,
+                    usage.wall_clock_seconds - (reserved.wall_clock_seconds - actual.wall_clock_seconds),
+                ),
+                model_turns=max(0, usage.model_turns - (reserved.model_turns - actual.model_turns)),
+                tool_calls=max(0, usage.tool_calls - (reserved.tool_calls - actual.tool_calls)),
+                tokens=max(0, usage.tokens - (reserved.tokens - actual.tokens)),
+                cost_usd=max(
+                    0.0, usage.cost_usd - (reserved.cost_usd - actual.cost_usd),
+                ),
+            )
+            result.update({"usage": settled})
+            run.budget_usage = settled
+
+        run, _event, _created = self.store.change_run(
+            run_id,
+            event_type="budget_updated",
+            public_payload=lambda updated: {
+                "usage": result["usage"].__dict__,
+                "limits": updated.budget_limits.__dict__,
+                "settled": True,
+                "status": updated.status.value,
+            },
+            idempotency_key=request_key,
+            mutate=mutate,
+        )
+        return run
+
     def consume_budget(
         self, group_id: str, run_id: str, delta: BudgetUsage, *, request_key: str,
     ) -> TaskRun:

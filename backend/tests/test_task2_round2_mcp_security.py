@@ -398,6 +398,79 @@ def test_test_seam_refuses_a_client_that_can_reach_the_network() -> None:
     asyncio.run(attempt())
 
 
+# ── I-R1：预算结算（退回预留下的差额）───────────────────────────────────────
+
+
+def test_settle_budget_refunds_the_unused_reservation(tmp_path: Any) -> None:
+    """I1：预留偏高时必须能退回，否则预算被系统性多扣。
+
+    复审实测过旧后果：provider 每次真实 1300 token、预留约 4615，22 次调用后 run 被判
+    BUDGET_EXHAUSTED，而实际只用了 27% —— `BudgetLimits(tokens=100000)` 的实际语义
+    变成约 27000。`consume_budget` 只能加不能减（BudgetUsage 拒绝负值），所以必须有一条
+    显式的结算路径。
+    """
+
+    from backend.groups import GroupRepository
+    from backend.task_runtime.contracts import BudgetLimits, BudgetUsage, TaskStatus
+    from backend.task_runtime.service import TaskRuntimeService
+
+    groups = GroupRepository(tmp_path)
+    service = TaskRuntimeService(tmp_path, groups)
+    group = groups.create_group("budget")
+    run = service.submit(
+        group.group_id, title="settle", request_key="s1",
+        budget_limits=BudgetLimits(tokens=10_000, model_turns=20, cost_usd=5.0),
+    )
+    run = service.schedule()[0]
+
+    # effect 前：预留 4615（输入 999 + 输出上限 3616 之类）
+    service.consume_budget(
+        group.group_id, run.run_id, BudgetUsage(model_turns=1, tokens=4615, cost_usd=0.01),
+        request_key="reserve-1",
+    )
+    assert service.store.get_run(run.run_id).budget_usage.tokens == 4615
+
+    # effect 后：provider 只报了 1300 → 结算应把 3315 退回
+    service.settle_budget(
+        group.group_id,
+        run.run_id,
+        actual=BudgetUsage(model_turns=1, tokens=1300, cost_usd=0.01),
+        reserved=BudgetUsage(model_turns=1, tokens=4615, cost_usd=0.01),
+        request_key="settle-1",
+    )
+    assert service.store.get_run(run.run_id).budget_usage.tokens == 1300
+    assert service.store.get_run(run.run_id).status is TaskStatus.RUNNING
+
+    service.close()
+
+
+def test_settle_budget_refuses_to_add_usage(tmp_path: Any) -> None:
+    """结算只能退不能补：actual > reserved 必须拒绝，避免它变成第二条隐式加账路径。"""
+
+    from backend.groups import GroupRepository
+    from backend.task_runtime.contracts import BudgetUsage
+    from backend.task_runtime.service import (
+        RuntimeConflictError,
+        TaskRuntimeService,
+    )
+
+    groups = GroupRepository(tmp_path)
+    service = TaskRuntimeService(tmp_path, groups)
+    group = groups.create_group("budget2")
+    run = service.submit(group.group_id, title="settle", request_key="s2")
+    run = service.schedule()[0]
+
+    with pytest.raises(RuntimeConflictError, match="exceeds the reservation"):
+        service.settle_budget(
+            group.group_id,
+            run.run_id,
+            actual=BudgetUsage(tokens=5000),
+            reserved=BudgetUsage(tokens=1000),
+            request_key="bad",
+        )
+    service.close()
+
+
 # ── I-R1：输出预留与 usage 解析 ──────────────────────────────────────────────
 
 

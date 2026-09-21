@@ -51,7 +51,10 @@ _PUBLIC_EVENT_FIELDS: dict[str, frozenset[str]] = {
     "run_queued": frozenset({"status", "kind", "route_label", "summary", "classification"}),
     "status_changed": frozenset({"from", "status", "summary", "blocking_reason", "failure_type"}),
     "agent_phase_changed": frozenset({"agent_id", "role", "phase", "operation_summary", "blocking_reason"}),
-    "budget_updated": frozenset({"usage", "limits", "exhausted_dimension", "status"}),
+    # `settled` 表示这条事件是"按实际用量结算预留"而不是普通累加（I-R1），
+    # 公开给审计方以便区分"预留上界"与"实际消耗"。它是封闭白名单的一部分，
+    # 所以新增字段必须显式登记在这里。
+    "budget_updated": frozenset({"usage", "limits", "exhausted_dimension", "status", "settled"}),
     "budget_exhausted": frozenset({"usage", "limits", "exhausted_dimension", "status"}),
     "approval_requested": frozenset({"status", "approval"}),
     "approval_resolved": frozenset({"status", "approval_id", "resolution", "failure_type"}),
