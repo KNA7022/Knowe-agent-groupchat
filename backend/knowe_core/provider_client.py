@@ -485,6 +485,14 @@ class ProviderClient:
             body.setdefault("stream_options", {"include_usage": True})
         if extra_body:
             body.update(extra_body)
+        # I-R1：`model` 与 `messages` 是**授权元数据**，不允许被 extra_body 覆盖。
+        # Gateway 的 capability registry 校验的是 self.model，DLP 扫描的是传入的
+        # messages；而 extra_body 最后合并，曾能把 body["model"] 换成另一个模型
+        # （复审实测：`extra_body={"model": "attacker"}` 生效，registry 却仍看原模型），
+        # 于是"授权时看到的请求"和"真正发出去的请求"不是同一个。这里在合并之后
+        # 重新写回权威值；想换模型必须改 self.model，那会重新走 registry 校验。
+        body["model"] = self.model
+        body["messages"] = messages
         return body
 
     async def _request(self, body: dict[str, Any]) -> dict[str, Any]:

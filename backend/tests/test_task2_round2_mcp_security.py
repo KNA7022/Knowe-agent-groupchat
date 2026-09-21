@@ -343,6 +343,36 @@ def test_expired_lease_cannot_be_redeemed() -> None:
     broker.close()
 
 
+# ── I-R1：授权元数据不得被 extra_body 覆盖 ────────────────────────────────────
+
+
+def test_extra_body_cannot_override_the_authorized_model() -> None:
+    """I-R1（部分）：Gateway 按 `self.model` 校验 capability，所以最终请求里的
+    `model` 必须就是它——否则"授权时看到的模型"与"实际调用的模型"脱节。
+
+    复审实测过旧行为：`extra_body={"model": "attacker"}` 会覆盖 body["model"]，
+    而 registry 仍然只校验原模型。
+    """
+
+    from backend.knowe_core.provider_client import ProviderClient
+
+    client = ProviderClient(
+        base_url="https://provider.example/v1",
+        api_key="k",
+        model="authorized-model",
+    )
+    body = client._build_body(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        temperature=None,
+        max_tokens=None,
+        stream=False,
+        extra_body={"model": "attacker-model", "messages": [{"role": "user", "content": "x"}]},
+    )
+    assert body["model"] == "authorized-model"
+    assert body["messages"] == [{"role": "user", "content": "hi"}]
+
+
 @pytest.mark.asyncio
 async def test_registry_builds_and_seals_transport_from_registered_config() -> None:
     methods: list[str] = []
