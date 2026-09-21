@@ -2495,14 +2495,17 @@ class ProviderGatewayClient:
             authority, run=run, requested=max_tokens,
         )
         reserved_output_tokens = output_limit
+        # I3：预留与 consume 必须用**同一份** BudgetUsage。旧实现声明
+        # `model_turns = 1 + max_retries` 却只 consume 1 轮/1 份成本，于是 settle 的
+        # 差值恒为 0、重试计费从未进账（复审实测：真重试 3 次，账上仍是 1 轮）。
+        reserved_usage = self._reserved_usage(
+            capability=capability,
+            tokens=estimated_input_tokens + reserved_output_tokens,
+        )
         budgeted = runtime.consume_budget(
             authority.group_id,
             authority.run_id,
-            BudgetUsage(
-                model_turns=1,
-                tokens=estimated_input_tokens + reserved_output_tokens,
-                cost_usd=capability.estimated_cost_usd,
-            ),
+            reserved_usage,
             request_key=f"provider-budget:{uuid.uuid4().hex}",
         )
         if budgeted.status is not TaskStatus.RUNNING:
@@ -2534,19 +2537,69 @@ class ProviderGatewayClient:
             capability=capability,
             run_id=authority.run_id,
             group_id=authority.group_id,
-            # 结算时按维度退回差额，所以要把本次预留的完整明细带上。
-            # ⚠ 按**最大尝试次数**预留模型轮次（I3）：`max_retries`（生产默认 2）意味着
-            #   一次授权最多 3 次 provider 网络调用，而旧实现只预留 1 轮——重试消耗完全
-            #   不入账。按 `attempts` 预留、effect 后按实际结算退回，两侧都不漏。
-            reserved_usage=BudgetUsage(
-                model_turns=self._max_attempts(),
-                tokens=estimated_input_tokens + reserved_output_tokens,
-                cost_usd=capability.estimated_cost_usd * self._max_attempts(),
-            ),
+            # 结算时按维度退回差额，所以带上**与 consume 完全相同**的那一份预留明细
+            # （由 `_reserved_usage` 统一构造，避免两处各写一遍而漂移——这正是 I3
+            #  "声明 3 轮却只扣 1 轮" 的成因）。
+            reserved_usage=reserved_usage,
             estimated_input_tokens=estimated_input_tokens,
             started_at=time.monotonic(),
             capability_digest=capability_digest,
         )
+
+    def _reserved_usage(self, *, capability: Any, tokens: int) -> BudgetUsage:
+        """本次调用的预留用量（consume 与 settle 共用同一份定义）。
+
+        `model_turns` 与 `cost_usd` 按**最大尝试次数**计（`1 + max_retries`）：一次授权
+        最多会发出这么多次 provider 调用。effect 之后由 `_reconcile_provider_usage`
+        按**实际**尝试次数结算退回，所以两边都不会偏。
+        """
+
+        attempts = self._max_attempts()
+        return BudgetUsage(
+            model_turns=attempts,
+            tokens=int(tokens),
+            cost_usd=capability.estimated_cost_usd * attempts,
+        )
+
+    def _actual_attempts(self) -> int:
+        """上一次 provider 调用**实际**发出的次数（含重试），拿不到就按 1 计。
+
+        由 `ProviderClient.last_attempts` 提供；它记录每次网络尝试。拿不到时按 1 计是
+        保守的：宁可少退（多扣一点）也不要按 0 计而把轮次全退掉。
+        """
+
+        transport = object.__getattribute__(self, "_transport")
+        attempts = int(getattr(transport, "last_attempts", 0) or 0)
+        return max(1, attempts)
+
+    def _settle_attempt_dimensions(
+        self, authorization: "_ProviderAuthorization", tokens: int | None,
+    ) -> None:
+        """只结算轮次/成本维度（provider 未上报 usage 时用）。"""
+
+        if authorization.runtime is None:
+            return
+        attempts = self._actual_attempts()
+        actual_usage = BudgetUsage(
+            tokens=(
+                authorization.reserved_usage.tokens if tokens is None else max(0, int(tokens))
+            ),
+            model_turns=attempts,
+            cost_usd=authorization.capability.estimated_cost_usd * attempts,
+            wall_clock_seconds=authorization.reserved_usage.wall_clock_seconds,
+        )
+        if actual_usage == authorization.reserved_usage:
+            return
+        try:
+            authorization.runtime.settle_budget(
+                authorization.group_id,
+                authorization.run_id,
+                actual=actual_usage,
+                reserved=authorization.reserved_usage,
+                request_key=f"provider-settle:{uuid.uuid4().hex}",
+            )
+        except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+            return
 
     def _max_attempts(self) -> int:
         """一次授权可能触发的 provider 调用次数（1 + 重试）。"""
@@ -2580,7 +2633,11 @@ class ProviderGatewayClient:
         return max(1, min(cap, remaining))
 
     def _reconcile_provider_usage(
-        self, authorization: "_ProviderAuthorization | None", response: Any,
+        self,
+        authorization: "_ProviderAuthorization | None",
+        response: Any,
+        *,
+        failed: bool = False,
     ) -> None:
         """按 provider 上报的 usage 对账（I-R1）。
 
@@ -2592,48 +2649,66 @@ class ProviderGatewayClient:
           22 次后 run 被判 BUDGET_EXHAUSTED 而实际只用了 27%，`BudgetLimits(tokens=100000)`
           的实际语义变成约 27000 —— "预算"这个数字不再可信。
 
+        I1 残余（第四轮复审）：**调用失败**时旧实现压根不调用本方法，于是预留被 100%
+        计入（实测账上 4115 / 真实 0）。失败时 token 维度保持预留是**故意保守**的
+        （失败前可能已经产生了输入消耗，无法从错误里得知），但轮次与成本维度会按实际
+        尝试次数结算——模型轮次是已知量，没有理由按最坏情况收费。
+
         usage 是不可信输入：只接受非负整数（见 `_provider_reported_total_tokens`），
         且补扣量以本次预留为上限，否则一个乱报用量的 provider 可以一次把预算扣穿。
         """
 
         if authorization is None or authorization.runtime is None:
             return
+        if failed:
+            self._settle_attempt_dimensions(authorization, None)
+            return
         actual = _provider_reported_total_tokens(response)
         if actual is None:
+            # provider 没报 usage：token 维度保持预留（保守），但轮次/成本仍按**实际
+            # 尝试次数**结算——否则未重试的成功调用会一直按最坏情况付模型轮次。
+            self._settle_attempt_dimensions(authorization, None)
             return
         reserved = authorization.reserved_tokens
         delta = actual - reserved
         if delta > 0:
             # 估算偏低：补扣，但以本次预留为上限（防 peer 用假 usage 扣穿预算）。
             top_up = min(delta, max(0, reserved))
-            if top_up <= 0:
-                return
-            try:
-                authorization.runtime.consume_budget(
-                    authorization.group_id,
-                    authorization.run_id,
-                    BudgetUsage(tokens=top_up),
-                    request_key=f"provider-usage:{uuid.uuid4().hex}",
-                )
-            except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
-                # 对账失败不能把一次已成功的调用变成失败；下一次调用会重新校验余额。
-                return
+            if top_up > 0:
+                try:
+                    authorization.runtime.consume_budget(
+                        authorization.group_id,
+                        authorization.run_id,
+                        BudgetUsage(tokens=top_up),
+                        request_key=f"provider-usage:{uuid.uuid4().hex}",
+                    )
+                    reserved += top_up
+                except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+                    # 对账失败不能把一次已成功的调用变成失败；下一次调用会重新校验余额。
+                    return
+        # 统一结算：tokens 按实际（或保持预留），轮次/成本按**实际尝试次数**（I3）。
+        # 预留是按最坏情况（1 + max_retries）扣的，没重试的部分必须退回去，否则
+        # 每次成功调用都多付 (max_retries) 轮与对应成本。
+        attempts = self._actual_attempts()
+        actual_usage = BudgetUsage(
+            tokens=max(0, reserved),
+            model_turns=attempts,
+            cost_usd=authorization.capability.estimated_cost_usd * attempts,
+            wall_clock_seconds=authorization.reserved_usage.wall_clock_seconds,
+        )
+        if actual_usage == authorization.reserved_usage:
             return
-        # 估算偏高：退回差额（只退 token 维度；模型轮次/成本是精确的，无需调整）。
-        surplus = -delta
-        if surplus <= 0:
-            return
+        # settle 要求 actual <= reserved：预留里 token 维度可能已被补差抬高，
+        # 把它一起抬到实际值再结算（结算后的账就是 actual_usage）。
+        settled_reserved = replace(
+            authorization.reserved_usage, tokens=max(0, reserved),
+        )
         try:
             authorization.runtime.settle_budget(
                 authorization.group_id,
                 authorization.run_id,
-                actual=BudgetUsage(
-                    tokens=max(0, reserved - surplus),
-                    model_turns=authorization.reserved_usage.model_turns,
-                    cost_usd=authorization.reserved_usage.cost_usd,
-                    wall_clock_seconds=authorization.reserved_usage.wall_clock_seconds,
-                ),
-                reserved=authorization.reserved_usage,
+                actual=actual_usage,
+                reserved=settled_reserved,
                 request_key=f"provider-settle:{uuid.uuid4().hex}",
             )
         except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
@@ -2708,6 +2783,10 @@ class ProviderGatewayClient:
                 messages, tools, temperature, max_tokens, extra_body,
             )
         except BaseException as exc:
+            # I1 残余：失败的调用也要结算**轮次/成本**维度，否则预留被 100% 计入
+            # （复审实测：失败时账上 4115 / 真实 0）。token 维度保持预留是故意的——
+            # 失败前可能已产生输入消耗，从错误里无法得知。
+            self._reconcile_provider_usage(authorization, None, failed=True)
             self._complete_authorized_effect(authorization, error=exc)
             raise
         # I-R1：预留是上界估计，effect 之后按 provider 上报的 usage 补差。
@@ -2737,12 +2816,14 @@ class ProviderGatewayClient:
             ):
                 yield event
         except BaseException as exc:
+            self._reconcile_provider_usage(authorization, None, failed=True)
             self._complete_authorized_effect(authorization, error=exc)
             raise
-        # ⚠ I-R1 未尽之处（已记入台账）：流式路径**没有**做 usage 对账。
-        # 原因：usage 只出现在 SSE 的最后一个 chunk 里，而这里拿到的是生成器，
-        # 逐个 yield 时看不到"最终用量"。输入预留与输出上限仍然照旧生效，
-        # 所以预算是被约束的，只是没有按实际用量做二次校正。
+        # ⚠ I-R1 未尽之处（已记入台账）：流式路径**不做 usage 对账**，因为 usage 只出现在
+        # SSE 的最后一个 chunk 里，而这里拿到的是生成器，逐个 yield 时看不到"最终用量"。
+        # 轮次/成本仍按实际尝试次数结算（下面这次调用），所以预算是被约束的，只是
+        # token 维度没有按实际用量做二次校正。
+        self._reconcile_provider_usage(authorization, None)
         self._complete_authorized_effect(authorization, error=None)
 
 

@@ -524,6 +524,103 @@ def test_ordinary_provider_request_writes_a_terminal_audit_event(tmp_path: Any) 
     runtime.close()
 
 
+def _budget_call(
+    tmp_path: Any, handler: Any, *, max_retries: int,
+) -> tuple[Any, Any]:
+    """跑一次真实授权的 provider 调用，返回 (runtime, run)。"""
+
+    from backend.commercial_gateway import (
+        LegacyToolAuthority,
+        ProviderGatewayClient,
+        legacy_tool_authority_context,
+    )
+    from backend.groups import GroupRepository
+    from backend.knowe_core.provider_client import ProviderClient
+    from backend.task_runtime.service import TaskRuntimeService
+
+    groups = GroupRepository(tmp_path)
+    runtime = TaskRuntimeService(tmp_path, groups)
+    group = groups.create_group("retry")
+    run = runtime.submit(group.group_id, title="retry", request_key="r1")
+    run = runtime.schedule()[0]
+
+    authorization = LegacyToolAuthority(
+        group_id=group.group_id, task_id=run.task_id, run_id=run.run_id, runtime=runtime,
+    )
+    client = ProviderGatewayClient(
+        base_url="https://api.openai.com/v1",
+        api_key="k",
+        model="m",
+        provider="openai-api",
+    )
+    object.__setattr__(
+        client,
+        "_transport",
+        ProviderClient(
+            base_url="https://api.openai.com/v1",
+            api_key="k",
+            model="m",
+            max_retries=max_retries,
+            client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            _gateway_managed=True,
+        ),
+    )
+
+    async def call() -> None:
+        with legacy_tool_authority_context(authorization):
+            await client.chat([{"role": "user", "content": "hi"}], max_tokens=100)
+
+    asyncio.run(call())
+    return runtime, runtime.store.get_run(run.run_id)
+
+
+def test_retried_call_charges_every_attempt(tmp_path: Any) -> None:
+    """I3：重试必须按**实际尝试次数**入账。
+
+    旧实现声明 `model_turns = 1 + max_retries` 却只 consume 1 轮，settle 差值恒为 0，
+    于是真重试 3 次账上仍是 1 轮——预留字段写了但从未生效。
+    """
+
+    calls = {"n": 0}
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return httpx.Response(500, json={"error": "boom"})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    runtime, run = _budget_call(tmp_path, handler, max_retries=2)
+    assert calls["n"] == 3, "本用例需要真的重试两次"
+    assert run.budget_usage.model_turns == 3, run.budget_usage
+    runtime.close()
+
+
+def test_successful_first_attempt_refunds_the_unused_retry_reservation(tmp_path: Any) -> None:
+    """反向：没重试就只应付 1 轮，多预留的 (max_retries) 轮必须退回。"""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        )
+
+    runtime, run = _budget_call(tmp_path, handler, max_retries=2)
+    # 预留过 3 轮，实际只用了 1 轮。
+    assert run.budget_usage.model_turns == 1, run.budget_usage
+    # 成本同理：只付 1 份。
+    assert run.budget_usage.cost_usd == pytest.approx(0.01, abs=1e-9), run.budget_usage
+    runtime.close()
+
+
 # ── I-R1：预算结算（退回预留下的差额）───────────────────────────────────────
 
 

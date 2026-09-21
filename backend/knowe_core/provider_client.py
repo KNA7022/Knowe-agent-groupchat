@@ -374,6 +374,11 @@ class ProviderClient:
 
     # ── Non-streaming ──
 
+    #: 上一次 `chat` 实际发出的 provider 调用次数（含重试）。
+    #: I3：Gateway 按 `1 + max_retries` 预留预算，必须能读到**实际**次数才能把多预留的
+    #: 部分退回去；否则重试计费要么不进账、要么每次都按最坏情况多扣。
+    last_attempts: int = 0
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -537,8 +542,11 @@ class ProviderClient:
     async def _request(self, body: dict[str, Any]) -> dict[str, Any]:
         self._assert_gateway_managed()
         total_attempts = self.max_retries + 1
+        # I3：记录本次真实发出的调用次数，供 Gateway 结算时退回多预留的部分。
+        self.last_attempts = 0
         for attempt in range(total_attempts):
             try:
+                self.last_attempts = attempt + 1
                 client = self._get_client()
                 response = await client.post(
                     self._endpoint,
