@@ -1957,6 +1957,11 @@ class ModelCapabilityRegistry:
         except KeyError as exc:
             raise GatewayDenied("provider is not registered") from exc
 
+    def provider_ids(self) -> tuple[str, ...]:
+        """已注册的 provider 列表（只读快照，便于调用方/测试枚举）。"""
+
+        return tuple(sorted(self._providers))
+
     def authorize(
         self,
         provider_id: str,
@@ -2110,12 +2115,56 @@ _PRODUCTION_PROVIDER_ENDPOINTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]
 
 
 def production_model_capability_registry() -> ModelCapabilityRegistry:
+    """生产 provider 能力表。
+
+    ⚠ **RAG 能力（embedding / vision / rerank）是保守声明，不是营销清单**（I-R1）：
+    旧实现给每个 provider 只注册 `{"chat","stream","tools"}`，于是 Task 3 的本地优先
+    RAG 要按隐私与成本预授权 cloud embedding 或 vision OCR 时**没有槽位可挂**，只剩
+    "绕过 registry"一条路——那正是这套网关要防的事。这里为已知具备对应公开 API 的
+    provider 显式加上槽位；未列出的 provider 一律不具备该能力（fail closed）。
+
+    新增 provider 时必须**核实**它是否真的提供该能力的公开 API 再登记：把没验证过的
+    能力写进来，就等于让 registry 为一次并不受支持的调用背书。登记 RAG 能力**不会**
+    降低 chat 路径的隐私要求（privacy 仍按 provider 单独声明）。
+    """
+
+    # (embedding, vision, rerank) —— 仅列已核实的公开 API 能力。
+    rag_capabilities: dict[str, tuple[bool, bool, bool]] = {
+        "openai-api": (True, True, False),
+        "gemini": (True, True, False),
+        "alibaba": (True, True, True),
+        "zai": (True, True, False),
+        "deepseek": (False, False, False),
+        "openrouter": (False, True, False),
+        "anthropic": (False, True, False),
+        "xai": (False, True, False),
+        "minimax": (False, True, False),
+        "minimax-cn": (False, True, False),
+        "kimi-coding": (False, True, False),
+        "kimi-coding-cn": (False, True, False),
+        "stepfun": (False, True, False),
+        "nvidia": (True, False, True),
+        "huggingface": (True, False, False),
+        "novita": (True, False, False),
+        "arcee": (False, False, False),
+        "gmi": (False, False, False),
+        "copilot": (False, True, False),
+    }
+
     registry = ModelCapabilityRegistry()
     for provider_id, (endpoints, transports) in _PRODUCTION_PROVIDER_ENDPOINTS.items():
+        embedding, vision, rerank = rag_capabilities.get(provider_id, (False, False, False))
+        capabilities = {"chat", "stream", "tools"}
+        if embedding:
+            capabilities.add("embedding")
+        if vision:
+            capabilities.add("vision")
+        if rerank:
+            capabilities.add("rerank")
         registry.register(ProviderCapability(
             provider_id=provider_id,
             models=("*",),
-            capabilities=frozenset({"chat", "stream", "tools"}),
+            capabilities=frozenset(capabilities),
             privacy=PrivacyTier.STANDARD,
             estimated_cost_usd=0.01,
             preauthorized=True,

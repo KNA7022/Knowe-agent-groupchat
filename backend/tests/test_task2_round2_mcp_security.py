@@ -405,6 +405,62 @@ def test_provider_reported_usage_is_parsed_strictly() -> None:
     assert _provider_reported_total_tokens("not-a-mapping") is None
 
 
+def test_production_registry_declares_rag_capabilities() -> None:
+    """I-R1 / Task 3 前置：RAG 需要 embedding / vision OCR / rerank 的注册槽位。
+
+    旧实现给每个 provider 只注册 `{"chat","stream","tools"}`，于是 Task 3 的本地优先
+    RAG 一旦要按隐私与成本预授权 cloud embedding 或 vision OCR，**没有任何槽位可挂**，
+    只能绕过 registry —— 那正是这套网关存在要防的事。
+    """
+
+    from backend.commercial_gateway import production_model_capability_registry
+
+    registry = production_model_capability_registry()
+    embedding_providers = [
+        pid for pid in registry.provider_ids()
+        if "embedding" in registry.get(pid).capabilities
+    ]
+    vision_providers = [
+        pid for pid in registry.provider_ids()
+        if "vision" in registry.get(pid).capabilities
+    ]
+    assert embedding_providers, "至少要有一个 provider 声明 embedding 能力（Task 3 的 BYOK 槽位）"
+    assert vision_providers, "至少要有一个 provider 声明 vision 能力（Task 3 的公式/图表 OCR 槽位）"
+
+
+def test_registry_rejects_a_capability_the_provider_did_not_declare() -> None:
+    """未声明的能力必须被拒绝，而不是靠通配 model 蒙混过去。"""
+
+    from backend.commercial_gateway import (
+        ModelCapabilityRegistry,
+        PrivacyTier,
+        ProviderCapability,
+        production_model_capability_registry,
+    )
+
+    registry = production_model_capability_registry()
+    # 找一个只声明 chat 的最小注册表来验证拒绝语义（不受生产数据表影响）。
+    minimal = ModelCapabilityRegistry()
+    minimal.register(ProviderCapability(
+        provider_id="chatonly",
+        models=("*",),
+        capabilities=frozenset({"chat"}),
+        privacy=PrivacyTier.STANDARD,
+        estimated_cost_usd=0.01,
+        preauthorized=True,
+        endpoint_authorities=("https://chat.example",),
+    ))
+    with pytest.raises(GatewayDenied, match="capability"):
+        minimal.authorize(
+            "chatonly",
+            model="any-model",
+            endpoint="https://chat.example",
+            transport="openai_chat",
+            required_capabilities=("embedding",),
+        )
+    assert registry is not None
+
+
 def test_extra_body_cannot_override_the_authorized_model() -> None:
     """I-R1（部分）：Gateway 按 `self.model` 校验 capability，所以最终请求里的
     `model` 必须就是它——否则"授权时看到的模型"与"实际调用的模型"脱节。
