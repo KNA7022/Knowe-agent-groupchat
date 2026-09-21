@@ -202,10 +202,12 @@ class KnoweAgent:
             ),
             max_retries=cfg.max_retries,
             client_factory=client_factory,
+            # 注入 factory 只是替换发送通道；策略（authority/DLP/预算/审计）照旧执行。
+            # 没有这个显式声明，注入 factory 会被拒绝（C-R1：不再有"注入即受管"）。
+            _trusted_test_transport=client_factory is not None,
             provider=cfg.provider,
             transport=cfg.transport,
             credential_provider=cfg.credential_provider,
-            allow_ungoverned_test_transport=client_factory is not None,
         )
         self._tool_registry = tool_registry or ToolRegistry()
         # Only the Coordinator uses durable raw AgentLoop messages. Worker state is

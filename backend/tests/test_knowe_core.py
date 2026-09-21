@@ -76,6 +76,7 @@ def client_for(script: list[bytes | int]) -> tuple[ProviderClient, FakeProvider]
         base_url="https://api.deepseek.com",
         api_key="sk-test",
         client_factory=fake.factory,
+        _trusted_test_transport=True,
     ), fake
 
 
@@ -331,6 +332,7 @@ async def test_sse_split_across_chunk_boundaries_still_parses():
     client = ProviderClient(
         base_url="https://x.com", api_key="k",
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        _trusted_test_transport=True,
     )
     text = "".join([
         e["content"] async for e in client.chat_stream([{"role": "user", "content": "hi"}])

@@ -204,6 +204,7 @@ class ProviderClient:
         backoff_base: float = DEFAULT_BACKOFF_BASE,
         credential_provider: CredentialProvider | None = None,
         _gateway_managed: bool = False,
+        _trusted_test_transport: bool = False,
     ):
         normalized_base = base_url.rstrip("/")
         # HTTPX requires an absolute URL even when MockTransport intercepts the request.
@@ -224,8 +225,23 @@ class ProviderClient:
         self._client_factory = client_factory
         # A real network client is an internal transport, never an application policy
         # boundary.  Production construction must come from ProviderGatewayClient.
-        # An injected client factory is the explicit isolated-test transport seam.
-        self._gateway_managed = bool(_gateway_managed or client_factory is not None)
+        #
+        # C-R1：这里原本是 `_gateway_managed or client_factory is not None`，即"注入任意
+        # factory 就自动受管"。那等于把"我只想要一个假 transport"和"我跳过整个
+        # Gateway 策略"混为一谈——复审实测：传一个**真实** httpx.AsyncClient 也能通过
+        # `_assert_gateway_managed`，于是真实网络请求可以绕过 authority/DLP/预算/审批/审计。
+        #
+        # 现在 client_factory 只在两种情况被接受：
+        #   1. _gateway_managed=True —— Gateway 构造时替换底层 transport（正常路径）；
+        #   2. _trusted_test_transport=True —— **仅测试**使用，专测 provider_client 自身的
+        #      凭据/重试等边界（那些行为与 Gateway 无关，无法经由 Gateway 触发）。
+        # 生产构造点（ProviderGatewayClient）永远只传 _gateway_managed，不传后者。
+        if client_factory is not None and not (_gateway_managed or _trusted_test_transport):
+            raise PermissionError(
+                "Production provider egress requires the Provider Gateway; "
+                "client_factory may only replace the transport of a gateway-managed client"
+            )
+        self._gateway_managed = bool(_gateway_managed or _trusted_test_transport)
         self._injected_client: httpx.AsyncClient | None = None
 
         # Never send an invalid ``Bearer `` header.  Omitting it lets the provider return

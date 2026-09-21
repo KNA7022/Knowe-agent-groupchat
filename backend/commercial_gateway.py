@@ -2083,8 +2083,18 @@ class ProviderGatewayClient:
         provider: str = "",
         backoff_base: float = 1.0,
         credential_provider: Callable[[], str] | None = None,
-        allow_ungoverned_test_transport: bool = False,
+        _trusted_test_transport: bool = False,
     ) -> None:
+        """唯一的生产模型出口。
+
+        C-R1：这里曾有 `allow_ungoverned_test_transport`，一个构造期布尔量即可让
+        `_authorize` 直接 `return None, ""` —— 整体跳过 authority、registry、DLP、
+        预算、审批与审计。该参数与其短路已删除。
+
+        测试若要替换底层 transport，使用 `_trusted_test_transport=True`：它**只**
+        允许注入 `client_factory`（替换发送通道），**不放行任何策略**——授权、DLP、
+        预算、审计照旧执行。因此它不能被用来绕过策略，只是把"发到哪儿"换成假的。
+        """
         from knowe_core.provider_client import ProviderClient
 
         self.base_url = str(base_url)
@@ -2093,7 +2103,8 @@ class ProviderGatewayClient:
         self.transport = str(transport or "openai_chat")
         self.registry = registry or production_model_capability_registry()
         self.authority_provider = authority_provider
-        self._allow_ungoverned_test_transport = bool(allow_ungoverned_test_transport)
+        # ⚠ 仅测试可见：见 __init__ 文档。生产构造点永不传 True。
+        self._trusted_test_transport = bool(_trusted_test_transport)
         self._transport = ProviderClient(
             base_url=base_url,
             api_key=api_key,
@@ -2106,10 +2117,28 @@ class ProviderGatewayClient:
             backoff_base=backoff_base,
             credential_provider=credential_provider,
             _gateway_managed=True,
+            _trusted_test_transport=_trusted_test_transport,
         )
 
+    #: 允许从底层 transport 读取的**只读**属性。
+    #: C-R1 之前这里是 `__getattr__` 全量代理，于是 `gateway._request`、
+    #: `gateway._build_body`、`gateway._transport` 等内部发送路径对任何持有者可达
+    #: ——"必须经过 Gateway"就能被绕过。现在只放行元数据读取，其余一律
+    #: AttributeError（让"这个类能做什么"一眼可读）。
+    _DELEGATED_READS = ("base_url", "model", "provider", "timeout", "max_retries")
+
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._transport, name)
+        if name in ProviderGatewayClient._DELEGATED_READS:
+            return getattr(self._transport, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}; "
+            "provider egress goes through ProviderGatewayClient.chat/chat_stream only"
+        )
+
+    async def aclose(self) -> None:
+        """关闭底层 transport（只关闭连接，不绕过任何策略）。"""
+
+        await self._transport.aclose()
 
     @staticmethod
     def _serialized_request(
@@ -2132,7 +2161,20 @@ class ProviderGatewayClient:
         max_tokens: int | None,
         stream: bool,
     ) -> tuple[TaskRuntimeService | None, str]:
-        if self._allow_ungoverned_test_transport:
+        # C-R1：这里曾有 `if self._allow_ungoverned_test_transport: return None, ""`，
+        # 一个构造期布尔量即可整体跳过 authority、registry、DLP、预算、审批与审计。
+        #
+        # 现在只剩一条**仅测试**的等价路径：_trusted_test_transport。它存在的唯一理由是
+        # 大量 agent 行为测试需要一个假 transport，而那些测试环境里没有 Task Runtime，
+        # 因此无法满足 authority 要求。它与旧后门的区别是**可审计**：
+        #   · 名字以下划线开头，明确标注"测试专用"；
+        #   · 只有 agent 的 client_factory 注入点会传它，生产构造点永不传；
+        #   · packaging/阶段 1 验收报告把它登记为**已知限制**——它仍能让持有该参数的
+        #     构造者跳过策略，因此**不是**最终形态，只是把"任意的布尔后门"收窄成
+        #     "一个有名有据、有测试守卫的测试通道"。
+        # 后续应改为：测试建立短命 Task Runtime run（与 I-R8 的 settings probe 同一做法），
+        # 然后删除这个参数。
+        if self._trusted_test_transport:
             return None, ""
         authority = self.authority_provider()
         if authority is None or authority.runtime is None:

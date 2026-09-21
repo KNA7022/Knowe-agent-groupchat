@@ -936,17 +936,64 @@ function registerMainSecretBoundary(): void {
 //       cwd 改回 PROJECT_ROOT；knowe_* 顶层包仍由 PYTHONPATH=BACKEND_DIR 兜底
 //       （与上方历史修法的双保险同一机制）。打包态不变（exe 自包含，cwd=BACKEND_DIR）。
 
-/** spawn 后端用的环境变量：固定数据根、固定安装根与 UTF-8 stdio。 */
-function buildBackendEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  for (const inheritedName of Object.keys(env)) {
-    if (/(?:API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|AUTH_TOKEN|MASTER_KEY|SECRET_KEY|PASSWORD)$/i.test(
-      inheritedName,
-    )) {
-      delete env[inheritedName];
-    }
+/**
+ * OS 运行必需变量（打包后必须原样传给 Python）。
+ * 白名单而不是黑名单：旧实现 `{...process.env}` 复制整份宿主环境、再按 7 类**后缀**
+ * 删除疑似密钥，实测漏掉 `AZURE_OPENAI_KEY`、`OPENAI_API_TOKEN`、`AWS_SECRET_ACCESS_KEY`、
+ * `GOOGLE_APPLICATION_CREDENTIALS`、`HF_TOKEN`、`GITHUB_TOKEN` 等一大批常见凭据名
+ * （见 I-R6）。凭据只应经 safeStorage + 短租进入后端，不能靠宿主环境继承。
+ */
+const BACKEND_ENV_ALLOWLIST = [
+  'PATH',
+  'Path',
+  'PATHEXT',
+  'SystemRoot',
+  'SystemDrive',
+  'windir',
+  'COMSPEC',
+  'TEMP',
+  'TMP',
+  'USERPROFILE',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'PROGRAMDATA',
+  'PROGRAMFILES',
+  'PROGRAMFILES(X86)',
+  'NUMBER_OF_PROCESSORS',
+  'PROCESSOR_ARCHITECTURE',
+  'OS',
+  'LANG',
+  'LC_ALL',
+] as const;
+
+/** 开发态额外放行：Conda/pyenv 环境（dev 后端用宿主解释器，需要它自己的环境）。 */
+const DEV_EXTRA_ENV_ALLOWLIST = [
+  'CONDA_PREFIX',
+  'CONDA_DEFAULT_ENV',
+  'CONDA_PYTHON_EXE',
+  'CONDA_SHLVL',
+  'CONDA_EXE',
+  'VIRTUAL_ENV',
+] as const;
+
+/** 强制透传的运行参数（非敏感，部署方可能显式设置）。 */
+const PASSTHROUGH_ENV = ['KNOWE_AGENT', 'KNOWE_DATA_DIR'] as const;
+
+/** spawn 后端用的环境变量：显式 allowlist + 固定运行参数 + UTF-8 stdio。 */
+export function buildBackendEnv(): NodeJS.ProcessEnv {
+  const inherited: NodeJS.ProcessEnv = {};
+  const allowed = new Set<string>([
+    ...BACKEND_ENV_ALLOWLIST,
+    ...(app.isPackaged ? [] : DEV_EXTRA_ENV_ALLOWLIST),
+    ...PASSTHROUGH_ENV,
+  ]);
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value !== undefined && allowed.has(name)) inherited[name] = value;
   }
-  Object.assign(env, {
+
+  const runtime: NodeJS.ProcessEnv = {
     PYTHONUNBUFFERED: '1',
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8',
@@ -958,28 +1005,26 @@ function buildBackendEnv(): NodeJS.ProcessEnv {
     KNOWE_SECRET_BROKER_TOKEN: secretBrokerToken,
     KNOWE_ATTACHMENT_KEY: getAttachmentSignKey(),
     KNOWE_AGENT: process.env.KNOWE_AGENT ?? 'deepseek',
-  });
+  };
+
   // [阶段1.5] PYTHONPATH 双保险只对开发态有意义（`python -m backend` 的模块解析兜底）；
   //           打包版是 PyInstaller 自包含产物（依赖在 _internal/），不再注入。
   if (!app.isPackaged) {
     // 双保险：dev 后端 cwd=PROJECT_ROOT（归一后 python -m backend 的解析前提）；
     // PYTHONPATH 指向 backend/，让 knowe_* 顶层包可解析。
-    env.PYTHONPATH = BACKEND_DIR;
+    runtime.PYTHONPATH = BACKEND_DIR;
   }
   if (app.isPackaged) {
     // 打包后：随包解释器不能继承宿主 Conda/virtualenv，否则依赖开发机环境。
-    // 开发态：KNOWE_DEV_PYTHON 指向 Conda Python，必须保留 Conda 环境变量。
-    delete env.PYTHONHOME;
-    delete env.VIRTUAL_ENV;
-    delete env.CONDA_PREFIX;
-    delete env.CONDA_DEFAULT_ENV;
+    // 白名单已天然排除这些变量；这里额外保证不残留 PYTHONHOME。
+    delete inherited.PYTHONHOME;
     // [阶段1.5] 打包版新增环境：浏览器内核随包分发（ms-playwright）并强制无头；
     //           KNOWE_VERSION 供后端上报版本（app 在模块层可用，直接取）。
-    env.PLAYWRIGHT_BROWSERS_PATH = join(BACKEND_DIR, 'ms-playwright');
-    env.KNOWE_BROWSER_HEADLESS = '1';
-    env.KNOWE_VERSION = app.getVersion();
+    runtime.PLAYWRIGHT_BROWSERS_PATH = join(BACKEND_DIR, 'ms-playwright');
+    runtime.KNOWE_BROWSER_HEADLESS = '1';
+    runtime.KNOWE_VERSION = app.getVersion();
   }
-  return env;
+  return { ...inherited, ...runtime };
 }
 
 /**

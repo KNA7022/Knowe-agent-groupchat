@@ -540,13 +540,14 @@ class DeepSeekAgent:
             ),
             max_retries=CONFIG.provider_max_retries,
             client_factory=self._client_factory,
+            # 注入 factory 只替换发送通道，不放行策略（C-R1）。
+            _trusted_test_transport=self._client_factory is not None,
             provider=str((binding or {}).get("provider") or "injected"),
             transport=str((binding or {}).get("transport") or "openai_chat"),
             credential_provider=(
                 (lambda selected=dict(binding): runtime_settings.resolve_provider_credential(selected))
                 if binding is not None else None
             ),
-            allow_ungoverned_test_transport=self._client_factory is not None,
         )
 
         deltas: list[str] = []
