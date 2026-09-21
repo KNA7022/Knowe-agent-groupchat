@@ -33,6 +33,8 @@ import { get as httpGet, request as httpRequest } from 'node:http';
 import { createConnection } from 'node:net'; // [1.2] 端口占用探测
 import { pathToFileURL } from 'node:url';
 
+import { buildRuntimeEnv, selectInheritedEnv } from './backendEnv';
+
 import {
   isPreviewControlRequest,
   isPreviewTopLevelUrlUnknown,
@@ -936,119 +938,28 @@ function registerMainSecretBoundary(): void {
 //       cwd 改回 PROJECT_ROOT；knowe_* 顶层包仍由 PYTHONPATH=BACKEND_DIR 兜底
 //       （与上方历史修法的双保险同一机制）。打包态不变（exe 自包含，cwd=BACKEND_DIR）。
 
-/**
- * OS 运行必需变量（打包后必须原样传给 Python）。
- * 白名单而不是黑名单：旧实现 `{...process.env}` 复制整份宿主环境、再按 7 类**后缀**
- * 删除疑似密钥，实测漏掉 `AZURE_OPENAI_KEY`、`OPENAI_API_TOKEN`、`AWS_SECRET_ACCESS_KEY`、
- * `GOOGLE_APPLICATION_CREDENTIALS`、`HF_TOKEN`、`GITHUB_TOKEN` 等一大批常见凭据名
- * （见 I-R6）。凭据只应经 safeStorage + 短租进入后端，不能靠宿主环境继承。
+/** spawn 后端用的环境变量：白名单继承 + 固定运行参数（实现见 `backendEnv.ts`）。
+
+ * 抽出去的原因：这段逻辑原先内联在这里，而本文件在模块顶层就调用 electron 的 `app`，
+ * 测试**无法导入执行**——只能抠数组字面量做静态断言，连"`ComSpec` 因大小写不匹配而
+ * 传不出去"都发现不了。现在由纯模块 `backendEnv.ts` 提供，测试可以真的跑。
  */
-const BACKEND_ENV_ALLOWLIST = [
-  'PATH',
-  'Path',
-  'PATHEXT',
-  'SystemRoot',
-  'SystemDrive',
-  'windir',
-  'COMSPEC',
-  'TEMP',
-  'TMP',
-  'USERPROFILE',
-  'HOMEDRIVE',
-  'HOMEPATH',
-  'APPDATA',
-  'LOCALAPPDATA',
-  'PROGRAMDATA',
-  'PROGRAMFILES',
-  'PROGRAMFILES(X86)',
-  'NUMBER_OF_PROCESSORS',
-  'PROCESSOR_ARCHITECTURE',
-  'OS',
-  'LANG',
-  'LC_ALL',
-  // ── 网络与 TLS（I6）──────────────────────────────────────────────────────
-  // 白名单第一版漏掉了这些，复审实测后果：需要走代理访问 OpenAI/Gemini 的部署、
-  // 以及装了企业 MITM CA 的环境，后端会**直连并失败**。它们不是凭据，必须放行。
-  // 后端唯一的 HTTP 客户端 httpx 默认 trust_env=True，正是靠这些变量挂代理/信任 CA，
-  // 而后端代码里没有任何替代的代理配置入口。
-  'HTTP_PROXY',
-  'HTTPS_PROXY',
-  'ALL_PROXY',
-  'NO_PROXY',
-  'http_proxy',
-  'https_proxy',
-  'all_proxy',
-  'no_proxy',
-  'SSL_CERT_FILE',
-  'SSL_CERT_DIR',
-  'REQUESTS_CA_BUNDLE',
-  'CURL_CA_BUNDLE',
-  'NODE_EXTRA_CA_CERTS',
-] as const;
-
-/** 开发态额外放行：Conda/pyenv 环境（dev 后端用宿主解释器，需要它自己的环境）。 */
-const DEV_EXTRA_ENV_ALLOWLIST = [
-  'CONDA_PREFIX',
-  'CONDA_DEFAULT_ENV',
-  'CONDA_PYTHON_EXE',
-  'CONDA_SHLVL',
-  'CONDA_EXE',
-  'VIRTUAL_ENV',
-] as const;
-
-/** 强制透传的运行参数（非敏感，部署方可能显式设置）。 */
-const PASSTHROUGH_ENV = ['KNOWE_AGENT', 'KNOWE_DATA_DIR'] as const;
-
-/** spawn 后端用的环境变量：显式 allowlist + 固定运行参数 + UTF-8 stdio。 */
 export function buildBackendEnv(): NodeJS.ProcessEnv {
-  const inherited: NodeJS.ProcessEnv = {};
-  // ⚠ 比较必须**大小写不敏感**（I6 残余）：Windows 的变量名是混合大小写
-  // （`ComSpec` / `ProgramData` / `ProgramFiles` / `ProgramFiles(x86)`），而
-  // allowlist 里写的是全大写。旧实现用 `allowed.has(name)` 精确匹配，实测这四个
-  // 变量**一个都没传出去**——配置文件写对了却静默失效，比漏写更难发现。
-  // 保留宿主原本的拼写（键名原样），只把匹配归一化。
-  const allowed = new Set<string>(
-    [
-      ...BACKEND_ENV_ALLOWLIST,
-      ...(app.isPackaged ? [] : DEV_EXTRA_ENV_ALLOWLIST),
-      ...PASSTHROUGH_ENV,
-    ].map((name) => name.toLowerCase()),
-  );
-  for (const [name, value] of Object.entries(process.env)) {
-    if (value !== undefined && allowed.has(name.toLowerCase())) inherited[name] = value;
-  }
-
-  const runtime: NodeJS.ProcessEnv = {
-    PYTHONUNBUFFERED: '1',
-    PYTHONUTF8: '1',
-    PYTHONIOENCODING: 'utf-8',
-    KNOWE_INSTALL_ROOT: INSTALL_ROOT,
-    KNOWE_DATA_DIR: BACKEND_DATA_ROOT,
-    KNOWE_HEALTH_PORT: String(HTTP_PORT),
-    KNOWE_WS_PORT: String(WS_PORT),
-    KNOWE_RUNTIME_TOKEN: runtimeToken,
-    KNOWE_SECRET_BROKER_TOKEN: secretBrokerToken,
-    KNOWE_ATTACHMENT_KEY: getAttachmentSignKey(),
-    KNOWE_AGENT: process.env.KNOWE_AGENT ?? 'deepseek',
-  };
-
-  // [阶段1.5] PYTHONPATH 双保险只对开发态有意义（`python -m backend` 的模块解析兜底）；
-  //           打包版是 PyInstaller 自包含产物（依赖在 _internal/），不再注入。
-  if (!app.isPackaged) {
-    // 双保险：dev 后端 cwd=PROJECT_ROOT（归一后 python -m backend 的解析前提）；
-    // PYTHONPATH 指向 backend/，让 knowe_* 顶层包可解析。
-    runtime.PYTHONPATH = BACKEND_DIR;
-  }
-  if (app.isPackaged) {
-    // 打包后：随包解释器不能继承宿主 Conda/virtualenv，否则依赖开发机环境。
-    // 白名单已天然排除这些变量；这里额外保证不残留 PYTHONHOME。
-    delete inherited.PYTHONHOME;
-    // [阶段1.5] 打包版新增环境：浏览器内核随包分发（ms-playwright）并强制无头；
-    //           KNOWE_VERSION 供后端上报版本（app 在模块层可用，直接取）。
-    runtime.PLAYWRIGHT_BROWSERS_PATH = join(BACKEND_DIR, 'ms-playwright');
-    runtime.KNOWE_BROWSER_HEADLESS = '1';
-    runtime.KNOWE_VERSION = app.getVersion();
-  }
+  const inherited = selectInheritedEnv(process.env, { isPackaged: app.isPackaged });
+  const runtime = buildRuntimeEnv({
+    installRoot: INSTALL_ROOT,
+    dataRoot: BACKEND_DATA_ROOT,
+    healthPort: HTTP_PORT,
+    wsPort: WS_PORT,
+    runtimeToken,
+    secretBrokerToken,
+    attachmentKey: getAttachmentSignKey(),
+    agent: process.env.KNOWE_AGENT ?? 'deepseek',
+    isPackaged: app.isPackaged,
+    backendDir: BACKEND_DIR,
+    projectRoot: PROJECT_ROOT,
+    appVersion: app.getVersion(),
+  });
   return { ...inherited, ...runtime };
 }
 

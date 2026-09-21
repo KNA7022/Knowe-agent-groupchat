@@ -18,7 +18,12 @@ describe('main-only OS credential boundary', () => {
     expect(main).toMatch(/\bsafeStorage\b/);
     expect(main).toContain('new SecretVault');
     expect(main).toContain('registerSecretIpc');
-    expect(main).toContain('KNOWE_SECRET_BROKER_TOKEN: secretBrokerToken');
+    // broker token 现在经 `backendEnv.ts` 的 `buildRuntimeEnv` 注入；main.ts 只负责
+    // 把值传进去（重构后字面量 `KNOWE_SECRET_BROKER_TOKEN: secretBrokerToken` 不再
+    // 出现在 main.ts 里，所以这里改断言"传递"这一事实 + 新模块里的键名）。
+    expect(main).toContain('secretBrokerToken,');
+    expect(main).toContain('buildRuntimeEnv(');
+    expect(source('electron/backendEnv.ts')).toContain('KNOWE_SECRET_BROKER_TOKEN: options.secretBrokerToken');
     expect(main).toContain("'X-Knowe-Secret-Broker-Token': secretBrokerToken");
     expect(main).toContain('/internal/credential-lease');
 
@@ -29,18 +34,18 @@ describe('main-only OS credential boundary', () => {
     expect(bridge).not.toContain('KNOWE_SECRET_BROKER_TOKEN');
   });
 
-  it('passes only an explicit allowlist of environment variables to the backend', () => {
+  it('builds the backend environment through the extracted pure module', () => {
     const main = source('electron/main.ts');
 
     // I-R6：旧实现是 `{...process.env}` 全量复制 + 7 类**后缀**黑名单，实测漏掉
     // AZURE_OPENAI_KEY / OPENAI_API_TOKEN / AWS_SECRET_ACCESS_KEY /
-    // GOOGLE_APPLICATION_CREDENTIALS / HF_TOKEN / GITHUB_TOKEN 等一大批常见凭据名，
-    // 于是宿主环境里的长生命周期凭据会被继承给 Python 进程。
-    // 现在改为显式 allowlist：进程只拿到 OS 运行必需变量 + 固定运行参数。
-    expect(main).toContain('BACKEND_ENV_ALLOWLIST');
-    expect(main).toContain('DEV_EXTRA_ENV_ALLOWLIST');
-    expect(main).toContain('PASSTHROUGH_ENV');
-    expect(main).toMatch(/allowed\.has\(name\)/);
+    // GOOGLE_APPLICATION_CREDENTIALS / HF_TOKEN / GITHUB_TOKEN 等一大批常见凭据名。
+    //
+    // 这里只断言**接线**：main.ts 必须把宿主环境交给抽出去的纯函数去筛。
+    // 筛选逻辑本身由 `backendEnv.test.ts` **真实执行**验证（原先这里是从源码抠
+    // 数组字面量做静态断言，观察不到任何行为，连 `ComSpec` 因大小写传不出去都发现不了）。
+    expect(main).toContain('selectInheritedEnv(process.env');
+    expect(main).toContain('buildRuntimeEnv(');
 
     // 反向断言：后缀黑名单这条路必须彻底消失（它证明不了什么，只会给人安全感）。
     expect(main).not.toMatch(/delete env\[inheritedName\]/);
@@ -49,11 +54,13 @@ describe('main-only OS credential boundary', () => {
   });
 
   it('keeps the networking and TLS variables the backend needs', () => {
-    const main = source('electron/main.ts');
-    const block = main.match(/const BACKEND_ENV_ALLOWLIST = \[([\s\S]*?)\] as const;/);
+    // allowlist 已移到 backendEnv.ts（为的是能被真实执行）；这里从该模块读取。
+    const env = source('electron/backendEnv.ts');
+    const block = env.match(/const BACKEND_ENV_ALLOWLIST = \[([\s\S]*?)\] as const;/);
     const allowed = [...(block?.[1] ?? '').matchAll(/'([^']+)'/g)]
       .map((m) => m[1])
       .filter((name): name is string => typeof name === 'string');
+    expect(block, '必须能从 backendEnv.ts 提取出 BACKEND_ENV_ALLOWLIST').not.toBeNull();
 
     // I6：白名单第一版只查"没有凭据名"，于是漏掉了代理/CA —— 需要代理访问
     // OpenAI/Gemini 的部署、以及装了企业 MITM CA 的环境会**直连并失败**。
@@ -73,24 +80,17 @@ describe('main-only OS credential boundary', () => {
   it('matches the allowlist case-insensitively so Windows names survive', () => {
     const main = source('electron/main.ts');
 
-    // I6 残余：Windows 的变量名是混合大小写（ComSpec / ProgramData / ProgramFiles /
-    // ProgramFiles(x86)），而 allowlist 里写的是全大写。复审实测：精确匹配让这四个
-    // 变量**一个都没传出去** —— 配置文件写对了却静默失效。
-    //
-    // ⚠ 局限说明：`buildBackendEnv` 在模块顶层依赖 electron 的 `app`，无法在
-    // vitest 里直接导入执行（导入 main.ts 会跑整个主进程入口）。所以这里只做静态
-    // 守卫；理想做法是把该函数抽到不依赖 electron 的独立模块再真实执行，已登记为遗留。
-    // （不做 `not.toContain('allowed.has(name)')` 这类反向断言：该字面量在文件其他位置
-    //   也会出现，反向断言会误报。）
-    expect(main).toContain('allowed.has(name.toLowerCase())');
+    // 顶层契约仍在 main.ts 里：它必须调用抽出去的纯函数。
+    expect(main).toContain('selectInheritedEnv(process.env');
+    expect(main).toContain('buildRuntimeEnv(');
   });
 
   it('refuses to inherit long-lived cloud credentials even though the names vary', () => {
-    const main = source('electron/main.ts');
+    const env = source('electron/backendEnv.ts');
 
     // 直接解析 allowlist 的内容，而不是拿整个文件做子串匹配：
     // 文件里（注释中）会正当地提到这些凭据名作为反例，整文件匹配会误报。
-    const block = main.match(/const BACKEND_ENV_ALLOWLIST = \[([\s\S]*?)\] as const;/);
+    const block = env.match(/const BACKEND_ENV_ALLOWLIST = \[([\s\S]*?)\] as const;/);
     expect(block, '必须能提取出 BACKEND_ENV_ALLOWLIST').not.toBeNull();
     const allowed = [...(block?.[1] ?? '').matchAll(/'([^']+)'/g)]
       .map((m) => m[1])
