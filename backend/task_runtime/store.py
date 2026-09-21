@@ -1407,6 +1407,24 @@ class TaskRuntimeStore:
         )
         return updated
 
+    def cancel_tool(self, invocation_id: str) -> ToolInvocation:
+        """Terminate a *running* invocation whose effect was abandoned, not failed.
+
+        M-6: ``GeneratorExit`` / ``CancelledError`` are control-flow signals.  Routing
+        them through ``complete_tool(status="failed")`` recorded a fake error type in
+        the audit trail, so an ordinary "the consumer stopped reading the stream" looked
+        like a crashed provider call.  A cancelled invocation is neither: it gets its own
+        terminal status and event type, and carries no ``error_type``.
+        """
+
+        cancelled, _changed = self._transition_tool_with_event(
+            invocation_id,
+            expected_statuses=frozenset({"running"}),
+            status="cancelled",
+            event_type="tool_cancelled",
+        )
+        return cancelled
+
     def claim_tool_execution(self, invocation_id: str) -> tuple[ToolInvocation, bool]:
         """Atomically move exactly one prepared invocation to the effect boundary."""
         return self._transition_tool_with_event(

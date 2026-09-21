@@ -77,6 +77,12 @@ _PUBLIC_EVENT_FIELDS: dict[str, frozenset[str]] = {
         "status", "invocation_id", "tool_name", "purpose", "risk", "started_at",
         "completed_at", "duration_ms", "usage", "error_type",
     }),
+    # M-6：消费者离开流式响应、或任务被取消时终止的 effect。它是**取消**，不是失败，
+    # 因此单独一种事件类型——`error_type` 保留在字段集里只为与其它终态同形，取消时为空。
+    "tool_cancelled": frozenset({
+        "status", "invocation_id", "tool_name", "purpose", "risk", "started_at",
+        "completed_at", "duration_ms", "usage", "error_type",
+    }),
     # `provider_egress` 同时承载 effect 前的 `authorized` 与 effect 后的终态
     # （`completed`/`failed`）。I-R5：普通（非敏感）请求此前**只有** authorized、
     # 没有终态，于是公开审计无法证明请求是否执行、耗时多久、实际用了多少 token。

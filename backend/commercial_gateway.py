@@ -2242,6 +2242,13 @@ def _provider_reported_total_tokens(response: Any) -> int | None:
 
     if not isinstance(response, Mapping):
         return None
+    # M-5：`total_tokens` 若存在优先采用。旧实现先跑 buckets，非空就**忽略** total——
+    # 复审实测 `{"total_tokens":42,"prompt_tokens":10}` 被算成 10（少算 32）。
+    usage = response.get("usage")
+    if isinstance(usage, Mapping):
+        total = usage.get("total_tokens")
+        if not isinstance(total, bool) and isinstance(total, int) and total >= 0:
+            return total
     try:
         from knowe_core.provider_client import normalize_usage_buckets
     except ImportError:  # pragma: no cover - 仅打包异常时
@@ -2249,18 +2256,13 @@ def _provider_reported_total_tokens(response: Any) -> int | None:
     if normalize_usage_buckets is not None:
         buckets = normalize_usage_buckets(response)
         if buckets:
-            total = sum(int(value) for value in buckets.values() if isinstance(value, int))
+            total = sum(
+                int(value) for value in buckets.values()
+                if isinstance(value, int) and not isinstance(value, bool)
+            )
             if total > 0:
                 return total
-    usage = response.get("usage")
-    if not isinstance(usage, Mapping):
-        return None
-    total = usage.get("total_tokens")
-    if total is None:
-        return None
-    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
-        return None
-    return total
+    return None
 
 
 class ProviderGatewayClient:
@@ -2720,6 +2722,7 @@ class ProviderGatewayClient:
         *,
         error: BaseException | None,
         actual_tokens: int | None = None,
+        cancelled: bool = False,
     ) -> None:
         """把 effect 的终态写回 Task Runtime。
 
@@ -2728,19 +2731,34 @@ class ProviderGatewayClient:
         `authorized`，**无法证明请求是否执行、何时结束、耗时多久、实际用了多少 token**。
         现在普通请求也会写一条 `provider_egress` 终态事件。
 
+        M-6：`cancelled` 必须与 `error` 分开。消费者离开流式响应（`aclose`）或任务被
+        取消时抛出的是 `GeneratorExit` / `CancelledError`——**控制流信号，不是运行
+        错误**。旧实现把它们塞进 `except BaseException`，于是 `type(error).__name__`
+        把 `GeneratorExit` 写成了错误类型，审计里就留下一次假的 `failed`。取消现在是
+        独立的 `cancelled` 终态，且**不写** `error_type`。
+
         终态 payload 只含 opaque id 与度量：status / capability_digest / privacy /
         duration_ms / actual_tokens / typed error——没有 body、凭据或 PII。
         """
 
+        if cancelled and error is not None:
+            raise ValueError("a cancelled effect cannot also carry an error")
         if authorization is None or authorization.runtime is None:
             return
-        status = "failed" if error is not None else "completed"
+        if cancelled:
+            status = "cancelled"
+        else:
+            status = "failed" if error is not None else "completed"
         if authorization.invocation_id:
-            authorization.runtime.store.complete_tool(
-                authorization.invocation_id,
-                status=status,
-                error_type=type(error).__name__ if error is not None else "",
-            )
+            store = authorization.runtime.store
+            if cancelled:
+                store.cancel_tool(authorization.invocation_id)
+            else:
+                store.complete_tool(
+                    authorization.invocation_id,
+                    status=status,
+                    error_type=type(error).__name__ if error is not None else "",
+                )
         duration_ms = max(
             0, int((time.monotonic() - (authorization.started_at or time.monotonic())) * 1000),
         )
@@ -2782,6 +2800,11 @@ class ProviderGatewayClient:
             result = await object.__getattribute__(self, "_transport").chat(
                 messages, tools, temperature, max_tokens, extra_body,
             )
+        except (GeneratorExit, asyncio.CancelledError):
+            # M-6：取消不是失败。终态记 `cancelled`，不写 error_type。
+            self._reconcile_provider_usage(authorization, None, failed=True)
+            self._complete_authorized_effect(authorization, error=None, cancelled=True)
+            raise
         except BaseException as exc:
             # I1 残余：失败的调用也要结算**轮次/成本**维度，否则预留被 100% 计入
             # （复审实测：失败时账上 4115 / 真实 0）。token 维度保持预留是故意的——
@@ -2815,6 +2838,15 @@ class ProviderGatewayClient:
                 messages, tools, temperature, max_tokens, extra_body,
             ):
                 yield event
+        except (GeneratorExit, asyncio.CancelledError):
+            # M-6：消费者提前 break / `aclose()`（或任务被取消）会让 `GeneratorExit`
+            # 从下面的 `yield` 处抛出。它是控制流信号，不是 provider 故障——旧实现把它
+            # 交给 `except BaseException`，于是审计里出现一次假的 `failed/GeneratorExit`。
+            # `GeneratorExit` 必须重新抛出，否则 async generator 会报
+            # "async generator ignored GeneratorExit"。
+            self._reconcile_provider_usage(authorization, None, failed=True)
+            self._complete_authorized_effect(authorization, error=None, cancelled=True)
+            raise
         except BaseException as exc:
             self._reconcile_provider_usage(authorization, None, failed=True)
             self._complete_authorized_effect(authorization, error=exc)

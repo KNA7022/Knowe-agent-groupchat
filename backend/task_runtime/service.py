@@ -567,6 +567,31 @@ class TaskRuntimeService:
             if run.group_id != current.group_id or run.status.terminal:
                 raise RuntimeConflictError("terminal or cross-group run cannot settle budget")
             usage = run.budget_usage
+            # M-9：`reserved` 必须**真的在账上**。旧实现不校验，于是传入一个大于余额的
+            # 预留（账上 100、声称预留 1000、actual 0）会把未预留的部分一起抹掉。
+            # 这里要求本次释放量不超过当前余额——它同时排除了"多扣"和"抹平"两种误用，
+            # 也让该 API 只能做"把预留替换为实际"这一件事。
+            for name in ("tokens", "model_turns", "tool_calls"):
+                release = int(getattr(reserved, name)) - int(getattr(actual, name))
+                if release > int(getattr(usage, name)):
+                    raise RuntimeConflictError(
+                        f"released {name} exceeds the recorded usage; "
+                        "the reservation is not on this run"
+                    )
+            release_seconds = (
+                reserved.wall_clock_seconds - actual.wall_clock_seconds
+            )
+            if release_seconds > usage.wall_clock_seconds + 1e-9:
+                raise RuntimeConflictError(
+                    "released wall_clock_seconds exceeds the recorded usage; "
+                    "the reservation is not on this run"
+                )
+            release_cost = reserved.cost_usd - actual.cost_usd
+            if release_cost > usage.cost_usd + 1e-9:
+                raise RuntimeConflictError(
+                    "released cost_usd exceeds the recorded usage; "
+                    "the reservation is not on this run"
+                )
             settled = BudgetUsage(
                 wall_clock_seconds=max(
                     0.0,

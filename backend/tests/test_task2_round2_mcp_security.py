@@ -621,6 +621,53 @@ def test_successful_first_attempt_refunds_the_unused_retry_reservation(tmp_path:
     runtime.close()
 
 
+def test_settle_budget_refuses_to_release_more_than_was_reserved(tmp_path: Any) -> None:
+    """M-9：`reserved` 必须真的在账上，否则结算会把用量抹掉。
+
+    复审实测过旧行为：账上只有 100，却传 `reserved=1000, actual=0` → 结算后余额被
+    清成 0（`max(0, …)` 兜住了不负数，但把**未预留的部分一起抹掉**）。当前唯一调用方
+    不可达，所以这是防将来接线出错的守卫，不是可利用漏洞。
+    """
+
+    from backend.groups import GroupRepository
+    from backend.task_runtime.contracts import BudgetUsage
+    from backend.task_runtime.service import RuntimeConflictError, TaskRuntimeService
+
+    groups = GroupRepository(tmp_path)
+    service = TaskRuntimeService(tmp_path, groups)
+    group = groups.create_group("settle-guard")
+    run = service.submit(group.group_id, title="guard", request_key="g1")
+    run = service.schedule()[0]
+
+    # 账上只有 100 token。
+    service.consume_budget(
+        group.group_id, run.run_id, BudgetUsage(tokens=100), request_key="only-100",
+    )
+
+    # 声称预留了 1000 —— 远超账上余额，必须拒绝而不是把用量抹平。
+    with pytest.raises(RuntimeConflictError, match="reservation"):
+        service.settle_budget(
+            group.group_id,
+            run.run_id,
+            actual=BudgetUsage(tokens=0),
+            reserved=BudgetUsage(tokens=1000),
+            request_key="bogus",
+        )
+    # 账上没有被改动。
+    assert service.store.get_run(run.run_id).budget_usage.tokens == 100
+
+    # 正常结算（预留 100、实际 40）仍然可用。
+    service.settle_budget(
+        group.group_id,
+        run.run_id,
+        actual=BudgetUsage(tokens=40),
+        reserved=BudgetUsage(tokens=100),
+        request_key="ok",
+    )
+    assert service.store.get_run(run.run_id).budget_usage.tokens == 40
+    service.close()
+
+
 # ── I-R1：预算结算（退回预留下的差额）───────────────────────────────────────
 
 
@@ -778,6 +825,10 @@ def test_usage_parsing_understands_non_openai_dialects() -> None:
     assert _provider_reported_total_tokens(
         {"usageMetadata": {"promptTokenCount": 8, "candidatesTokenCount": 4}}
     ) == 12
+    # M-5：`total_tokens` 存在时必须优先于分项求和（旧实现会算成 10，少算 32）。
+    assert _provider_reported_total_tokens(
+        {"usage": {"total_tokens": 42, "prompt_tokens": 10}}
+    ) == 42
     # 仍然拒绝畸形输入
     assert _provider_reported_total_tokens({"usage": {"input_tokens": True}}) is None
 
@@ -1007,3 +1058,228 @@ async def test_registry_builds_and_seals_transport_from_registered_config() -> N
     assert accepted["tools"] == ("lookup",)
     assert methods == ["initialize", "notifications/initialized", "tools/list"]
     await registry.close()
+
+
+_STREAM_SSE = (
+    'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":"b"}}]}\n\n'
+    "data: [DONE]\n\n"
+)
+
+
+def _authorized_stream_client(
+    tmp_path: Any, *, sse: str, label: str = "cancel",
+) -> tuple[Any, Any, Any, Any, Any, Any]:
+    """Build a genuinely authorized Gateway client whose socket layer is a MockTransport.
+
+    ``_trusted_test_transport`` is deliberately **not** used: it skips authorization
+    wholesale, so it writes no ``provider_egress`` audit at all -- and audit fidelity is
+    exactly what this module checks.
+    """
+
+    from backend.commercial_gateway import (
+        LegacyToolAuthority,
+        ProviderGatewayClient,
+        legacy_tool_authority_context,
+    )
+    from backend.groups import GroupRepository
+    from backend.knowe_core.provider_client import ProviderClient
+    from backend.task_runtime.contracts import TaskStatus
+    from backend.task_runtime.service import TaskRuntimeService
+
+    groups = GroupRepository(tmp_path)
+    runtime = TaskRuntimeService(tmp_path, groups)
+    group = groups.create_group(label)
+    run = runtime.submit(group.group_id, title=label, request_key=f"{label}:1")
+    run = runtime.schedule()[0]
+    assert run.status is TaskStatus.RUNNING
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=sse,
+        )
+
+    authorization = LegacyToolAuthority(
+        group_id=group.group_id, task_id=run.task_id, run_id=run.run_id, runtime=runtime,
+    )
+    client = ProviderGatewayClient(
+        base_url="https://api.openai.com/v1",
+        api_key="k",
+        model="m",
+        provider="openai-api",
+    )
+    object.__setattr__(
+        client,
+        "_transport",
+        ProviderClient(
+            base_url="https://api.openai.com/v1",
+            api_key="k",
+            model="m",
+            client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+            _gateway_managed=True,
+        ),
+    )
+    return client, runtime, group, run, authorization, legacy_tool_authority_context
+
+
+def test_abandoned_stream_is_audited_as_cancelled_not_failed(tmp_path: Any) -> None:
+    """M-6：消费者提前离开流（``aclose``）是取消，不是一次运行失败。
+
+    旧实现用 ``except BaseException`` 一把抓，于是 ``GeneratorExit``——一个纯粹的
+    控制流信号——被 ``type(error).__name__`` 记成错误类型，审计里就出现一次
+    ``failed / GeneratorExit``。那会让正常取消看起来像崩溃，且被永久写进事件流。
+    """
+
+    client, runtime, group, run, authorization, authority_context = _authorized_stream_client(
+        tmp_path, sse=_STREAM_SSE,
+    )
+
+    async def consume_one() -> dict[str, Any]:
+        with authority_context(authorization):
+            stream = client.chat_stream([{"role": "user", "content": "hi"}])
+            first = await stream.__anext__()
+            # 消费者只想要第一个增量就离开——真实 UI 每秒钟都在做这件事。
+            await stream.aclose()
+            return first
+
+    first = asyncio.run(consume_one())
+    assert first["type"] == "delta"
+
+    payloads = [
+        event.public_payload for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "provider_egress"
+    ]
+    assert payloads, "the effect must still be audited"
+    terminal = [payload for payload in payloads if payload.get("status") != "authorized"]
+    assert terminal, payloads
+    assert terminal[-1]["status"] == "cancelled", payloads
+    assert not [
+        payload for payload in payloads if payload.get("error_type") == "GeneratorExit"
+    ], payloads
+    runtime.close()
+
+
+def test_cancel_tool_is_a_distinct_terminal_state(tmp_path: Any) -> None:
+    """M-6 store 层：取消的 invocation 有自己的状态与事件类型，且不伪造 ``error_type``。
+
+    这条路径在普通（非敏感）出站上不会被走到——只有需要审批的 effect 才有
+    ``invocation_id``。所以它必须单独测，否则"取消不再记成失败"只兑现了 payload 那一半。
+    """
+
+    from backend.groups import GroupRepository
+    from backend.task_runtime.contracts import TaskStatus
+    from backend.task_runtime.service import TaskRuntimeService
+
+    groups = GroupRepository(tmp_path)
+    runtime = TaskRuntimeService(tmp_path, groups)
+    group = groups.create_group("cancel-tool")
+    run = runtime.submit(group.group_id, title="cancel-tool", request_key="ct:1")
+    run = runtime.schedule()[0]
+    assert run.status is TaskStatus.RUNNING
+
+    approval = runtime.request_approval(
+        group.group_id, run.run_id, kind="tool", summary="Approve the effect",
+        risk=RiskLevel.HIGH, request_key="ct:approval",
+        requested_capabilities=("provider_egress",), tool_name="provider_egress",
+        operation_scope={"destination": "portal"}, purpose="provider_egress",
+    )
+    _resolved, grant, _owner = runtime.resolve_approval(
+        group.group_id, approval.approval_id, approved=True,
+        capabilities=("provider_egress",), request_key="ct:resolve",
+    )
+    assert grant is not None
+    invocation = runtime.prepare_tool(
+        group.group_id, run.run_id, task_id=run.task_id, tool_name="provider_egress",
+        idempotency_key="ct:invocation", risk=RiskLevel.HIGH,
+        public_summary="Governed provider egress prepared",
+        approval_id=approval.approval_id, grant_id=grant.grant_id,
+        operation_scope={"destination": "portal"}, purpose="provider_egress",
+    )
+    running, claimed = runtime.store.claim_tool_execution(invocation.invocation_id)
+    assert claimed and running.status == "running"
+
+    cancelled = runtime.store.cancel_tool(invocation.invocation_id)
+
+    assert cancelled.status == "cancelled"
+    assert cancelled.error_type == ""
+    events = [
+        event for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "tool_cancelled"
+    ]
+    assert len(events) == 1, [
+        getattr(event, "event_type", "") for event in runtime.store.events_after(run.run_id, 0)
+    ]
+    payload = events[0].public_payload
+    assert payload["status"] == "cancelled"
+    assert payload["error_type"] == ""
+    runtime.close()
+
+
+def test_completing_an_authorized_effect_distinguishes_cancel_from_failure() -> None:
+    """M-6 接线：`cancelled=True` 必须走 `cancel_tool`，而不是 `complete_tool(failed)`。"""
+
+    from backend.commercial_gateway import (
+        ProviderGatewayClient,
+        _ProviderAuthorization,
+        production_model_capability_registry,
+    )
+
+    class _Store:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict[str, Any]]] = []
+            self.events: list[dict[str, Any]] = []
+
+        def cancel_tool(self, invocation_id: str) -> None:
+            self.calls.append(("cancel_tool", {"invocation_id": invocation_id}))
+
+        def complete_tool(
+            self, invocation_id: str, *, status: str, error_type: str = "",
+        ) -> None:
+            self.calls.append((
+                "complete_tool",
+                {"invocation_id": invocation_id, "status": status, "error_type": error_type},
+            ))
+
+        def change_run(
+            self, run_id: str, *, event_type: str, public_payload: dict[str, Any],
+            idempotency_key: str,
+        ) -> None:
+            self.events.append({"run_id": run_id, "event_type": event_type,
+                                "public_payload": public_payload})
+
+    class _Runtime:
+        def __init__(self) -> None:
+            self.store = _Store()
+
+    invocation_id = "tool_" + "0" * 32
+    runtime = _Runtime()
+    authorization = _ProviderAuthorization(
+        runtime=runtime,  # type: ignore[arg-type]
+        invocation_id=invocation_id,
+        reserved_tokens=10,
+        capability=production_model_capability_registry().get("openai-api"),
+        run_id="run_" + "0" * 32,
+        group_id="grp_" + "0" * 32,
+    )
+    client = ProviderGatewayClient(
+        base_url="https://api.openai.com/v1", api_key="k", model="m", provider="openai-api",
+    )
+
+    client._complete_authorized_effect(authorization, error=None, cancelled=True)
+
+    assert runtime.store.calls == [("cancel_tool", {"invocation_id": invocation_id})], \
+        runtime.store.calls
+    terminal = runtime.store.events[-1]
+    assert terminal["event_type"] == "provider_egress"
+    assert terminal["public_payload"]["status"] == "cancelled"
+    assert "error_type" not in terminal["public_payload"]
+
+    # 取消与错误是互斥的两件事，同时给出说明调用方搞错了语义。
+    runtime.store.calls.clear()
+    with pytest.raises(ValueError):
+        client._complete_authorized_effect(
+            authorization, error=RuntimeError("boom"), cancelled=True,
+        )
+    assert runtime.store.calls == []
