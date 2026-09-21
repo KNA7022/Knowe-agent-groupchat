@@ -1490,6 +1490,98 @@ def test_a_duck_typed_runtime_cannot_authorize_provider_egress() -> None:
     assert sent == [], f"egress happened without a Task Runtime: {sent}"
 
 
+def test_a_duck_typed_runtime_is_rejected_before_any_approval_work() -> None:
+    """M-1（第六轮复审）：上面那条红测走的是普通 payload —— DLP 判定 `requires_approval`
+    为 False，于是 `prepare_tool` / `claim_tool_execution` 从未被走到，被钉住的只是
+    **非敏感**路径上的闸门。
+
+    这条补上敏感路径：payload 真的触发 DLP 审批要求，authority 也带上 approval/grant，
+    然后断言闸门在**任何审批工作之前**就拒掉这次 egress —— 假 runtime 的 `prepare_tool`
+    与 `claim_tool_execution` 一次都不许被调用。
+
+    测试里先独立验证"这份 payload 确实要求审批"，否则它会在 DLP 不触发时静默变成一条
+    只重复了上一条测试的空断言。
+    """
+
+    from backend.commercial_gateway import (
+        GatewayDenied,
+        LegacyToolAuthority,
+        PiiDlpGateway,
+        ProviderGatewayClient,
+    )
+    from backend.task_runtime.contracts import TaskStatus
+
+    sensitive_text = "学号 2026123456，手机号 13800138000"
+    approval_work: list[str] = []
+
+    class _FakeRun:
+        group_id = "grp_" + "0" * 32
+        task_id = "task_" + "0" * 32
+        run_id = "run_" + "0" * 32
+        status = TaskStatus.RUNNING
+        budget_limits = None
+        budget_usage = None
+
+    class _FakeStore:
+        def get_run(self, _run_id: str) -> Any:
+            return _FakeRun()
+
+        def change_run(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def claim_tool_execution(self, *_args: Any, **_kwargs: Any) -> Any:
+            approval_work.append("claim_tool_execution")
+            raise AssertionError("claim_tool_execution must not be reached")
+
+    class _FakeRuntime:
+        def __init__(self) -> None:
+            self.store = _FakeStore()
+
+        def prepare_tool(self, *_args: Any, **_kwargs: Any) -> Any:
+            approval_work.append("prepare_tool")
+            raise AssertionError("prepare_tool must not be reached")
+
+        def consume_budget(self, *_args: Any, **_kwargs: Any) -> Any:
+            approval_work.append("consume_budget")
+            raise AssertionError("consume_budget must not be reached")
+
+    authority = LegacyToolAuthority(
+        group_id=_FakeRun.group_id,
+        task_id=_FakeRun.task_id,
+        run_id=_FakeRun.run_id,
+        runtime=_FakeRuntime(),  # type: ignore[arg-type]
+        approval_id="apr_" + "1" * 32,
+        grant_id="grant_" + "2" * 32,
+    )
+    messages = [{"role": "user", "content": sensitive_text}]
+    client = ProviderGatewayClient(
+        base_url="https://api.deepseek.com",
+        api_key="k",
+        model="deepseek-chat",
+        provider="deepseek",
+        authority_provider=lambda: authority,
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"choices": []}),
+        )),
+    )
+
+    # 前置条件：这份 payload 必须真的要求审批，否则本测试证明不了审批路径。
+    serialized = client._serialized_request(messages, None, None)  # noqa: SLF001
+    assert PiiDlpGateway().decide_outbound(serialized, approved=False).requires_approval, (
+        "this payload must actually require approval; a test that silently takes the "
+        "non-sensitive path would just repeat the test above"
+    )
+
+    async def attempt() -> None:
+        with pytest.raises(GatewayDenied):
+            await client.chat(messages)
+
+    asyncio.run(attempt())
+    assert approval_work == [], (
+        f"approval work ran before the runtime gate rejected the stand-in: {approval_work}"
+    )
+
+
 @pytest.mark.parametrize("abort", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
 def test_aborted_chat_is_audited_as_cancelled_not_failed(
     tmp_path: Any, abort: type[BaseException],
@@ -1677,6 +1769,62 @@ def test_production_authority_is_rebuilt_from_the_store_not_from_a_mapping(
     ]:
         assert canonicalize(stub, raw) is None, f"a bare mapping minted authority: {label}"
 
+    runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_cancellation_survives_a_failing_terminal_write(tmp_path: Any) -> None:
+    """I-2（第六轮复审实测）：`ToolGateway._invoke` 里那段终态兜底**零覆盖**。
+
+    复审的变异很直接——把兜底删掉，round-2 文件仍然 44 passed；而它正是"终态写入失败
+    不能替换掉取消"这条承诺的**全部实现**。台账当时却把它记为已修/已验证。这是第五轮
+    I-3 那条"修了但没锁住"的同一形态，而且它就发生在我修 I-3 的同一个提交里。
+
+    这条测试断言：`store.cancel_tool` 抛错时，调用方看到的仍然是它自己的
+    `CancelledError`，不是一个数据库异常。
+    """
+
+    from backend.commercial_gateway import (
+        ToolDescriptor,
+        ToolExecutionRequest,
+        ToolGateway,
+    )
+    from backend.groups import GroupRepository
+    from backend.task_runtime.service import TaskRuntimeService
+    from backend.task_runtime.store import RuntimeStoreError
+
+    groups = GroupRepository(tmp_path)
+    runtime = TaskRuntimeService(tmp_path, groups)
+    group = groups.create_group("tool-cancel-guard")
+    run = runtime.submit(group.group_id, title="tool-cancel-guard", request_key="tcg:1")
+    run = runtime.schedule()[0]
+
+    def effect(_request: Any) -> str:
+        raise asyncio.CancelledError()
+
+    gateway = ToolGateway(runtime)
+    gateway.register(
+        ToolDescriptor(tool_name="reader", kind="builtin", risk=RiskLevel.LOW),
+        effect,
+    )
+    request = ToolExecutionRequest(
+        group_id=group.group_id,
+        task_id=run.task_id,
+        run_id=run.run_id,
+        tool_name="reader",
+        idempotency_key="tcg:effect",
+        purpose="read",
+    )
+
+    def exploding(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeStoreError("store is unavailable: cancel_tool")
+
+    # 只让终态记录失败，其余（claim、授权）照常。
+    runtime.store.cancel_tool = exploding  # type: ignore[method-assign]
+
+    # 修复前/去掉兜底后：这里会抛 RuntimeStoreError，把取消替换掉。
+    with pytest.raises(asyncio.CancelledError):
+        await gateway.invoke(request)
     runtime.close()
 
 
