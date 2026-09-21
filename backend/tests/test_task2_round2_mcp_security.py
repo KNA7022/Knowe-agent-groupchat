@@ -343,7 +343,66 @@ def test_expired_lease_cannot_be_redeemed() -> None:
     broker.close()
 
 
-# ── I-R1：授权元数据不得被 extra_body 覆盖 ────────────────────────────────────
+# ── I-R1：输出预留与 usage 解析 ──────────────────────────────────────────────
+
+
+class _FakeBudget:
+    def __init__(self, tokens: int) -> None:
+        self.tokens = tokens
+
+
+class _FakeRun:
+    def __init__(self, limit: int, used: int) -> None:
+        self.budget_limits = _FakeBudget(limit)
+        self.budget_usage = _FakeBudget(used)
+
+
+def test_unset_max_tokens_reserves_a_real_output_budget() -> None:
+    """I-R1：`max_tokens=None` 曾预留 0，而生产 Worker 传的就是 None。
+
+    旧式 `max(0, int(max_tokens or 0))` 在 None 时得到 0，于是输出用量完全不在预算里，
+    "预算耗尽会拦住调用"这句话没有依据。
+    """
+
+    from backend.commercial_gateway import (
+        _DEFAULT_OUTPUT_TOKEN_CAP,
+        ProviderGatewayClient,
+    )
+
+    authority = object()
+    # 额度充足 → 用默认上限
+    assert ProviderGatewayClient._effective_output_limit(
+        authority, run=_FakeRun(100_000, 0), requested=None,
+    ) == _DEFAULT_OUTPUT_TOKEN_CAP
+    # 显式给出 → 尊重它（连通性探针传 1）
+    assert ProviderGatewayClient._effective_output_limit(
+        authority, run=_FakeRun(100_000, 0), requested=1,
+    ) == 1
+    # 剩余额度小于上限 → 收敛到剩余
+    assert ProviderGatewayClient._effective_output_limit(
+        authority, run=_FakeRun(100_000, 99_990), requested=None,
+    ) == 10
+    # 额度已尽 → 不预留，让下游预算检查直接拒绝
+    assert ProviderGatewayClient._effective_output_limit(
+        authority, run=_FakeRun(100, 100), requested=None,
+    ) == 0
+
+
+def test_provider_reported_usage_is_parsed_strictly() -> None:
+    """usage 是不可信输入：只接受非负整数，bool 与畸形结构一律当作"无 usage"。"""
+
+    from backend.commercial_gateway import _provider_reported_total_tokens
+
+    assert _provider_reported_total_tokens({"usage": {"total_tokens": 42}}) == 42
+    assert _provider_reported_total_tokens(
+        {"usage": {"prompt_tokens": 10, "completion_tokens": 5}}
+    ) == 15
+    # 缺 usage / 结构不对 / 负值 / bool 都不采纳
+    assert _provider_reported_total_tokens({}) is None
+    assert _provider_reported_total_tokens({"usage": None}) is None
+    assert _provider_reported_total_tokens({"usage": {"total_tokens": -1}}) is None
+    assert _provider_reported_total_tokens({"usage": {"total_tokens": True}}) is None
+    assert _provider_reported_total_tokens("not-a-mapping") is None
 
 
 def test_extra_body_cannot_override_the_authorized_model() -> None:

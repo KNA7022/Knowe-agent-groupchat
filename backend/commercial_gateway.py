@@ -2125,6 +2125,59 @@ def production_model_capability_registry() -> ModelCapabilityRegistry:
     return registry
 
 
+@dataclass
+class _ProviderAuthorization:
+    """一次 provider egress 的授权结果（I-R1）。
+
+    旧实现只把 `(runtime, invocation_id)` 传出去，于是 effect 之后**没有**任何信息
+    可以用来做 usage 对账：既不知道预留了多少 token，也拿不到 capability 的单价。
+    这个对象把对账需要的三项一起带出来。
+    """
+
+    runtime: TaskRuntimeService | None
+    invocation_id: str
+    reserved_tokens: int
+    capability: ProviderCapability
+    run_id: str
+    group_id: str
+
+
+#: `max_tokens` 未显式给出时施加的 backend 输出上限。
+#:
+#: 旧实现 `reserved_output_tokens = max(0, int(max_tokens or 0))` 在 None 时预留 0，
+#: 而**生产 Worker 恰好就传 None**（worker_gateway_runtime.py），于是输出用量完全不在
+#: 预算里——"预算耗尽会拦住调用"这句话就没有依据。这里给一个保守上限，并按剩余额度
+#: 收敛；真正准确的对账由 effect 后的 usage 补偿完成。
+_DEFAULT_OUTPUT_TOKEN_CAP = 4096
+
+
+def _provider_reported_total_tokens(response: Any) -> int | None:
+    """从 provider 响应里取本次使用的 token 总数（拿不到就返回 None）。
+
+    只接受非负整数且拒绝 bool——usage 是不可信输入，不能让 `True` 之类的东西混进来。
+    """
+
+    if not isinstance(response, Mapping):
+        return None
+    usage = response.get("usage")
+    if not isinstance(usage, Mapping):
+        return None
+    total = usage.get("total_tokens")
+    if total is not None:
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            return None
+        return total
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    if isinstance(prompt, bool) or isinstance(completion, bool):
+        return None
+    if not isinstance(prompt, int) or not isinstance(completion, int):
+        return None
+    if prompt < 0 or completion < 0:
+        return None
+    return prompt + completion
+
+
 class ProviderGatewayClient:
     """The sole production model-egress facade.
 
@@ -2228,7 +2281,7 @@ class ProviderGatewayClient:
         extra_body: Any,
         max_tokens: int | None,
         stream: bool,
-    ) -> tuple[TaskRuntimeService | None, str]:
+    ) -> "_ProviderAuthorization | None":
         # C-R1：这里曾有 `if self._allow_ungoverned_test_transport: return None, ""`，
         # 一个构造期布尔量即可整体跳过 authority、registry、DLP、预算、审批与审计。
         #
@@ -2243,7 +2296,7 @@ class ProviderGatewayClient:
         # 后续应改为：测试建立短命 Task Runtime run（与 I-R8 的 settings probe 同一做法），
         # 然后删除这个参数。
         if self._trusted_test_transport:
-            return None, ""
+            return None
         authority = self.authority_provider()
         if authority is None or authority.runtime is None:
             raise GatewayDenied("authoritative Task Runtime context is unavailable for provider egress")
@@ -2306,7 +2359,12 @@ class ProviderGatewayClient:
             invocation_id = invocation.invocation_id
 
         estimated_input_tokens = max(1, math.ceil(len(serialized) / 4))
-        reserved_output_tokens = max(0, int(max_tokens or 0))
+        # I-R1：`max_tokens=None`（生产 Worker 的值）时不再预留 0，而是施加一个保守
+        # 上限并受剩余额度收敛；准确用量由 effect 后的 usage 对账补齐。
+        output_limit = self._effective_output_limit(
+            authority, run=run, requested=max_tokens,
+        )
+        reserved_output_tokens = output_limit
         budgeted = runtime.consume_budget(
             authority.group_id,
             authority.run_id,
@@ -2339,19 +2397,91 @@ class ProviderGatewayClient:
                 else (_ for _ in ()).throw(RuntimeStoreError("provider run is no longer running"))
             ),
         )
-        return runtime, invocation_id
+        return _ProviderAuthorization(
+            runtime=runtime,
+            invocation_id=invocation_id,
+            reserved_tokens=estimated_input_tokens + reserved_output_tokens,
+            capability=capability,
+            run_id=authority.run_id,
+            group_id=authority.group_id,
+        )
+
+    @staticmethod
+    def _effective_output_limit(
+        authority: LegacyToolAuthority, *, run: Any, requested: int | None,
+    ) -> int:
+        """本次调用要预留多少输出 token（I-R1）。
+
+        - 显式给出 max_tokens：尊重它（连通性探针传 1）。
+        - 未给出（生产 Worker 的路径）：用 `_DEFAULT_OUTPUT_TOKEN_CAP`，并按 run 的
+          剩余 token 额度收敛，避免预留本身就超预算。
+        """
+
+        if requested is not None and int(requested) > 0:
+            return int(requested)
+        cap = _DEFAULT_OUTPUT_TOKEN_CAP
+        limits = getattr(run, "budget_limits", None)
+        used = getattr(run, "budget_usage", None)
+        total = int(getattr(limits, "tokens", 0) or 0)
+        consumed = int(getattr(used, "tokens", 0) or 0)
+        remaining = total - consumed
+        if remaining <= 0:
+            # 额度已尽：不预留任何输出，让下游的 budget 检查立刻拒绝。
+            return 0
+        return max(1, min(cap, remaining))
+
+    def _reconcile_provider_usage(
+        self, authorization: "_ProviderAuthorization | None", response: Any,
+    ) -> None:
+        """按 provider 上报的 usage 对账（I-R1）。
+
+        预留是**上界估计**（输入按字符数/4 估、输出按上限估）。这里只补差额：
+        实际用量高于预留时补扣，低于预留时不动（预留已扣，缺一个释放 API，
+        保守多扣比漏扣安全）。usage 是不可信输入，所以：
+          · 只接受非负整数（见 `_provider_reported_total_tokens`）；
+          · 补扣量以本次预留为上限——否则一个乱报 usage 的 provider 可以一下把预算
+            扣穿，反而成了拒绝服务的手段。
+        """
+
+        if authorization is None or authorization.runtime is None:
+            return
+        actual = _provider_reported_total_tokens(response)
+        if actual is None:
+            return
+        delta = actual - authorization.reserved_tokens
+        if delta <= 0:
+            return
+        # 补扣量以本次预留为上限：usage 来自 peer，不设上限就成了"peer 可扣穿预算"。
+        delta = min(delta, max(0, authorization.reserved_tokens))
+        if delta <= 0:
+            return
+        try:
+            authorization.runtime.consume_budget(
+                authorization.group_id,
+                authorization.run_id,
+                BudgetUsage(tokens=delta),
+                request_key=f"provider-usage:{uuid.uuid4().hex}",
+            )
+        except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+            # 对账失败不能把一次已成功的调用变成失败：预留已扣，最坏是少扣一点。
+            # 下一次调用会重新校验余额，所以这里不需要（也不应该）改状态。
+            return
 
     @staticmethod
     def _complete_authorized_effect(
-        runtime: TaskRuntimeService | None,
-        invocation_id: str,
+        authorization: "_ProviderAuthorization | None",
         *,
         error: BaseException | None,
     ) -> None:
-        if runtime is None or not invocation_id:
+        """把 effect 的终态写回 Task Runtime（`_trusted_test_transport` 下无授权，跳过）。"""
+
+        if authorization is None or authorization.runtime is None:
             return
-        runtime.store.complete_tool(
-            invocation_id,
+        if not authorization.invocation_id:
+            # 非敏感请求不会创建 invocation（只有需要审批的才有），此时没有终态要写。
+            return
+        authorization.runtime.store.complete_tool(
+            authorization.invocation_id,
             status="failed" if error is not None else "completed",
             error_type=type(error).__name__ if error is not None else "",
         )
@@ -2364,7 +2494,7 @@ class ProviderGatewayClient:
         max_tokens: int | None = None,
         extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        runtime, invocation_id = self._authorize(
+        authorization = self._authorize(
             messages=messages, tools=tools, extra_body=extra_body,
             max_tokens=max_tokens, stream=False,
         )
@@ -2373,9 +2503,11 @@ class ProviderGatewayClient:
                 messages, tools, temperature, max_tokens, extra_body,
             )
         except BaseException as exc:
-            self._complete_authorized_effect(runtime, invocation_id, error=exc)
+            self._complete_authorized_effect(authorization, error=exc)
             raise
-        self._complete_authorized_effect(runtime, invocation_id, error=None)
+        # I-R1：预留是上界估计，effect 之后按 provider 上报的 usage 补差。
+        self._reconcile_provider_usage(authorization, result)
+        self._complete_authorized_effect(authorization, error=None)
         return result
 
     async def chat_stream(
@@ -2386,7 +2518,7 @@ class ProviderGatewayClient:
         max_tokens: int | None = None,
         extra_body: dict[str, Any] | None = None,
     ):
-        runtime, invocation_id = self._authorize(
+        authorization = self._authorize(
             messages=messages, tools=tools, extra_body=extra_body,
             max_tokens=max_tokens, stream=True,
         )
@@ -2396,9 +2528,13 @@ class ProviderGatewayClient:
             ):
                 yield event
         except BaseException as exc:
-            self._complete_authorized_effect(runtime, invocation_id, error=exc)
+            self._complete_authorized_effect(authorization, error=exc)
             raise
-        self._complete_authorized_effect(runtime, invocation_id, error=None)
+        # ⚠ I-R1 未尽之处（已记入台账）：流式路径**没有**做 usage 对账。
+        # 原因：usage 只出现在 SSE 的最后一个 chunk 里，而这里拿到的是生成器，
+        # 逐个 yield 时看不到"最终用量"。输入预留与输出上限仍然照旧生效，
+        # 所以预算是被约束的，只是没有按实际用量做二次校正。
+        self._complete_authorized_effect(authorization, error=None)
 
 
 @dataclass
