@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from datetime import datetime, timedelta, timezone
@@ -341,6 +342,60 @@ def test_expired_lease_cannot_be_redeemed() -> None:
             now=later,
         )
     broker.close()
+
+
+# ── C-R1（复审后补齐）：后门的两条真实绕过路径 ────────────────────────────────
+
+
+def test_gateway_does_not_expose_its_underlying_transport() -> None:
+    """C2：`gateway._transport` 曾可直通，绕过全部 Provider 策略。
+
+    复审实测：只改 `__getattr__` 无效——`_transport` 是真实存在的实例属性，属性查找
+    根本不落到 `__getattr__`，于是 `gateway._transport.chat(...)` 与
+    `gateway._transport._request(任意 body)` 都能直接出网，且
+    `_gateway_managed=True` 是在 Gateway 构造时设置的，所以断言一律放行。
+    """
+
+    from backend.commercial_gateway import ProviderGatewayClient
+
+    client = ProviderGatewayClient(
+        base_url="https://provider.example/v1",
+        api_key="k",
+        model="m",
+        provider="openai-api",
+    )
+    for name in ("_transport", "_request", "_build_body"):
+        with pytest.raises(AttributeError):
+            getattr(client, name)
+    # 白名单只读属性仍可用；类内部仍能取到密封 transport。
+    assert client.base_url == "https://provider.example/v1"
+    assert client._sealed_transport() is not None
+
+
+def test_test_seam_refuses_a_client_that_can_reach_the_network() -> None:
+    """C1：测试通道必须**物理上出不了网**，否则它只是改了名的后门。
+
+    复审实测：传入一个真实的 `httpx.AsyncClient`（不是 MockTransport）时，
+    未注册的 provider/model/endpoint 也能照发。现在 `_get_client` 要求注入的 client
+    挂载 `httpx.MockTransport`——它由 handler 直接产生响应，不建立任何 socket。
+    """
+
+    from backend.commercial_gateway import ProviderGatewayClient
+
+    client = ProviderGatewayClient(
+        base_url="https://not-registered.example/v1",
+        api_key="k",
+        model="m",
+        provider="not-registered",
+        client_factory=lambda: httpx.AsyncClient(),
+        _trusted_test_transport=True,
+    )
+
+    async def attempt() -> None:
+        with pytest.raises(PermissionError, match="MockTransport"):
+            await client.chat([{"role": "user", "content": "hi"}])
+
+    asyncio.run(attempt())
 
 
 # ── I-R1：输出预留与 usage 解析 ──────────────────────────────────────────────

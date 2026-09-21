@@ -311,6 +311,29 @@ class ProviderClient:
         if self._client_factory is not None:
             if self._injected_client is None or self._injected_client.is_closed:
                 self._injected_client = self._client_factory()
+            # C-R1（真的那一半）：测试通道必须**物理上出不了网**。
+            #
+            # 复审实测过：只把旧布尔改名的做法等于后门照旧——传入一个真实的
+            # `httpx.AsyncClient` 就能带着未注册的 provider/model/endpoint 发出去。
+            #
+            # 约束按"这个对象是不是真的 httpx client"判定：
+            #   · 真正的 `httpx.AsyncClient` 一定带 `_transport`。若它不是
+            #     `httpx.MockTransport`（后者由 handler 直接产生响应、不建 socket），
+            #     拒绝——这正是复审用来绕过的那条路。
+            #   · 既有的测试替身是自定义 fake 类（没有 `_transport`），继续放行，
+            #     否则会误伤大量合法的 agent 行为测试。
+            #
+            # ⚠ 诚实边界：这条检查拦得住"直接传真实 client"，拦不住"自己包一层
+            #   wrapper 把真 client 藏起来"。它不是密码学边界，只是把这条测试通道
+            #   从"任意构造者都能真实外发"收窄成"必须刻意包装才能外发"。
+            #   终局仍是删除该参数（已登记为遗留）。
+            transport = getattr(self._injected_client, "_transport", None)
+            if transport is not None and not isinstance(transport, httpx.MockTransport):
+                self._injected_client = None
+                raise PermissionError(
+                    "an injected httpx client must use httpx.MockTransport: "
+                    "the test seam may not perform real network egress"
+                )
             return self._injected_client
 
         loop = asyncio.get_running_loop()

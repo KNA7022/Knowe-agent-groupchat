@@ -2258,12 +2258,22 @@ class ProviderGatewayClient:
         """唯一的生产模型出口。
 
         C-R1：这里曾有 `allow_ungoverned_test_transport`，一个构造期布尔量即可让
-        `_authorize` 直接 `return None, ""` —— 整体跳过 authority、registry、DLP、
-        预算、审批与审计。该参数与其短路已删除。
+        `_authorize` 直接 `return None` —— 整体跳过 authority、registry、DLP、
+        预算、审批与审计。
 
-        测试若要替换底层 transport，使用 `_trusted_test_transport=True`：它**只**
-        允许注入 `client_factory`（替换发送通道），**不放行任何策略**——授权、DLP、
-        预算、审计照旧执行。因此它不能被用来绕过策略，只是把"发到哪儿"换成假的。
+        【复审后的诚实状态】该参数**没有**被删除，而是改名为
+        `_trusted_test_transport`，短路逻辑与三个 agent 调用点都还在（上一轮的
+        提交信息声称"参数、短路与三个调用点都已删除"，那是**不实陈述**，本注释
+        予以更正）。它仍然让持有者跳过全部策略检查。
+
+        压缩该风险的是**下一层**而非本类：注入的 client 必须是
+        `httpx.MockTransport`（见 `provider_client._get_client`），所以这条通道
+        能在本地跳过策略，但**无法完成一次真实外发** —— 一个未注册的
+        provider/model/endpoint 不会真的被请求。
+
+        终局做法（已登记为遗留）：删除这个参数，让 agent 行为测试建立短命
+        Task Runtime run（I-R8 已证明该路径可行），把"测试"表达为运行时上下文
+        而不是构造期开关。
         """
         from knowe_core.provider_client import ProviderClient
 
@@ -2274,6 +2284,20 @@ class ProviderGatewayClient:
         self.registry = registry or production_model_capability_registry()
         self.authority_provider = authority_provider
         # ⚠ 仅测试可见：见 __init__ 文档。生产构造点永不传 True。
+        #
+        # 【复审更正后的诚实表述】这个参数**确实**让持有者跳过 authority/registry/
+        # DLP/预算/审批/审计（下一行就 return None）——它功能上等价于被删掉的
+        # `allow_ungoverned_test_transport`，只是名字更明确。**不要**在别处声称它
+        # "不放行策略"：那是与本代码直接矛盾的假话。
+        #
+        # 目前压缩风险的实际防线在**下一层**：注入的 client 必须是
+        # `httpx.MockTransport`（见 provider_client._get_client），因此这条通道
+        # 物理上出不了网，无法把"未注册的 provider/model/endpoint"真正发出去。
+        # 也就是说它可以跳过本地策略检查，但**不能**完成一次真实外发。
+        #
+        # 仍未闭合的部分（已登记）：它是构造期布尔而非逐调用 capability，且
+        # `gateway._transport` 曾被直通（已由 _HIDDEN_FROM_OUTSIDE 堵住）。
+        # 终局做法是删除该参数，让 agent 行为测试建立短命 Task Runtime run。
         self._trusted_test_transport = bool(_trusted_test_transport)
         self._transport = ProviderClient(
             base_url=base_url,
@@ -2292,14 +2316,31 @@ class ProviderGatewayClient:
 
     #: 允许从底层 transport 读取的**只读**属性。
     #: C-R1 之前这里是 `__getattr__` 全量代理，于是 `gateway._request`、
-    #: `gateway._build_body`、`gateway._transport` 等内部发送路径对任何持有者可达
-    #: ——"必须经过 Gateway"就能被绕过。现在只放行元数据读取，其余一律
-    #: AttributeError（让"这个类能做什么"一眼可读）。
+    #: `gateway._build_body` 等内部发送路径对任何持有者可达。
     _DELEGATED_READS = ("base_url", "model", "provider", "timeout", "max_retries")
 
+    #: 这些名字**不允许**从实例上取到。
+    #:
+    #: ⚠ 复审实测：只改 `__getattr__` 是无效的——`_transport` 是真实存在的实例属性，
+    #: 属性查找根本不会落到 `__getattr__`，于是 `gateway._transport.chat(...)` 与
+    #: `gateway._transport._request(任意 body)` 都能直接出网，绕过 authority、
+    #: registry、DLP、预算与审计。这里用 `__getattribute__` 明确挡住它们；
+    #: 类内部通过 `object.__getattribute__(self, "_transport")` 访问，不受影响。
+    _HIDDEN_FROM_OUTSIDE = frozenset({"_transport"})
+
+    def __getattribute__(self, name: str) -> Any:
+        if name in ProviderGatewayClient._HIDDEN_FROM_OUTSIDE:
+            raise AttributeError(
+                f"{type(self).__name__!r} does not expose {name!r}; "
+                "provider egress goes through ProviderGatewayClient.chat/chat_stream only"
+            )
+        return object.__getattribute__(self, name)
+
     def __getattr__(self, name: str) -> Any:
+        # 只有**不存在的**属性会走到这里（真实属性已被上面的 __getattribute__ 处理）。
         if name in ProviderGatewayClient._DELEGATED_READS:
-            return getattr(self._transport, name)
+            transport = object.__getattribute__(self, "_transport")
+            return getattr(transport, name)
         raise AttributeError(
             f"{type(self).__name__!r} object has no attribute {name!r}; "
             "provider egress goes through ProviderGatewayClient.chat/chat_stream only"
@@ -2308,7 +2349,12 @@ class ProviderGatewayClient:
     async def aclose(self) -> None:
         """关闭底层 transport（只关闭连接，不绕过任何策略）。"""
 
-        await self._transport.aclose()
+        await self._sealed_transport().aclose()
+
+    def _sealed_transport(self) -> Any:
+        """取出底层 transport，仅供**类内部**使用（见 `_HIDDEN_FROM_OUTSIDE`）。"""
+
+        return object.__getattribute__(self, "_transport")
 
     @staticmethod
     def _serialized_request(
@@ -2548,7 +2594,7 @@ class ProviderGatewayClient:
             max_tokens=max_tokens, stream=False,
         )
         try:
-            result = await self._transport.chat(
+            result = await self._sealed_transport().chat(
                 messages, tools, temperature, max_tokens, extra_body,
             )
         except BaseException as exc:
@@ -2572,7 +2618,7 @@ class ProviderGatewayClient:
             max_tokens=max_tokens, stream=True,
         )
         try:
-            async for event in self._transport.chat_stream(
+            async for event in self._sealed_transport().chat_stream(
                 messages, tools, temperature, max_tokens, extra_body,
             ):
                 yield event
