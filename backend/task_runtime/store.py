@@ -789,6 +789,48 @@ class TaskRuntimeStore:
             ).fetchone()
         return None if row is None else self._row_run(row)
 
+    def prune_terminal_runs(self, *, group_id: str, keep: int = 50) -> int:
+        """删除某 group 下**终态** run 的多余部分，只保留最近的 `keep` 条（I5）。
+
+        用途：Settings 连接测试每次点击都会建一个短命 run 再取消，于是 run 数量随点击
+        次数无界增长。这是**有界保留**而不是级联删除——它刻意做得很窄：
+
+        · 只作用于调用方指定的**单个 group**；
+        · 只删**终态** run（RUNNING/排队中的永不删）；
+        · 只保留最近 `keep` 条，`keep` 有下限保护；
+        · 依赖 `studycrew_run_events.run_id` 的外键 `ON DELETE CASCADE` 一并清事件。
+
+        与 `delete_group` 不同，这里不要求"删除意图证明"：它删的是探针自己产生的、
+        不含用户内容的终态运行记录，不是用户数据级联。
+        """
+
+        if keep < 1:
+            raise RuntimeStoreError("prune must keep at least one run")
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """SELECT run_id FROM studycrew_task_runs
+                   WHERE group_id=? AND status NOT IN (?, ?, ?, ?)
+                   ORDER BY rowid DESC
+                   LIMIT -1 OFFSET ?""",
+                (
+                    group_id,
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.QUEUED.value,
+                    TaskStatus.WAITING_APPROVAL.value,
+                    TaskStatus.VERIFYING.value,
+                    int(keep),
+                ),
+            ).fetchall()
+            run_ids = [str(row[0]) for row in rows]
+            if not run_ids:
+                return 0
+            placeholders = ",".join("?" for _ in run_ids)
+            conn.execute(
+                f"DELETE FROM studycrew_task_runs WHERE run_id IN ({placeholders})",
+                tuple(run_ids),
+            )
+        return len(run_ids)
+
     def list_runs(
         self, *, group_id: str | None = None, statuses: set[TaskStatus] | None = None,
         limit: int = 10_000,

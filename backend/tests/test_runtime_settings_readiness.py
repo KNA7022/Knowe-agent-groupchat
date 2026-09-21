@@ -168,36 +168,40 @@ class SettingsProbeAuthorityTest(unittest.TestCase):
         self.assertEqual(authority.run_id, run.run_id)
         self.assertIs(authority.runtime, self.runtime)
 
-    def test_probe_run_is_short_lived_and_recoverable(self) -> None:
-        """I5：探针 run 必须是**短命**的，且旧 run 终结后能自动换新。
+    def test_probe_run_is_short_lived_bounded_and_recoverable(self) -> None:
+        """I5：探针 run 必须短命、**有界**，且旧 run 终结后能自动换新。
 
-        复审实测过旧后果：固定 request_key 复用同一个 run 且从不收尾，第 21 次点击时
-        它撞上默认 `model_turns=20` 被判 BUDGET_EXHAUSTED，此后每次点击都抛
-        RuntimeError 并逃出到 HTTP handler，连接测试**永久失效**。
+        复审实测过两轮问题：先是固定 request_key 复用且从不收尾，第 21 次点击撞上
+        `model_turns=20` 被判 BUDGET_EXHAUSTED，此后永久失效并留下一个 RUNNING run；
+        改成"每次新建 + 收尾"后，又变成每次点击留一条 CANCELLED 记录（无界增长）。
+        现在是**有界保留**：只留最近 `_PROBE_RUN_RETENTION` 条。
         """
 
         from backend.task_runtime.contracts import TaskStatus
 
+        keep = runtime_settings._PROBE_RUN_RETENTION
+        clicks = keep + 15
         seen: list[str] = []
-        for _ in range(25):
+        for _ in range(clicks):
             _authority, run_id = runtime_settings.probe_authority(self.groups, self.runtime)
             seen.append(run_id)
-            # `_probe_once` 在 finally 里做的事：探针结束即收尾。
+            # `_probe_once` 在 finally 里做的事：探针结束即收尾（取消）。
             runtime_settings._finish_probe_run(self.groups, self.runtime, run_id)
 
-        # 每个 run 都被收尾，没有任何 RUNNING 残留（旧实现会留一个永不结束的）。
-        self.assertEqual(len(set(seen)), 25)
-        for run_id in seen:
-            stored = self.runtime.store.get_run(run_id)
-            self.assertIsNotNone(stored)
-            self.assertIsNot(stored.status, TaskStatus.RUNNING)
+        self.assertEqual(len(set(seen)), clicks, "每次探针都应当是独立的 run")
+        group_id = self.groups.list_groups()[0].group_id
+        surviving = self.runtime.store.list_runs(group_id=group_id)
+        # 有界：数量不随点击次数线性增长。
+        self.assertLessEqual(len(surviving), keep + 1, len(surviving))
+        # 没有 RUNNING 残留（旧实现会留一个永不结束的）。
+        for run in surviving:
+            self.assertIsNot(run.status, TaskStatus.RUNNING)
 
-        # 第 26 次仍然可用 —— 这正是旧实现缺失的恢复路径。
+        # 仍然可用 —— 这正是旧实现缺失的恢复路径。
         _authority, run_id = runtime_settings.probe_authority(self.groups, self.runtime)
         self.assertTrue(run_id)
         self.assertIs(self.runtime.store.get_run(run_id).status, TaskStatus.RUNNING)
 
-        # 25 次点击之后仍然只有一个 group。
         names = [group.name for group in self.groups.list_groups()]
         self.assertEqual(names.count("settings-probe"), 1)
         runtime_settings._finish_probe_run(self.groups, self.runtime, run_id)

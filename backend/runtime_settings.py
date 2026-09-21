@@ -1020,6 +1020,8 @@ _TEST_TIMEOUT_S = 15
 _PROBE_GROUP_NAME = "settings-probe"
 #: 探针 run 的标题。
 _PROBE_TITLE = "Settings provider probe"
+#: 探针 run 的有界保留数（I5）：每次点击建一个短命 run，超出部分清理，避免无界增长。
+_PROBE_RUN_RETENTION = 20
 
 
 def probe_authority(
@@ -1076,24 +1078,38 @@ def probe_authority(
         return None
 
     run = _running_probe_run()
-    if run is None:
-        run = runtime.submit(
-            group.group_id,
-            title=_PROBE_TITLE,
-            request_key=f"settings-probe:{secrets.token_hex(16)}",
-            # 只读 + 低风险：它不写任何用户工作区，也不碰高风险副作用。
-            read_only=True,
-            risk=RiskLevel.LOW,
-            public_summary="Settings connection test",
+    if run is not None:
+        # 复用一个仍存活的探针 run（并发下避免互相 cancel，见 _running_probe_run 注释）。
+        prune_probe_runs(groups, runtime, group.group_id)
+        return (
+            LegacyToolAuthority(
+                group_id=group.group_id,
+                task_id=run.task_id,
+                run_id=run.run_id,
+                runtime=runtime,
+            ),
+            run.run_id,
         )
-        # 只有 RUNNING 的 run 才能通过 Gateway 的 authority 校验。
-        if getattr(run, "status", None) is not TaskStatus.RUNNING:
-            for scheduled in runtime.schedule():
-                if scheduled.run_id == run.run_id:
-                    run = scheduled
-                    break
+
+    run = runtime.submit(
+        group.group_id,
+        title=_PROBE_TITLE,
+        request_key=f"settings-probe:{secrets.token_hex(16)}",
+        # 只读 + 低风险：它不写任何用户工作区，也不碰高风险副作用。
+        read_only=True,
+        risk=RiskLevel.LOW,
+        public_summary="Settings connection test",
+    )
+    # 只有 RUNNING 的 run 才能通过 Gateway 的 authority 校验。
+    if getattr(run, "status", None) is not TaskStatus.RUNNING:
+        for scheduled in runtime.schedule():
+            if scheduled.run_id == run.run_id:
+                run = scheduled
+                break
     if getattr(run, "status", None) is not TaskStatus.RUNNING:
         raise RuntimeError("settings probe run is not running")
+    # I5：建完新 run 后把该 group 里多余的终态 run 清掉，避免随点击次数无界增长。
+    prune_probe_runs(groups, runtime, group.group_id)
     return (
         LegacyToolAuthority(
             group_id=group.group_id,
@@ -1103,6 +1119,24 @@ def probe_authority(
         ),
         run.run_id,
     )
+
+
+def prune_probe_runs(groups: Any, runtime: Any, group_id: str) -> int:
+    """清理探针 group 里多余的终态 run（I5），返回删除条数。
+
+    只作用于该 group、只删终态 run，动作很窄；失败不影响探针本身。
+    """
+
+    if groups is None or runtime is None:
+        return 0
+    try:
+        return int(
+            runtime.store.prune_terminal_runs(
+                group_id=group_id, keep=_PROBE_RUN_RETENTION,
+            )
+        )
+    except Exception:
+        return 0
 
 
 def _finish_probe_run(groups: Any, runtime: Any, run_id: str) -> None:
