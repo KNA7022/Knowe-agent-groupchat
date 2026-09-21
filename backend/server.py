@@ -9798,7 +9798,15 @@ class KnoweServer:
             return
 
         # urllib 是同步阻塞——丢线程池，别把事件循环钉在网络等待上（最多 15s）。
-        result = await asyncio.to_thread(runtime_settings.test_binding, binding)
+        # I-R8：把本进程的 group 仓库与 Task Runtime 一起传下去，让探针能在一个
+        # backend-authored 的短命 run 内执行（否则 Gateway 会在联网前拒绝，
+        # "连接测试"永远不可用）。
+        result = await asyncio.to_thread(
+            runtime_settings.test_binding,
+            binding,
+            groups=self.groups,
+            runtime=self.task_runtime,
+        )
         body = json.dumps(result, ensure_ascii=False).encode()
         self._write_http(writer, b"200 OK", body, b"application/json; charset=utf-8")
 

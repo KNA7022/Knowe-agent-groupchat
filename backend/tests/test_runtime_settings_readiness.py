@@ -130,5 +130,55 @@ class RuntimeSettingsWaiterTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await waiter)
 
 
+class SettingsProbeAuthorityTest(unittest.TestCase):
+    """I-R8：Settings 连接测试必须在一个 backend-authored 的短命 Task Runtime run 内跑。
+
+    这条测试**不发明网络请求**（那会依赖真实 provider），只验证 authority 是否被正确
+    建立：这是"连接测试必然失败"这个缺陷的直接修复点 —— Gateway 在没有 authority 时
+    会在联网前就以 GatewayDenied 拒绝。
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from backend.groups import GroupRepository
+        from backend.task_runtime.service import TaskRuntimeService
+
+        self._dir = tempfile.TemporaryDirectory()
+        root = Path(self._dir.name)
+        self.groups = GroupRepository(root)
+        self.runtime = TaskRuntimeService(root, self.groups)
+
+    def tearDown(self) -> None:
+        self.runtime.close()
+        self._dir.cleanup()
+
+    def test_probe_authority_creates_a_running_run_that_the_gateway_accepts(self) -> None:
+        from backend.task_runtime.contracts import TaskStatus
+
+        authority, run_id = runtime_settings.probe_authority(self.groups, self.runtime)
+
+        run = self.runtime.store.get_run(run_id)
+        self.assertIsNotNone(run)
+        # Gateway 的 authority 校验要求 run 处于 RUNNING。
+        self.assertIs(run.status, TaskStatus.RUNNING)
+        self.assertEqual(authority.group_id, run.group_id)
+        self.assertEqual(authority.task_id, run.task_id)
+        self.assertEqual(authority.run_id, run.run_id)
+        self.assertIs(authority.runtime, self.runtime)
+
+    def test_probe_authority_is_reused_across_calls(self) -> None:
+        """不能每点一次"测试连接"就新建一个 group/run（request_key 幂等）。"""
+
+        first, first_run = runtime_settings.probe_authority(self.groups, self.runtime)
+        second, second_run = runtime_settings.probe_authority(self.groups, self.runtime)
+
+        self.assertEqual(first.group_id, second.group_id)
+        self.assertEqual(first_run, second_run)
+        names = [group.name for group in self.groups.list_groups()]
+        self.assertEqual(names.count("settings-probe"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

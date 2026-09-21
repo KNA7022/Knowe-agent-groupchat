@@ -1016,13 +1016,79 @@ def aux_effective() -> dict[str, str] | None:
 
 _TEST_TIMEOUT_S = 15
 
+#: Settings 连接测试专用的持久 group 名（单本地用户，一个就够）。
+_PROBE_GROUP_NAME = "settings-probe"
+#: 复用同一个 run：submit 按 request_key 幂等，不会每次点击都新建一行。
+_PROBE_REQUEST_KEY = "settings-probe-run"
 
-def _probe_once(binding: Mapping[str, Any]) -> tuple[bool, str]:
+
+def probe_authority(
+    groups: Any, runtime: Any,
+) -> tuple[Any, str]:
+    """为一个 Settings 探针建立**短命但有据**的 Task Runtime authority（I-R8）。
+
+    旧实现直接用普通 `ProviderGatewayClient` 且不带 authority，于是 Gateway 在联网前
+    就以 `GatewayDenied` 拒绝——Settings 的"连接测试"功能**必然失败**，而且既没有红测
+    也没有绿测记录这个事实。
+
+    这里不再走"打开 ungoverned seam"那条路（那正是 C-R1 修掉的洞），而是按计划的要求
+    建立 backend-authored 的短命 run：固定用途、固定 group、单回合、max_tokens=1，
+    沿同一个 Gateway 留下完整 audit。
+    """
+
+    from .commercial_gateway import LegacyToolAuthority
+    from .task_runtime.contracts import RiskLevel, TaskStatus
+
+    group = None
+    for candidate in groups.list_groups():
+        if getattr(candidate, "name", "") == _PROBE_GROUP_NAME:
+            group = candidate
+            break
+    if group is None:
+        group = groups.create_group(_PROBE_GROUP_NAME)
+
+    run = runtime.submit(
+        group.group_id,
+        title="Settings provider probe",
+        request_key=_PROBE_REQUEST_KEY,
+        # 只读 + 低风险：它不写任何用户工作区，也不碰高风险副作用。
+        read_only=True,
+        risk=RiskLevel.LOW,
+        public_summary="Settings connection test",
+    )
+    # 只有 RUNNING 的 run 才能通过 Gateway 的 authority 校验。
+    if getattr(run, "status", None) is not TaskStatus.RUNNING:
+        for scheduled in runtime.schedule():
+            if scheduled.run_id == run.run_id:
+                run = scheduled
+                break
+    if getattr(run, "status", None) is not TaskStatus.RUNNING:
+        raise RuntimeError("settings probe run is not running")
+    return (
+        LegacyToolAuthority(
+            group_id=group.group_id,
+            task_id=run.task_id,
+            run_id=run.run_id,
+            runtime=runtime,
+        ),
+        run.run_id,
+    )
+
+
+def _probe_once(
+    binding: Mapping[str, Any], *, groups: Any = None, runtime: Any = None,
+) -> tuple[bool, str]:
     """Run the settings probe through the same governed provider boundary as Agents."""
 
-    from .commercial_gateway import ProviderGatewayClient
+    from .commercial_gateway import (
+        ProviderGatewayClient,
+        legacy_tool_authority_context,
+    )
 
     selected = dict(binding)
+    authority = None
+    if groups is not None and runtime is not None:
+        authority, _run_id = probe_authority(groups, runtime)
 
     async def run_probe() -> None:
         client = ProviderGatewayClient(
@@ -1045,13 +1111,16 @@ def _probe_once(binding: Mapping[str, Any]) -> tuple[bool, str]:
             await client.aclose()
 
     try:
-        asyncio.run(run_probe())
+        with legacy_tool_authority_context(authority):
+            asyncio.run(run_probe())
         return True, ""
     except Exception as exc:  # settings response exposes only a typed category
         return False, type(exc).__name__
 
 
-def _test_binding_impl(binding: dict[str, Any]) -> dict[str, Any]:
+def _test_binding_impl(
+    binding: dict[str, Any], *, groups: Any = None, runtime: Any = None,
+) -> dict[str, Any]:
     """
     对一份绑定真发**最小请求**（max_tokens=1），验证接入点 + Key + 模型三件事。
     同步阻塞实现（urllib）——server 用 asyncio.to_thread 包着调。
@@ -1076,7 +1145,7 @@ def _test_binding_impl(binding: dict[str, Any]) -> dict[str, Any]:
             "latency_ms": None,
         }
 
-    ok, failure_type = _probe_once(b)
+    ok, failure_type = _probe_once(b, groups=groups, runtime=runtime)
     if not ok:
         return {
             "ok": False,
@@ -1090,10 +1159,17 @@ def _test_binding_impl(binding: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_binding(binding: dict[str, Any]) -> dict[str, Any]:
-    """Run the real probe and bind the result to the exact tested configuration."""
+def test_binding(
+    binding: dict[str, Any], *, groups: Any = None, runtime: Any = None,
+) -> dict[str, Any]:
+    """Run the real probe and bind the result to the exact tested configuration.
 
-    result = _test_binding_impl(binding)
+    I-R8：传入 `groups`/`runtime` 时，探针会在一个 backend-authored 的短命 Task Runtime
+    run 内执行 —— 这是它唯一能通过 Gateway authority 的方式，也是"连接测试"真正可用的
+    前提。不传则保持旧行为（探针会在联网前被 Gateway 拒绝，返回 typed category）。
+    """
+
+    result = _test_binding_impl(binding, groups=groups, runtime=runtime)
     result["tested_fingerprint"] = binding_fingerprint(binding)
     result["zinnia_compatible"] = _zinnia_usable(binding)
     return result
