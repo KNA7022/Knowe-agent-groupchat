@@ -168,16 +168,39 @@ class SettingsProbeAuthorityTest(unittest.TestCase):
         self.assertEqual(authority.run_id, run.run_id)
         self.assertIs(authority.runtime, self.runtime)
 
-    def test_probe_authority_is_reused_across_calls(self) -> None:
-        """不能每点一次"测试连接"就新建一个 group/run（request_key 幂等）。"""
+    def test_probe_run_is_short_lived_and_recoverable(self) -> None:
+        """I5：探针 run 必须是**短命**的，且旧 run 终结后能自动换新。
 
-        first, first_run = runtime_settings.probe_authority(self.groups, self.runtime)
-        second, second_run = runtime_settings.probe_authority(self.groups, self.runtime)
+        复审实测过旧后果：固定 request_key 复用同一个 run 且从不收尾，第 21 次点击时
+        它撞上默认 `model_turns=20` 被判 BUDGET_EXHAUSTED，此后每次点击都抛
+        RuntimeError 并逃出到 HTTP handler，连接测试**永久失效**。
+        """
 
-        self.assertEqual(first.group_id, second.group_id)
-        self.assertEqual(first_run, second_run)
+        from backend.task_runtime.contracts import TaskStatus
+
+        seen: list[str] = []
+        for _ in range(25):
+            _authority, run_id = runtime_settings.probe_authority(self.groups, self.runtime)
+            seen.append(run_id)
+            # `_probe_once` 在 finally 里做的事：探针结束即收尾。
+            runtime_settings._finish_probe_run(self.groups, self.runtime, run_id)
+
+        # 每个 run 都被收尾，没有任何 RUNNING 残留（旧实现会留一个永不结束的）。
+        self.assertEqual(len(set(seen)), 25)
+        for run_id in seen:
+            stored = self.runtime.store.get_run(run_id)
+            self.assertIsNotNone(stored)
+            self.assertIsNot(stored.status, TaskStatus.RUNNING)
+
+        # 第 26 次仍然可用 —— 这正是旧实现缺失的恢复路径。
+        _authority, run_id = runtime_settings.probe_authority(self.groups, self.runtime)
+        self.assertTrue(run_id)
+        self.assertIs(self.runtime.store.get_run(run_id).status, TaskStatus.RUNNING)
+
+        # 25 次点击之后仍然只有一个 group。
         names = [group.name for group in self.groups.list_groups()]
         self.assertEqual(names.count("settings-probe"), 1)
+        runtime_settings._finish_probe_run(self.groups, self.runtime, run_id)
 
 
 if __name__ == "__main__":

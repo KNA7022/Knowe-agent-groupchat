@@ -1018,8 +1018,8 @@ _TEST_TIMEOUT_S = 15
 
 #: Settings 连接测试专用的持久 group 名（单本地用户，一个就够）。
 _PROBE_GROUP_NAME = "settings-probe"
-#: 复用同一个 run：submit 按 request_key 幂等，不会每次点击都新建一行。
-_PROBE_REQUEST_KEY = "settings-probe-run"
+#: 探针 run 的标题。
+_PROBE_TITLE = "Settings provider probe"
 
 
 def probe_authority(
@@ -1031,9 +1031,16 @@ def probe_authority(
     就以 `GatewayDenied` 拒绝——Settings 的"连接测试"功能**必然失败**，而且既没有红测
     也没有绿测记录这个事实。
 
-    这里不再走"打开 ungoverned seam"那条路（那正是 C-R1 修掉的洞），而是按计划的要求
-    建立 backend-authored 的短命 run：固定用途、固定 group、单回合、max_tokens=1，
-    沿同一个 Gateway 留下完整 audit。
+    这里不再走"打开 ungoverned seam"那条路（那正是 C-R1 修掉的洞），而是建立
+    backend-authored 的短命 run：固定 group、单回合、低风险、只读。
+
+    ⚠ I5 修复：旧实现用**固定 request_key** 复用同一个 run 且从不收尾。复审实测后果：
+    第 21 次点击时该 run 撞上默认 `model_turns=20` 被判 `BUDGET_EXHAUSTED`，随后
+    `probe_authority` 抛 `RuntimeError`（而它在 `_probe_once` 的 try 之外），
+    **连接测试从此永久失效**，还留下一个永不结束的 RUNNING run。
+
+    现在每次调用都用唯一 request_key 建新 run，并把 run_id 交回调用方，由
+    `_probe_once` 在探针结束后立即收尾——"short-lived" 因此名副其实。
     """
 
     from .commercial_gateway import LegacyToolAuthority
@@ -1047,21 +1054,44 @@ def probe_authority(
     if group is None:
         group = groups.create_group(_PROBE_GROUP_NAME)
 
-    run = runtime.submit(
-        group.group_id,
-        title="Settings provider probe",
-        request_key=_PROBE_REQUEST_KEY,
-        # 只读 + 低风险：它不写任何用户工作区，也不碰高风险副作用。
-        read_only=True,
-        risk=RiskLevel.LOW,
-        public_summary="Settings connection test",
-    )
-    # 只有 RUNNING 的 run 才能通过 Gateway 的 authority 校验。
-    if getattr(run, "status", None) is not TaskStatus.RUNNING:
-        for scheduled in runtime.schedule():
-            if scheduled.run_id == run.run_id:
-                run = scheduled
-                break
+    def _running_probe_run() -> Any:
+        """找到一个仍处于 RUNNING 的探针 run（没有就 None）。
+
+        为什么是"复用仍存活的、终结后换新"而不是每次新建：调度器有并发上限，
+        新提交的 run 不保证立刻被调度到 RUNNING（实测：已有 run 占位时
+        `schedule()` 不会把它推起来），而 Gateway 的 authority 校验要求 RUNNING。
+        复用则天然满足，且只在旧 run 终结（例如撞上 model_turns 上限）时换新——
+        这同时解决了 I5 的"永久失效"。
+        """
+
+        try:
+            runs = runtime.store.list_runs(
+                group_id=group.group_id, statuses={TaskStatus.RUNNING},
+            )
+        except Exception:
+            return None
+        for run in runs:
+            if getattr(run, "title", "") == _PROBE_TITLE:
+                return run
+        return None
+
+    run = _running_probe_run()
+    if run is None:
+        run = runtime.submit(
+            group.group_id,
+            title=_PROBE_TITLE,
+            request_key=f"settings-probe:{secrets.token_hex(16)}",
+            # 只读 + 低风险：它不写任何用户工作区，也不碰高风险副作用。
+            read_only=True,
+            risk=RiskLevel.LOW,
+            public_summary="Settings connection test",
+        )
+        # 只有 RUNNING 的 run 才能通过 Gateway 的 authority 校验。
+        if getattr(run, "status", None) is not TaskStatus.RUNNING:
+            for scheduled in runtime.schedule():
+                if scheduled.run_id == run.run_id:
+                    run = scheduled
+                    break
     if getattr(run, "status", None) is not TaskStatus.RUNNING:
         raise RuntimeError("settings probe run is not running")
     return (
@@ -1075,6 +1105,35 @@ def probe_authority(
     )
 
 
+def _finish_probe_run(groups: Any, runtime: Any, run_id: str) -> None:
+    """收尾探针 run：探针结束即**取消**它，不留 RUNNING 状态（I5）。
+
+    为什么用 `cancel` 而不是 `complete`：`TaskRuntimeService.complete` 要求 run 先进入
+    `VERIFYING` 并且有一份 task-bound Verifier 决定——探针既没有验证者也不产出可验收
+    结果，套那条路径是硬塞。探针 run 的生命周期就是"一次连通性验证"，用完取消是正确
+    语义，也正好满足 `probe_authority` 里"只复用 RUNNING run"的前提。
+    """
+
+    if groups is None or runtime is None or not run_id:
+        return
+    try:
+        stored = runtime.store.get_run(run_id)
+        group_id = stored.group_id if stored is not None else ""
+    except Exception:
+        return
+    if not group_id:
+        return
+    try:
+        runtime.cancel(
+            group_id,
+            run_id,
+            request_key=f"settings-probe-cancel:{secrets.token_hex(16)}",
+        )
+    except Exception:
+        # 收尾失败不影响探针结论；下一次点击会用新的 run，不会永久损坏。
+        return
+
+
 def _probe_once(
     binding: Mapping[str, Any], *, groups: Any = None, runtime: Any = None,
 ) -> tuple[bool, str]:
@@ -1086,9 +1145,17 @@ def _probe_once(
     )
 
     selected = dict(binding)
-    authority = None
-    if groups is not None and runtime is not None:
-        authority, _run_id = probe_authority(groups, runtime)
+    run_id = ""
+    try:
+        authority, run_id = (
+            probe_authority(groups, runtime)
+            if groups is not None and runtime is not None
+            else (None, "")
+        )
+    except Exception as exc:
+        # I5：authority 建立失败必须变成 typed category，而不是逃出到 HTTP handler
+        # （旧实现让它抛 RuntimeError 出界）。
+        return False, type(exc).__name__
 
     async def run_probe() -> None:
         client = ProviderGatewayClient(
@@ -1116,6 +1183,9 @@ def _probe_once(
         return True, ""
     except Exception as exc:  # settings response exposes only a typed category
         return False, type(exc).__name__
+    finally:
+        # 探针结束即收尾：不留 RUNNING run，也就不会积累到撞上限而永久失效。
+        _finish_probe_run(groups, runtime, run_id)
 
 
 def _test_binding_impl(
