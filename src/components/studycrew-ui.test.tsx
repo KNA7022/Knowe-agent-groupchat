@@ -248,7 +248,7 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
       event_type: 'tool_prepared',
       public_payload: {
         status: 'prepared', invocation_id: `inv_${'8'.repeat(32)}`,
-        tool_name: 'local_files', disposition: 'approval_required',
+        tool_name: 'local_files', disposition: 'requires_new_approval',
         usage: { wall_clock_seconds: 13, model_turns: 2, tool_calls: 2, tokens: 510, cost_usd: 0.02 },
       },
       sensitivity: 'public',
@@ -259,7 +259,11 @@ describe('StudyCrew Group mapping and Agent status bar', () => {
     fireEvent.click(screen.getByRole('button', { name: /详情/ }));
     fireEvent.click(screen.getByRole('tab', { name: '工具' }));
     expect(screen.getByText('local_files')).toBeInTheDocument();
-    expect(screen.getByText('approval_required')).toBeInTheDocument();
+    // 用后端真实取值（`created` / `requires_new_approval` / `recovered_blocked`）。
+    // 这里原来写的是 `approval_required`——一个后端从不产生的字符串；由于
+    // `tool_prepared` 的公开字段白名单只校验字段名、不校验这个值，测试照样通过，
+    // 于是它证明的是"UI 会显示 payload 里的任意字符串"，而不是"UI 显示真实状态"。
+    expect(screen.getByText('requires_new_approval')).toBeInTheDocument();
     expect(document.body.textContent).not.toContain('private_payload');
     const toolTab = screen.getByRole('tab', { name: '工具' });
     fireEvent.keyDown(toolTab, { key: 'ArrowRight' });
