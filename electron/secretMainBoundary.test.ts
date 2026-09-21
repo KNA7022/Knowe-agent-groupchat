@@ -48,6 +48,28 @@ describe('main-only OS credential boundary', () => {
     expect(main).toContain('/internal/credential-revoke');
   });
 
+  it('keeps the networking and TLS variables the backend needs', () => {
+    const main = source('electron/main.ts');
+    const block = main.match(/const BACKEND_ENV_ALLOWLIST = \[([\s\S]*?)\] as const;/);
+    const allowed = [...(block?.[1] ?? '').matchAll(/'([^']+)'/g)]
+      .map((m) => m[1])
+      .filter((name): name is string => typeof name === 'string');
+
+    // I6：白名单第一版只查"没有凭据名"，于是漏掉了代理/CA —— 需要代理访问
+    // OpenAI/Gemini 的部署、以及装了企业 MITM CA 的环境会**直连并失败**。
+    // 这里断言必需集合是白名单的子集，而不是反过来只做凭据名反查。
+    for (const name of [
+      'HTTPS_PROXY',
+      'HTTP_PROXY',
+      'NO_PROXY',
+      'SSL_CERT_FILE',
+      'REQUESTS_CA_BUNDLE',
+      'SSL_CERT_DIR',
+    ]) {
+      expect(allowed, `allowlist 必须放行 ${name}`).toContain(name);
+    }
+  });
+
   it('refuses to inherit long-lived cloud credentials even though the names vary', () => {
     const main = source('electron/main.ts');
 

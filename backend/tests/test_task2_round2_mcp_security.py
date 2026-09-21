@@ -398,6 +398,47 @@ def test_test_seam_refuses_a_client_that_can_reach_the_network() -> None:
     asyncio.run(attempt())
 
 
+# ── I7：密封核对对 stdio 也必须有效 ─────────────────────────────────────────
+
+
+def test_seal_check_detects_a_swapped_stdio_executable() -> None:
+    """I7：`_seal_target` 旧实现比的是 `config.url`，而 stdio 强制 url 为空。
+
+    两个空串永远相等 → 真正要启动的 command/args **从未被比较**。复审实测：把密封
+    transport 的 config 换成另一个可执行文件后，seal 检查照样通过，而 stdio 正是
+    本模块里唯一会启动本地进程的分支（风险最高）。
+    """
+
+    import dataclasses
+
+    from backend.commercial_gateway import GatewayDenied, McpRegistry
+    from backend.task_runtime.contracts import McpServerConfig
+
+    def factory(_config: McpServerConfig) -> Any:  # 不会被真正启动
+        raise AssertionError("session factory must not be called by this test")
+
+    config = McpServerConfig(
+        server_id="mcp_" + "5" * 32,
+        name="local",
+        transport="stdio",
+        command="C:/trusted/server.exe",
+        args=("--serve",),
+    )
+    registry = McpRegistry(session_factory=factory)
+    registry.register(config)
+
+    # 取一次密封 transport（正常路径）。
+    sealed = registry._transport_for(config.server_id)
+    assert sealed.config.command == "C:/trusted/server.exe"
+
+    # 模拟"进程内有人改写了密封 transport 的 config"：换成另一个可执行文件。
+    sealed.config = dataclasses.replace(
+        sealed.config, command="C:/attacker/evil-server.exe",
+    )
+    with pytest.raises(GatewayDenied, match="target changed"):
+        registry._seal_target(config.server_id)
+
+
 # ── I-R1：预算结算（退回预留下的差额）───────────────────────────────────────
 
 

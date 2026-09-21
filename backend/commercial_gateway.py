@@ -1072,9 +1072,24 @@ class McpRegistry:
 
         config = self._config(server_id)
         transport = self._transport_for(config.server_id)
-        configured_url = str(getattr(transport, "config", None).url or "")
-        if configured_url != str(config.url):
+        sealed_config = getattr(transport, "config", None)
+        if sealed_config is None:
+            raise GatewayDenied("MCP sealed transport has no bound config")
+        # I7：比较**规范化 endpoint**而不是 URL。旧实现比 `config.url`，而 stdio 的
+        # `McpServerConfig` 强制 url 为空 —— 于是两个空串永远相等，真正要启动的
+        # command/args **从未被比较**（复审实测：换掉可执行文件后 seal 仍然通过）。
+        # `_canonical_mcp_endpoint` 对 stdio 也会产出可比较的标识，register 时已经在用它。
+        if _canonical_mcp_endpoint(sealed_config) != _canonical_mcp_endpoint(config):
             raise GatewayDenied("MCP sealed transport target changed after registration")
+        # 顺带核对 server_id 与 transport 类型，避免"同 endpoint 但换了 peer 类型"。
+        if sealed_config.server_id != config.server_id:
+            raise GatewayDenied("MCP sealed transport is bound to a different server")
+        expected_type = (
+            "McpStreamableHttpTransport" if config.transport == "streamable_http"
+            else "McpStdioTransport"
+        )
+        if type(transport).__name__ != expected_type:
+            raise GatewayDenied("MCP sealed transport type does not match its config")
         return config, transport
 
     def _config(self, server_id: str) -> McpServerConfig:

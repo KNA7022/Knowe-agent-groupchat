@@ -966,6 +966,24 @@ const BACKEND_ENV_ALLOWLIST = [
   'OS',
   'LANG',
   'LC_ALL',
+  // ── 网络与 TLS（I6）──────────────────────────────────────────────────────
+  // 白名单第一版漏掉了这些，复审实测后果：需要走代理访问 OpenAI/Gemini 的部署、
+  // 以及装了企业 MITM CA 的环境，后端会**直连并失败**。它们不是凭据，必须放行。
+  // 后端唯一的 HTTP 客户端 httpx 默认 trust_env=True，正是靠这些变量挂代理/信任 CA，
+  // 而后端代码里没有任何替代的代理配置入口。
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'ALL_PROXY',
+  'NO_PROXY',
+  'http_proxy',
+  'https_proxy',
+  'all_proxy',
+  'no_proxy',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'REQUESTS_CA_BUNDLE',
+  'CURL_CA_BUNDLE',
+  'NODE_EXTRA_CA_CERTS',
 ] as const;
 
 /** 开发态额外放行：Conda/pyenv 环境（dev 后端用宿主解释器，需要它自己的环境）。 */
