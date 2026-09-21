@@ -1118,6 +1118,18 @@ _STREAM_SSE = (
 )
 
 
+class _StoreAbort(BaseException):
+    """A `BaseException` that is **not** an `Exception`.
+
+    Stands in for `KeyboardInterrupt` / `SystemExit` in the cancellation-guard tests, and
+    is deliberately not one of them: pytest treats `KeyboardInterrupt` as a user interrupt
+    and aborts the whole session, so a regression would surface as "the run stopped"
+    instead of "this test failed". Measured — reverting either guard to `except Exception`
+    while injecting `KeyboardInterrupt` prints `!!! KeyboardInterrupt !!!` and ends the
+    session with the remaining tests unrun, which is a much worse signal than a failure.
+    """
+
+
 def _authorized_stream_client(
     tmp_path: Any, *, sse: str, label: str = "cancel",
 ) -> tuple[Any, Any, Any, Any, Any, Any]:
@@ -1809,6 +1821,8 @@ def test_production_authority_is_rebuilt_from_the_store_not_from_a_mapping(
         pytest.param("runtime_store_error", id="RuntimeStoreError"),
         pytest.param("sqlite_locked", id="sqlite3-OperationalError-locked"),
         pytest.param("sqlite_closed", id="sqlite3-ProgrammingError-closed-db"),
+        pytest.param("store_abort", id="non-Exception-BaseException-from-store"),
+        pytest.param("second_cancel", id="second-CancelledError-from-store"),
     ],
 )
 async def test_tool_cancellation_survives_a_failing_terminal_write(
@@ -1867,7 +1881,13 @@ async def test_tool_cancellation_survives_a_failing_terminal_write(
             raise RuntimeStoreError("store is unavailable: cancel_tool")
         if failure == "sqlite_locked":
             raise sqlite3.OperationalError("database is locked")
-        raise sqlite3.ProgrammingError("Cannot operate on a closed database")
+        if failure == "sqlite_closed":
+            raise sqlite3.ProgrammingError("Cannot operate on a closed database")
+        if failure == "store_abort":
+            # 非 `Exception` 的 `BaseException`：`except Exception` 漏掉它，而在 `except`
+            # 块里抛出会取代正在处理的取消。
+            raise _StoreAbort()
+        raise asyncio.CancelledError()
 
     # 只让终态记录失败，其余（claim、授权）照常。
     runtime.store.cancel_tool = exploding  # type: ignore[method-assign]
@@ -1876,6 +1896,71 @@ async def test_tool_cancellation_survives_a_failing_terminal_write(
     with pytest.raises(asyncio.CancelledError):
         await gateway.invoke(request)
     runtime.close()
+
+
+def test_a_cancelled_effect_swallows_baseexception_but_a_live_one_does_not() -> None:
+    """取消路径上连 `BaseException` 都不能替换取消；正常路径必须让它传播。
+
+    第九轮的窄复审读代码指出：`except Exception` 漏掉 `BaseException` 子类，而在
+    `except` 块里抛出的任何异常都会取代正在处理的异常。它**没能构造出成功案例**（生产
+    store 没有在 `cancel_tool` 内抛 `BaseException` 的路径），所以这是被指出的理论缺口
+    而不是实测缺陷——但"清理代码不许替换取消"这句话应该没有例外。
+
+    这条同时锁住一个我修它时差点弄坏的点：吞掉之后**终态事件仍然必须写出**（`change_run`
+    被调用）。取消时的 `provider_egress: cancelled` 正是 M-6 的交付物，清理失败不能把它
+    一起吞掉。
+    """
+
+    from backend.commercial_gateway import (
+        ProviderGatewayClient,
+        _ProviderAuthorization,
+        production_model_capability_registry,
+    )
+
+    class _Store:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def cancel_tool(self, invocation_id: str) -> None:
+            self.calls.append("cancel_tool")
+            raise _StoreAbort()
+
+        def complete_tool(
+            self, invocation_id: str, *, status: str, error_type: str = "",
+        ) -> None:
+            self.calls.append("complete_tool")
+            raise _StoreAbort()
+
+        def change_run(
+            self, run_id: str, *, event_type: str, public_payload: dict[str, Any],
+            idempotency_key: str,
+        ) -> None:
+            self.calls.append("change_run")
+
+    class _Runtime:
+        def __init__(self) -> None:
+            self.store = _Store()
+
+    runtime = _Runtime()
+    complete = ProviderGatewayClient._complete_authorized_effect
+    authorization = _ProviderAuthorization(
+        runtime=runtime,  # type: ignore[arg-type]
+        invocation_id="tool_" + "0" * 32,
+        reserved_tokens=10,
+        capability=production_model_capability_registry().get("openai-api"),
+        run_id="run_" + "0" * 32,
+        group_id="grp_" + "0" * 32,
+    )
+
+    # 取消路径：吞掉 BaseException，而且终态事件照写。
+    complete(authorization, error=None, cancelled=True)
+    assert runtime.store.calls == ["cancel_tool", "change_run"], runtime.store.calls
+
+    # 正常路径：非 `Exception` 的 `BaseException`（`KeyboardInterrupt` / `SystemExit`
+    # 这一类）属于用户或进程，必须传播出去。
+    runtime.store.calls.clear()
+    with pytest.raises(_StoreAbort):
+        complete(authorization, error=None)
 
 
 @pytest.mark.parametrize("abort", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])

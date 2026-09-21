@@ -16,6 +16,14 @@ Note `.superpowers/sdd/` is gitignored, so these files need `git add -f`.
 | 6th | `448c4c3` | FAIL — 0 Critical / 2 Important / 2 Minor | `REVIEW-448c4c3-sixth.md` |
 | 7th | `8331715` | FAIL — 0 Critical / 1 Important / 1 Minor | `REVIEW-8331715-seventh.md` |
 | 8th | `cc94652` | PASS — 0 Critical / 0 Important / 3 Minor | `REVIEW-cc94652-eighth.md` |
+| 9th | `ddddaad` | **CLOSED** (narrow: one question — is the seventh review's Important fixed?) | `REVIEW-ddddaad-narrow.md` |
+
+The ninth entry is a *narrow* review on purpose. The seventh review was cancelled as
+unresponsive after three goal-rounds and then returned with a real Important; the ninth was
+commissioned to answer one question only — whether `ddddaad` fixes it — after two broader
+reviews of the same material failed to return a verdict at all. Its verdict line is therefore
+"CLOSED", not "PASS", and it does not by itself certify the stage. It also caught a false
+statement in the brief I gave it (see that report's parent notes).
 
 Two things to read these with:
 

@@ -397,22 +397,30 @@ class ToolGateway:
             # 理由）：调用方要看到的是它自己的取消，不是一个数据库异常。
             try:
                 self.runtime.store.cancel_tool(invocation.invocation_id)
-            except Exception:  # noqa: BLE001 -- 理由见下
-                # 为什么是 `Exception` 而不是一串具体类型（I-1，第七轮复审实测）：这里
-                # 原本捕 `(RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError,
-                # ValueError)`，而 `knowe_storage/_sqlite.py` 的 `transaction()` 在回滚后
-                # **原样重抛** `sqlite3.*`，store 层不做任何包装。于是存储真正坏掉时抛出的
-                # 两类异常——`database is locked`（busy_timeout 默认 1000ms）与
+            except BaseException:  # noqa: BLE001 -- 理由见下
+                # 为什么是 `BaseException` 而不是一串具体类型（I-1，第七轮复审实测；窄范围
+                # 由第九轮的窄复审追加指出）：这里原本捕
+                # `(RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError)`，
+                # 而 `knowe_storage/_sqlite.py` 的 `transaction()` 在回滚后**原样重抛**
+                # `sqlite3.*`，store 层不做任何包装。于是存储真正坏掉时抛出的两类异常——
+                # `database is locked`（busy_timeout 默认 1000ms）与
                 # `Cannot operate on a closed database`（关闭竞态）——照样替换掉取消，
-                # 而当时的注释写的是"最多少一条终态记录"。
+                # 而当时的注释写的是"最多少一条终态记录"。**实测**（在 effect 里关掉真实
+                # 数据库 / 让另一个连接持有写锁，然后取消）：修复前两条路径都把
+                # `sqlite3.ProgrammingError` / `sqlite3.OperationalError` 抛给了调用方，
+                # 修复后拿到的是 `CancelledError`。
                 #
-                # 这段代码的**唯一职责**是"终态写入失败不得替换取消"，所以它不能只认识我们
-                # 自己造的异常类型：存储实现是可替换的，穷举注定会再漏一次。
+                # 用 `BaseException` 而不是 `Exception`：这段代码的**唯一职责**是"终态写入
+                # 失败不得替换取消"，而在 `except` 块里抛出的任何异常都会取代正在处理的异常
+                # （原取消降级成 `__context__`）。`Exception` 漏掉 `BaseException` 子类，
+                # 于是 `cancel_tool` 内的 `KeyboardInterrupt` / `SystemExit` / 第二次取消
+                # 仍会替换它。第九轮的窄复审读了代码、没能构造出成功案例（生产 store 里没有
+                # 这样的路径），所以这是被指出的理论缺口而不是实测缺陷——但补上它不花钱，
+                # 而"清理代码不许替换取消"这句话应该没有例外。
                 #
-                # 代价（如实写下）：它同时会吞掉编程错误（例如 store 接口不匹配导致的
-                # AttributeError）。本模块没有 logger，所以代价是"静默"。取舍的理由是这条
-                # 路径上"取消被替换"比"少一条终态记录"更糟——前者把用户的正常中止变成一次
-                # 数据库异常（M-6 要消除的正是这个），后者只是审计缺一条。
+                # 代价（如实写下）：它也会吞掉编程错误（例如 store 接口不匹配导致的
+                # AttributeError）以及清理期间的 Ctrl+C。本模块没有 logger，所以代价是
+                # "静默"。取舍的理由是这条路径上"取消被替换"比"少一条终态记录"更糟。
                 pass
             raise
         except Exception as exc:
@@ -2835,6 +2843,15 @@ class ProviderGatewayClient:
                 # "少一条终态记录"（连下面的 provider_egress 事件通常也一起失败）。这次修复
                 # 只保证它不再破坏取消语义，不保证审计不丢。
                 pass
+            except BaseException:  # noqa: BLE001 -- 见下
+                # `Exception` 漏掉 `BaseException` 子类，而在 `except` 块里抛出的任何异常都会
+                # 取代正在处理的异常。取消路径上这必须吞（本方法就在 `except GeneratorExit`
+                # 分支里）；**正常路径上不能吞**——`KeyboardInterrupt` / `SystemExit` 属于用户
+                # 或进程，必须传播。第九轮的窄复审读代码指出这个缺口、但没能构造出成功案例
+                # （生产 store 没有在 `cancel_tool` 内抛 `BaseException` 的路径），所以这是
+                # 被指出的理论缺口而非实测缺陷。
+                if not cancelled:
+                    raise
         duration_ms = max(
             0, int((time.monotonic() - (authorization.started_at or time.monotonic())) * 1000),
         )
