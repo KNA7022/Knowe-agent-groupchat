@@ -149,9 +149,10 @@ async def test_provider_resolves_credential_at_request_boundary_without_retainin
         model="gpt-test",
         credential_provider=resolve,
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        # 本用例专测 provider_client 自身的凭据边界（不经 Gateway 也可触发），
-        # 因此显式声明为受信测试 transport —— C-R1 之后这是唯一的直连路径。
-        _trusted_test_transport=True,
+        # 本用例专测 provider_client 自身的凭据边界（不经 Gateway 也可触发）。
+        # `_gateway_managed` 只声明"我扮演 Gateway 内部"——它不豁免任何策略，因为
+        # 策略不在这层（原来的 `_trusted_test_transport` 就是"我豁免策略"，已删除）。
+        _gateway_managed=True,
     )
     serialized_state = repr(client.__dict__)
     assert secret not in serialized_state
@@ -178,7 +179,7 @@ async def test_provider_fails_before_network_when_credential_lease_is_unavailabl
         model="gpt-test",
         credential_provider=lambda: "",
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        _trusted_test_transport=True,
+        _gateway_managed=True,
     )
     with pytest.raises(Exception, match="credential lease|credential.*unavailable"):
         await client.chat([{"role": "user", "content": "hello"}])

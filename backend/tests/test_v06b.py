@@ -88,7 +88,7 @@ async def test_empty_key_no_longer_raises_local_protocol_error():
     client = ProviderClient(
         base_url="https://api.deepseek.com", api_key="",
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        _trusted_test_transport=True,
+        _gateway_managed=True,
     )
 
     from knowe_core.errors import ProviderAuthError

@@ -23,6 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.agents import zinnia as z                  # noqa: E402
 from backend.agents.base import Turn                    # noqa: E402
+from backend.tests import support_authority             # noqa: E402
+from backend.tests.support_authority import AgentProviderAuthority  # noqa: E402
 
 
 # ═══════════ 假客户端：把 SSE 那一层照着真格式喂回去 ═══════════
@@ -99,8 +101,17 @@ def run(agent: z.ZinniaAgent, content: str = "帮我在项目里搜一下运行�
         async def propose(self, **kw):
             return "approved"
 
+    # 真实授权：provider egress 必须携带一段 RUNNING 的 Task Runtime run（跳过授权的
+    # 那条测试通道已删除）。延迟到真正要发请求时再建，省掉纯 prompt 用例的开销。
+    authority = getattr(agent, "_provider_authority", None)
+    if authority is None:
+        authority = AgentProviderAuthority(support_authority.authority_store())
+        authority.configure(agent)
+        agent._provider_authority = authority
+
     turn = Turn("__platform__", "平台", content, [])
-    asyncio.run(agent.run_turn(turn, emit, FakeGate()))
+    with authority.active():
+        asyncio.run(agent.run_turn(turn, emit, FakeGate()))
     return events
 
 

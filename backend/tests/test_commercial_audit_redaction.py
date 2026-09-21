@@ -49,7 +49,7 @@ async def test_provider_error_diagnostics_redact_secret_and_student_pii() -> Non
         api_key="test-only",
         model="model",
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-        _trusted_test_transport=True,
+        _gateway_managed=True,
     )
     with pytest.raises(ProviderAuthError) as caught:
         await client.chat([{"role": "user", "content": "hello"}])

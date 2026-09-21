@@ -2291,7 +2291,6 @@ class ProviderGatewayClient:
         provider: str = "",
         backoff_base: float = 1.0,
         credential_provider: Callable[[], str] | None = None,
-        _trusted_test_transport: bool = False,
     ) -> None:
         """唯一的生产模型出口。
 
@@ -2299,19 +2298,14 @@ class ProviderGatewayClient:
         `_authorize` 直接 `return None` —— 整体跳过 authority、registry、DLP、
         预算、审批与审计。
 
-        【复审后的诚实状态】该参数**没有**被删除，而是改名为
-        `_trusted_test_transport`，短路逻辑与三个 agent 调用点都还在（上一轮的
-        提交信息声称"参数、短路与三个调用点都已删除"，那是**不实陈述**，本注释
-        予以更正）。它仍然让持有者跳过全部策略检查。
+        该参数的**前身**改名成 `_trusted_test_transport` 活了一段时间，而且它的
+        "物理上出不了网"的说辞被复审证伪：一层 wrapper、或一个 handler 会转发的
+        `MockTransport`，都能真的建立 socket。那样的东西不是"已知限制"，是一条被
+        洗白的后门，所以它现在**已删除**——本类不再有任何跳过授权的构造参数。
 
-        压缩该风险的是**下一层**而非本类：注入的 client 必须是
-        `httpx.MockTransport`（见 `provider_client._get_client`），所以这条通道
-        能在本地跳过策略，但**无法完成一次真实外发** —— 一个未注册的
-        provider/model/endpoint 不会真的被请求。
-
-        终局做法（已登记为遗留）：删除这个参数，让 agent 行为测试建立短命
-        Task Runtime run（I-R8 已证明该路径可行），把"测试"表达为运行时上下文
-        而不是构造期开关。
+        押注在"下一层拦得住"是错的：这一层必须自己就是边界。测试要注入假 transport
+        时走的是 `client_factory`（只替换发送通道，授权/预算/审计照旧），把 client
+        放进一个真实的短命 Task Runtime run 里（`settings_probe` 用的就是这条路径）。
         """
         from knowe_core.provider_client import ProviderClient
 
@@ -2321,22 +2315,6 @@ class ProviderGatewayClient:
         self.transport = str(transport or "openai_chat")
         self.registry = registry or production_model_capability_registry()
         self.authority_provider = authority_provider
-        # ⚠ 仅测试可见：见 __init__ 文档。生产构造点永不传 True。
-        #
-        # 【复审更正后的诚实表述】这个参数**确实**让持有者跳过 authority/registry/
-        # DLP/预算/审批/审计（下一行就 return None）——它功能上等价于被删掉的
-        # `allow_ungoverned_test_transport`，只是名字更明确。**不要**在别处声称它
-        # "不放行策略"：那是与本代码直接矛盾的假话。
-        #
-        # 目前压缩风险的实际防线在**下一层**：注入的 client 必须是
-        # `httpx.MockTransport`（见 provider_client._get_client），因此这条通道
-        # 物理上出不了网，无法把"未注册的 provider/model/endpoint"真正发出去。
-        # 也就是说它可以跳过本地策略检查，但**不能**完成一次真实外发。
-        #
-        # 仍未闭合的部分（已登记）：它是构造期布尔而非逐调用 capability，且
-        # `gateway._transport` 曾被直通（已由 _HIDDEN_FROM_OUTSIDE 堵住）。
-        # 终局做法是删除该参数，让 agent 行为测试建立短命 Task Runtime run。
-        self._trusted_test_transport = bool(_trusted_test_transport)
         self._transport = ProviderClient(
             base_url=base_url,
             api_key=api_key,
@@ -2349,7 +2327,6 @@ class ProviderGatewayClient:
             backoff_base=backoff_base,
             credential_provider=credential_provider,
             _gateway_managed=True,
-            _trusted_test_transport=_trusted_test_transport,
         )
 
     #: 允许从底层 transport 读取的**只读**属性。
@@ -2416,19 +2393,9 @@ class ProviderGatewayClient:
     ) -> "_ProviderAuthorization | None":
         # C-R1：这里曾有 `if self._allow_ungoverned_test_transport: return None, ""`，
         # 一个构造期布尔量即可整体跳过 authority、registry、DLP、预算、审批与审计。
-        #
-        # 现在只剩一条**仅测试**的等价路径：_trusted_test_transport。它存在的唯一理由是
-        # 大量 agent 行为测试需要一个假 transport，而那些测试环境里没有 Task Runtime，
-        # 因此无法满足 authority 要求。它与旧后门的区别是**可审计**：
-        #   · 名字以下划线开头，明确标注"测试专用"；
-        #   · 只有 agent 的 client_factory 注入点会传它，生产构造点永不传；
-        #   · packaging/阶段 1 验收报告把它登记为**已知限制**——它仍能让持有该参数的
-        #     构造者跳过策略，因此**不是**最终形态，只是把"任意的布尔后门"收窄成
-        #     "一个有名有据、有测试守卫的测试通道"。
-        # 后续应改为：测试建立短命 Task Runtime run（与 I-R8 的 settings probe 同一做法），
-        # 然后删除这个参数。
-        if self._trusted_test_transport:
-            return None
+        # 后来它改名成 `_trusted_test_transport` 继续短路（同样的东西、更明确的名字），
+        # 现在**已彻底删除**：`_authorize` 没有任何提前返回，每一次 provider egress
+        # 都必须带着真实的 Task Runtime 授权走完全程。
         authority = self.authority_provider()
         if authority is None or authority.runtime is None:
             raise GatewayDenied("authoritative Task Runtime context is unavailable for provider egress")

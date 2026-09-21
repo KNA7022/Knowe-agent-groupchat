@@ -204,7 +204,6 @@ class ProviderClient:
         backoff_base: float = DEFAULT_BACKOFF_BASE,
         credential_provider: CredentialProvider | None = None,
         _gateway_managed: bool = False,
-        _trusted_test_transport: bool = False,
     ):
         normalized_base = base_url.rstrip("/")
         # HTTPX requires an absolute URL even when MockTransport intercepts the request.
@@ -231,17 +230,18 @@ class ProviderClient:
         # Gateway 策略"混为一谈——复审实测：传一个**真实** httpx.AsyncClient 也能通过
         # `_assert_gateway_managed`，于是真实网络请求可以绕过 authority/DLP/预算/审批/审计。
         #
-        # 现在 client_factory 只在两种情况被接受：
-        #   1. _gateway_managed=True —— Gateway 构造时替换底层 transport（正常路径）；
-        #   2. _trusted_test_transport=True —— **仅测试**使用，专测 provider_client 自身的
-        #      凭据/重试等边界（那些行为与 Gateway 无关，无法经由 Gateway 触发）。
-        # 生产构造点（ProviderGatewayClient）永远只传 _gateway_managed，不传后者。
-        if client_factory is not None and not (_gateway_managed or _trusted_test_transport):
+        # 终局（前身 `_trusted_test_transport` 已删除）：这里只剩 `_gateway_managed`
+        # 一个声明，而它**不跳过任何策略**——策略根本不在这层。授权、DLP、预算、审批与
+        # 审计全部在 `ProviderGatewayClient`；本类只是传输层。这个布尔唯一做的事，是拒绝
+        # "绕过 Gateway 直接构造 transport 并发请求"。生产构造点（ProviderGatewayClient）
+        # 无条件传 True。测试若要单测本类的传输/凭据边界，就得同样声明"我扮演 Gateway
+        # 内部"，而不是"我豁免策略"——后者已经不存在了。
+        self._gateway_managed = bool(_gateway_managed)
+        if client_factory is not None and not self._gateway_managed:
             raise PermissionError(
                 "Production provider egress requires the Provider Gateway; "
                 "client_factory may only replace the transport of a gateway-managed client"
             )
-        self._gateway_managed = bool(_gateway_managed or _trusted_test_transport)
         self._injected_client: httpx.AsyncClient | None = None
 
         # Never send an invalid ``Bearer `` header.  Omitting it lets the provider return
@@ -324,9 +324,11 @@ class ProviderClient:
             #     否则会误伤大量合法的 agent 行为测试。
             #
             # ⚠ 诚实边界：这条检查拦得住"直接传真实 client"，拦不住"自己包一层
-            #   wrapper 把真 client 藏起来"。它不是密码学边界，只是把这条测试通道
-            #   从"任意构造者都能真实外发"收窄成"必须刻意包装才能外发"。
-            #   终局仍是删除该参数（已登记为遗留）。
+            #   wrapper 把真 client 藏起来"。它不是密码学边界——`client_factory` 接受
+            #   任意可调用对象，所以这里承诺的只是"明显误传会被立刻拒绝"。
+            #   真正的边界不在这层：真实 provider egress 必须经过
+            #   `ProviderGatewayClient._authorize`，而那条路径已经没有任何可跳过授权的
+            #   开关（`_trusted_test_transport` 已删除，见该类 `__init__` 的说明）。
             transport = getattr(self._injected_client, "_transport", None)
             if transport is not None and not isinstance(transport, httpx.MockTransport):
                 self._injected_client = None

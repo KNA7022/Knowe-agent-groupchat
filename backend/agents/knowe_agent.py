@@ -202,11 +202,6 @@ class KnoweAgent:
             ),
             max_retries=cfg.max_retries,
             client_factory=client_factory,
-            # ⚠ 这个开关**确实**让本次调用跳过 authority/DLP/预算/审计——不要声称
-            #    "策略照旧执行"，那是与代码矛盾的。真正的约束在下一层：注入的
-            #    client 必须是 httpx.MockTransport，所以它跳得过本地检查、
-            #    发不出真实请求。终局做法是删掉它，改为建立短命 Task Runtime run。
-            _trusted_test_transport=client_factory is not None,
             provider=cfg.provider,
             transport=cfg.transport,
             credential_provider=cfg.credential_provider,

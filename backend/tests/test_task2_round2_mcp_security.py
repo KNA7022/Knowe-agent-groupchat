@@ -377,30 +377,63 @@ def test_gateway_does_not_proxy_unknown_attributes() -> None:
     assert callable(client.aclose)
 
 
-def test_test_seam_refuses_a_client_that_can_reach_the_network() -> None:
-    """C1：测试通道必须**物理上出不了网**，否则它只是改了名的后门。
+def test_injecting_a_transport_no_longer_bypasses_authorization() -> None:
+    """C-R1 终局：不存在"跳过授权"的构造参数，注入 transport 也不再换来确定性。
 
-    复审实测：传入一个真实的 `httpx.AsyncClient`（不是 MockTransport）时，
-    未注册的 provider/model/endpoint 也能照发。现在 `_get_client` 要求注入的 client
-    挂载 `httpx.MockTransport`——它由 handler 直接产生响应，不建立任何 socket。
+    这条测试取代了旧的 `test_test_seam_refuses_a_client_that_can_reach_the_network`。
+    旧断言只证明"注入真实 client 会被 MockTransport 检查拦下"——它守的是一条本就
+    不该存在的通道，而且复审证伪了那条通道的说辞：一层 wrapper、或一个 handler 会
+    转发的 `MockTransport`，都能真的建立 socket。所以现在断言的是**通道本身不存在**。
+
+    1. `ProviderGatewayClient` 没有 `_trusted_test_transport` 这个参数；
+    2. 注入 `client_factory` 但拿不出 Task Runtime 授权 —— 请求在出网前被拒；
+    3. 传输层仍拒绝明显误传的真实 client（这是早期反馈，不是安全边界）。
     """
 
     from backend.commercial_gateway import ProviderGatewayClient
+    from backend.knowe_core.provider_client import ProviderClient
 
+    # 1. 那条被洗白的后门参数已经不存在了。
+    with pytest.raises(TypeError):
+        ProviderGatewayClient(  # type: ignore[call-arg]
+            base_url="https://not-registered.example/v1",
+            api_key="k",
+            model="m",
+            provider="not-registered",
+            _trusted_test_transport=True,
+        )
+
+    # 2. 就算注入了假 transport，没有真实授权就走不出去。
     client = ProviderGatewayClient(
         base_url="https://not-registered.example/v1",
         api_key="k",
         model="m",
         provider="not-registered",
-        client_factory=lambda: httpx.AsyncClient(),
-        _trusted_test_transport=True,
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"choices": []}),
+        )),
     )
 
     async def attempt() -> None:
-        with pytest.raises(PermissionError, match="MockTransport"):
+        with pytest.raises(GatewayDenied):
             await client.chat([{"role": "user", "content": "hi"}])
 
     asyncio.run(attempt())
+
+    # 3. 传输层对"明显误传真实 client"仍会立刻拒绝。
+    transport = ProviderClient(
+        base_url="https://x.example/v1",
+        api_key="k",
+        model="m",
+        client_factory=lambda: httpx.AsyncClient(),
+        _gateway_managed=True,
+    )
+
+    async def misuse() -> None:
+        with pytest.raises(PermissionError, match="MockTransport"):
+            await transport.chat([{"role": "user", "content": "hi"}])
+
+    asyncio.run(misuse())
 
 
 # ── I7：密封核对对 stdio 也必须有效 ─────────────────────────────────────────
@@ -481,9 +514,8 @@ def test_ordinary_provider_request_writes_a_terminal_audit_event(tmp_path: Any) 
     authorization = LegacyToolAuthority(
         group_id=group.group_id, task_id=run.task_id, run_id=run.run_id, runtime=runtime,
     )
-    # ⚠ 这里**不能**用 `_trusted_test_transport`：那条通道跳过整个授权（包括审计），
-    #   于是本来就不写任何 provider_egress 事件。要验证 I-R5 必须走真实授权路径，
-    #   只在最底层把发送通道换成 MockTransport。
+    # ⚠ 走真实授权路径，只在最底层把发送通道换成 MockTransport。旧注释在这里警告过
+    #   `_trusted_test_transport` 会跳过整个授权（连审计都不写）——那个参数已删除。
     client = ProviderGatewayClient(
         base_url="https://api.openai.com/v1",
         api_key="k",
@@ -1072,9 +1104,10 @@ def _authorized_stream_client(
 ) -> tuple[Any, Any, Any, Any, Any, Any]:
     """Build a genuinely authorized Gateway client whose socket layer is a MockTransport.
 
-    ``_trusted_test_transport`` is deliberately **not** used: it skips authorization
-    wholesale, so it writes no ``provider_egress`` audit at all -- and audit fidelity is
-    exactly what this module checks.
+    The authorization path is real; the only thing faked is the socket layer, via
+    ``client_factory``.  The seam that used to skip authorization wholesale -- and with it
+    every ``provider_egress`` audit -- has been deleted, and audit fidelity is exactly what
+    this module checks.
     """
 
     from backend.commercial_gateway import (

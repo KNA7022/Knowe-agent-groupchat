@@ -26,6 +26,8 @@ from backend.agents.deepseek import (
 from backend.config import CONFIG
 from backend.gate import Gate
 from backend.hub import Hub
+from backend.tests import support_authority
+from backend.tests.support_authority import AgentProviderAuthority
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -93,14 +95,25 @@ class Harness:
         self.fake = FakeDeepSeek(script)
         self.hub = Hub()
         self.gate = Gate(self.hub, "p1")
+        # 真实授权：provider egress 现在**必须**携带一段 RUNNING 的 Task Runtime run
+        # （`_trusted_test_transport` 那条跳过授权的通道已删除）。这里建的就是它，
+        # 外加一条真的凭据 lease——被替换掉的只有最底层的 socket。
+        self.authority = AgentProviderAuthority(
+            support_authority.authority_store(),
+        )
         self.agent = DeepSeekAgent(client_factory=self.fake.factory)
+        self.authority.configure(self.agent)
 
     async def emit(self, payload: dict[str, Any]) -> dict[str, Any]:
         return await self.hub.emit("p1", payload)
 
     async def run(self, content: str = "做个官网") -> None:
         turn = Turn("p1", "项目一", content, [])
-        await self.agent.run_turn(turn, self.emit, self.gate)
+        with self.authority.active():
+            await self.agent.run_turn(turn, self.emit, self.gate)
+
+    def close(self) -> None:
+        self.authority.close()
 
     # ⚠ 事件要从 hub 的 ring 里读，不能只收 agent 的 emit：
     #   审批卡和 approval_resolved 是 gate 直接经 hub 发的，不经过 agent。

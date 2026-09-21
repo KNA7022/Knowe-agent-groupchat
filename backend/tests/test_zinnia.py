@@ -29,6 +29,8 @@ from backend.config import CONFIG
 from backend.gate import Gate
 from backend.hub import Hub
 from backend.server import KnoweServer
+from backend.tests import support_authority
+from backend.tests.support_authority import AgentProviderAuthority
 
 # 复用 DeepSeek 测试里那台假模型（同一套 SSE 格式，没必要写两遍）
 from .test_deepseek import FakeDeepSeek, auto_approve, sse, tool_stream  # noqa: F401
@@ -59,10 +61,14 @@ class Harness:
         self.hub = Hub()
         self.gate = Gate(self.hub, PLATFORM_PROJECT_ID)
         self.created: list[tuple[str, str]] = []
+        # 真实授权：provider egress 现在必须携带一段 RUNNING 的 Task Runtime run
+        # （跳过授权的那条测试通道已删除），所以每个用例建一个短命 run。
+        self.authority = AgentProviderAuthority(support_authority.authority_store())
         self.agent = ZinniaAgent(
             create_project=self._create,
             client_factory=self.fake.factory,
         )
+        self.authority.configure(self.agent)
 
     async def _create(self, name: str) -> tuple[str, str]:
         pid = new_project_id()
@@ -74,7 +80,11 @@ class Harness:
 
     async def run(self, content: str = "我想做个网站") -> None:
         turn = Turn(PLATFORM_PROJECT_ID, "知知", content, [])
-        await self.agent.run_turn(turn, self.emit, self.gate)
+        with self.authority.active():
+            await self.agent.run_turn(turn, self.emit, self.gate)
+
+    def close(self) -> None:
+        self.authority.close()
 
     @property
     def events(self) -> list[dict[str, Any]]:

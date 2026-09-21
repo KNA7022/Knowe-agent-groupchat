@@ -1303,11 +1303,6 @@ class ZinniaAgent:
             ),
             max_retries=CONFIG.provider_max_retries,
             client_factory=self._client_factory,
-            # ⚠ 这个开关**确实**让本次调用跳过 authority/DLP/预算/审计（别再声称
-            #    "不放行策略"）。真正的约束在下一层：注入的 client 必须是
-            #    httpx.MockTransport，所以它跳得过本地检查、发不出真实请求。
-            #    终局做法是删掉它，改为在测试里建立短命 Task Runtime run。
-            _trusted_test_transport=self._client_factory is not None,
             provider=self.provider,
             transport=str((binding or {}).get("transport") or "openai_chat"),
             credential_provider=(

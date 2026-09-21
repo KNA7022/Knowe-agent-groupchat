@@ -64,3 +64,22 @@ def _restore_config_baseline():
     _reset_runtime_settings()
     for name, value in TEST_BASELINE.items():
         object.__setattr__(CONFIG, name, value)
+
+
+@pytest.fixture(autouse=True)
+def _agent_authority_store(tmp_path):
+    """Give agent tests a per-test directory for their real Task Runtime authority.
+
+    Provider egress can no longer be attempted without an authoritative Task Runtime
+    context (the old ``_trusted_test_transport`` bypass is gone), so the agent test
+    harnesses build a short-lived run for every case.  They need somewhere on disk to
+    put it — pytest owns that lifetime instead of the harness guessing at one.
+    """
+
+    from backend.tests import support_authority
+
+    token = support_authority.set_authority_store(tmp_path)
+    try:
+        yield
+    finally:
+        support_authority._CURRENT_STORE.reset(token)  # noqa: SLF001
