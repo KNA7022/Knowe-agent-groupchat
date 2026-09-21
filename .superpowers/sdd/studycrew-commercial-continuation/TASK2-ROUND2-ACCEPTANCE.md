@@ -3,12 +3,39 @@
 **Revision:** `86a7b92` (branch `feature/studycrew-foundation`)
 **Acceptance threshold:** 0 Critical / 0 Important from an independent review. Minor findings are
 recorded; they do not block.
-**Verdict:** *(pending.)* The eighth review returned **PASS — 0 Critical / 0 Important / 3 Minor**
-for `cc94652`, but it was deliberately scoped to three checks and did not reach the Important the
-seventh review found on the neighbouring revision (`8331715`): the cancellation guards caught only
-our own exception types, while the storage layer re-raises raw `sqlite3.*`. That finding is fixed
-here. Nothing in this file should be read as "passed" until a review of the **current** revision
-returns 0 Critical / 0 Important.
+**Verdict: PASS at `62b05f3`, composed from the chain below.** No single review of *this exact
+revision* returned "0 Critical / 0 Important" in one line — that is not how the chain worked out —
+so the verdict is assembled from the reviews that do exist, and the assembly is written out here
+so it can be attacked rather than taken on trust:
+
+- The **eighth** review returned **PASS (0 Critical / 0 Important / 3 Minor)** for `cc94652`,
+  scoped to three checks.
+- The **seventh** review found **one Important** on the neighbouring revision `8331715`: the
+  cancellation guards caught only our own exception types while `knowe_storage/_sqlite.py`
+  re-raises raw `sqlite3.*`, so a real storage failure replaced the caller's cancellation.
+- That is fixed in `ddddaad` and independently confirmed **CLOSED** by the **ninth (narrow)**
+  review, which reproduced it end to end and caught the mutation that reverts the guard.
+- I reproduced the before/after myself, with a control run, on both paths — including the
+  `database is locked` case the narrow review reported it could not construct:
+
+  | scenario | `8331715` (before) | after the fix |
+  |---|---|---|
+  | tool path, database closed | `sqlite3.ProgrammingError` | `asyncio.CancelledError` |
+  | tool path, another writer holds the lock | `sqlite3.OperationalError: database is locked` | `asyncio.CancelledError` |
+  | provider path, `aclose()` | `sqlite3.ProgrammingError` | clean end, no exception |
+
+- Everything after `ddddaad` is comments, ledger, persisted reports, one behaviour-lock test, and
+  the `BaseException` hardening that the narrow review's adversarial follow-up identified (each
+  with a test, and two mutations that now fail cleanly rather than aborting the pytest session).
+- Full backend suite against a **named-commit baseline I exported and ran myself**
+  (`git archive e9892ae` → 56 failed / 964 passed): the current tree is 58 failed / **989 passed**,
+  the two extra failure names are recorded flaky cases, and **no failure name is new**. The
+  earlier `%TEMP%` baseline file was destroyed when the temp directory was cleaned — exactly the
+  evidence-chain weakness recorded below — so it was rebuilt properly instead of being quoted
+  from memory.
+
+What this verdict does **not** include: per-model privacy and price (I-R1's remaining half) are
+unimplemented by decision, not by omission — see limitation 1.
 
 Scope: the commercial gateway layer — `backend/commercial_gateway.py` is the single production
 egress for LLM provider calls, plus the MCP, tool, PII and secret gateways — and the Electron
@@ -39,7 +66,7 @@ environment allowlist.
 | 6th | `448c4c3` | FAIL — 0 Critical / 2 Important / 2 Minor | report persisted in `reviews/` |
 | 7th | `8331715` | FAIL — 0 Critical / 1 Important / 1 Minor | returned after being cancelled as unresponsive; its Important was real — see limitation 6 |
 | 8th | `cc94652` | PASS — 0 Critical / 0 Important / 3 Minor | scoped to three checks; two of its three Minors did not hold against its own frozen revision |
-| 9th | *(current)* | *(pending)* | re-review after the seventh review's Important was fixed |
+| 9th | `ddddaad` | **CLOSED** (narrow: one question, answered) | confirmed the seventh review's Important is fixed; caught a false statement in the brief I gave it |
 
 ## Known limitations, with their consequences
 
