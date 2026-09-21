@@ -45,13 +45,15 @@ environment allowlist.
 
 1. **Per-model privacy and price (I-R1's remaining half).** `models=("*",)` means any model name
    passes for a registered provider, with `privacy=STANDARD` and `estimated_cost_usd=0.01` at the
-   **provider** level. Measured this round: the repository's sourced pricing catalogue
-   (`backend/token_pricing.py`, 14 providers with source URLs) has **no entry at all** for five
-   registry providers (`copilot`, `gmi`, `huggingface`, `kimi-coding`, `kimi-coding-cn`), so
-   tightening the wildcard would make those five unusable, and it contains **no privacy data
-   whatsoever** — per-model privacy cannot be derived from it. Recommendation on record: keep the
-   wildcard until a verified per-model privacy list exists, then make **privacy** per-model (the
-   part with real user consequence) and leave price at provider level. This is a product decision.
+   **provider** level. Measured (this is the number the ninth review was asked to check): the
+   repository's sourced pricing catalogue `backend/token_pricing.py` holds 17 providers and covers
+   **14 of the registry's 19** — it has **no entry at all** for `copilot`, `gmi`, `huggingface`,
+   `kimi-coding` and `kimi-coding-cn`. So keying `models` off the catalogue would leave those five
+   with an empty model set (fail-closed, i.e. unusable) and would also reject any new model a user
+   configures. And the catalogue carries **no privacy data whatsoever** — per-model privacy cannot be
+   derived from it. Recommendation on record: keep the wildcard until a verified per-model privacy
+   list exists, then make **privacy** per-model (the part with real user consequence) and leave price
+   at provider level. This is a product decision, not an oversight.
 2. **`chat_stream` terminal event is not guaranteed.** If a consumer neither closes the generator
    nor lets the event loop run `shutdown_asyncgens`, the terminal `provider_egress` event can be
    missing entirely. Measured by the fifth review; not fixable inside that function.
@@ -84,5 +86,5 @@ environment allowlist.
   is not one of the recorded flaky cases
 - Frontend: 575 passed / 52 files
 - `git status --porcelain -uall` clean
-- Per-change mutation table: 15 behaviour changes, each with the mutation that reverts it and the
+- Per-change mutation table: 16 behaviour changes, each with the mutation that reverts it and the
   test that must fail (see `progress.md`)

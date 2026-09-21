@@ -89,6 +89,7 @@
   | `settle_budget` guards (5 dimensions + float tolerance) | `8ae1263` | drop each guard / widen tolerance to 1e9 | 5th + 6th review | CAUGHT |
   | `_complete_authorized_effect` terminal-record guard | `94479dc` | remove the `try`/`except` | 6th review | CAUGHT |
   | `ToolGateway._invoke` cancellation guard | `448c4c3` | remove the `try`/`except` | this round | CAUGHT |
+  | that guard's exception list, widened to `Exception` | `ddddaad` | restore the narrow tuple | this round | CAUGHT |
   | `_authorize` `isinstance` gate | `247c9ae` | delete the check | 6th review | CAUGHT |
   | the `_trusted_test_transport` seam deleted | `ebf7feb` | restore the parameter / insert `return None` | 5th review | CAUGHT |
   | `SecretLeaseBroker` per-field redemption binding (I-R3b) | pre-existing | drop the `transport` / `endpoint` comparison | this round | CAUGHT |
