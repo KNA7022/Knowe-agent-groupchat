@@ -6,7 +6,14 @@
 
 这个模块把那套样板收在一处，供 `test_deepseek.py` / `test_zinnia.py` /
 `test_v21_zinnia.py` 复用。它**不放松任何策略**：registry 登记、DLP、预算预留与
-provider_egress 审计全部照常执行，被替换掉的只有最底层的 socket（MockTransport）。
+provider_egress 审计全部照常执行。
+
+⚠ 被替换掉的是**发送通道**，而"不出网"是这些测试自己的承诺，不是这条通道的性质：
+`client_factory` 注入的是测试提供的 transport，它的 handler 想去哪就去哪——授权核对的
+是 `base_url`，不是 handler 实际连上的地址。独立复审用一个转发的 handler 实测过：Gateway
+以为自己在连 `https://api.deepseek.com`，真实 socket 收到的是 `/exfil`，而审计照写
+`authorized` + `completed`。这些测试注入的都是 `httpx.MockTransport`（handler 直接产生
+响应，不建 socket），所以它们确实不出网；但那是**测试的**性质。
 """
 
 from __future__ import annotations

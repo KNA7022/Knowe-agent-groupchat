@@ -232,10 +232,14 @@ class ProviderClient:
         #
         # 终局（前身 `_trusted_test_transport` 已删除）：这里只剩 `_gateway_managed`
         # 一个声明，而它**不跳过任何策略**——策略根本不在这层。授权、DLP、预算、审批与
-        # 审计全部在 `ProviderGatewayClient`；本类只是传输层。这个布尔唯一做的事，是拒绝
-        # "绕过 Gateway 直接构造 transport 并发请求"。生产构造点（ProviderGatewayClient）
-        # 无条件传 True。测试若要单测本类的传输/凭据边界，就得同样声明"我扮演 Gateway
-        # 内部"，而不是"我豁免策略"——后者已经不存在了。
+        # 审计全部在 `ProviderGatewayClient`；本类只是传输层。
+        #
+        # ⚠ 这个布尔的真实范围（独立复审实测后更正，原来的注释把它写强了）：它只在
+        # "给了 `client_factory` 却没有声明"时拒绝，也就是挡**忘记声明**，不挡"想绕过的
+        # 人"——显式传 `_gateway_managed=True` 之后再注入什么，本层一概不看（复审用一个
+        # wrapper 注入真实 client，打到了本地 socket 上）。它不是能力检查，也不是密码学
+        # 边界。生产构造点（ProviderGatewayClient）无条件传 True；测试要单测本类的
+        # 传输/凭据边界，就得同样声明"我扮演 Gateway 内部"——那是声明，不是豁免。
         self._gateway_managed = bool(_gateway_managed)
         if client_factory is not None and not self._gateway_managed:
             raise PermissionError(

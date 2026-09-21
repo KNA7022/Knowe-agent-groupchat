@@ -653,12 +653,29 @@ def test_successful_first_attempt_refunds_the_unused_retry_reservation(tmp_path:
     runtime.close()
 
 
-def test_settle_budget_refuses_to_release_more_than_was_reserved(tmp_path: Any) -> None:
+@pytest.mark.parametrize(
+    ("dimension", "granted", "claimed"),
+    [
+        ("tokens", 100, 1000),
+        ("model_turns", 2, 20),
+        ("tool_calls", 1, 10),
+        ("wall_clock_seconds", 1.0, 60.0),
+        ("cost_usd", 0.01, 1.0),
+    ],
+)
+def test_settle_budget_refuses_to_release_more_than_was_reserved(
+    tmp_path: Any, dimension: str, granted: Any, claimed: Any,
+) -> None:
     """M-9：`reserved` 必须真的在账上，否则结算会把用量抹掉。
 
     复审实测过旧行为：账上只有 100，却传 `reserved=1000, actual=0` → 结算后余额被
     清成 0（`max(0, …)` 兜住了不负数，但把**未预留的部分一起抹掉**）。当前唯一调用方
     不可达，所以这是防将来接线出错的守卫，不是可利用漏洞。
+
+    I-4：原测试只覆盖 `tokens` 一个维度——独立复审删掉 `wall_clock_seconds` /
+    `cost_usd` 的守卫、或把浮点容差放大到 1e9，测试都仍然全绿，而 `8ae1263` 的提交信息
+    写的是 "in every dimension"。所以这里逐维度参数化：删掉任何一维的守卫，至少有一个
+    参数会失败。
     """
 
     from backend.groups import GroupRepository
@@ -667,36 +684,38 @@ def test_settle_budget_refuses_to_release_more_than_was_reserved(tmp_path: Any) 
 
     groups = GroupRepository(tmp_path)
     service = TaskRuntimeService(tmp_path, groups)
-    group = groups.create_group("settle-guard")
+    group = groups.create_group(f"settle-guard-{dimension}")
     run = service.submit(group.group_id, title="guard", request_key="g1")
     run = service.schedule()[0]
 
-    # 账上只有 100 token。
+    granted_usage = BudgetUsage(**{dimension: granted})
     service.consume_budget(
-        group.group_id, run.run_id, BudgetUsage(tokens=100), request_key="only-100",
+        group.group_id, run.run_id, granted_usage, request_key="granted",
     )
+    before = getattr(service.store.get_run(run.run_id).budget_usage, dimension)
+    assert before == granted
 
-    # 声称预留了 1000 —— 远超账上余额，必须拒绝而不是把用量抹平。
-    with pytest.raises(RuntimeConflictError, match="reservation"):
+    # 声称预留了远超账上余额的量 —— 必须拒绝而不是把用量抹平。
+    with pytest.raises(RuntimeConflictError, match=dimension):
         service.settle_budget(
             group.group_id,
             run.run_id,
-            actual=BudgetUsage(tokens=0),
-            reserved=BudgetUsage(tokens=1000),
+            actual=BudgetUsage(),
+            reserved=BudgetUsage(**{dimension: claimed}),
             request_key="bogus",
         )
     # 账上没有被改动。
-    assert service.store.get_run(run.run_id).budget_usage.tokens == 100
+    assert getattr(service.store.get_run(run.run_id).budget_usage, dimension) == before
 
-    # 正常结算（预留 100、实际 40）仍然可用。
+    # 释放量恰好等于余额时仍然允许（守卫比较的是 `release > usage`），结果是归零。
     service.settle_budget(
         group.group_id,
         run.run_id,
-        actual=BudgetUsage(tokens=40),
-        reserved=BudgetUsage(tokens=100),
-        request_key="ok",
+        actual=BudgetUsage(),
+        reserved=granted_usage,
+        request_key="exact",
     )
-    assert service.store.get_run(run.run_id).budget_usage.tokens == 40
+    assert getattr(service.store.get_run(run.run_id).budget_usage, dimension) == 0
     service.close()
 
 
@@ -1390,3 +1409,254 @@ def test_cancellation_is_not_replaced_by_a_failing_audit_write() -> None:
 
     # 修复前：RuntimeStoreError 会从这里冒出来。
     asyncio.run(consume_one())
+
+
+def test_a_duck_typed_runtime_cannot_authorize_provider_egress() -> None:
+    """I-1：`_authorize` 必须拒绝"长得像 runtime"的假对象。
+
+    `authority_provider` 是**公开构造参数**。只做鸭子类型检查时，一个二十行的假对象
+    （`store.get_run` 返回 `status=RUNNING` 的假 run）就能让整个授权流程放行并真的发起
+    egress —— 全程没有 Task Runtime。`ebf7feb` 的提交信息声称"没有任何配置能让 provider
+    egress 在没有权威 Task Runtime run 的情况下进行"，独立复审用这个假对象实测把它证伪。
+
+    这条测试断言的是**要求**：非 `TaskRuntimeService` 的 runtime 一律拒绝，且在拒绝之前
+    一个字节都不许发出去。
+    """
+
+    from backend.commercial_gateway import LegacyToolAuthority, ProviderGatewayClient
+    from backend.task_runtime.contracts import TaskStatus
+
+    sent: list[str] = []
+
+    class _FakeRun:
+        group_id = "grp_" + "0" * 32
+        task_id = "task_" + "0" * 32
+        run_id = "run_" + "0" * 32
+        status = TaskStatus.RUNNING
+        budget_limits = None
+        budget_usage = None
+
+    class _FakeStore:
+        def get_run(self, _run_id: str) -> Any:
+            return _FakeRun()
+
+        def change_run(self, *_args: Any, **_kwargs: Any) -> None:
+            sent.append("audit")
+
+    class _FakeRuntime:
+        def __init__(self) -> None:
+            self.store = _FakeStore()
+
+        def consume_budget(self, *_args: Any, **_kwargs: Any) -> Any:
+            usage = type("U", (), {
+                "tokens": 0, "model_turns": 0, "tool_calls": 0,
+                "wall_clock_seconds": 0.0, "cost_usd": 0.0,
+            })()
+            return type("B", (), {
+                "budget_usage": usage, "status": TaskStatus.RUNNING,
+            })()
+
+        def settle_budget(self, *_args: Any, **_kwargs: Any) -> None:
+            sent.append("settle")
+
+        def cancel(self, *_args: Any, **_kwargs: Any) -> None:
+            sent.append("cancel")
+
+    authority = LegacyToolAuthority(
+        group_id=_FakeRun.group_id,
+        task_id=_FakeRun.task_id,
+        run_id=_FakeRun.run_id,
+        runtime=_FakeRuntime(),  # type: ignore[arg-type]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(f"SENT {request.method} {request.url}")
+        return httpx.Response(200, json={"choices": [], "usage": {"total_tokens": 3}})
+
+    client = ProviderGatewayClient(
+        base_url="https://api.deepseek.com",
+        api_key="k",
+        model="deepseek-chat",
+        provider="deepseek",
+        authority_provider=lambda: authority,
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    async def attempt() -> None:
+        with pytest.raises(GatewayDenied):
+            await client.chat([{"role": "user", "content": "hi"}])
+
+    asyncio.run(attempt())
+    assert sent == [], f"egress happened without a Task Runtime: {sent}"
+
+
+@pytest.mark.parametrize("abort", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+def test_aborted_chat_is_audited_as_cancelled_not_failed(
+    tmp_path: Any, abort: type[BaseException],
+) -> None:
+    """I-3 + M-4：非流式 `chat` 的中止分支此前**零覆盖**——独立复审删掉整个子句，
+    Round-2 文件 30/30 仍然全绿，也就是说那条分支正确与否没有任何测试在管。
+
+    流式路径有 `test_abandoned_stream_is_audited_as_cancelled_not_failed`，非流式没有。
+    两条路径的中止语义必须一致：`CancelledError` / `KeyboardInterrupt` / `SystemExit`
+    都是**调用方中止**，不是 provider 故障，审计里不得写成 `failed / <那个异常名>`
+    （复审实测过 `failed / KeyboardInterrupt`）。
+    """
+
+    client, runtime, group, run, authorization, authority_context = _authorized_stream_client(
+        tmp_path, sse=_STREAM_SSE, label=f"abort-{abort.__name__.lower()}",
+    )
+
+    async def aborted(*_args: Any, **_kwargs: Any) -> Any:
+        raise abort()
+
+    # 只换掉这一次请求的实现，其余（授权、预算、审计）全走真实路径。
+    object.__getattribute__(client, "_transport").chat = aborted
+
+    async def call() -> None:
+        with authority_context(authorization):
+            with pytest.raises(abort):
+                await client.chat([{"role": "user", "content": "hi"}])
+
+    asyncio.run(call())
+
+    payloads = [
+        event.public_payload for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "provider_egress"
+    ]
+    assert payloads, "the effect must still be audited"
+    terminal = [payload for payload in payloads if payload.get("status") != "authorized"]
+    assert terminal, payloads
+    assert terminal[-1]["status"] == "cancelled", payloads
+    assert not [
+        payload for payload in payloads if payload.get("error_type") == abort.__name__
+    ], payloads
+    runtime.close()
+
+
+def test_injecting_a_client_factory_requires_the_gateway_declaration() -> None:
+    """M-2：把 `_gateway_managed` 的**真实范围**钉在测试里，而不是让它留在注释里。
+
+    独立复审实测：`ProviderClient(..., client_factory=<wrapper>, _gateway_managed=True)`
+    能真的连上本地 socket。所以这个布尔挡的是"忘记声明"，不是"想绕过的人"。本测试同时
+    断言两半，避免下一个人再把它当能力检查：
+      · 给了 `client_factory` 却没声明 → 构造期就拒绝；
+      · 显式声明 True 之后 → 本层不再检查注入的东西（这是**已知**事实，不是被掩盖的缺陷）。
+    """
+
+    from backend.knowe_core.provider_client import ProviderClient
+
+    with pytest.raises(PermissionError, match="Provider Gateway"):
+        ProviderClient(
+            base_url="https://x.example/v1",
+            api_key="k",
+            client_factory=lambda: httpx.AsyncClient(),
+        )
+
+    declared = ProviderClient(
+        base_url="https://x.example/v1",
+        api_key="k",
+        client_factory=lambda: httpx.AsyncClient(),
+        _gateway_managed=True,
+    )
+    assert declared is not None, "the declaration is accepted without inspecting the factory"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_tool_effect_is_not_left_running(tmp_path: Any) -> None:
+    """M-6 的同一条纪律必须也适用于 `ToolGateway`（独立复审列为观察，未定级）。
+
+    `_invoke` 用 `except Exception` 收尾，而 `CancelledError` / `KeyboardInterrupt` /
+    `SystemExit` 都不是 `Exception` 的子类。于是 effect 被取消时 `complete_tool` 根本不会
+    被调用，invocation 就一直停在 `running`，直到重启恢复把它标成 `recovered_blocked`——
+    审计里一次"用户中止"看起来像"工具还在跑"。provider egress 那条路径已经按"取消不是
+    失败"处理了（M-6），工具路径没有，这个不对称本身就是缺陷。
+    """
+
+    from backend.commercial_gateway import (
+        ToolDescriptor,
+        ToolExecutionRequest,
+        ToolGateway,
+    )
+    from backend.groups import GroupRepository
+    from backend.task_runtime.service import TaskRuntimeService
+
+    groups = GroupRepository(tmp_path)
+    runtime = TaskRuntimeService(tmp_path, groups)
+    group = groups.create_group("tool-cancel")
+    run = runtime.submit(group.group_id, title="tool-cancel", request_key="tc:1")
+    run = runtime.schedule()[0]
+
+    def effect(_request: Any) -> str:
+        raise asyncio.CancelledError()
+
+    gateway = ToolGateway(runtime)
+    gateway.register(
+        ToolDescriptor(tool_name="reader", kind="builtin", risk=RiskLevel.LOW),
+        effect,
+    )
+    request = ToolExecutionRequest(
+        group_id=group.group_id,
+        task_id=run.task_id,
+        run_id=run.run_id,
+        tool_name="reader",
+        idempotency_key="tc:effect",
+        purpose="read",
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await gateway.invoke(request)
+
+    with runtime.store.db.transaction() as conn:
+        row = conn.execute(
+            "SELECT status FROM studycrew_tool_invocations WHERE group_id=?",
+            (group.group_id,),
+        ).fetchone()
+    assert row is not None, "the effect must have been claimed"
+    assert row[0] == "cancelled", f"cancelled effect left as {row[0]!r}"
+    runtime.close()
+
+
+@pytest.mark.parametrize("abort", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
+def test_aborted_stream_is_audited_as_cancelled_not_failed(
+    tmp_path: Any, abort: type[BaseException],
+) -> None:
+    """M-4 的流式一半：`CancelledError` / `KeyboardInterrupt` / `SystemExit` 从流里
+    冒出来时，与 `GeneratorExit` 一样属于**调用方中止**，不得记成 provider 故障。
+
+    （`GeneratorExit` 那一半由 `test_abandoned_stream_is_audited_as_cancelled_not_failed`
+    覆盖：消费者 `aclose()` 时它从 `yield` 点抛出。补这条是因为 mutation 显示：把
+    `chat_stream` 的中止子句收窄回 `(GeneratorExit, CancelledError)`，没有任何测试失败，
+    也就是修好的那一半没被锁住。）
+    """
+
+    client, runtime, group, run, authorization, authority_context = _authorized_stream_client(
+        tmp_path, sse=_STREAM_SSE, label=f"stream-abort-{abort.__name__.lower()}",
+    )
+
+    async def aborted(*_args: Any, **_kwargs: Any):
+        raise abort()
+        yield {}  # 不可达；它只是让这个函数成为 async generator
+
+    object.__getattribute__(client, "_transport").chat_stream = aborted
+
+    async def call() -> None:
+        with authority_context(authorization):
+            with pytest.raises(abort):
+                async for _event in client.chat_stream([{"role": "user", "content": "hi"}]):
+                    pass
+
+    asyncio.run(call())
+
+    payloads = [
+        event.public_payload for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "provider_egress"
+    ]
+    assert payloads, "the effect must still be audited"
+    terminal = [payload for payload in payloads if payload.get("status") != "authorized"]
+    assert terminal, payloads
+    assert terminal[-1]["status"] == "cancelled", payloads
+    assert not [
+        payload for payload in payloads if payload.get("error_type") == abort.__name__
+    ], payloads
+    runtime.close()

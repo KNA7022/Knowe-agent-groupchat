@@ -53,6 +53,13 @@ def _reset_runtime_settings() -> None:
     runtime_settings._state.clear()  # noqa: SLF001
     runtime_settings._state.update(runtime_settings._default_state())  # noqa: SLF001
     runtime_settings._loaded = True  # noqa: SLF001
+    # M-6 (review): the secret-lease broker is another module-level global and was never
+    # reset here, so a case that installed one left every later case running with a
+    # broker it did not create.  The independent review reproduced that leak on the
+    # e9892ae baseline too, so it is pre-existing rather than caused by the new
+    # authority fixture -- but the fixture is what makes it easy to trip over, so it is
+    # fixed here.
+    runtime_settings._secret_lease_broker = None  # noqa: SLF001
 
 
 @pytest.fixture(autouse=True)

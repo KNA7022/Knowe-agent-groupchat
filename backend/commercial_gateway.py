@@ -384,6 +384,19 @@ class ToolGateway:
             result = effect(request)
             if inspect.isawaitable(result):
                 result = await result
+        except (GeneratorExit, asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            # M-6 的同一条纪律，应用到工具路径：取消不是 effect 失败。此前这里只有
+            # `except Exception`，而这三个都不是 `Exception` 的子类——于是 effect 被取消时
+            # `complete_tool` 根本不会被调用，invocation 一直停在 `running`，直到重启恢复
+            # 把它标成 `recovered_blocked`。审计里一次"用户中止"看起来像"工具还在跑"。
+            #
+            # 终态记录自己失败时也不能替换掉取消（与 `_complete_authorized_effect` 同样的
+            # 理由）：调用方要看到的是它自己的取消，不是一个数据库异常。
+            try:
+                self.runtime.store.cancel_tool(invocation.invocation_id)
+            except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+                pass
+            raise
         except Exception as exc:
             self.runtime.store.complete_tool(
                 invocation.invocation_id, status="failed", error_type=type(exc).__name__,
@@ -2304,8 +2317,20 @@ class ProviderGatewayClient:
         洗白的后门，所以它现在**已删除**——本类不再有任何跳过授权的构造参数。
 
         押注在"下一层拦得住"是错的：这一层必须自己就是边界。测试要注入假 transport
-        时走的是 `client_factory`（只替换发送通道，授权/预算/审计照旧），把 client
-        放进一个真实的短命 Task Runtime run 里（`settings_probe` 用的就是这条路径）。
+        时走的是 `client_factory`，把 client 放进一个真实的短命 Task Runtime run 里
+        （`settings_probe` 用的就是这条路径）。
+
+        ⚠ 下面两句曾被我自己写在这里、又被独立复审实测打掉，一并更正（`ebf7feb` 的
+        提交信息里还留着第一句，提交信息改不了，只能在此更正）：
+
+          · "没有任何配置能让 provider egress 在没有权威 Task Runtime run 的情况下
+            进行" —— **不成立**。`authority_provider` 是公开构造参数，一个鸭子类型的
+            假 runtime 曾经就能让整段授权放行并真的发出请求；`_authorize` 现在加了
+            `isinstance(runtime, TaskRuntimeService)`，但那只挡住"随手写个假对象"。
+          · "`client_factory` 只替换发送通道" —— **过强**。它注入的是测试提供的
+            transport，而那个 transport 的 handler 想连哪里就连哪里：授权核对的是
+            `base_url`，不是 handler 实际连上的地址。不转发是**测试的承诺**，不是
+            代码的保证。
         """
         from knowe_core.provider_client import ProviderClient
 
@@ -2400,6 +2425,21 @@ class ProviderGatewayClient:
         if authority is None or authority.runtime is None:
             raise GatewayDenied("authoritative Task Runtime context is unavailable for provider egress")
         runtime = authority.runtime
+        # I-1（独立复审实测）：此前这一段只做**鸭子类型**检查，而 `authority_provider`
+        # 是公开构造参数。一个二十行的假对象——`store.get_run` 返回 `status=RUNNING` 的
+        # 假 run，再加 `consume_budget`/`settle_budget`——就能让整段授权全绿并发起真实
+        # egress，全程没有 Task Runtime（复审的 trace：`authorized` → `SENT POST` →
+        # `completed`）。所以这里要求 runtime 真的是 `TaskRuntimeService`。
+        #
+        # ⚠ 诚实边界：`isinstance` 不是密码学边界——子类、或一个真实的
+        # `TaskRuntimeService` 实例，仍然由持有者决定。它挡住的是"随手写个假对象就成了"
+        # （也就是复审证伪的那条路），不是"铁了心要绕过的调用方"。真正的约束有两层：
+        # `authority_provider` 的默认值是 backend 自己设的 ContextVar，而且 `git grep`
+        # 显示**没有任何生产调用点**传这个参数——它存在的理由是测试需要注入授权。
+        if not isinstance(runtime, TaskRuntimeService):
+            raise GatewayDenied(
+                "provider egress requires a real Task Runtime, not a stand-in"
+            )
         run = runtime.store.get_run(authority.run_id)
         if (
             run is None
@@ -2780,8 +2820,11 @@ class ProviderGatewayClient:
             result = await object.__getattribute__(self, "_transport").chat(
                 messages, tools, temperature, max_tokens, extra_body,
             )
-        except (GeneratorExit, asyncio.CancelledError):
+        except (GeneratorExit, asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             # M-6：取消不是失败。终态记 `cancelled`，不写 error_type。
+            # M-4（独立复审实测）：`KeyboardInterrupt` / `SystemExit` 同样不是 provider
+            # 故障——它们与 `CancelledError` 一样是"调用方中止"，此前会记成
+            # `failed / KeyboardInterrupt`。两者仍然重新抛出，调用方要看到它们。
             self._reconcile_provider_usage(authorization, None, failed=True)
             self._complete_authorized_effect(authorization, error=None, cancelled=True)
             raise
@@ -2818,12 +2861,19 @@ class ProviderGatewayClient:
                 messages, tools, temperature, max_tokens, extra_body,
             ):
                 yield event
-        except (GeneratorExit, asyncio.CancelledError):
+        except (GeneratorExit, asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             # M-6：消费者提前 break / `aclose()`（或任务被取消）会让 `GeneratorExit`
             # 从下面的 `yield` 处抛出。它是控制流信号，不是 provider 故障——旧实现把它
             # 交给 `except BaseException`，于是审计里出现一次假的 `failed/GeneratorExit`。
             # `GeneratorExit` 必须重新抛出，否则 async generator 会报
-            # "async generator ignored GeneratorExit"。
+            # "async generator ignored GeneratorExit"。`KeyboardInterrupt` /
+            # `SystemExit` 同理（M-4，独立复审实测它们此前记成 `failed`）。
+            #
+            # ⚠ M-5 已知限制（复审实测，本段修不掉）：这段清理代码**不保证执行**。消费者
+            # 若既不 `aclose()` 也不让事件循环 `shutdown_asyncgens()`（例如直接在已关闭的
+            # 循环上丢弃生成器），终态事件可以是**空的**——审计里连 `cancelled` 都没有。
+            # 这是 async generator 的终结语义，不是这里能补的；要彻底解决得让调用方持有
+            # 生命周期（或在 effect 外层记录"开始过"，由恢复流程收敛）。
             self._reconcile_provider_usage(authorization, None, failed=True)
             self._complete_authorized_effect(authorization, error=None, cancelled=True)
             raise
