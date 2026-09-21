@@ -1316,3 +1316,77 @@ def test_completing_an_authorized_effect_distinguishes_cancel_from_failure() -> 
             authorization, error=RuntimeError("boom"), cancelled=True,
         )
     assert runtime.store.calls == []
+
+
+def test_cancellation_is_not_replaced_by_a_failing_audit_write() -> None:
+    """取消路径上写库失败，不能把 `GeneratorExit` 换成另一个异常。
+
+    `_complete_authorized_effect` **结尾**的事件写入有 try/except，但同一函数里更靠前的
+    终态记录（`complete_tool` / `cancel_tool`）没有。而它就在 `except GeneratorExit`
+    分支里：存储一旦在那一刻不可用，`aclose()` 抛出的就不是"干净结束"，而是一个与
+    调用者毫无关系的数据库异常——`async for ... break` 的消费者（真实 UI 每秒都在
+    那么做）会看到它。
+    """
+
+    from backend.commercial_gateway import (
+        ProviderGatewayClient,
+        _ProviderAuthorization,
+        production_model_capability_registry,
+    )
+    from backend.task_runtime.contracts import BudgetUsage
+    from backend.task_runtime.store import RuntimeStoreError
+
+    class _ExplodingStore:
+        """任何一次调用都失败——模拟结算那一刻存储写不进去。"""
+
+        def __getattr__(self, name: str) -> Any:
+            def boom(*_args: Any, **_kwargs: Any) -> Any:
+                raise RuntimeStoreError(f"store is unavailable: {name}")
+
+            return boom
+
+    class _Runtime:
+        """runtime 的每个入口都失败——不论调用方走 store 还是直接走 runtime。"""
+
+        def __init__(self) -> None:
+            self.store = _ExplodingStore()
+
+        def __getattr__(self, name: str) -> Any:
+            def boom(*_args: Any, **_kwargs: Any) -> Any:
+                raise RuntimeStoreError(f"runtime is unavailable: {name}")
+
+            return boom
+
+    authorization = _ProviderAuthorization(
+        runtime=_Runtime(),  # type: ignore[arg-type]
+        invocation_id="tool_" + "0" * 32,
+        reserved_tokens=10,
+        capability=production_model_capability_registry().get("openai-api"),
+        run_id="run_" + "0" * 32,
+        group_id="grp_" + "0" * 32,
+        # 预留声称 3 轮，实际只尝试 1 轮 —— 于是对账真的会去写存储（而不是提前返回）。
+        reserved_usage=BudgetUsage(
+            tokens=10, model_turns=3, tool_calls=0, wall_clock_seconds=0.0, cost_usd=0.03,
+        ),
+    )
+
+    client = ProviderGatewayClient(
+        base_url="https://api.openai.com/v1",
+        api_key="k",
+        model="m",
+        provider="openai-api",
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, text=_STREAM_SSE,
+            ),
+        )),
+    )
+    client._authorize = lambda **_kwargs: authorization  # type: ignore[method-assign]
+
+    async def consume_one() -> None:
+        stream = client.chat_stream([{"role": "user", "content": "hi"}])
+        await stream.__anext__()
+        await stream.aclose()
+
+    # 修复前：RuntimeStoreError 会从这里冒出来。
+    asyncio.run(consume_one())

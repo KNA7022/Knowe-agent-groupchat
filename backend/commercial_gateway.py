@@ -2718,14 +2718,27 @@ class ProviderGatewayClient:
             status = "failed" if error is not None else "completed"
         if authorization.invocation_id:
             store = authorization.runtime.store
-            if cancelled:
-                store.cancel_tool(authorization.invocation_id)
-            else:
-                store.complete_tool(
-                    authorization.invocation_id,
-                    status=status,
-                    error_type=type(error).__name__ if error is not None else "",
-                )
+            try:
+                if cancelled:
+                    store.cancel_tool(authorization.invocation_id)
+                else:
+                    store.complete_tool(
+                        authorization.invocation_id,
+                        status=status,
+                        error_type=type(error).__name__ if error is not None else "",
+                    )
+            except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+                # 终态记录失败不能改变 effect 的结局。**取消路径上这一条尤其要紧**：本
+                # 方法就在 `except GeneratorExit` 分支里，这里抛出的任何异常都会替换掉
+                # `GeneratorExit`，于是一次正常取消变成 `aclose()` 的意外异常——消费者
+                # （真实 UI 每一帧都在 `async for ... break`）看到的是"存储炸了"，而不是
+                # "流结束了"。下面的事件写入一直有这个保护，终态记录此前没有，这个不对称
+                # 就是本段存在的原因。
+                #
+                # 诚实边界：这里**静默**吞掉，本模块没有 logger，所以存储不可用时的表现是
+                # "少一条终态记录"（连下面的 provider_egress 事件通常也一起失败）。这次修复
+                # 只保证它不再破坏取消语义，不保证审计不丢。
+                pass
         duration_ms = max(
             0, int((time.monotonic() - (authorization.started_at or time.monotonic())) * 1000),
         )
