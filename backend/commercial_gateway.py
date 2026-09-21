@@ -2433,9 +2433,21 @@ class ProviderGatewayClient:
         #
         # ⚠ 诚实边界：`isinstance` 不是密码学边界——子类、或一个真实的
         # `TaskRuntimeService` 实例，仍然由持有者决定。它挡住的是"随手写个假对象就成了"
-        # （也就是复审证伪的那条路），不是"铁了心要绕过的调用方"。真正的约束有两层：
-        # `authority_provider` 的默认值是 backend 自己设的 ContextVar，而且 `git grep`
-        # 显示**没有任何生产调用点**传这个参数——它存在的理由是测试需要注入授权。
+        # （也就是复审证伪的那条路），不是"铁了心要绕过的调用方"。
+        #
+        # 【第二次更正】我在这里先写过"`git grep` 显示没有任何生产调用点传这个参数"——
+        # **那句是错的**（写的时候并没有真去 grep）。实际有两个调用点，而且其中一个就是
+        # 生产路径：
+        #   · `worker_gateway_runtime.py:332` 传 `authority_provider=lambda: authority`；
+        #   · 那个 `authority` 来自 `engine._canonical_legacy_tool_authority(...)`，它
+        #     **不接受 mapping 作为授权**：它拿三个 id 回 Task Runtime store 查 run、
+        #     核 group/task 归属、核 approval/grant，然后用 `runtime=self._task_runtime_service`
+        #     重建 authority（也就是 engine 自己的真实服务实例）。
+        #   · `engine.bind_commercial_tool_registry` 也接受同一个参数，默认 `None` → 回落到
+        #     ContextVar。
+        # 所以真实的论证不是"没人传"，而是"**传进来的 authority 是由 store 重建的**"：
+        # 假 mapping 换不来授权，且重建出的 runtime 一定是真实实例，因而必然通过下面的
+        # isinstance。这段注释存在的意义就是别再让第三种说法冒出来。
         if not isinstance(runtime, TaskRuntimeService):
             raise GatewayDenied(
                 "provider egress requires a real Task Runtime, not a stand-in"

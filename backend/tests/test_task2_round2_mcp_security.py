@@ -1617,6 +1617,69 @@ async def test_cancelled_tool_effect_is_not_left_running(tmp_path: Any) -> None:
     runtime.close()
 
 
+def test_production_authority_is_rebuilt_from_the_store_not_from_a_mapping(
+    tmp_path: Any,
+) -> None:
+    """I-1 的**正确**论证，顺带补上一条此前零覆盖的生产防线。
+
+    生产**确实**传 `authority_provider`（`worker_gateway_runtime.py:332`，值是
+    `lambda: authority`）。安全不来自"没人传"——我在上一轮注释里这么写过，而那句话
+    没有真的 `git grep` 就写了，是错的——而来自：那个 `authority` 是
+    `Engine._canonical_legacy_tool_authority(...)` 的产物，它**不接受 mapping 作为
+    授权**，而是拿三个 id 回 Task Runtime store 重建，并挂上 engine 自己的真实
+    `TaskRuntimeService`。
+
+    `git grep _canonical_legacy_tool_authority -- backend/tests` 此前是 **0**：这条防线
+    从来没有测试。所以这里既有断言"mapping 换不来授权"，也有断言"重建出的 runtime 是
+    真实实例"（后者正是 `_authorize` 新增的 isinstance 在生产路径上必然通过的原因）。
+    """
+
+    from backend.engine import ProjectEngine
+    from backend.groups import GroupRepository
+    from backend.task_runtime.service import TaskRuntimeService
+
+    groups = GroupRepository(tmp_path)
+    runtime = TaskRuntimeService(tmp_path, groups)
+    group = groups.create_group("canonical-authority")
+    run = runtime.submit(group.group_id, title="canonical", request_key="ca:1")
+    run = runtime.schedule()[0]
+
+    # 该方法只用到 `self._task_runtime_service`，所以用未绑定方法 + 一个 stub self，
+    # 不必把整个 Engine 立起来。
+    canonicalize = ProjectEngine._canonical_legacy_tool_authority
+    stub = type("Stub", (), {"_task_runtime_service": runtime})()
+
+    rebuilt = canonicalize(stub, {
+        "group_id": group.group_id, "run_id": run.run_id, "task_id": run.task_id,
+    })
+    assert rebuilt is not None, "a real, matching triple must resolve"
+    assert rebuilt.runtime is runtime
+    assert isinstance(rebuilt.runtime, TaskRuntimeService)
+
+    for label, raw in [
+        ("no mapping at all", None),
+        ("missing fields", {"group_id": group.group_id}),
+        ("unknown run", {
+            "group_id": group.group_id,
+            "run_id": "run_" + "f" * 32,
+            "task_id": run.task_id,
+        }),
+        ("group mismatch", {
+            "group_id": "grp_" + "e" * 32,
+            "run_id": run.run_id,
+            "task_id": run.task_id,
+        }),
+        ("task mismatch", {
+            "group_id": group.group_id,
+            "run_id": run.run_id,
+            "task_id": "task_" + "d" * 32,
+        }),
+    ]:
+        assert canonicalize(stub, raw) is None, f"a bare mapping minted authority: {label}"
+
+    runtime.close()
+
+
 @pytest.mark.parametrize("abort", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
 def test_aborted_stream_is_audited_as_cancelled_not_failed(
     tmp_path: Any, abort: type[BaseException],
