@@ -524,9 +524,12 @@ class _McpJsonRpcTransport:
 
     _MAX_DISCOVERY_PAGES = 16
 
-    def __init__(self) -> None:
+    def __init__(self, *, allowed_resources: Iterable[str] = ()) -> None:
         self._rpc_id = 0
         self._initialize_result: dict[str, Any] | None = None
+        # capability 驱动 discovery：config 没声明资源能力时，连 resources/list
+        # 都不发（旧实现无条件先 tools/list 再 resources/list）。
+        self._allowed_resources = tuple(str(item) for item in allowed_resources)
 
     async def _exchange(self, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         raise NotImplementedError
@@ -590,7 +593,10 @@ class _McpJsonRpcTransport:
         # prompts/list is deliberately never sent.  Prompt capability is disabled
         # even when a malicious peer advertises it.
         tools = await self._list_all("tools/list", "tools")
-        resources = await self._list_all("resources/list", "resources")
+        # capability 驱动：只有注册了资源能力才请求 resources/list。
+        resources: list[Any] = []
+        if self._allowed_resources:
+            resources = await self._list_all("resources/list", "resources")
         return {"tools": tools, "resources": resources}
 
     async def invoke(self, name: str, arguments: Mapping[str, Any]) -> Any:
@@ -699,52 +705,31 @@ class McpStdioTransport(_McpJsonRpcTransport):
         self,
         config: McpServerConfig,
         *,
-        gateway: ToolGateway,
-        launch_request: ToolExecutionRequest,
-        session_factory: McpStdioSessionFactory | None = None,
+        session_factory: Callable[[McpServerConfig], Any] | None = None,
         trusted_test_seam: bool = False,
     ) -> None:
-        super().__init__()
+        super().__init__(allowed_resources=config.allowed_resources)
         if config.transport != "stdio":
             raise ValueError("McpStdioTransport requires a stdio config")
         self.config = config
-        self.gateway = gateway
-        self.launch_request = launch_request
         self.session_factory = session_factory
         self.trusted_test_seam = bool(trusted_test_seam)
         self._session: McpRpcSession | None = None
 
-    def _validate_exact_launch(self) -> None:
-        try:
-            configured = _canonical_path(self.config.command).as_posix().casefold()
-            requested = _canonical_path(self.launch_request.executable).as_posix().casefold()
-        except GatewayDenied as exc:
-            raise GatewayDenied("MCP stdio launch requires an exact absolute executable") from exc
-        if configured != requested or tuple(self.config.args) != tuple(self.launch_request.argv):
-            raise GatewayDenied("MCP stdio launch does not match the exact registered command")
-        if not self.launch_request.cwd:
-            raise GatewayDenied("MCP stdio launch requires an exact working directory")
-
     async def _ensure_session(self) -> McpRpcSession:
         if self._session is not None:
             return self._session
-        self._validate_exact_launch()
-        if not isinstance(self.gateway, ToolGateway):
-            raise GatewayDenied("MCP stdio launch has no Tool Gateway")
         if self.session_factory is None or not self.trusted_test_seam:
             raise GatewayDenied(
                 "MCP stdio requires an explicitly trusted sandbox executor"
             )
-
-        async def launch_effect(_request: ToolExecutionRequest) -> McpRpcSession:
-            assert self.session_factory is not None
-            value = self.session_factory(self.config, self.launch_request)
-            session = await value if inspect.isawaitable(value) else value
-            if not all(callable(getattr(session, name, None)) for name in ("request", "notify", "close")):
-                raise GatewayDenied("MCP stdio session factory returned an invalid session")
-            return session
-
-        session = await self.gateway.invoke_with_effect(self.launch_request, launch_effect)
+        # C-R2 之后，stdio 的进程创建完全由**注入的受信 factory** 负责，它按密封的
+        # config 构造会话；transport 不再从调用方接收 launch request，因此
+        # "authorization 指向 A、实际启动 B" 这条错位路径不复存在。
+        value = self.session_factory(self.config)
+        session = await value if inspect.isawaitable(value) else value
+        if not all(callable(getattr(session, name, None)) for name in ("request", "notify", "close")):
+            raise GatewayDenied("MCP stdio session factory returned an invalid session")
         self._session = session
         return session
 
@@ -771,7 +756,7 @@ class McpStreamableHttpTransport(_McpJsonRpcTransport):
         *,
         client_factory: Callable[[], httpx.AsyncClient] | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__(allowed_resources=config.allowed_resources)
         if config.transport != "streamable_http":
             raise ValueError("McpStreamableHttpTransport requires a Streamable HTTP config")
         parsed = urlparse(config.url)
@@ -961,11 +946,35 @@ def _canonical_schema(schema: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
 
 
 class McpRegistry:
-    """MCP configuration, handshake, discovery and invocation policy registry."""
+    """MCP configuration, handshake, discovery and invocation policy registry.
 
-    def __init__(self) -> None:
+    ⚠ 设计要点（C-R2 修复）：**registry 自己拥有并密封 transport**。
+    旧实现的 `handshake(server_id, transport)` / `invoke(..., transport=)` /
+    `read_resource(..., effect=)` 把"用哪个 peer"交给调用方，于是 approval/grant 里
+    记录的 server/endpoint 与实际发包的对象**没有任何绑定**——identity 校验的是
+    registry 里的 config，执行的却是外部传入的 transport。
+
+    现在 transport 只能由 registry 在 `register()` 时按 config 构造并持有；
+    invoke/read 一律从密封实例取通道，且每次调用前重新核对 canonical endpoint。
+    """
+
+    #: 允许的 MCP 协议版本（必须精确属于此集合）。
+    SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26", "2025-06-18")
+
+    def __init__(
+        self,
+        *,
+        http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+        session_factory: Callable[[McpServerConfig], Any] | None = None,
+    ) -> None:
         self._configs: dict[str, McpServerConfig] = {}
         self._discovery: dict[str, dict[str, Any]] = {}
+        # 工厂由**调用方在构造时**提供，registry 之后不再接受任何外部 transport/effect。
+        # 生产环境由部署方注入受信 sandbox executor 的 session factory；测试注入
+        # 不可联网的 fake。registry 只负责"按 config 密封"，不负责信任判定。
+        self._http_client_factory = http_client_factory
+        self._session_factory = session_factory
+        self._transports: dict[str, McpTransport] = {}
 
     def register(self, config: McpServerConfig) -> None:
         if config.server_id in self._configs:
@@ -974,6 +983,44 @@ class McpRegistry:
             self._validate_url(config, config.url)
         _canonical_mcp_endpoint(config)
         self._configs[config.server_id] = config
+
+    def _transport_for(self, server_id: str) -> McpTransport:
+        """按注册 config 构造并缓存密封 transport（不接收外部实例）。"""
+
+        config = self._config(server_id)
+        existing = self._transports.get(config.server_id)
+        if existing is not None:
+            return existing
+        if config.transport == "streamable_http":
+            transport: McpTransport = McpStreamableHttpTransport(
+                config, client_factory=self._http_client_factory,
+            )
+        else:
+            if self._session_factory is None:
+                raise GatewayDenied(
+                    "MCP stdio requires an explicitly trusted sandbox session factory"
+                )
+            transport = McpStdioTransport(
+                config,
+                session_factory=self._session_factory,
+                trusted_test_seam=True,
+            )
+        self._transports[config.server_id] = transport
+        return transport
+
+    def _seal_target(self, server_id: str) -> tuple[McpServerConfig, McpTransport]:
+        """取密封 transport，并重新确认它的目标与注册 config 一致。
+
+        这一步是 C-R2 的核心：identity/approval 里的 endpoint 与真正发包的对象
+        必须在**每次**使用前对齐，而不是只在注册时对齐一次。
+        """
+
+        config = self._config(server_id)
+        transport = self._transport_for(config.server_id)
+        configured_url = str(getattr(transport, "config", None).url or "")
+        if configured_url != str(config.url):
+            raise GatewayDenied("MCP sealed transport target changed after registration")
+        return config, transport
 
     def _config(self, server_id: str) -> McpServerConfig:
         try:
@@ -1432,21 +1479,40 @@ class McpRegistry:
         self._discovery[server_id] = accepted
         return accepted
 
-    async def handshake(self, server_id: str, transport: McpTransport) -> dict[str, Any]:
-        config = self._config(server_id)
+    async def handshake(self, server_id: str) -> dict[str, Any]:
+        """握手：transport 由 registry 按 config 自建，不接受外部实例。"""
+
+        config, transport = self._seal_target(server_id)
         initialized = await transport.initialize()
+        # 协议版本必须精确属于支持集合：旧实现只要求"非空且 ≤40 字符"，
+        # 于是 "banana" / "9999-01-01" 都会被接受（复审实测）。
         protocol = str(initialized.get("protocolVersion") or "")
-        if not protocol or len(protocol) > 40:
-            raise GatewayDenied("MCP handshake protocol version is invalid")
+        if protocol not in self.SUPPORTED_PROTOCOL_VERSIONS:
+            raise GatewayDenied("MCP handshake protocol version is not supported")
         capabilities = initialized.get("capabilities")
-        if (
-            "prompts" in initialized
-            or isinstance(capabilities, Mapping) and "prompts" in capabilities
-        ):
+        # capabilities 必须是 Mapping；旧实现在它不是 Mapping 时直接跳过 prompts 检查。
+        if not isinstance(capabilities, Mapping):
+            raise GatewayDenied("MCP handshake capabilities are malformed")
+        if "prompts" in initialized or "prompts" in capabilities:
             raise GatewayDenied("MCP prompt capability is disabled")
         if config.transport == "streamable_http" and initialized.get("redirect"):
             raise GatewayDenied("MCP redirects are forbidden")
-        return self.accept_discovery(server_id, await transport.discover())
+        discovery = await transport.discover()
+        # discovery 由 capability 驱动：只在注册了资源时才请求 resources/list，
+        # 因此调用方拿到的方法序列与 config 声明一致。
+        return self.accept_discovery(server_id, discovery)
+
+    async def close(self) -> None:
+        """关闭所有密封 transport（stdio 会关子进程/会话）。"""
+
+        transports, self._transports = self._transports, {}
+        for transport in transports.values():
+            closer = getattr(transport, "close", None)
+            if closer is None:
+                continue
+            value = closer()
+            if inspect.isawaitable(value):
+                await value
 
     def tool_descriptor(
         self, server_id: str, name: str, *, risk: RiskLevel,
@@ -1498,6 +1564,81 @@ class McpRegistry:
             raise GatewayDenied("MCP capability authorization is stale or mismatched")
         self._validate_arguments(dict(arguments), record["schema"])
         return identity
+
+    @staticmethod
+    def _validate_tool_result(value: Any) -> Mapping[str, Any]:
+        """校验 CallToolResult 的确切形状与内容策略（I-R4）。
+
+        旧实现把 tool result **原样返回**（`return await transport.invoke(...)`），
+        既没有形状/大小限制，也没有 prompt-injection / DLP 扫描——而 resource 路径
+        有 `_validate_resource_result` 做同等校验。这个不对称意味着 MCP tool 返回的
+        文本可以带着注入指令直接进入后续模型上下文。此方法补上对称的校验。
+        """
+
+        if not isinstance(value, Mapping) or not frozenset(value).issubset(
+            {"content", "isError", "structuredContent", "_meta"}
+        ):
+            raise GatewayDenied("MCP tool result is malformed")
+        content = value.get("content")
+        if not isinstance(content, list) or len(content) > 64:
+            raise GatewayDenied("MCP tool result content is malformed")
+        total = 0
+        for item in content:
+            if not isinstance(item, Mapping) or not frozenset(item).issubset(
+                {"type", "text", "data", "mimeType", "resource", "_meta"}
+            ):
+                raise GatewayDenied("MCP tool result entry is malformed")
+            kind = str(item.get("type") or "")
+            if kind not in {"text", "image", "audio", "resource"}:
+                raise GatewayDenied("MCP tool result content type is not supported")
+            text = item.get("text")
+            if text is not None and not isinstance(text, str):
+                raise GatewayDenied("MCP tool result text is malformed")
+            if isinstance(text, str):
+                total += len(text.encode("utf-8"))
+                if _PROMPT_INJECTION.search(text) or PiiDlpGateway().decide_outbound(
+                    text, approved=False,
+                ).requires_approval:
+                    raise GatewayDenied("MCP tool result violates prompt/DLP policy")
+            if "data" in item:
+                encoded = item.get("data")
+                if not isinstance(encoded, str):
+                    raise GatewayDenied("MCP tool result data is malformed")
+                try:
+                    decoded = base64.b64decode(encoded, validate=True)
+                except (binascii.Error, ValueError) as exc:
+                    raise GatewayDenied("MCP tool result data is not valid base64") from exc
+                total += len(decoded)
+            if "resource" in item:
+                McpRegistry._validate_bounded_metadata(
+                    item.get("resource"), label="tool result resource",
+                )
+            if "_meta" in item:
+                McpRegistry._validate_bounded_metadata(
+                    item["_meta"], label="tool result",
+                )
+            if total > 1_048_576:
+                raise GatewayDenied("MCP tool result exceeds the size limit")
+        structured = value.get("structuredContent")
+        if structured is not None:
+            if not isinstance(structured, Mapping):
+                raise GatewayDenied("MCP tool structured content is malformed")
+            # 结构化内容同样可能把注入文本带进上下文，因此一并做内容扫描。
+            serialized = json.dumps(
+                dict(structured), ensure_ascii=True, sort_keys=True,
+                separators=(",", ":"), default=str,
+            )
+            if len(serialized.encode("utf-8")) > 262_144:
+                raise GatewayDenied("MCP tool structured content exceeds the size limit")
+            if _PROMPT_INJECTION.search(serialized) or PiiDlpGateway().decide_outbound(
+                serialized, approved=False,
+            ).requires_approval:
+                raise GatewayDenied("MCP tool structured content violates prompt/DLP policy")
+        if "isError" in value and not isinstance(value["isError"], bool):
+            raise GatewayDenied("MCP tool result isError flag is malformed")
+        if "_meta" in value:
+            McpRegistry._validate_bounded_metadata(value["_meta"], label="tool result")
+        return value
 
     @staticmethod
     def _validate_resource_result(uri: str, value: Any) -> Mapping[str, Any]:
@@ -1562,11 +1703,11 @@ class McpRegistry:
         name: str,
         arguments: Mapping[str, Any],
         *,
-        transport: McpTransport,
         gateway: ToolGateway,
         request: ToolExecutionRequest,
     ) -> Any:
-        config = self._config(server_id)
+        # transport 来自密封实例，不经调用方传入。
+        config, transport = self._seal_target(server_id)
         accepted = self._discovery.get(server_id)
         if accepted is None or name not in accepted["tools"]:
             raise GatewayDenied("MCP tool was not inspected and granted")
@@ -1586,7 +1727,9 @@ class McpRegistry:
         self.validate_tool_capability(server_id, name, arguments, descriptor)
 
         async def governed_effect(_request: ToolExecutionRequest) -> Any:
-            return await transport.invoke(name, arguments)
+            value = await transport.invoke(name, arguments)
+            # I-R4：tool result 必须与 resource 走同等的形状/内容校验。
+            return self._validate_tool_result(value)
 
         return await gateway.invoke_with_effect(request, governed_effect)
 
@@ -1595,11 +1738,10 @@ class McpRegistry:
         server_id: str,
         uri: str,
         *,
-        effect: Callable[[str], Awaitable[Any]],
         gateway: ToolGateway,
         request: ToolExecutionRequest,
     ) -> Any:
-        config = self._config(server_id)
+        config, transport = self._seal_target(server_id)
         accepted = self._discovery.get(server_id)
         if accepted is None or uri not in accepted["resources"]:
             raise GatewayDenied("MCP resource was not inspected and granted")
@@ -1616,7 +1758,7 @@ class McpRegistry:
             raise GatewayDenied("MCP resource authorization is stale or mismatched")
 
         async def governed_read(_request: ToolExecutionRequest) -> Any:
-            value = await effect(uri)
+            value = await transport.read_resource(uri)
             return self._validate_resource_result(uri, value)
 
         return await gateway.invoke_with_effect(request, governed_read)
