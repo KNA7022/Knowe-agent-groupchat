@@ -132,11 +132,28 @@ export const TaskRunSchema = z.object({
   }
 });
 
-const publicEventFields: Record<string, ReadonlySet<string>> = {
+/**
+ * `backend/task_runtime/contracts.py` 的 `_PUBLIC_EVENT_FIELDS` 的**逐字镜像**。
+ *
+ * 这不是"前端关心的字段"清单，而是"后端会广播的字段"清单——`RunEventSchema` 是
+ * `parse`（不是 `safeParse`），多一个未知字段、或遇到一个没登记的事件类型，事件就
+ * 整个被拒绝。所以两边必须完全一致，而不是一边是另一边的子集。
+ *
+ * 之前这里漂移过：缺 `provider_egress`、`tool_claimed`、`tool_completed`、
+ * `tool_failed`、`tool_cancelled`、`tool_recovered_blocked` 六种类型，以及
+ * `budget_updated.settled` 一个字段。后端却会广播它们（`server.py` 的事件桥不过滤
+ * 类型），于是每次工具调用完成、每次 provider egress 都会在前端抛 ZodError——
+ * `App.tsx` 的 `applyEvent` 与 `socket.ts` 的 `onEvent` 都没有 try/catch，那批事件的
+ * 投递就地中断。
+ *
+ * `src/contract/publicEvents.drift.test.ts` 现在守着这份镜像：它读后端的真实定义并
+ * 逐项比对。**加字段时先改后端，再改这里。**
+ */
+export const publicEventFields: Record<string, ReadonlySet<string>> = {
   run_queued: new Set(['status', 'kind', 'route_label', 'summary', 'classification']),
   status_changed: new Set(['from', 'status', 'summary', 'blocking_reason', 'failure_type']),
   agent_phase_changed: new Set(['agent_id', 'role', 'phase', 'operation_summary', 'blocking_reason']),
-  budget_updated: new Set(['usage', 'limits', 'exhausted_dimension', 'status']),
+  budget_updated: new Set(['usage', 'limits', 'exhausted_dimension', 'status', 'settled']),
   budget_exhausted: new Set(['usage', 'limits', 'exhausted_dimension', 'status']),
   approval_requested: new Set(['status', 'approval']),
   approval_resolved: new Set(['status', 'approval_id', 'resolution', 'failure_type']),
@@ -144,6 +161,29 @@ const publicEventFields: Record<string, ReadonlySet<string>> = {
   message_routed: new Set(['route_label', 'summary', 'classification']),
   restart_recovery: new Set(['status', 'blocking_reason']),
   tool_prepared: new Set(['status', 'invocation_id', 'tool_name', 'disposition', 'usage']),
+  tool_claimed: new Set([
+    'status', 'invocation_id', 'tool_name', 'purpose', 'risk', 'started_at', 'usage',
+  ]),
+  tool_completed: new Set([
+    'status', 'invocation_id', 'tool_name', 'purpose', 'risk', 'started_at',
+    'completed_at', 'duration_ms', 'usage', 'error_type',
+  ]),
+  tool_failed: new Set([
+    'status', 'invocation_id', 'tool_name', 'purpose', 'risk', 'started_at',
+    'completed_at', 'duration_ms', 'usage', 'error_type',
+  ]),
+  tool_cancelled: new Set([
+    'status', 'invocation_id', 'tool_name', 'purpose', 'risk', 'started_at',
+    'completed_at', 'duration_ms', 'usage', 'error_type',
+  ]),
+  tool_recovered_blocked: new Set([
+    'status', 'invocation_id', 'tool_name', 'purpose', 'risk', 'started_at',
+    'completed_at', 'duration_ms', 'usage', 'error_type',
+  ]),
+  provider_egress: new Set([
+    'status', 'capability_digest', 'privacy', 'usage', 'approval_required',
+    'duration_ms', 'error_type', 'actual_tokens', 'settled',
+  ]),
   verifier_decision: new Set(['status', 'decision_id', 'outcome', 'approved', 'evidence_count']),
 };
 
