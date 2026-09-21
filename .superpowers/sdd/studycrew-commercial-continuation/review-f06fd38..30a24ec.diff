@@ -1,0 +1,1519 @@
+# COMMITS
+30a24ec fix(knowledge): close atomic profile authorization
+
+# STAT
+ .../task-1-report.md                               | 323 +++++++++++++++++++++
+ backend/knowledge_api.py                           | 177 +++++++----
+ backend/knowledge_assets.py                        | 246 +++++++++++++---
+ backend/server.py                                  |   3 +-
+ backend/tests/test_knowledge_group_scope.py        |  54 +++-
+ backend/tests/test_profile_atomic_authorization.py | 286 ++++++++++++++++++
+ 6 files changed, 982 insertions(+), 107 deletions(-)
+
+# DIFF
+diff --git a/.superpowers/sdd/studycrew-commercial-continuation/task-1-report.md b/.superpowers/sdd/studycrew-commercial-continuation/task-1-report.md
+new file mode 100644
+index 0000000..c6c0484
+--- /dev/null
++++ b/.superpowers/sdd/studycrew-commercial-continuation/task-1-report.md
+@@ -0,0 +1,323 @@
++# Task 1 实现报告：关闭原子 Profile 授权（Task 4B）
++
++## 1. 基线与范围
++
++- 工作分支：`feature/studycrew-foundation`
++- 执行基线：`f06fd383eb4bec6d9c9d70b2fddfeab7069ea9ea`
++- 绑定上下文基线：`3a35d8b`
++- 仅实现 Task 1；未开始 Task 2。
++- 未读取或修改其他 `.superpowers/sdd` 计划目录内容。
++- 工作树原有未跟踪 `skills/` 保持未修改、未暂存、未提交。
++
++## 2. 实现结果
++
++### 2.1 generation-consistent `ProfileBundle`
++
++`backend/knowledge_assets.py` 新增不可变 `ProfileBundle`，在一个既有
++`KnowledgeGraphManager.root_lock()` 临界区中生成以下同代数据：
++
++- Profile 正文 `body`；
++- availability / `exists`；
++- `source_ids`、`course_ids` contributor proof；
++- `locked` 状态；
++- opaque `generation_token`。
++
++generation token 对当前 graph revision、正文、availability、contributors 和 locked
++状态做稳定 SHA-256 摘要；任一授权相关输入改变都会形成不同 token。保留
++`profile_snapshot()` 兼容入口，但它现在只投影已经锁内生成的 `ProfileBundle`，不再自行拼接
++正文和 contributor proof。
++
++### 2.2 Assets availability 只由锁内 bundle 授权
++
++`backend/knowledge_api.py` 将以下路由转为 async Profile 授权路径：
++
++- merged `GET /api/knowledge/assets`；
++- project-specific `GET /api/knowledge/{project_id}/assets`；
++- detail `GET /api/knowledge/{project_id}/profile`。
++
++Assets 行仍可从既有 general snapshot 读取，但 Profile 的 `profile_exists`、
++`profile_source_ids`、`profile_course_ids` 只取自 `profile_bundle()`。general snapshot
++即使在竞态中返回旧 Profile 字段，也不再有授权作用。
++
++merged route 在 bundle/engine loop 不可用时只将 Profile fail-closed 为 unavailable；direct
++Assets 和 detail Profile route 返回既有 503/504 错误语义。
++
++### 2.3 Profile POST 锁内重新授权与 generation CAS
++
++新增 `KnowledgeAssetManager.set_profile_authorized(...)`：
++
++1. 在注册 engine event loop 上获取既有 per-root `root_lock`；
++2. 锁内读取当前 `ProfileBundle`；
++3. 锁内调用 API 传入的 scope authorization predicate；
++4. 锁内重新读取 token 并与已授权 generation 比较；
++5. 仅在授权仍成立且 token 相同的情况下写正文、设置 `profile_locked=true` 并保存 graph/event。
++
++Profile POST 不再先用 unlocked general snapshot 授权后另行进入 `set_profile()`。若 generation
++在授权过程中改变，返回 `409 stale_profile_generation`；若当前 generation 已是 ownerless/越界，
++继续返回既有 403 scope reason。`backend/server.py` 增加 409 HTTP reason mapping。
++
++### 2.4 deterministic concurrency tests
++
++新增 `backend/tests/test_profile_atomic_authorization.py`，用真实 manager 与
++`threading.Event` barrier 固化：
++
++- merged/direct Assets 在旧正文读后发生 allowed → locked ownerless generation swap；
++- Profile POST 在旧正文读后与 ownerless writer 并发；
++- auto-compilation 从 unavailable 生成 allowed bundle；
++- purge 最后一个 preference 后删除 auto Profile；
++- 每个 lifecycle generation 的 token、availability、contributors、locked 状态；
++- foreign registered event loop 下 direct/detail/POST 不进入 `root_lock`，merged fail-closed。
++
++原有 detail GET generation barrier 改到稳定的正文读取接缝，继续证明正文与 contributor proof
++同代；原有 ownerless、narrow contributor、strict approved-global 策略测试保持通过。
++
++## 3. 自审
++
++### 并发与锁
++
++- 无锁重入：`profile_bundle()` 是取锁的 public async 入口；锁内写路径只调用不再取锁的
++  `_profile_bundle_sync()` / `_set_profile_sync()`。
++- 没有从 worker thread 获取或等待 `asyncio.Lock`；`to_thread` 只执行持锁期间的同步磁盘读取。
++- manager writer 要么在 Profile POST 之前完成并被重新授权拒绝，要么被 POST 所持锁阻塞并在
++  POST 之后成为更新 generation；旧授权 POST 不可能覆盖一个已经更新的 generation。
++- generation compare 与 mutation 之间没有 `await`，并且仍处在同一个 root-lock 临界区。
++
++### Event loop、取消与超时
++
++- bundle route 在获取 lock 前验证 `reg.loop` 与当前 loop 相同；foreign/stopped loop 不触碰 lock。
++- detail/direct 继续使用 15 秒 `profile_snapshot_timeout`；POST 继续使用 15 秒
++  `override_timeout`。
++- `CancelledError` 继续上抛；超时取消后的 worker thread 最多完成只读 bundle 构建，结果被丢弃，
++  不执行 mutation。
++
++### API 与策略兼容
++
++- detail GET 的 status/body/source/course 结构未改变。
++- Assets response 仍保留原字段；仅 Profile 字段的授权真源改为 bundle。
++- `profile_snapshot()` 保留旧 key，并新增 locked/generation 元数据供内部调用。
++- ownerless Profile 仍 fail-closed；没有新增 Profile global 例外。
++- approved-global 逻辑、普通 Assets/Skillpack contributor 策略未改。
++- general `snapshot()` 的旧 Profile 字段为内部兼容而保留，但所有 HTTP Profile 授权点已通过搜索
++  确认不再消费它们。
++
++### 范围检查
++
++- 未修改 RAG、memory 或 Task 2 行为。
++- 未修改前端业务代码。
++- 未修改/暂存/提交 `skills/`。
++
++## 4. 测试命令与原样结果
++
++### 4.1 TDD 红测（实现前）
++
++```powershell
++py -3.12 -m pytest backend/tests/test_profile_atomic_authorization.py -vv
++```
++
++```text
++collected 3 items
++backend\tests\test_profile_atomic_authorization.py::test_assets_profile_availability_reauthorizes_after_generation_swap[merged] FAILED
++backend\tests\test_profile_atomic_authorization.py::test_assets_profile_availability_reauthorizes_after_generation_swap[project] FAILED
++backend\tests\test_profile_atomic_authorization.py::test_profile_post_never_overwrites_a_newer_ownerless_generation FAILED
++3 failed in 0.83s
++```
++
++失败证据未改写：两个 Assets response 均为 `profile_exists is True`；POST 最终正文为
++`STALE AUTHORIZED EDIT\n` 而不是已写入的 `PRIVATE OWNERLESS PROFILE\n`。
++
++### 4.2 Knowledge 聚焦分区（最终）
++
++```powershell
++py -3.12 -m pytest backend/tests/test_knowledge_graph.py backend/tests/test_knowledge_group_scope.py backend/tests/test_profile_atomic_authorization.py -q
++```
++
++```text
++.......................                                                  [100%]
++23 passed in 2.54s
++```
++
++### 4.3 Task Runtime 后端分区
++
++```powershell
++$taskTests = Get-ChildItem -LiteralPath 'backend\tests' -Filter 'test_task_runtime*.py' | Sort-Object Name | ForEach-Object { $_.FullName }; & py -3.12 -m pytest @taskTests -q
++```
++
++```text
++........................................................................ [ 33%]
++........................................................................ [ 67%]
++......................................................................   [100%]
++214 passed in 69.17s (0:01:09)
++```
++
++### 4.4 Task 4A 前端回归集
++
++```powershell
++npx vitest run src/store/groupDeletionAsync.test.ts src/store/groupDeletionFence.test.ts src/store/groups.test.ts src/store/incrementalSync.test.ts src/store/knowledge.test.ts src/store/knowledgeMutationDeletion.test.ts src/store/recordsIdentity.test.ts src/store/skeletonCache.test.ts src/store/task4aRound2Adversarial.test.ts
++```
++
++```text
++Test Files  9 passed (9)
++     Tests  72 passed (72)
++  Duration  8.94s
++```
++
++测试 stderr 仍有既有一行：
++
++```text
++[displayInfo] 未识别的 agent 前缀: w1 w1
++```
++
++### 4.5 全前端
++
++```powershell
++npm test
++```
++
++```text
++Test Files  46 passed (46)
++     Tests  545 passed (545)
++  Duration  29.54s
++```
++
++测试过程存在既有预期 stderr（Zustand deprecation、测试内 127.0.0.1:8081
++`ECONNREFUSED`、contract rejection 日志），exit code 为 0。
++
++### 4.6 静态与运行时门禁
++
++```powershell
++npm run lint
++```
++
++```text
++> studycrew-desktop@1.0.36 lint
++> eslint src/ electron/ --ext .ts,.tsx --max-warnings 0
++
++exit code 0
++```
++
++```powershell
++npm run preflight
++```
++
++```text
++> studycrew-desktop@1.0.36 preflight
++> node scripts/preflight.mjs
++
++✅ preflight OK
++```
++
++```powershell
++npm run verify:runtime
++```
++
++```text
++> studycrew-desktop@1.0.36 verify:runtime
++> node scripts/verify-runtime.mjs
++
++✅ StudyCrew runtime and Windows packaging contract verified
++```
++
++```powershell
++npm run typecheck
++```
++
++```text
++> studycrew-desktop@1.0.36 typecheck
++> tsc --noEmit && tsc --noEmit -p electron/tsconfig.json
++
++exit code 1
++```
++
++原样错误清单（均在未修改的 TypeScript 文件）：
++
++```text
++src/__tests__/v04.test.tsx(28,3): error TS2741: Property 'unread' is missing in type '{ projectId: string; items: never[]; members: never[]; banner: null; draft: string; }' but required in type 'Conv'.
++src/__tests__/v04.test.tsx(200,21): error TS2345: Argument of type 'HTMLImageElement | null' is not assignable to parameter of type 'Element | Node | Window | Document'.
++src/app/v04.test.tsx(28,3): error TS2741: Property 'unread' is missing in type '{ projectId: string; items: never[]; members: never[]; banner: null; draft: string; }' but required in type 'Conv'.
++src/app/v04.test.tsx(200,21): error TS2345: Argument of type 'HTMLImageElement | null' is not assignable to parameter of type 'Element | Node | Window | Document'.
++src/app/v05b.test.tsx(22,3): error TS2741: Property 'unread' is missing in type '{ projectId: string; projectName: string; items: never[]; members: never[]; banner: null; draft: string; }' but required in type 'Conv'.
++src/components/__testkit.ts(37,9): error TS2741: Property 'unread' is missing in type '{ projectId: string; projectName: string; items: Item[]; members: Member[]; banner: string | null; draft: string; }' but required in type 'Conv'.
++src/components/__testkit.ts(83,28): error TS2740: Type '{ connect: () => void; disconnect: () => void; sendMessage: ... }' is missing properties from type 'SocketAPI'.
++src/components/batchA.test.tsx(11,42): error TS6133: 'installSocketSpy' is declared but its value is never read.
++src/components/batchC.test.tsx(123,16): error TS2741: Property 'unread' is missing in type '{ projectId: string; items: never[]; members: Member[]; banner: null; draft: string; }' but required in type 'Conv'.
++src/components/batchC.test.tsx(133,9): error TS2741: Property 'unread' is missing in type '{ projectId: string; items: never[]; banner: null; draft: string; members: Member[]; }' but required in type 'Conv'.
++src/components/DateCalendar.tsx(60,39): error TS2345: Argument of type '{ project_id: string; date: string | undefined; page: string; page_size: string; }' is not assignable to parameter of type 'string | Record<string, string> | URLSearchParams | string[][] | undefined'.
++src/components/DateCalendar.tsx(66,48): error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
++src/components/DirectoryRecoveryCard.tsx(140,23): error TS2769: No overload matches this call.
++src/components/FileCard.fold.test.tsx(13,1): error TS6133: 'React' is declared but its value is never read.
++src/components/TokenUsagePanel.m4.test.tsx(15,1): error TS6133: 'React' is declared but its value is never read.
++src/components/TokenUsagePanel.m4.test.tsx(17,18): error TS6133: 'act' is declared but its value is never read.
++src/components/TokenUsagePanel.tsx(679,9): error TS6133: 'latestSavedChars' is declared but its value is never read.
++src/fakeserver/FakeKnoweServer.test.ts(86,31): error TS2550: Property 'at' does not exist on type 'Json[]'.
++src/observe/corridor.test.ts(47,20): error TS2550: Property 'at' does not exist on type 'CorridorEntry[]'.
++src/preview/renderers/PdfPreview.tsx(10,26): error TS2307: Cannot find module 'pdfjs-dist/build/pdf.worker.min.mjs?url' or its corresponding type declarations.
++src/store/displayInfo.test.ts(22,3): error TS2741: Property 'unread' is missing in type '{ projectId: string; items: never[]; members: never[]; banner: null; draft: string; }' but required in type 'Conv'.
++src/store/filePreview.ts(236,16): error TS6133: 'sha256Hex' is declared but its value is never read.
++src/store/state.test.ts(17,3): error TS2741: Property 'unread' is missing in type '{ projectId: string; projectName: string; items: never[]; members: never[]; banner: null; draft: string; }' but required in type 'Conv'.
++src/store/state.ts(705,40): error TS2345: inbound event union is not assignable to parameter of type 'ActivityLike'.
++src/store/state.ts(724,60): error TS2345: inbound event union is not assignable to parameter of type 'ActivityLike'.
++src/store/store.ts(303,38): error TS2538: Type 'undefined' cannot be used as an index type.
++src/store/store.ts(323,36): error TS2538: Type 'undefined' cannot be used as an index type.
++src/store/store.ts(388,7): error TS2322: Type 'number | undefined' is not assignable to type 'number'.
++src/store/store.ts(498,28): error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
++src/store/store.ts(1182,39): error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
++src/store/store.ts(1533,74): error TS2345: Argument of type 'Conv | undefined' is not assignable to parameter of type 'Conv'.
++src/store/toolActivity.ts(143,11): error TS18048: 'pending' is possibly 'undefined'.
++src/store/toolActivity.ts(144,9): error TS18048: 'pending' is possibly 'undefined'.
++src/store/toolActivity.ts(147,9): error TS18048: 'pending' is possibly 'undefined'.
++src/store/toolActivity.ts(148,9): error TS18048: 'pending' is possibly 'undefined'.
++src/store/toolActivity.ts(153,56): error TS18048: 'line' is possibly 'undefined'.
++src/store/toolActivity.ts(154,19): error TS18048: 'line' is possibly 'undefined'.
++src/store/v23.test.ts(26,3): error TS2741: Property 'unread' is missing in type '{ projectId: string; projectName: string; items: never[]; members: never[]; banner: null; draft: string; }' but required in type 'Conv'.
++src/store/v23.test.ts(112,12): error TS2532: Object is possibly 'undefined'.
++src/store/v23.test.ts(251,12): error TS2532: Object is possibly 'undefined'.
++src/transport/socket.wars.test.ts: multiple TS2550 errors: Property 'at' does not exist on type 'ConnStatus[]' / 'CorridorEntry[]'.
++```
++
++Task 1 未修改任何 TypeScript 文件，因此按要求只记录该既有全库 typecheck 基线。
++
++### 4.7 全后端基线
++
++```powershell
++py -3.12 -m pytest backend/tests -q
++```
++
++```text
++ERROR backend\tests\test_v10182_runtime_ui.py
++ERROR backend\tests\test_v22_dispatch_reliability.py
++ERROR backend\tests\test_v27_weld.py
++ERROR backend\tests\test_v28_weld.py
++!!!!!!!!!!!!!!!!!!! Interrupted: 4 errors during collection !!!!!!!!!!!!!!!!!!!
++4 errors in 0.85s
++```
++
++四个收集错误均为原样既有基线：
++
++```text
++ImportError: cannot import name 'ACTION_CONTRACT' from 'backend.engine'
++```
++
++为取得其余测试结果，另运行：
++
++```powershell
++py -3.12 -m pytest backend/tests -q --ignore=backend/tests/test_v10182_runtime_ui.py --ignore=backend/tests/test_v22_dispatch_reliability.py --ignore=backend/tests/test_v27_weld.py --ignore=backend/tests/test_v28_weld.py
++```
++
++```text
++46 failed, 874 passed, 5 skipped, 16 errors, 10 subtests passed in 108.27s (0:01:48)
++```
++
++该次失败分布在未修改的旧 browser/process、create_project directory contract、E2E fixture、
++renderer/invariant/souls 与其他历史契约测试；其中包含已知 renderer 基线
++`test_v1017_invariants.py::test_worker_text_is_passed_through_not_templated`。分区隔离结果仍为：
++
++- Knowledge：23 passed；
++- Task Runtime：214 passed；
++- 全前端：545 passed。
++
++按任务约束，不修复 `ACTION_CONTRACT`、renderer 或其他全库历史基线。
++
++## 5. 结论与 concerns
++
++范围内无未解决实现问题。已知仓库级 concerns 仅为上述既有全后端/TypeScript 静态基线；它们与
++Task 1 修改文件无重叠，且本任务没有扩展处理。
+diff --git a/backend/knowledge_api.py b/backend/knowledge_api.py
+index e414a5b..c4f50d2 100644
+--- a/backend/knowledge_api.py
++++ b/backend/knowledge_api.py
+@@ -9,20 +9,21 @@ from __future__ import annotations
+ import asyncio
+ import json
+ import logging
+ import threading
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Any, Callable, Coroutine
+ from urllib.parse import parse_qs, unquote
+ 
+ from backend.groups import GroupLifecycle, GroupNotFoundError, GroupRepository
++from backend.knowledge_assets import ProfileBundle
+ 
+ log = logging.getLogger("knowe.knowledge.api")
+ 
+ _OVERRIDE_TIMEOUT_S = 15.0
+ _MAX_BODY_BYTES = 64 * 1024
+ 
+ 
+ @dataclass
+ class _ProjectReg:
+     project_id: str
+@@ -250,33 +251,43 @@ def _contributors_allowed(
+ 
+ def _row_allowed(row: dict[str, Any], project_id: str, scope: _KnowledgeScope) -> bool:
+     approved_global = _approved_global(row)
+     if row.get("scope") == "global" and not approved_global:
+         return False
+     if project_id not in scope.project_ids and row.get("scope") != "global":
+         return False
+     return _contributors_allowed(row, scope, allow_ownerless_global=approved_global)
+ 
+ 
+-def _profile_row(snapshot: dict[str, Any], project_id: str) -> dict[str, Any]:
++def _profile_snapshot(bundle: ProfileBundle | dict[str, Any]) -> dict[str, Any]:
++    if isinstance(bundle, ProfileBundle):
++        return bundle.as_snapshot()
++    if isinstance(bundle, dict):
++        return bundle
++    raise TypeError("invalid_profile_bundle")
++
++
++def _profile_row(bundle: ProfileBundle | dict[str, Any], project_id: str) -> dict[str, Any]:
+     """Build the one Profile authorization row shared by list/detail routes."""
++    snapshot = _profile_snapshot(bundle)
+     return {
+         "project_id": project_id,
+         "scope": "project",
+         "source_ids": list(snapshot.get("profile_source_ids") or []),
+         "course_ids": list(snapshot.get("profile_course_ids") or []),
+     }
+ 
+ 
+ def _profile_authorization(
+-    snapshot: dict[str, Any], project_id: str, scope: _KnowledgeScope | None,
++    bundle: ProfileBundle | dict[str, Any], project_id: str, scope: _KnowledgeScope | None,
+ ) -> tuple[dict[str, Any], bool]:
++    snapshot = _profile_snapshot(bundle)
+     row = _profile_row(snapshot, project_id)
+     allowed = bool(snapshot.get("profile_exists")) and (
+         scope is None or _row_allowed(row, project_id, scope)
+     )
+     return row, allowed
+ 
+ 
+ def _sanitize_scoped_row(row: dict[str, Any], scope: _KnowledgeScope) -> dict[str, Any]:
+     """Remove ownership labels and nested evidence outside a requested narrow scope."""
+     sanitized = dict(row)
+@@ -365,36 +376,67 @@ def _merged_nodes(
+             })
+         for raw in snap.get("nodes") or []:
+             if isinstance(raw, dict):
+                 row = {**raw, "project_id": reg.project_id}
+                 if _row_allowed(row, reg.project_id, scope):
+                     nodes.append(_sanitize_scoped_row(row, scope))
+     nodes.sort(key=lambda row: str(row.get("last_seen") or ""), reverse=True)
+     return {"ok": True, "projects": projects, "nodes": nodes}
+ 
+ 
+-def _merged_assets(only_project: str | None, scope: _KnowledgeScope | None = None) -> dict[str, Any]:
++async def _read_profile_bundle(
++    reg: _ProjectReg,
++) -> tuple[ProfileBundle | None, KnowledgeHttpResponse | None]:
++    current = asyncio.get_running_loop()
++    if reg.loop is not None and (reg.loop.is_closed() or reg.loop is not current):
++        return None, _fail(503, "engine_loop_unavailable", project_id=reg.project_id)
++    try:
++        bundle = await asyncio.wait_for(
++            reg.assets.profile_bundle(reg.project_id, reg.workspace_provider()),
++            timeout=_OVERRIDE_TIMEOUT_S,
++        )
++    except asyncio.TimeoutError:
++        return None, _fail(504, "profile_snapshot_timeout", project_id=reg.project_id)
++    if not isinstance(bundle, ProfileBundle):
++        return None, _fail(500, "invalid_profile_bundle", project_id=reg.project_id)
++    return bundle, None
++
++
++async def _merged_assets(
++    only_project: str | None, scope: _KnowledgeScope,
++) -> dict[str, Any]:
+     projects: list[dict[str, Any]] = []
+     assets: list[dict[str, Any]] = []
+     for reg in _registrations():
+         if only_project and reg.project_id != only_project:
+             continue
+         if reg.assets is None:
+             continue
+         try:
+-            snap = reg.assets.snapshot(reg.project_id, reg.workspace_provider())
++            snap = await asyncio.to_thread(
++                reg.assets.snapshot, reg.project_id, reg.workspace_provider(),
++            )
+         except Exception:
+             log.exception("[%s] 资产合并快照失败（跳过该项目）", reg.project_id)
+             continue
+-        if scope is None or reg.project_id in scope.project_ids:
+-            profile_row, profile_allowed = _profile_authorization(
+-                snap, reg.project_id, scope,
++        if reg.project_id in scope.project_ids:
++            bundle, bundle_error = await _read_profile_bundle(reg)
++            if bundle_error is not None:
++                log.warning(
++                    "[%s] Profile 锁内快照不可用，列表按不可用处理：%s",
++                    reg.project_id,
++                    bundle_error.body.get("error"),
++                )
++            profile_row, profile_allowed = (
++                _profile_authorization(bundle, reg.project_id, scope)
++                if bundle is not None
++                else ({"source_ids": [], "course_ids": []}, False)
+             )
+             projects.append({
+                 "project_id": reg.project_id,
+                 "revision": snap.get("revision", 0),
+                 "updated_at": snap.get("updated_at"),
+                 "counts": snap.get("counts") or {},
+                 "profile_exists": profile_allowed,
+                 "profile_source_ids": profile_row["source_ids"] if profile_allowed else [],
+                 "profile_course_ids": profile_row["course_ids"] if profile_allowed else [],
+             })
+@@ -472,67 +514,82 @@ def _find_skillpack(
+             continue
+         pack = result.get("pack") if isinstance(result.get("pack"), dict) else result
+         if (result.get("found") and _row_allowed(pack, reg.project_id, scope)
+                 and _contributors_allowed(
+                     result, scope, allow_ownerless_global=_approved_global(pack),
+                 )):
+             return reg, result
+     return None
+ 
+ 
++async def _dispatch_assets_get(
++    parts: list[str], query: dict[str, list[str]], groups: GroupRepository | None,
++) -> KnowledgeHttpResponse:
++    rest = parts[2:]
++    scope = _resolve_scope(query, groups)
++    if rest == ["assets"]:
++        return _ok(await _merged_assets((query.get("project") or [None])[0], scope))
++    if len(rest) != 2 or rest[1] != "assets":
++        return _fail(404, "not_found")
++    reg = _registration(rest[0])
++    if reg is not None and reg.project_id not in scope.project_ids:
++        return _fail(403, "project_outside_group_scope", project_id=rest[0])
++    if reg is None:
++        return _fail(404, "unknown_project", project_id=rest[0])
++    if reg.assets is None:
++        return _fail(503, "assets_unavailable", project_id=rest[0])
++    snap = await asyncio.to_thread(
++        reg.assets.snapshot, reg.project_id, reg.workspace_provider(),
++    )
++    bundle, bundle_error = await _read_profile_bundle(reg)
++    if bundle_error is not None:
++        return bundle_error
++    assert bundle is not None
++    assets = [
++        _sanitize_scoped_row(dict(row), scope)
++        for row in snap.get("assets") or []
++        if isinstance(row, dict) and _row_allowed(row, reg.project_id, scope)
++    ]
++    profile_row, profile_allowed = _profile_authorization(bundle, reg.project_id, scope)
++    return _ok({
++        "ok": True,
++        "project_id": str(snap.get("project_id") or reg.project_id),
++        "revision": snap.get("revision", 0),
++        "updated_at": snap.get("updated_at"),
++        "generated_at": snap.get("generated_at"),
++        "counts": snap.get("counts") or {},
++        "assets": assets,
++        "profile_exists": profile_allowed,
++        "profile_source_ids": profile_row["source_ids"] if profile_allowed else [],
++        "profile_course_ids": profile_row["course_ids"] if profile_allowed else [],
++    })
++
++
+ def _dispatch_get_sync(
+     parts: list[str], query: dict[str, list[str]], groups: GroupRepository | None,
+ ) -> KnowledgeHttpResponse:
+     rest = parts[2:]
+     if rest == ["health"]:
+         return _ok({"ok": True, "projects": project_count()})
+     scope = _resolve_scope(query, groups)
+     if rest == ["projects"]:
+         return _ok({"ok": True, "projects": _project_rows(scope)})
+     if rest == ["nodes"]:
+         return _ok(_merged_nodes((query.get("project") or [None])[0], scope))
+-    if rest == ["assets"]:
+-        return _ok(_merged_assets((query.get("project") or [None])[0], scope))
+     if rest == ["skillpacks"]:
+         return _ok(_merged_skillpacks((query.get("project") or [None])[0], scope))
+     if len(rest) == 2 and rest[0] == "skillpacks":
+         found = _find_skillpack(rest[1], scope)
+         return (
+             _fail(404, "skillpack_not_found", pack_id=rest[1])
+             if found is None else _ok({"ok": True, **found[1]})
+         )
+-    if len(rest) == 2 and rest[1] == "assets":
+-        reg = _registration(rest[0])
+-        if reg is not None and reg.project_id not in scope.project_ids:
+-            return _fail(403, "project_outside_group_scope", project_id=rest[0])
+-        if scope is not None and reg is not None and reg.project_id not in scope.project_ids:
+-            return _fail(403, "project_outside_group_scope", project_id=rest[0])
+-        if reg is None:
+-            return _fail(404, "unknown_project", project_id=rest[0])
+-        if reg.assets is None:
+-            return _fail(503, "assets_unavailable", project_id=rest[0])
+-        snap = reg.assets.snapshot(reg.project_id, reg.workspace_provider())
+-        assets = [_sanitize_scoped_row(dict(row), scope) for row in snap.get("assets") or []
+-                  if isinstance(row, dict) and _row_allowed(row, reg.project_id, scope)]
+-        profile_row, profile_allowed = _profile_authorization(snap, reg.project_id, scope)
+-        return _ok({
+-            "ok": True,
+-            "project_id": str(snap.get("project_id") or reg.project_id),
+-            "revision": snap.get("revision", 0),
+-            "updated_at": snap.get("updated_at"),
+-            "generated_at": snap.get("generated_at"),
+-            "counts": snap.get("counts") or {},
+-            "assets": assets,
+-            "profile_exists": profile_allowed,
+-            "profile_source_ids": profile_row["source_ids"] if profile_allowed else [],
+-            "profile_course_ids": profile_row["course_ids"] if profile_allowed else [],
+-        })
+     if len(rest) == 3 and rest[1] == "assets":
+         reg = _registration(rest[0])
+         if reg is None:
+             return _fail(404, "unknown_project", project_id=rest[0])
+         if reg.assets is None:
+             return _fail(503, "assets_unavailable", project_id=rest[0])
+         result = reg.assets.read_asset(reg.project_id, reg.workspace_provider(), rest[2])
+         row = result.get("asset") if isinstance(result.get("asset"), dict) else result
+         if result.get("found") and not _row_allowed(row, reg.project_id, scope):
+             return _fail(403, "asset_outside_group_scope", asset_id=rest[2])
+@@ -581,41 +638,35 @@ async def _dispatch_profile_get(
+ ) -> KnowledgeHttpResponse:
+     project_id = parts[2]
+     scope = _resolve_scope(query, groups)
+     reg = _registration(project_id)
+     if reg is not None and reg.project_id not in scope.project_ids:
+         return _fail(403, "profile_outside_group_scope", project_id=project_id)
+     if reg is None:
+         return _fail(404, "unknown_project", project_id=project_id)
+     if reg.assets is None:
+         return _fail(503, "assets_unavailable", project_id=project_id)
+-    current = asyncio.get_running_loop()
+-    if reg.loop is not None and (reg.loop.is_closed() or reg.loop is not current):
+-        return _fail(503, "engine_loop_unavailable", project_id=project_id)
+-    try:
+-        snapshot = await asyncio.wait_for(
+-            reg.assets.profile_snapshot(reg.project_id, reg.workspace_provider()),
+-            timeout=_OVERRIDE_TIMEOUT_S,
+-        )
+-    except asyncio.TimeoutError:
+-        return _fail(504, "profile_snapshot_timeout", project_id=project_id)
+-    profile_row, profile_allowed = _profile_authorization(snapshot, reg.project_id, scope)
++    bundle, bundle_error = await _read_profile_bundle(reg)
++    if bundle_error is not None:
++        return bundle_error
++    assert bundle is not None
++    profile_row, profile_allowed = _profile_authorization(bundle, reg.project_id, scope)
+     if not profile_allowed:
+         reason = (
+             "profile_outside_narrow_group_scope"
+             if scope.source_ids or scope.course_id else "profile_outside_group_scope"
+         )
+         return _fail(403, reason, project_id=project_id)
+     return _ok({
+         "ok": True,
+         "project_id": reg.project_id,
+-        "text": str(snapshot.get("profile_text") or ""),
++        "text": bundle.body,
+         "source_ids": profile_row["source_ids"],
+         "course_ids": profile_row["course_ids"],
+     })
+ 
+ 
+ async def _run_override(
+     reg: _ProjectReg,
+     operation: Coroutine[Any, Any, dict[str, Any]],
+     *,
+     not_found_reason: str,
+@@ -736,55 +787,67 @@ async def _dispatch_post(
+             return await _run_override(
+                 reg,
+                 reg.assets.apply_user_override(
+                     reg.project_id, reg.workspace_provider(), asset_id, **patch,
+                 ),
+                 not_found_reason="asset_not_found",
+             )
+     if len(parts) == 4 and parts[3] == "profile":
+         if reg.assets is None:
+             return _fail(503, "assets_unavailable", project_id=project_id)
+-        snap = await asyncio.to_thread(reg.assets.snapshot, reg.project_id, reg.workspace_provider())
+-        _profile, profile_allowed = _profile_authorization(snap, reg.project_id, scope)
+-        if not profile_allowed:
++        def authorize(bundle: ProfileBundle) -> bool:
++            return _profile_authorization(bundle, reg.project_id, scope)[1]
++
++        response = await _run_override(
++            reg,
++            reg.assets.set_profile_authorized(
++                reg.project_id,
++                reg.workspace_provider(),
++                str(body.get("text") or ""),
++                authorize,
++            ),
++            not_found_reason="profile_not_found",
++        )
++        failure = response.body.get("reason")
++        if failure == "profile_not_authorized":
+             reason = (
+                 "profile_outside_narrow_group_scope"
+                 if scope.source_ids or scope.course_id else "profile_outside_group_scope"
+             )
+             return _fail(403, reason, project_id=project_id)
+-        return await _run_override(
+-            reg,
+-            reg.assets.set_profile(
+-                reg.project_id, reg.workspace_provider(), str(body.get("text") or ""),
+-            ),
+-            not_found_reason="profile_not_found",
+-        )
++        if failure == "stale_profile_generation":
++            return _fail(409, "stale_profile_generation", project_id=project_id)
++        return response
+     return _fail(404, "not_found")
+ 
+ 
+ async def dispatch_knowledge_http(
+     method: str,
+     path: str,
+     query: str,
+     body: bytes,
+     groups: GroupRepository | None = None,
+ ) -> KnowledgeHttpResponse:
+     """Dispatch one already-authenticated request without opening another server."""
+     try:
+         parts = [unquote(part) for part in path.strip("/").split("/") if part]
+         if parts[:2] != ["api", "knowledge"]:
+             return _fail(404, "not_found")
+         verb = method.upper()
+         if verb == "GET":
+             parsed_query = parse_qs(query)
+             if len(parts) == 4 and parts[3] == "profile":
+                 return await _dispatch_profile_get(parts, parsed_query, groups)
++            if parts[2:] == ["assets"] or (
++                len(parts) == 4 and parts[3] == "assets"
++            ):
++                return await _dispatch_assets_get(parts, parsed_query, groups)
+             return await asyncio.to_thread(_dispatch_get_sync, parts, parsed_query, groups)
+         if verb == "POST":
+             if len(body) > _MAX_BODY_BYTES:
+                 return _fail(413, "body_too_large")
+             try:
+                 payload = json.loads(body.decode("utf-8")) if body else {}
+             except (UnicodeDecodeError, json.JSONDecodeError):
+                 return _fail(400, "bad_json")
+             if not isinstance(payload, dict):
+                 return _fail(400, "bad_json")
+diff --git a/backend/knowledge_assets.py b/backend/knowledge_assets.py
+index fd7783d..e40319b 100644
+--- a/backend/knowledge_assets.py
++++ b/backend/knowledge_assets.py
+@@ -45,20 +45,21 @@ from __future__ import annotations
+ import asyncio
+ import hashlib
+ import json
+ import logging
+ import math
+ import os
+ import re
+ import shutil
+ import sys
+ import threading
++from dataclasses import dataclass
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Any, Awaitable, Callable
+ 
+ from .config import CONFIG
+ from .i18n_backend import msg
+ from .knowledge_graph import (
+     KnowledgeGraphManager,
+     _atomic_write,
+     _clip,
+@@ -89,20 +90,89 @@ _SKILL_REGISTRY = ".registry.json"
+ _SKILL_MD = "SKILL.md"
+ 
+ SKILLPACK_SCHEMA_VERSION = 1
+ SKILLPACK_KINDS = ("system_builtin", "project_experience", "third_party")
+ SKILLPACK_STATUSES = ("active", "pending", "retired")
+ 
+ _PROJECT_SKILL_LOCKS_GUARD = threading.Lock()
+ _PROJECT_SKILL_LOCKS: dict[str, threading.Lock] = {}
+ _THIRD_PARTY_SKILL_LOCK = threading.Lock()
+ 
++
++@dataclass(frozen=True)
++class ProfileBundle:
++    """One lock-bound Profile generation used for authorization and rendering."""
++
++    project_id: str
++    revision: int
++    exists: bool
++    body: str
++    source_ids: tuple[str, ...]
++    course_ids: tuple[str, ...]
++    locked: bool
++    generation_token: str
++
++    @property
++    def available(self) -> bool:
++        return self.exists
++
++    @property
++    def availability(self) -> bool:
++        return self.exists
++
++    @property
++    def contributors(self) -> dict[str, tuple[str, ...]]:
++        return {"source_ids": self.source_ids, "course_ids": self.course_ids}
++
++    @property
++    def generation(self) -> str:
++        return self.generation_token
++
++    @property
++    def profile_exists(self) -> bool:
++        return self.exists
++
++    @property
++    def profile_text(self) -> str:
++        return self.body
++
++    @property
++    def profile_source_ids(self) -> tuple[str, ...]:
++        return self.source_ids
++
++    @property
++    def profile_course_ids(self) -> tuple[str, ...]:
++        return self.course_ids
++
++    @property
++    def profile_locked(self) -> bool:
++        return self.locked
++
++    @property
++    def profile_generation(self) -> str:
++        return self.generation_token
++
++    def as_snapshot(self) -> dict[str, Any]:
++        """Keep the established Profile snapshot keys for API and caller compatibility."""
++        return {
++            "project_id": self.project_id,
++            "revision": self.revision,
++            "profile_exists": self.exists,
++            "profile_text": self.body,
++            "profile_source_ids": list(self.source_ids),
++            "profile_course_ids": list(self.course_ids),
++            "profile_locked": self.locked,
++            "profile_generation": self.generation_token,
++            "generation_token": self.generation_token,
++        }
++
++
+ # ── 五类资产（报告 §三 表格）与 id 前缀 ──
+ ASSET_CLASSES = ("preference", "playbook", "pitfall", "fact", "decision")
+ _CLASS_PREFIX = {
+     "preference": "P", "playbook": "B", "pitfall": "W", "fact": "F", "decision": "D",
+ }
+ # 数据映射：class/category 的中文标签体系与资产文件数据绑定（功能性数据，不 i18n）
+ _CLASS_ZH = {
+     "preference": "用户偏好", "playbook": "打法", "pitfall": "坑与解法",
+     "fact": "项目事实", "decision": "决策存档",
+ }
+@@ -1154,69 +1224,177 @@ class KnowledgeAssetManager:
+ 
+     def profile_text(self, internal_workspace: Path | str) -> str:
+         try:
+             path = self.profile_path(internal_workspace)
+             if path.is_file():
+                 return path.read_text("utf-8", errors="replace")
+         except OSError:
+             pass
+         return ""
+ 
+-    async def profile_snapshot(
++    @staticmethod
++    def _profile_generation_token(
++        *,
++        revision: int,
++        exists: bool,
++        body: str,
++        source_ids: tuple[str, ...],
++        course_ids: tuple[str, ...],
++        locked: bool,
++    ) -> str:
++        payload = json.dumps(
++            {
++                "revision": revision,
++                "exists": exists,
++                "body": body,
++                "source_ids": source_ids,
++                "course_ids": course_ids,
++                "locked": locked,
++            },
++            ensure_ascii=False,
++            separators=(",", ":"),
++            sort_keys=True,
++        )
++        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
++
++    def _profile_bundle_sync(
+         self, project_id: str, internal_workspace: Path | str,
+-    ) -> dict[str, Any]:
+-        """Read one indivisible Profile body/proof while fencing every manager writer."""
++    ) -> ProfileBundle:
++        """Build a Profile generation; callers must hold ``root_lock``."""
++        root = KnowledgeGraphManager.knowledge_dir(internal_workspace)
++        graph = self._graph.load_graph(project_id, root)
++        revision = int(graph.get("revision") or 0)
++        locked = bool(graph.get("profile_locked"))
++        exists = self.profile_path(internal_workspace).is_file()
++        body = self.profile_text(internal_workspace) if exists else ""
++        source_ids, course_ids = (
++            self._profile_contributor_ids(
++                graph,
++                internal_workspace,
++                sources=graph.get("sources") or {},
++                profile_text=body,
++            )
++            if exists
++            else ([], [])
++        )
++        source_tuple = tuple(source_ids)
++        course_tuple = tuple(course_ids)
++        return ProfileBundle(
++            project_id=project_id,
++            revision=revision,
++            exists=exists,
++            body=body,
++            source_ids=source_tuple,
++            course_ids=course_tuple,
++            locked=locked,
++            generation_token=self._profile_generation_token(
++                revision=revision,
++                exists=exists,
++                body=body,
++                source_ids=source_tuple,
++                course_ids=course_tuple,
++                locked=locked,
++            ),
++        )
++
++    async def profile_bundle(
++        self, project_id: str, internal_workspace: Path | str,
++    ) -> ProfileBundle:
++        """Read body, availability, proof, lock state and token under one root lock."""
+         try:
+             async with self._graph.root_lock(internal_workspace):
+                 return await asyncio.to_thread(
+-                    self._profile_snapshot_sync, project_id, internal_workspace,
++                    self._profile_bundle_sync, project_id, internal_workspace,
+                 )
++        except asyncio.CancelledError:
++            raise
+         except Exception:
+-            log.exception("[%s] profile snapshot 失败（回落为空）", project_id)
+-            return {
+-                "project_id": project_id, "revision": 0, "profile_exists": False,
+-                "profile_text": "", "profile_source_ids": [], "profile_course_ids": [],
+-            }
++            log.exception("[%s] profile bundle 失败（回落为空）", project_id)
++            source_ids: tuple[str, ...] = ()
++            course_ids: tuple[str, ...] = ()
++            return ProfileBundle(
++                project_id=project_id,
++                revision=0,
++                exists=False,
++                body="",
++                source_ids=source_ids,
++                course_ids=course_ids,
++                locked=False,
++                generation_token=self._profile_generation_token(
++                    revision=0,
++                    exists=False,
++                    body="",
++                    source_ids=source_ids,
++                    course_ids=course_ids,
++                    locked=False,
++                ),
++            )
+ 
+-    def _profile_snapshot_sync(
++    async def profile_snapshot(
+         self, project_id: str, internal_workspace: Path | str,
+     ) -> dict[str, Any]:
+-        snapshot = self.snapshot(project_id, internal_workspace)
+-        return {
+-            "project_id": project_id,
+-            "revision": snapshot.get("revision", 0),
+-            "profile_exists": bool(snapshot.get("profile_exists")),
+-            "profile_text": self.profile_text(internal_workspace),
+-            "profile_source_ids": list(snapshot.get("profile_source_ids") or []),
+-            "profile_course_ids": list(snapshot.get("profile_course_ids") or []),
+-        }
++        """Compatibility projection of the lock-bound ``ProfileBundle``."""
++        return (await self.profile_bundle(project_id, internal_workspace)).as_snapshot()
++
++    def _set_profile_sync(
++        self, project_id: str, internal_workspace: Path | str, text: str,
++    ) -> dict[str, Any]:
++        """Mutate a Profile while the caller holds ``root_lock``."""
++        root = KnowledgeGraphManager.knowledge_dir(internal_workspace)
++        graph = self._graph.load_graph(project_id, root)
++        max_lines = _bounded(CONFIG.knowledge_profile_max_lines, 10, 80)
++        lines = [ln.rstrip() for ln in str(text or "").splitlines()][:max_lines]
++        _atomic_write(self.profile_path(internal_workspace), "\n".join(lines).strip() + "\n")
++        graph["profile_locked"] = True
++        graph["updated_at"] = _now_iso()
++        self._graph.save_graph(root, graph)
++        self._graph.append_event(root, {
++            "type": "profile_user_edited", "project_id": project_id,
++            "at": _now_iso(),
++        })
++        return {"ok": True}
++
++    async def set_profile_authorized(
++        self,
++        project_id: str,
++        internal_workspace: Path | str,
++        text: str,
++        authorize: Callable[[ProfileBundle], bool],
++    ) -> dict[str, Any]:
++        """Authorize and CAS one Profile generation inside a single root-lock boundary."""
++        try:
++            async with self._graph.root_lock(internal_workspace):
++                authorized = await asyncio.to_thread(
++                    self._profile_bundle_sync, project_id, internal_workspace,
++                )
++                if not authorize(authorized):
++                    return {"ok": False, "reason": "profile_not_authorized"}
++                expected_generation = authorized.generation_token
++                current = await asyncio.to_thread(
++                    self._profile_bundle_sync, project_id, internal_workspace,
++                )
++                if current.generation_token != expected_generation:
++                    return {"ok": False, "reason": "stale_profile_generation"}
++                return self._set_profile_sync(project_id, internal_workspace, text)
++        except asyncio.CancelledError:
++            raise
++        except Exception as exc:
++            log.exception(msg("knowledge_assets.py.043"), project_id)
++            return {"ok": False, "reason": type(exc).__name__}
+ 
+     async def set_profile(
+         self, project_id: str, internal_workspace: Path | str, text: str,
+     ) -> dict[str, Any]:
+         """用户直改画像（视图入口）：改完即锁定，编译器不再覆盖（用户话语权最高）。"""
+-        root = KnowledgeGraphManager.knowledge_dir(internal_workspace)
+         try:
+             async with self._graph.root_lock(internal_workspace):
+-                graph = self._graph.load_graph(project_id, root)
+-                max_lines = _bounded(CONFIG.knowledge_profile_max_lines, 10, 80)
+-                lines = [ln.rstrip() for ln in str(text or "").splitlines()][:max_lines]
+-                _atomic_write(self.profile_path(internal_workspace),
+-                              "\n".join(lines).strip() + "\n")
+-                graph["profile_locked"] = True
+-                graph["updated_at"] = _now_iso()
+-                self._graph.save_graph(root, graph)
+-                self._graph.append_event(root, {
+-                    "type": "profile_user_edited", "project_id": project_id,
+-                    "at": _now_iso(),
+-                })
+-                return {"ok": True}
++                return self._set_profile_sync(project_id, internal_workspace, text)
+         except asyncio.CancelledError:
+             raise
+         except Exception as exc:
+             log.exception(msg("knowledge_assets.py.043"), project_id)
+             return {"ok": False, "reason": type(exc).__name__}
+ 
+     def _compile_profile(
+         self, graph: dict[str, Any], internal_workspace: Path | str,
+     ) -> None:
+         """把置信度最高的 preference 编译成 PROFILE.md（用户锁定后不再覆盖）。"""
+@@ -2301,14 +2479,14 @@ def _rewrite_skill_status(path: Path, status: str) -> None:
+         _atomic_write(path, text)
+     except OSError:
+         pass
+ 
+ 
+ def _skill_status_zh(status: str) -> str:
+     return {"active": msg("ka.062a"), "pending": msg("ka.062b"), "retired": msg("ka.062c")}.get(status, status)
+ 
+ 
+ __all__ = [
+-    "KnowledgeAssetManager", "DistillCall", "ASSET_CLASSES", "CATEGORIES",
++    "KnowledgeAssetManager", "ProfileBundle", "DistillCall", "ASSET_CLASSES", "CATEGORIES",
+     "ASSET_SCHEMA_VERSION", "SKILLPACK_SCHEMA_VERSION", "SKILLPACK_KINDS",
+     "SKILLPACK_STATUSES",
+ ]
+diff --git a/backend/server.py b/backend/server.py
+index 14c34d7..622559a 100644
+--- a/backend/server.py
++++ b/backend/server.py
+@@ -6618,21 +6618,22 @@ class KnoweServer:
+                     await writer.drain()
+                     self._shutdown_event.set()
+                     return
+ 
+                 if path.startswith("/api/knowledge"):
+                     response = await dispatch_knowledge_http(
+                         method, path, split.query, body_bytes, self.groups,
+                     )
+                     status = {
+                         200: b"200 OK", 400: b"400 Bad Request", 403: b"403 Forbidden", 404: b"404 Not Found",
+-                        405: b"405 Method Not Allowed", 413: b"413 Payload Too Large",
++                        405: b"405 Method Not Allowed", 409: b"409 Conflict",
++                        413: b"413 Payload Too Large",
+                         500: b"500 Internal Server Error", 503: b"503 Service Unavailable",
+                         504: b"504 Gateway Timeout",
+                     }.get(response.status, f"{response.status} Error".encode("ascii"))
+                     body = json.dumps(response.body, ensure_ascii=False).encode("utf-8")
+                     self._write_http(writer, status, body, b"application/json; charset=utf-8")
+                     await writer.drain()
+                     return
+ 
+                 # [v0.44 设置] 设置面板的三个端点（与 /preview 同一个本机只信 127.0.0.1 的小服务）：
+                 #   GET  /settings       → 当前生效设置快照（前端开机对账用）
+diff --git a/backend/tests/test_knowledge_group_scope.py b/backend/tests/test_knowledge_group_scope.py
+index a706111..9b59783 100644
+--- a/backend/tests/test_knowledge_group_scope.py
++++ b/backend/tests/test_knowledge_group_scope.py
+@@ -1,57 +1,81 @@
+ from __future__ import annotations
+ 
+ import asyncio
+ import threading
+ from pathlib import Path
++from typing import Callable
+ 
+ import pytest
+ 
+ from backend.groups import GroupRepository
+-from backend.knowledge_assets import KnowledgeAssetManager
++from backend.knowledge_assets import KnowledgeAssetManager, ProfileBundle
+ from backend.knowledge_api import (
+     dispatch_knowledge_http,
+     register_project,
+     unregister_project,
+ )
+ from backend.knowledge_graph import KnowledgeGraphManager
+ 
+ 
+ class _Assets:
+     def __init__(self, project_id: str, rows: list[dict[str, object]]) -> None:
+         self.project_id = project_id
+         self.rows = rows
++        self.profile_body = f"profile:{project_id}"
+ 
+     def snapshot(self, project_id: str, _workspace: Path) -> dict[str, object]:
+         assert project_id == self.project_id
+         return {
+             "revision": 1, "updated_at": "2026-08-19T00:00:00Z", "counts": {},
+             "profile_exists": True, "assets": self.rows,
+         }
+ 
+     def read_asset(self, project_id: str, _workspace: Path, asset_id: str) -> dict[str, object]:
+         row = next((item for item in self.rows if item["asset_id"] == asset_id), None)
+         return {"found": bool(row), "asset": row} if row else {"found": False, "asset_id": asset_id}
+ 
+     def profile_text(self, _workspace: Path) -> str:
+-        return f"profile:{self.project_id}"
++        return self.profile_body
+ 
+-    async def profile_snapshot(self, project_id: str, workspace: Path) -> dict[str, object]:
++    async def profile_bundle(self, project_id: str, workspace: Path) -> ProfileBundle:
+         snapshot = self.snapshot(project_id, workspace)
+-        return {
+-            "project_id": project_id,
+-            "revision": snapshot.get("revision", 0),
+-            "profile_exists": bool(snapshot.get("profile_exists")),
+-            "profile_text": self.profile_text(workspace),
+-            "profile_source_ids": list(snapshot.get("profile_source_ids") or []),
+-            "profile_course_ids": list(snapshot.get("profile_course_ids") or []),
+-        }
++        source_ids = tuple(str(value) for value in snapshot.get("profile_source_ids") or [])
++        course_ids = tuple(str(value) for value in snapshot.get("profile_course_ids") or [])
++        body = self.profile_text(workspace)
++        revision = int(snapshot.get("revision") or 0)
++        return ProfileBundle(
++            project_id=project_id,
++            revision=revision,
++            exists=bool(snapshot.get("profile_exists")),
++            body=body,
++            source_ids=source_ids,
++            course_ids=course_ids,
++            locked=False,
++            generation_token=f"{revision}:{body}:{source_ids}:{course_ids}",
++        )
++
++    async def profile_snapshot(self, project_id: str, workspace: Path) -> dict[str, object]:
++        return (await self.profile_bundle(project_id, workspace)).as_snapshot()
++
++    async def set_profile_authorized(
++        self,
++        project_id: str,
++        workspace: Path,
++        text: str,
++        authorize: Callable[[ProfileBundle], bool],
++    ) -> dict[str, object]:
++        bundle = await self.profile_bundle(project_id, workspace)
++        if not authorize(bundle):
++            return {"ok": False, "reason": "profile_not_authorized"}
++        self.profile_body = text.strip() + "\n"
++        return {"ok": True}
+ 
+     def list_skillpacks(self, project_id: str, _workspace: Path) -> dict[str, object]:
+         source_ids = sorted({
+             str(value) for row in self.rows for value in row.get("source_ids", [])
+         })
+         course_ids = sorted({
+             str(value) for row in self.rows for value in row.get("course_ids", [])
+         })
+         return {
+             "system_builtin": [],
+@@ -627,30 +651,30 @@ async def test_real_manager_profile_detail_body_and_contributors_share_one_gener
+             "updated_at": "2026-08-29T00:00:00Z",
+         },
+     }
+     graph_manager.save_graph(root, graph)
+     assets = KnowledgeAssetManager(graph_manager)
+     original_body = "# Profile\n\n- [P-01] Use the allowed contributor\n"
+     assets.profile_path(workspace).write_text(original_body, encoding="utf-8")
+ 
+     captured = threading.Event()
+     release = threading.Event()
+-    original_snapshot = assets.snapshot
++    original_profile_text = assets.profile_text
+ 
+-    def pause_after_allowed_snapshot(*args: object, **kwargs: object) -> dict[str, object]:
+-        result = original_snapshot(*args, **kwargs)
++    def pause_after_allowed_body(internal_workspace: Path | str) -> str:
++        result = original_profile_text(internal_workspace)
+         captured.set()
+         if not release.wait(timeout=5):
+             raise AssertionError("profile request did not resume")
+         return result
+ 
+-    monkeypatch.setattr(assets, "snapshot", pause_after_allowed_snapshot)
++    monkeypatch.setattr(assets, "profile_text", pause_after_allowed_body)
+     try:
+         register_project(
+             project_id, manager=graph_manager, assets=assets,
+             workspace_provider=lambda: workspace,
+         )
+         query = (
+             f"group_id={group.group_id}&legacy_project_id={project_id}"
+             f"&source_id={source_id}&course_id=course-atomic"
+         )
+         request = asyncio.create_task(dispatch_knowledge_http(
+diff --git a/backend/tests/test_profile_atomic_authorization.py b/backend/tests/test_profile_atomic_authorization.py
+new file mode 100644
+index 0000000..d93d546
+--- /dev/null
++++ b/backend/tests/test_profile_atomic_authorization.py
+@@ -0,0 +1,286 @@
++from __future__ import annotations
++
++import asyncio
++import threading
++from pathlib import Path
++
++import pytest
++
++from backend.groups import GroupRepository
++from backend.knowledge_api import (
++    dispatch_knowledge_http,
++    register_project,
++    unregister_project,
++)
++from backend.knowledge_assets import KnowledgeAssetManager
++from backend.knowledge_graph import KnowledgeGraphManager
++
++
++def _seed_allowed_profile(
++    tmp_path: Path, project_id: str,
++) -> tuple[
++    GroupRepository,
++    KnowledgeGraphManager,
++    KnowledgeAssetManager,
++    Path,
++    str,
++    str,
++]:
++    repo = GroupRepository(tmp_path / "groups")
++    group = repo.create_group("atomic-profile", legacy_project_id=project_id)
++    repo.bind_course(group.group_id, "course-atomic")
++    source_id = repo.link_source(group.group_id).source_id
++    workspace = tmp_path / "workspace"
++    graph_manager = KnowledgeGraphManager(tmp_path / "manager-data")
++    graph_manager.ensure_project_graph(project_id, workspace)
++    root = KnowledgeGraphManager.knowledge_dir(workspace)
++    graph = graph_manager.load_graph(project_id, root)
++    graph["revision"] = 1
++    graph["updated_at"] = "2026-08-29T00:00:00Z"
++    graph["profile_locked"] = False
++    graph["assets"] = {
++        "P-01": {
++            "id": "P-01",
++            "class": "preference",
++            "title": "Atomic preference",
++            "one_liner": "Use the allowed contributor",
++            "applies_when": "always",
++            "body_md": "Allowed preference body.",
++            "status": "core",
++            "scope": "project",
++            "scope_set_by": "system",
++            "needs_review": False,
++            "source_ids": [source_id],
++            "course_ids": ["course-atomic"],
++            "evidence": [],
++            "usage_events": [],
++            "metrics": {},
++            "created_at": "2026-08-29T00:00:00Z",
++            "updated_at": "2026-08-29T00:00:00Z",
++        },
++    }
++    graph_manager.save_graph(root, graph)
++    assets = KnowledgeAssetManager(graph_manager)
++    assets.profile_path(workspace).write_text(
++        "# Profile\n\n- [P-01] Use the allowed contributor\n",
++        encoding="utf-8",
++    )
++    query = (
++        f"group_id={group.group_id}&legacy_project_id={project_id}"
++        f"&source_id={source_id}&course_id=course-atomic"
++    )
++    return repo, graph_manager, assets, workspace, source_id, query
++
++
++def _pause_first_profile_body_read(
++    assets: KnowledgeAssetManager,
++    monkeypatch: pytest.MonkeyPatch,
++) -> tuple[threading.Event, threading.Event]:
++    captured = threading.Event()
++    release = threading.Event()
++    original_profile_text = assets.profile_text
++
++    def pause_after_read(internal_workspace: Path | str) -> str:
++        text = original_profile_text(internal_workspace)
++        if not captured.is_set():
++            captured.set()
++            if not release.wait(timeout=5):
++                raise AssertionError("profile request did not resume")
++        return text
++
++    monkeypatch.setattr(assets, "profile_text", pause_after_read)
++    return captured, release
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "route",
++    [
++        "/api/knowledge/assets",
++        "/api/knowledge/atomic-profile-assets/assets",
++    ],
++    ids=["merged", "project"],
++)
++async def test_assets_profile_availability_reauthorizes_after_generation_swap(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    route: str,
++) -> None:
++    project_id = "atomic-profile-assets"
++    repo, graph_manager, assets, workspace, _source_id, query = _seed_allowed_profile(
++        tmp_path, project_id,
++    )
++    captured, release = _pause_first_profile_body_read(assets, monkeypatch)
++    try:
++        register_project(
++            project_id,
++            manager=graph_manager,
++            assets=assets,
++            workspace_provider=lambda: workspace,
++        )
++        request = asyncio.create_task(
++            dispatch_knowledge_http("GET", route, query, b"", repo),
++        )
++        assert await asyncio.to_thread(captured.wait, 5)
++
++        replacement = await assets.set_profile(
++            project_id, workspace, "PRIVATE OWNERLESS PROFILE",
++        )
++        assert replacement == {"ok": True}
++        release.set()
++        response = await request
++
++        assert response.status == 200
++        project = (
++            response.body["projects"][0]
++            if route == "/api/knowledge/assets"
++            else response.body
++        )
++        assert project["profile_exists"] is False
++        assert project["profile_source_ids"] == []
++        assert project["profile_course_ids"] == []
++        assert "PRIVATE OWNERLESS PROFILE" not in str(project)
++    finally:
++        release.set()
++        unregister_project(project_id)
++
++
++@pytest.mark.asyncio
++async def test_profile_post_never_overwrites_a_newer_ownerless_generation(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    project_id = "atomic-profile-post"
++    repo, graph_manager, assets, workspace, _source_id, query = _seed_allowed_profile(
++        tmp_path, project_id,
++    )
++    captured, release = _pause_first_profile_body_read(assets, monkeypatch)
++    try:
++        register_project(
++            project_id,
++            manager=graph_manager,
++            assets=assets,
++            workspace_provider=lambda: workspace,
++        )
++        request = asyncio.create_task(dispatch_knowledge_http(
++            "POST",
++            f"/api/knowledge/{project_id}/profile",
++            query,
++            b'{"text":"STALE AUTHORIZED EDIT"}',
++            repo,
++        ))
++        assert await asyncio.to_thread(captured.wait, 5)
++
++        replacement = asyncio.create_task(
++            assets.set_profile(project_id, workspace, "PRIVATE OWNERLESS PROFILE"),
++        )
++        await asyncio.sleep(0)
++        replacement_was_blocked = not replacement.done()
++        release.set()
++        response = await request
++        assert await replacement == {"ok": True}
++
++        final_snapshot = await assets.profile_snapshot(project_id, workspace)
++        assert final_snapshot["profile_text"] == "PRIVATE OWNERLESS PROFILE\n"
++        assert final_snapshot["profile_source_ids"] == []
++        assert final_snapshot["profile_course_ids"] == []
++        if not replacement_was_blocked:
++            assert response.status == 403
++    finally:
++        release.set()
++        unregister_project(project_id)
++
++
++@pytest.mark.asyncio
++async def test_profile_bundle_tracks_auto_compilation_and_deletion_generations(
++    tmp_path: Path,
++) -> None:
++    project_id = "profile-bundle-lifecycle"
++    _repo, graph_manager, assets, workspace, source_id, _query = _seed_allowed_profile(
++        tmp_path, project_id,
++    )
++    root = KnowledgeGraphManager.knowledge_dir(workspace)
++    graph = graph_manager.load_graph(project_id, root)
++    graph["assets"]["P-01"]["status"] = "candidate"
++    graph_manager.save_graph(root, graph)
++    assets.profile_path(workspace).unlink()
++
++    missing = await assets.profile_bundle(project_id, workspace)
++    assert missing.available is False
++    assert missing.body == ""
++    assert missing.contributors == {"source_ids": (), "course_ids": ()}
++    assert missing.locked is False
++
++    approved = await assets.review(project_id, workspace, "P-01", "approve")
++    assert approved["ok"] is True
++    compiled = await assets.profile_bundle(project_id, workspace)
++    assert compiled.available is True
++    assert "- [P-01] Use the allowed contributor" in compiled.body
++    assert compiled.source_ids == (source_id,)
++    assert compiled.course_ids == ("course-atomic",)
++    assert compiled.locked is False
++    assert compiled.generation != missing.generation
++
++    assert await assets.purge(project_id, workspace, "P-01") == {
++        "ok": True,
++        "asset_id": "P-01",
++    }
++    deleted = await assets.profile_bundle(project_id, workspace)
++    assert deleted.available is False
++    assert deleted.body == ""
++    assert deleted.source_ids == ()
++    assert deleted.course_ids == ()
++    assert deleted.locked is False
++    assert deleted.generation not in {missing.generation, compiled.generation}
++
++
++@pytest.mark.asyncio
++async def test_profile_lock_is_never_entered_from_a_foreign_registered_loop(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    project_id = "profile-loop-owner"
++    repo, graph_manager, assets, workspace, _source_id, query = _seed_allowed_profile(
++        tmp_path, project_id,
++    )
++    foreign_loop = asyncio.new_event_loop()
++
++    def reject_lock_entry(_workspace: Path | str) -> asyncio.Lock:
++        raise AssertionError("foreign event loop attempted to enter root_lock")
++
++    monkeypatch.setattr(graph_manager, "root_lock", reject_lock_entry)
++    try:
++        register_project(
++            project_id,
++            manager=graph_manager,
++            assets=assets,
++            workspace_provider=lambda: workspace,
++            loop=foreign_loop,
++        )
++        direct = await dispatch_knowledge_http(
++            "GET", f"/api/knowledge/{project_id}/assets", query, b"", repo,
++        )
++        detail = await dispatch_knowledge_http(
++            "GET", f"/api/knowledge/{project_id}/profile", query, b"", repo,
++        )
++        post = await dispatch_knowledge_http(
++            "POST",
++            f"/api/knowledge/{project_id}/profile",
++            query,
++            b'{"text":"must not run"}',
++            repo,
++        )
++        merged = await dispatch_knowledge_http(
++            "GET", "/api/knowledge/assets", query, b"", repo,
++        )
++
++        for response in (direct, detail, post):
++            assert response.status == 503
++            assert response.body["error"] == "engine_loop_unavailable"
++        assert merged.status == 200
++        assert merged.body["projects"][0]["profile_exists"] is False
++        assert merged.body["projects"][0]["profile_source_ids"] == []
++        assert merged.body["projects"][0]["profile_course_ids"] == []
++    finally:
++        unregister_project(project_id)
++        foreign_loop.close()

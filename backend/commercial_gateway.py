@@ -372,7 +372,10 @@ class ToolGateway:
                 operation_scope=request.operation_scope(descriptor),
                 purpose=request.purpose,
             )
-        except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 -- 存储故障同样必须变成 GatewayDenied
+            # 同上：`sqlite3.*` 由 `_sqlite.transaction()` 原样重抛，不包进来就会让一次
+            # 存储故障以数据库异常的形式穿出 `invoke`，而不是 fail-closed 的 GatewayDenied。
+            # `from exc` 保留原始原因，排查时仍看得到。
             raise GatewayDenied("Task Runtime denied tool authority") from exc
         if invocation.disposition != "created" or invocation.status != "prepared":
             raise GatewayDenied("fresh purpose-specific approval is required")
@@ -394,7 +397,22 @@ class ToolGateway:
             # 理由）：调用方要看到的是它自己的取消，不是一个数据库异常。
             try:
                 self.runtime.store.cancel_tool(invocation.invocation_id)
-            except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+            except Exception:  # noqa: BLE001 -- 理由见下
+                # 为什么是 `Exception` 而不是一串具体类型（I-1，第七轮复审实测）：这里
+                # 原本捕 `(RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError,
+                # ValueError)`，而 `knowe_storage/_sqlite.py` 的 `transaction()` 在回滚后
+                # **原样重抛** `sqlite3.*`，store 层不做任何包装。于是存储真正坏掉时抛出的
+                # 两类异常——`database is locked`（busy_timeout 默认 1000ms）与
+                # `Cannot operate on a closed database`（关闭竞态）——照样替换掉取消，
+                # 而当时的注释写的是"最多少一条终态记录"。
+                #
+                # 这段代码的**唯一职责**是"终态写入失败不得替换取消"，所以它不能只认识我们
+                # 自己造的异常类型：存储实现是可替换的，穷举注定会再漏一次。
+                #
+                # 代价（如实写下）：它同时会吞掉编程错误（例如 store 接口不匹配导致的
+                # AttributeError）。本模块没有 logger，所以代价是"静默"。取舍的理由是这条
+                # 路径上"取消被替换"比"少一条终态记录"更糟——前者把用户的正常中止变成一次
+                # 数据库异常（M-6 要消除的正是这个），后者只是审计缺一条。
                 pass
             raise
         except Exception as exc:
@@ -2194,9 +2212,12 @@ def production_model_capability_registry() -> ModelCapabilityRegistry:
         registry.register(ProviderCapability(
             provider_id=provider_id,
             # I-R1 的**剩余部分**，写在这里以免下一个人以为它是随手写的通配符：
-            # `authorize()` 只在 `"*" not in capability.models` 时才核对模型名，所以这
-            # 一行等于"这个 provider 的任何模型名都通过"，于是 `privacy` 与
-            # `estimated_cost_usd` 实际上都是**按 provider**声明、不按模型。
+            # `authorize()` 的判定原文是
+            # `if "*" not in capability.models and str(model) not in capability.models`
+            # （见本文件 `ModelCapabilityRegistry.authorize`）。这里放的是 `("*",)`，
+            # 于是第一个条件恒为假、整个判定短路——等于"这个 provider 的任何模型名都
+            # 通过"，`privacy` 与 `estimated_cost_usd` 因此都是**按 provider**声明、
+            # 不按模型。（第一版注释把判定转述成只剩前半句，第八轮复审指出后已补全。）
             #
             # 为什么不收紧：项目里确实有一份带来源 URL 的逐模型价格表
             # (`backend/token_pricing.py`)，但它 (a) 对 `copilot` / `gmi` /
@@ -2633,7 +2654,7 @@ class ProviderGatewayClient:
                 reserved=authorization.reserved_usage,
                 request_key=f"provider-settle:{uuid.uuid4().hex}",
             )
-        except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+        except Exception:  # noqa: BLE001 -- 见 ToolGateway._invoke 里的详细说明
             return
 
     def _max_attempts(self) -> int:
@@ -2718,7 +2739,7 @@ class ProviderGatewayClient:
                         request_key=f"provider-usage:{uuid.uuid4().hex}",
                     )
                     reserved += top_up
-                except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+                except Exception:  # noqa: BLE001 -- 见 ToolGateway._invoke 里的详细说明
                     # 对账失败不能把一次已成功的调用变成失败；下一次调用会重新校验余额。
                     return
         # 统一结算：tokens 按实际（或保持预留），轮次/成本按**实际尝试次数**（I3）。
@@ -2746,7 +2767,7 @@ class ProviderGatewayClient:
                 reserved=settled_reserved,
                 request_key=f"provider-settle:{uuid.uuid4().hex}",
             )
-        except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+        except Exception:  # noqa: BLE001 -- 见 ToolGateway._invoke 里的详细说明
             return
 
     @staticmethod
@@ -2793,7 +2814,7 @@ class ProviderGatewayClient:
                         status=status,
                         error_type=type(error).__name__ if error is not None else "",
                     )
-            except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+            except Exception:  # noqa: BLE001 -- 见 ToolGateway._invoke 里的详细说明
                 # 终态记录失败不能改变 effect 的结局。**取消路径上这一条尤其要紧**：本
                 # 方法就在 `except GeneratorExit` 分支里，这里抛出的任何异常都会替换掉
                 # `GeneratorExit`，于是一次正常取消变成 `aclose()` 的意外异常——消费者
@@ -2826,7 +2847,7 @@ class ProviderGatewayClient:
                 public_payload=payload,
                 idempotency_key=f"provider-terminal:{uuid.uuid4().hex}",
             )
-        except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError):
+        except Exception:  # noqa: BLE001 -- 见 ToolGateway._invoke 里的详细说明
             # 终态审计失败不能把一次已完成的调用变成失败。
             return
 

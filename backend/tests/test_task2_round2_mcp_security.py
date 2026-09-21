@@ -1803,16 +1803,32 @@ def test_production_authority_is_rebuilt_from_the_store_not_from_a_mapping(
 
 
 @pytest.mark.asyncio
-async def test_tool_cancellation_survives_a_failing_terminal_write(tmp_path: Any) -> None:
-    """I-2（第六轮复审实测）：`ToolGateway._invoke` 里那段终态兜底**零覆盖**。
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param("runtime_store_error", id="RuntimeStoreError"),
+        pytest.param("sqlite_locked", id="sqlite3-OperationalError-locked"),
+        pytest.param("sqlite_closed", id="sqlite3-ProgrammingError-closed-db"),
+    ],
+)
+async def test_tool_cancellation_survives_a_failing_terminal_write(
+    tmp_path: Any, failure: str,
+) -> None:
+    """`ToolGateway._invoke` 的终态兜底必须扛住**存储层真实抛出的**异常。
 
-    复审的变异很直接——把兜底删掉，round-2 文件仍然 44 passed；而它正是"终态写入失败
-    不能替换掉取消"这条承诺的**全部实现**。台账当时却把它记为已修/已验证。这是第五轮
-    I-3 那条"修了但没锁住"的同一形态，而且它就发生在我修 I-3 的同一个提交里。
+    I-2（第六轮复审实测）：这段兜底原本零覆盖——把它删掉，round-2 文件仍然 44 passed，
+    而它正是"终态写入失败不能替换取消"这条承诺的全部实现。
 
-    这条测试断言：`store.cancel_tool` 抛错时，调用方看到的仍然是它自己的
-    `CancelledError`，不是一个数据库异常。
+    I-1（第七轮复审实测，本参数化就是为此而加）：兜底当时只捕
+    `(RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError, ValueError)`，而
+    `knowe_storage/_sqlite.py` 的 `transaction()` 在回滚后**原样重抛** `sqlite3.*`，store
+    层不做包装。于是存储真正坏掉时抛出的两类异常——`database is locked`（busy_timeout
+    默认 1000ms）与 `Cannot operate on a closed database`（关闭竞态）——照样替换掉取消，
+    而注释写的是"最多少一条终态记录"。用真实类型参数化，正是为了让"只捕自己造的异常"
+    这种写法无法再通过。
     """
+
+    import sqlite3
 
     from backend.commercial_gateway import (
         ToolDescriptor,
@@ -1847,12 +1863,16 @@ async def test_tool_cancellation_survives_a_failing_terminal_write(tmp_path: Any
     )
 
     def exploding(*_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeStoreError("store is unavailable: cancel_tool")
+        if failure == "runtime_store_error":
+            raise RuntimeStoreError("store is unavailable: cancel_tool")
+        if failure == "sqlite_locked":
+            raise sqlite3.OperationalError("database is locked")
+        raise sqlite3.ProgrammingError("Cannot operate on a closed database")
 
     # 只让终态记录失败，其余（claim、授权）照常。
     runtime.store.cancel_tool = exploding  # type: ignore[method-assign]
 
-    # 修复前/去掉兜底后：这里会抛 RuntimeStoreError，把取消替换掉。
+    # 修复前/去掉兜底后：这里会抛上面那个存储异常，把取消替换掉。
     with pytest.raises(asyncio.CancelledError):
         await gateway.invoke(request)
     runtime.close()
