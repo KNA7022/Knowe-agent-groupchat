@@ -2,24 +2,33 @@
 
 Task 3 的"精确引用"建立在这里，所以位置字符串有两个硬要求：
 
-1. 它指向原文里**可复查**的地方（`para:12`、`page:3`、`sheet:Sheet1!A1:C4`）；
+1. 它指向原文里**可复查**的地方（`para:12`、`slide:3`、`sheet:成绩!A1:C4`）；
 2. 它对同一份文件**可复现**——解析两次得到完全相同的位置与顺序，否则引用会
    指向别处而依然"合法"。
 
-本模块只覆盖不需要新依赖的三种格式（TXT / Markdown / HTML，全部标准库）。PDF 与三种
-Office 格式需要先决定引入哪些库——那会给 PyInstaller 产物增加体积，是一个要摆到台面上的
-取舍，所以它们在这里**被显式拒绝**而不是静默返回空列表（见 `PENDING_SUFFIXES`）。
+覆盖六种格式，全部只用标准库：TXT / Markdown / HTML，以及 DOCX / PPTX / XLSX。后三种是
+ZIP + XML，`zipfile` + `ElementTree` 就够，所以不引入 python-docx / openpyxl /
+python-pptx：三个库既给 PyInstaller 产物增重，又只给对象模型、不给稳定位置。
+
+PDF 还没做（见 `PENDING_SUFFIXES`），因为"引入哪个 PDF 库"会给安装包增重，是一个要摆到
+台面上的取舍；在决定之前它**显式拒绝**而不是静默返回空列表。旧版二进制 Office 格式
+（`.doc`/`.ppt`/`.xls`）是另一套格式，永远不走这里（见 `LEGACY_SUFFIXES`）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from html.parser import HTMLParser
 from pathlib import Path
 import re
+import xml.etree.ElementTree as ElementTree
+import zipfile
 
 __all__ = [
+    "LEGACY_SUFFIXES",
     "PENDING_SUFFIXES",
+    "SHEET_ROWS_PER_BLOCK",
     "SUPPORTED_SUFFIXES",
     "ParsedBlock",
     "UnsupportedFormat",
@@ -45,11 +54,17 @@ class ParsedBlock:
 
 
 #: 现在能解析的。
-SUPPORTED_SUFFIXES = frozenset({".txt", ".md", ".markdown", ".html", ".htm"})
+SUPPORTED_SUFFIXES = frozenset({
+    ".docx", ".htm", ".html", ".markdown", ".md", ".pptx", ".txt", ".xlsx",
+})
 
 #: 规格里要求、但尚未决定依赖的。单独列出来是为了让"还没做"和"不管这种类型"区分开——
 #: 混在一起会让人以为 PDF 永远不支持。
-PENDING_SUFFIXES = frozenset({".pdf", ".docx", ".pptx", ".xlsx"})
+PENDING_SUFFIXES = frozenset({".pdf"})
+
+#: 旧版二进制 Office 格式。它们**不是**"还没做"：这套解析器永远不支持它们，能行动的
+#: 答复是"先另存为新格式"，所以错误消息里直接给出目标后缀。
+LEGACY_SUFFIXES = {".doc": ".docx", ".ppt": ".pptx", ".xls": ".xlsx"}
 
 
 # ── TXT ───────────────────────────────────────────────────────────────
@@ -229,14 +244,367 @@ def _parse_html(raw: str) -> tuple[ParsedBlock, ...]:
     return tuple(extractor.blocks)
 
 
+# ── OOXML 公共部分（DOCX / PPTX / XLSX）───────────────────────────────
+#
+# 三种格式都是 ZIP + XML，共用的只有"包怎么打开、成员怎么读、XML 怎么解析"。
+
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def _open_package(path: Path) -> zipfile.ZipFile:
+    try:
+        return zipfile.ZipFile(path)
+    except zipfile.BadZipFile as exc:
+        # 把 .doc 直接改名成 .docx 是很常见的操作，那时文件根本不是 ZIP。泄漏
+        # BadZipFile 会让上层把它当成一次未知崩溃，而不是"这份文件读不了"。
+        raise UnsupportedFormat(
+            f"{Path(path).suffix} 不是一个有效的 OOXML 包"
+            f"（把旧格式改名过来就会是这样）：{exc}"
+        ) from exc
+
+
+def _package_member(archive: zipfile.ZipFile, name: str, suffix: str) -> bytes:
+    try:
+        return archive.read(name)
+    except KeyError as exc:
+        raise UnsupportedFormat(f"{suffix} 包里缺少 {name}，无法解析正文") from exc
+
+
+def _parse_xml(raw: bytes, name: str, suffix: str) -> ElementTree.Element:
+    try:
+        return ElementTree.fromstring(raw)
+    except ElementTree.ParseError as exc:
+        raise UnsupportedFormat(f"{suffix} 包里的 {name} 不是可解析的 XML：{exc}") from exc
+
+
+# ── DOCX ──────────────────────────────────────────────────────────────
+
+#: Word 的标题是样式，不是标记。样式 ID 在英文版是 `Heading1`，中文版也是 `Heading1`
+#: （界面显示"标题 1"），个别生成器写成 `heading 1`，所以匹配留出空格并忽略大小写。
+_DOCX_HEADING_STYLE = re.compile(r"^heading\s*([1-6])$", re.IGNORECASE)
+
+
+def _docx_paragraph_text(paragraph: ElementTree.Element) -> str:
+    """拼一个段落的文本。
+
+    段落文本分散在多个 run 里，制表符和换行是**独立元素**而不是字符：丢掉它们会把
+    "姓名<TAB>分数"读成"姓名分数"，表格化段落的列就没了。
+    """
+    parts: list[str] = []
+    for node in paragraph.iter():
+        if node.tag == f"{_W}t":
+            parts.append(node.text or "")
+        elif node.tag == f"{_W}tab":
+            parts.append("\t")
+        elif node.tag in (f"{_W}br", f"{_W}cr"):
+            parts.append("\n")
+    return "".join(parts).strip()
+
+
+def _docx_heading_level(paragraph: ElementTree.Element) -> int | None:
+    properties = paragraph.find(f"{_W}pPr")
+    if properties is None:
+        return None
+    style = properties.find(f"{_W}pStyle")
+    if style is None:
+        return None
+    match = _DOCX_HEADING_STYLE.match((style.get(f"{_W}val") or "").strip())
+    return int(match.group(1)) if match else None
+
+
+def _docx_table_text(table: ElementTree.Element) -> str:
+    lines: list[str] = []
+    for row in table.findall(f"{_W}tr"):
+        cells = [
+            " ".join(
+                text
+                for text in (_docx_paragraph_text(p) for p in cell.iter(f"{_W}p"))
+                if text
+            )
+            for cell in row.findall(f"{_W}tc")
+        ]
+        if any(cells):
+            lines.append("\t".join(cells))
+    return "\n".join(lines)
+
+
+def _parse_docx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBlock, ...]:
+    name = "word/document.xml"
+    root = _parse_xml(_package_member(archive, name, suffix), name, suffix)
+    body = root.find(f"{_W}body")
+    if body is None:
+        raise UnsupportedFormat(f"{suffix} 包里的 {name} 没有 w:body")
+
+    blocks: list[ParsedBlock] = []
+    paragraph_index = 0
+    table_index = 0
+    heading_counts: dict[int, int] = {}
+
+    # 只遍历 body 的**直接子元素**：表格单元格里的段落由表格那一支负责，否则同一段文字
+    # 会在索引里出现两次、位置还不一样，引用指向其中一份而读者看到的是另一份。
+    for child in body:
+        if child.tag == f"{_W}p":
+            text = _docx_paragraph_text(child)
+            if not text:
+                continue
+            level = _docx_heading_level(child)
+            if level is None:
+                paragraph_index += 1
+                blocks.append(ParsedBlock(
+                    text=text, location=f"para:{paragraph_index}", kind="paragraph",
+                ))
+            else:
+                heading_counts[level] = heading_counts.get(level, 0) + 1
+                blocks.append(ParsedBlock(
+                    text=text, location=f"h{level}:{heading_counts[level]}", kind="heading",
+                ))
+        elif child.tag == f"{_W}tbl":
+            text = _docx_table_text(child)
+            if not text:
+                continue
+            table_index += 1
+            blocks.append(ParsedBlock(text=text, location=f"table:{table_index}", kind="table"))
+    return tuple(blocks)
+
+
+# ── PPTX ──────────────────────────────────────────────────────────────
+
+_PPTX_SLIDE = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
+
+
+def _parse_pptx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBlock, ...]:
+    # 按**编号**排序，不按文件名字符串：字典序会把 slide10 排在 slide2 前面，于是第 2 页的
+    # 引用指向第 10 页的内容，而位置看起来完全合法。
+    slides = sorted(
+        (int(match.group(1)), name)
+        for name in archive.namelist()
+        if (match := _PPTX_SLIDE.match(name))
+    )
+    if not slides:
+        raise UnsupportedFormat(f"{suffix} 包里没有任何 ppt/slides/slideN.xml")
+
+    blocks: list[ParsedBlock] = []
+    for number, name in slides:
+        root = _parse_xml(_package_member(archive, name, suffix), name, suffix)
+        paragraphs = [
+            text
+            for paragraph in root.iter(f"{_A}p")
+            if (text := "".join(node.text or "" for node in paragraph.iter(f"{_A}t")).strip())
+        ]
+        if paragraphs:
+            blocks.append(ParsedBlock(
+                text="\n".join(paragraphs), location=f"slide:{number}", kind="slide",
+            ))
+    return tuple(blocks)
+
+
+# ── XLSX ──────────────────────────────────────────────────────────────
+
+#: 一张表切成多少行一块。整张表做成一个块，检索命中时给出的证据会是"这张表"，引用也就
+#: 落不到具体几行上；太小又会把一段连续数据切碎。200 行是中小学一张成绩表/课表的量级。
+SHEET_ROWS_PER_BLOCK = 200
+
+_XLSX_CELL_REFERENCE = re.compile(r"^([A-Za-z]{1,3})(\d+)$")
+
+
+def _xlsx_column_index(reference: str) -> int | None:
+    """`C12` -> 2（0 基列号）。认不出来就返回 None，由调用方决定怎么退。"""
+    match = _XLSX_CELL_REFERENCE.match(reference)
+    if not match:
+        return None
+    index = 0
+    for letter in match.group(1).upper():
+        index = index * 26 + (ord(letter) - ord("A") + 1)
+    return index - 1
+
+
+def _xlsx_column_name(index: int) -> str:
+    name = ""
+    position = index + 1
+    while position:
+        position, remainder = divmod(position - 1, 26)
+        name = chr(ord("A") + remainder) + name
+    return name
+
+
+def _xlsx_workbook_sheets(
+    archive: zipfile.ZipFile, suffix: str,
+) -> list[tuple[str, str]]:
+    """工作表名与它在包里对应的成员路径。
+
+    名字要**来自 workbook.xml**，不能用 `sheet1.xml` 推：位置里写的是用户看得见的那张表，
+    而文件编号与显示顺序无关（挪动工作表不会重命名文件）。
+    """
+    workbook_name = "xl/workbook.xml"
+    root = _parse_xml(_package_member(archive, workbook_name, suffix), workbook_name, suffix)
+    relationships_name = "xl/_rels/workbook.xml.rels"
+    relationships = _parse_xml(
+        _package_member(archive, relationships_name, suffix), relationships_name, suffix,
+    )
+    targets = {
+        relationship.get("Id"): relationship.get("Target")
+        for relationship in relationships
+    }
+
+    container = root.find(f"{_S}sheets")
+    if container is None:
+        raise UnsupportedFormat(f"{suffix} 包里的 {workbook_name} 没有 sheets")
+
+    sheets: list[tuple[str, str]] = []
+    for sheet in container.findall(f"{_S}sheet"):
+        name = sheet.get("name") or ""
+        target = targets.get(sheet.get(f"{_R}id") or "")
+        if not name or not target:
+            raise UnsupportedFormat(
+                f"{suffix} 的工作表 {name or '(无名)'} 没有可读的正文成员"
+            )
+        # Target 可以是相对 `xl/` 的路径，也可以是以 / 开头的包内绝对路径。
+        member = target.lstrip("/") if target.startswith("/") else f"xl/{target}"
+        sheets.append((name, member))
+    if not sheets:
+        raise UnsupportedFormat(f"{suffix} 包里没有任何工作表")
+    return sheets
+
+
+def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+    # 没有共享字符串表是合法的（整张表只用内联字符串或数字），不是缺件。
+    try:
+        raw = archive.read("xl/sharedStrings.xml")
+    except KeyError:
+        return []
+    root = _parse_xml(raw, "xl/sharedStrings.xml", ".xlsx")
+    return [
+        "".join(node.text or "" for node in item.iter(f"{_S}t"))
+        for item in root.findall(f"{_S}si")
+    ]
+
+
+def _xlsx_cell_value(cell: ElementTree.Element, shared: list[str]) -> str:
+    kind = cell.get("t")
+    if kind == "s":
+        raw = cell.find(f"{_S}v")
+        index = (raw.text or "").strip() if raw is not None and raw.text else ""
+        if not index.isdigit() or int(index) >= len(shared):
+            return ""
+        return shared[int(index)]
+    if kind == "inlineStr":
+        return "".join(node.text or "" for node in cell.iter(f"{_S}t")).strip()
+    if kind == "b":
+        raw = cell.find(f"{_S}v")
+        return "TRUE" if (raw is not None and (raw.text or "").strip() == "1") else "FALSE"
+    # 数字、`t="str"`（公式的字符串结果）、`t="e"`（错误码）都直接取 <v> 的原文。
+    # 日期不做转换：那需要先读 styles.xml 的 numFmt，见模块末尾的已知限制。
+    raw = cell.find(f"{_S}v")
+    return (raw.text or "").strip() if raw is not None and raw.text else ""
+
+
+def _xlsx_sheet_rows(
+    sheet_root: ElementTree.Element, shared: list[str],
+) -> list[tuple[int, list[tuple[int, str]]]]:
+    """(行号, [(0 基列号, 值)])——只保留有值的单元格，全空行不出现在结果里。"""
+    data = sheet_root.find(f"{_S}sheetData")
+    if data is None:
+        return []
+    rows: list[tuple[int, list[tuple[int, str]]]] = []
+    current_row = 0
+    for row_element in data.findall(f"{_S}row"):
+        declared = row_element.get("r")
+        current_row = int(declared) if declared and declared.isdigit() else current_row + 1
+        column = -1
+        values: list[tuple[int, str]] = []
+        for cell in row_element.findall(f"{_S}c"):
+            # 单元格可以不写 `r`（有的生成器只在跳列时才写）。不推断的话格子会全挤到第一
+            # 列，引用就指向错的格子；所以缺 `r` 时按同行上一个单元格右移一格。
+            reference = cell.get("r")
+            if reference:
+                resolved = _xlsx_column_index(reference)
+                column = resolved if resolved is not None else column + 1
+            else:
+                column += 1
+            value = _xlsx_cell_value(cell, shared)
+            if value:
+                values.append((column, value))
+        if values:
+            rows.append((current_row, values))
+    return rows
+
+
+def _xlsx_bands(
+    rows: list[tuple[int, list[tuple[int, str]]]],
+) -> list[list[tuple[int, list[tuple[int, str]]]]]:
+    """把行切成块：连续的行归一块，且不超过 `SHEET_ROWS_PER_BLOCK` 行。
+
+    不连续的行必须**断开**：位置声明的范围里每一行都要在文本里，否则"A1:A3"配两行文本，
+    引用能对上位置却对不上内容。
+    """
+    bands: list[list[tuple[int, list[tuple[int, str]]]]] = []
+    current: list[tuple[int, list[tuple[int, str]]]] = []
+    previous: int | None = None
+    for row in rows:
+        if current and (row[0] != previous + 1 or len(current) >= SHEET_ROWS_PER_BLOCK):
+            bands.append(current)
+            current = []
+        current.append(row)
+        previous = row[0]
+    if current:
+        bands.append(current)
+    return bands
+
+
+def _parse_xlsx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBlock, ...]:
+    shared = _xlsx_shared_strings(archive)
+    blocks: list[ParsedBlock] = []
+    for name, member in _xlsx_workbook_sheets(archive, suffix):
+        sheet_root = _parse_xml(_package_member(archive, member, suffix), member, suffix)
+        for band in _xlsx_bands(_xlsx_sheet_rows(sheet_root, shared)):
+            first_row, last_row = band[0][0], band[-1][0]
+            first_column = min(column for _, values in band for column, _ in values)
+            last_column = max(column for _, values in band for column, _ in values)
+            # 位置声明了列范围，文本就必须逐列对得上，所以空单元格用制表符占位——
+            # 压掉它会让"B 列是空的"变成"这一行只有两列"，引用里的列号就错位了。
+            lines = [
+                "\t".join(
+                    dict(values).get(column, "")
+                    for column in range(first_column, last_column + 1)
+                )
+                for _, values in band
+            ]
+            blocks.append(ParsedBlock(
+                text="\n".join(lines),
+                location=(
+                    f"sheet:{name}!"
+                    f"{_xlsx_column_name(first_column)}{first_row}:"
+                    f"{_xlsx_column_name(last_column)}{last_row}"
+                ),
+                kind="sheet",
+            ))
+    return tuple(blocks)
+
+
 # ── 入口 ──────────────────────────────────────────────────────────────
 
+def _read_text(path: Path) -> str:
+    return Path(path).read_text(encoding="utf-8", errors="replace")
+
+
+def _parse_ooxml(path: Path, parse_package) -> tuple[ParsedBlock, ...]:
+    suffix = Path(path).suffix.casefold()
+    with _open_package(path) as archive:
+        return parse_package(archive, suffix)
+
+
 _PARSERS = {
-    ".txt": _parse_plain_text,
-    ".md": _parse_markdown,
-    ".markdown": _parse_markdown,
-    ".html": _parse_html,
-    ".htm": _parse_html,
+    ".txt": lambda path: _parse_plain_text(_read_text(path)),
+    ".md": lambda path: _parse_markdown(_read_text(path)),
+    ".markdown": lambda path: _parse_markdown(_read_text(path)),
+    ".html": lambda path: _parse_html(_read_text(path)),
+    ".htm": lambda path: _parse_html(_read_text(path)),
+    ".docx": partial(_parse_ooxml, parse_package=_parse_docx_package),
+    ".pptx": partial(_parse_ooxml, parse_package=_parse_pptx_package),
+    ".xlsx": partial(_parse_ooxml, parse_package=_parse_xlsx_package),
 }
 
 
@@ -247,13 +615,19 @@ def parse_document(path: Path) -> tuple[ParsedBlock, ...]:
     静默少一份资料——用户看不出差别，直到答案开始不对。
     """
 
-    suffix = Path(path).suffix.casefold()
+    path = Path(path)
+    suffix = path.suffix.casefold()
     parser = _PARSERS.get(suffix)
     if parser is None:
         if suffix in PENDING_SUFFIXES:
             raise UnsupportedFormat(
-                f"{suffix} parsing is not yet supported: it needs a dependency decision "
-                "(PyInstaller size) before it can be added"
+                f"{suffix} 还没做：要先决定引入哪个 PDF 库（会给安装包增重），"
+                "所以现在显式拒绝，而不是当成一份空文件"
+            )
+        if suffix in LEGACY_SUFFIXES:
+            raise UnsupportedFormat(
+                f"{suffix} 是旧版 Office 二进制格式，本产品不解析它："
+                f"请先另存为 {LEGACY_SUFFIXES[suffix]} 再导入"
             )
         raise UnsupportedFormat(f"unsupported document format: {suffix or '(no suffix)'}")
-    return parser(Path(path).read_text(encoding="utf-8", errors="replace"))
+    return parser(path)

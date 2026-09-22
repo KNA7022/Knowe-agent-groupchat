@@ -188,18 +188,18 @@ def test_unsupported_suffix_fails_loudly(tmp_path: Path) -> None:
         parse_document(path)
 
 
-def test_office_and_pdf_are_named_as_not_yet_supported(tmp_path: Path) -> None:
-    """PDF 与三种 Office 格式**必须**被明确列为"尚未支持"，而不是走"未知后缀"。
+def test_pdf_is_named_as_not_yet_supported(tmp_path: Path) -> None:
+    """PDF **必须**被明确列为"还没做"，而不是走"未知后缀"。
 
     两者的运维含义不同：一个是"我们还没做"，另一个是"这个文件类型我们不管"。混在一起
-    会让人以为 PDF 永远不支持。
+    会让人以为 PDF 永远不支持。PDF 要等一个库的取舍决定；三种 Office 格式已经用标准库
+    支持了（见 `test_rag_office_parsers.py`）。
     """
-    for name in ("a.pdf", "a.docx", "a.pptx", "a.xlsx"):
-        path = tmp_path / name
-        path.write_bytes(b"stub")
-        with pytest.raises(UnsupportedFormat) as caught:
-            parse_document(path)
-        assert "not yet" in str(caught.value).lower()
+    path = tmp_path / "a.pdf"
+    path.write_bytes(b"%PDF-1.7 stub")
+    with pytest.raises(UnsupportedFormat) as caught:
+        parse_document(path)
+    assert "还没做" in str(caught.value)
 
 
 def test_parsing_is_deterministic(tmp_path: Path) -> None:
