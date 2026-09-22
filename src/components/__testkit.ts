@@ -76,6 +76,15 @@ export function installSocketSpy(): SocketSpy {
     reject: (id: string, projectId: string) => { spy.rejected.push({ id, projectId }); },
     createProject: (id: string, name: string) => { spy.created.push({ id, name }); },
     addAgents: () => {},   // [v1.0.23.4] 中途添加：测试桩记录可选项，静默即可
+    // The six below were added to `SocketAPI` after this stub was written, so it stopped being
+    // assignable. Silent stubs, matching `addAgents` above: a test that needs to assert on one of
+    // them should record into `spy` deliberately rather than have this guess what to capture.
+    feedbackInstruction: () => {},
+    stopWorker: () => {},
+    setProjectDirectory: () => {},
+    cancelProjectDirectory: () => {},
+    sendCommand: () => {},
+    noteIncremental: () => {},
     requestSnapshot: () => {},
     watermarks: {},
     status: 'live' as ConnStatus,

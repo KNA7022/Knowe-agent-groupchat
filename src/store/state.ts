@@ -671,17 +671,22 @@ type ActivityIdentity = { scopeId: string; channelId: string };
 
 const LEGACY_ACTIVITY_SCOPE = 'legacy-single-turn';
 
-function activityIdentity(c: Conv, ev: ActivityLike): ActivityIdentity {
-  const taskId = optionalString(ev.task_id);
-  const attemptId = optionalString(ev.attempt_id);
-  const scopeId = optionalString(ev.scope_id)
+function activityIdentity(c: Conv, ev: unknown): ActivityIdentity {
+  // `InboundEvent` is a 32-variant union and one of its variants is zod-inferred, which TypeScript
+  // does not consider structurally assignable to `ActivityLike` even though every field below is
+  // read through a runtime guard anyway. Taking `unknown` and narrowing once keeps that guard
+  // explicit instead of scattering `as ActivityLike` across the call sites.
+  const bag = (typeof ev === 'object' && ev !== null ? ev : {}) as ActivityLike;
+  const taskId = optionalString(bag.task_id);
+  const attemptId = optionalString(bag.attempt_id);
+  const scopeId = optionalString(bag.scope_id)
     || (taskId && attemptId ? `task:${taskId}:attempt:${attemptId}` : undefined)
-    || optionalString(ev.run_id)
-    || optionalString(ev.completion_id)
+    || optionalString(bag.run_id)
+    || optionalString(bag.completion_id)
     || LEGACY_ACTIVITY_SCOPE;
   return {
     scopeId,
-    channelId: optionalString(ev.channel_id) || c.projectId,
+    channelId: optionalString(bag.channel_id) || c.projectId,
   };
 }
 

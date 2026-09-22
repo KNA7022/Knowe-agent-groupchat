@@ -137,8 +137,11 @@ export function appendToolActivity(
       && parseToolActivity(line.tool).name === parsed.name
     ));
 
-    if (pendingIdx >= 0) {
-      const pending = list[pendingIdx];
+    // `noUncheckedIndexedAccess` cannot tell that a non-negative `findIndex` result indexes an
+    // existing element, so the lookup is narrowed explicitly — the same shape as the `last &&`
+    // guards below, rather than a `!` that nobody can check later.
+    const pending = pendingIdx >= 0 ? list[pendingIdx] : undefined;
+    if (pending) {
       let concreteIdx = pendingIdx;
       if (pending.n > 1) {
         pending.n -= 1;
@@ -150,7 +153,7 @@ export function appendToolActivity(
 
       const line = list[concreteIdx];
       const prev = list[concreteIdx - 1];
-      if (prev && !prev.pendingDetail && prev.tool === line.tool) {
+      if (line && prev && !prev.pendingDetail && prev.tool === line.tool) {
         prev.n += line.n;
         list.splice(concreteIdx, 1);
         concreteIdx -= 1;

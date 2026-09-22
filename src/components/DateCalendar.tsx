@@ -56,6 +56,9 @@ async function probeMonth(
   const worker = async (): Promise<void> => {
     while (idx < dates.length) {
       const my = dates[idx++];
+      // `noUncheckedIndexedAccess` makes this `string | undefined`; skipping it here also lets
+      // the two uses below (`URLSearchParams` and `found.add`) stay plainly typed.
+      if (my === undefined) continue;
       try {
         const q = new URLSearchParams({
           project_id: projectId, date: my, page: '1', page_size: '1',

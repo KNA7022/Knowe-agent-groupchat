@@ -299,8 +299,13 @@ function insertProjectOrder(draft: ConversationOrderDraft, pid: string): void {
     draft.projectOrder.unshift(pid);
   } else {
     let afterPins = 0;
-    while (afterPins < draft.projectOrder.length
-           && !!draft.pinnedProjects[draft.projectOrder[afterPins]]) afterPins += 1;
+    // `noUncheckedIndexedAccess` types `projectOrder[afterPins]` as possibly undefined even
+    // inside the bounds check, so the element is pulled out once and narrowed.
+    while (afterPins < draft.projectOrder.length) {
+      const nextPid = draft.projectOrder[afterPins];
+      if (!nextPid || !draft.pinnedProjects[nextPid]) break;
+      afterPins += 1;
+    }
     draft.projectOrder.splice(afterPins, 0, pid);
   }
   normalizeProjectOrder(draft);
@@ -319,8 +324,11 @@ function bumpProjectOrder(draft: ConversationOrderDraft, pid: string): void {
   }
   draft.projectOrder.splice(idx, 1);
   let afterPins = 0;
-  while (afterPins < draft.projectOrder.length
-         && !!draft.pinnedProjects[draft.projectOrder[afterPins]]) afterPins += 1;
+  while (afterPins < draft.projectOrder.length) {
+    const nextPid = draft.projectOrder[afterPins];
+    if (!nextPid || !draft.pinnedProjects[nextPid]) break;
+    afterPins += 1;
+  }
   draft.projectOrder.splice(afterPins, 0, pid);
 }
 
@@ -369,7 +377,7 @@ function reconcileConversationStateAlias(
   if (!requestProjectId || !canonicalProjectId || requestProjectId === canonicalProjectId) return;
   const oldPinned = Object.prototype.hasOwnProperty.call(
     draft.pinnedProjects, requestProjectId,
-  ) ? draft.pinnedProjects[requestProjectId] : 0;
+  ) ? (draft.pinnedProjects[requestProjectId] ?? 0) : 0;
   const oldMuted = !!draft.mutedProjects[requestProjectId];
   const oldFolded = !!draft.foldedProjects[requestProjectId];
   const canonicalKnown = Object.prototype.hasOwnProperty.call(
@@ -495,7 +503,8 @@ function reconcileSnapshotAlias(requestProjectId: string, canonicalProjectId: st
     if (_snapQueue[i] === requestProjectId) _snapQueue[i] = canonicalProjectId;
   }
   for (let i = _snapQueue.length - 1; i >= 0; i -= 1) {
-    if (_snapQueue.indexOf(_snapQueue[i]) !== i) _snapQueue.splice(i, 1);
+    const entry = _snapQueue[i];
+    if (entry !== undefined && _snapQueue.indexOf(entry) !== i) _snapQueue.splice(i, 1);
   }
 }
 
@@ -1179,7 +1188,8 @@ export const useKnoweStore = create<KnoweStore>()(
           if (belongsToDeletedProject(convId)) _synced.delete(convId);
         }
         for (let i = _snapQueue.length - 1; i >= 0; i -= 1) {
-          if (belongsToDeletedProject(_snapQueue[i])) _snapQueue.splice(i, 1);
+          const entry = _snapQueue[i];
+          if (entry !== undefined && belongsToDeletedProject(entry)) _snapQueue.splice(i, 1);
         }
 
         set((draft) => {
@@ -1530,7 +1540,10 @@ export const useKnoweStore = create<KnoweStore>()(
           applyEvent(conv, ev, agents, roleTypes);
         }
       });
-      scheduleTransientFrameFallback(projectId, pendingTransientFrameIds(get().convs[projectId]));
+      // `ensureConversation` above guarantees the entry, but the re-read through `get()` is a
+      // fresh lookup that the compiler cannot connect to it — narrowed rather than asserted.
+      const conv = get().convs[projectId];
+      if (conv) scheduleTransientFrameFallback(projectId, pendingTransientFrameIds(conv));
     },
 
     ackTransientFrame(projectId: string, frameId: string): void {

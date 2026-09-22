@@ -130,6 +130,12 @@ const FullCard: React.FC<{ projectId: string; entry: DirectoryEntry }> = ({ proj
   useEffect(() => {
     if (!active) return;
     const total = DIRECTORY_CARD_DURATION_MS / 1000;
+    // Declared before `tick` so the timeout branch can reach it. The old code called
+    // `clearInterval(t)` — `t` is the i18n translate function in this file, not a timer handle,
+    // so the interval was never cleared and kept ticking (re-rendering every second) until the
+    // component unmounted. `tick()` runs once before the interval exists, hence the undefined
+    // check rather than an unconditional call.
+    let timer: ReturnType<typeof setInterval> | undefined;
     const tick = (): void => {
       const left = (openUntil - Date.now()) / 1000;
       setRemain(left);
@@ -137,13 +143,13 @@ const FullCard: React.FC<{ projectId: string; entry: DirectoryEntry }> = ({ proj
       if (bar) bar.style.transform = `scaleX(${Math.max(0, Math.min(100, (left / total) * 100)) / 100})`;
       if (left <= 0 && !firedRef.current) {
         firedRef.current = true;
-        clearInterval(t);
+        if (timer !== undefined) clearInterval(timer);
         // 超时 = 回退到暂缓态：回传取消并收起（红字留着，不循环弹）。
         cancel(projectId);
       }
     };
     tick();
-    const timer = setInterval(tick, 1000);
+    timer = setInterval(tick, 1000);
     return () => clearInterval(timer);
   }, [projectId, openUntil, active]);
 

@@ -109,7 +109,7 @@ describe('v0.23 问题二 · 推理可见性', () => {
     }
     const acts = (c.items[0] as AgentItem).activities!;
     expect(acts.length).toBeLessThanOrEqual(6);
-    expect(acts[acts.length - 1].tool).toBe('tool_39');     // 留的是最近的
+    expect(acts.at(-1)?.tool).toBe('tool_39');     // 留的是最近的
   });
 
   it('没有流式气泡时 tool_gen 自愈建立过程气泡', () => {
@@ -248,7 +248,7 @@ describe('v0.23 问题三 · 卡片和它上面那句话', () => {
 
     const agents = c.items.filter((x) => x.kind === 'agent') as AgentItem[];
     expect(agents).toHaveLength(1);
-    expect(agents[0].text).toBe('好，我派给宋陈。');
+    expect(agents[0]?.text).toBe('好，我派给宋陈。');
   });
 });
 

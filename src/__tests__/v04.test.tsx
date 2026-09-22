@@ -196,7 +196,7 @@ describe('头像 · Avatar 组件', () => {
     const { container } = render(<Avatar glyph="前" src="./avatars/agent/不存在.png" />);
     await waitFor(() => expect(container.querySelector('img')).not.toBeNull());
     const img = container.querySelector('img');
-
+    if (!img) throw new Error('the avatar image was never rendered');
     fireEvent.error(img);   // 走 React 合成事件，原生 dispatchEvent 到不了 onError
 
     await waitFor(() => expect(container.querySelector('img')).toBeNull());
