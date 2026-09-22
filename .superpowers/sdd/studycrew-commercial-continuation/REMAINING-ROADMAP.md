@@ -51,17 +51,24 @@ The two items inside Task 6 that are **independent of everything else**, and che
 Start with those two, then Task 3's **data layer** (parsers + AES-256-GCM store) before anything
 touching models. Reasons: the collection errors are small, independent, and immediately raise how
 much the repository's own tests are worth; and within Task 3 the parsers plus encrypted store are
-what everything else — OCR, embeddings, indexes, memories — is built on, while the capability-pack
-machinery (download, SHA-256, atomic install/rollback) depends on external artefacts and model
-licences and can be sequenced later.
+what everything else — page rendering, embeddings, indexes, memories — is built on, while the
+capability-pack machinery (download, SHA-256, atomic install/rollback) depends on external
+artefacts and model licences and can be sequenced later. Dropping the local OCR engine (see below)
+removed the largest piece of that machinery.
 
 ## What I have not estimated
 
 Sizes for Tasks 3–5. I have no measurement for them, and inventing a number would be the same
 failure this project keeps punishing. The one real datum is Task 2: ~3,200 + ~1,600 lines across
-nine review rounds, and Task 3 is specified to be larger than Task 2 (seven document formats, an
-ONNX OCR path, an optional cloud-vision fallback, two index types, hybrid retrieval with RRF and
-MMR, and an encryption layer over five kinds of artefact).
+nine review rounds.
+
+The local OCR path was **removed from the Task 3 spec on 2026-09-21** (decision recorded in
+`.superpowers/plans/studycrew-commercial-continuation.md`, including its consequences). What
+Task 3 still needs to build is: seven document parsers, local page rendering for text-layer-free
+PDFs, an ONNX embedding pack with the download/verify/install/rollback machinery, an AES-256-GCM
+store, two index types, and hybrid retrieval with RRF and MMR. What it no longer needs is an OCR
+engine or OCR capability pack — which was the single largest piece of the original spec, and the
+only one that would have shipped a second ONNX model plus a licence manifest.
 
 ## Two decisions that belong to the user, not to me
 

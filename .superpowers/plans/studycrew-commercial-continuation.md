@@ -9,7 +9,7 @@
 - User data is local-first. Chat, difficult vision and optional cloud embeddings use BYOK only after DLP authorization.
 - Group and task authority are backend-owned. Retrieved content and memories are untrusted and cannot grant tools or change policy.
 - Preserve upstream MIT attribution; record Mem0 Apache-2.0 and model licenses.
-- No plaintext secrets, PII, source bodies, memories, embeddings or OCR caches in logs, telemetry, diagnostics or durable indexes.
+- No plaintext secrets, PII, source bodies, memories, embeddings or vision-extracted page text in logs, telemetry, diagnostics or durable indexes.
 - Files remain UTF-8. Preserve user-owned untracked `skills/`; never modify or commit it.
 - Each task requires focused tests and independent 0 Critical / 0 Important review before dependent work begins.
 
@@ -33,12 +33,14 @@
 
 ## Task 3: Implement local-first encrypted RAG
 
-- Parse PDF, DOCX, PPTX, XLSX, Markdown, TXT and HTML locally with structural locations.
-- Ship no PaddlePaddle runtime. Download a pinned PP-OCRv6 Small ONNX capability pack on demand with license manifest, SHA-256 verification and atomic install/rollback/delete.
-- Use BYOK multimodal vision only for formulas, charts, complex tables and low-confidence pages after DLP approval.
+- Parse PDF, DOCX, PPTX, XLSX, Markdown, TXT and HTML locally with structural locations. A PDF with a text layer needs no model at all — extraction is pure local parsing.
+- Pages with **no** text layer (scans, photographs, slide and textbook images) are rendered locally to page images and read by a BYOK multimodal model after DLP approval. **There is no local OCR engine and no OCR capability pack** (decision 2026-09-21): a multimodal model reads complex layouts, formulas, tables and handwriting better than a small local OCR model, and dropping the engine removes an entire download / licence-manifest / SHA-256 / atomic-install / rollback / delete subsystem. Local page rendering (pdfium or pymupdf, offline and free) is still required and is not OCR.
+- Consequence of that decision, recorded here so it is a known trade rather than a later discovery:
+  - a user with no BYOK provider configured **cannot** turn a scanned page into text at all, where the local OCR path would have managed it offline;
+  - every scanned page leaves the machine (under DLP authorization) where the local path would have kept it local. Text-layer documents are unaffected and remain fully local.
 - Use local INT8 ONNX `multilingual-e5-small` by default; offer BGE-M3 as an optional quality pack; cloud embeddings require per-source authorization.
 - Implement deterministic child/parent chunks, stable IDs, deduplication, incremental rebuild and delete propagation.
-- Encrypt sources, OCR, chunks, embeddings and caches with AES-256-GCM; keep only opaque metadata plaintext.
+- Encrypt sources, vision-extracted text, chunks, embeddings and caches with AES-256-GCM; keep only opaque metadata plaintext.
 - Build group/course-scoped in-memory BM25 and USearch indexes; retrieve BM25 40, vector 40 and graph 10, then RRF, optional rerank, MMR and 8-12 evidence packing.
 - Verify permission, version, course isolation and exact citations; abstain for unsupported school facts.
 
@@ -64,7 +66,7 @@
 
 - Eliminate renderer TypeScript baseline diagnostics and backend `ACTION_CONTRACT` collection failures.
 - Verify Electron/Node/Python alignment, PyInstaller sidecar, reproducible Windows NSIS, install/upgrade/migration/uninstall, crash recovery and encrypted backup.
-- Make OCR/embedding packs independently downloadable, verifiable, removable and disk-usage visible.
+- Make embedding packs independently downloadable, verifiable, removable and disk-usage visible. (The OCR pack was removed together with the local OCR path — see Task 3.)
 - Prepare certificate injection and signed-update verification; unsigned builds remain controlled trial artifacts with public auto-update disabled.
 - Add third-party notices, privacy documentation, threat model, permission matrix, PII flow, architecture diagrams and reproducible demo data.
 - Build at least 120 sanitized/synthetic scenarios, fault-injection reports, demo script, README/architecture summary and truthful resume/interview material.
