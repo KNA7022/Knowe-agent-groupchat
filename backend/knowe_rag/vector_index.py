@@ -117,14 +117,17 @@ class VectorIndex:
         排序在 Python 里做而不是 `np.argsort`：同分时要按 id 定序，而 numpy 的排序不保证
         稳定，`argsort` 加上稳定的 `kind` 也只保证"输入顺序"，不保证"id 顺序"。对个人知识
         库的规模，这点开销远小于一次网络调用。
+
+        维度校验放在空索引判断**之前**：反过来的话，空索引 + 错误维度会静默返回空结果，
+        调用方看到的是"库里没有相关内容"——一个维度错误伪装成了一次没有命中。
         """
-        if limit <= 0 or self._count == 0:
-            return ()
         query = np.asarray(vector, dtype="float32")
         if query.shape != (self._dimensions,):
             raise VectorIndexError(
                 f"查询向量维度是 {query.shape}，索引期望 ({self._dimensions},)"
             )
+        if limit <= 0 or self._count == 0:
+            return ()
         block = self._matrix[: self._count]
         query_norm = float(np.linalg.norm(query))
         norms = np.linalg.norm(block, axis=1) * query_norm

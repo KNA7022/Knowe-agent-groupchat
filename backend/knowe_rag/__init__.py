@@ -39,17 +39,27 @@ from .parsers import (
     UnsupportedFormat,
     parse_document,
 )
+from .retrieval import (
+    BM25_RECALL,
+    GRAPH_RECALL,
+    VECTOR_RECALL,
+    RetrievalError,
+    ScopeIndex,
+)
 from .store import EncryptedKnowledgeStore, StoreError
 from .vector_index import VectorIndex, VectorIndexError
 
 __all__ = [
+    "BM25_RECALL",
     "CHILD_MAX_CHARS",
     "EVIDENCE_MAXIMUM",
     "EVIDENCE_MINIMUM",
+    "GRAPH_RECALL",
     "LEGACY_SUFFIXES",
     "PARENT_MAX_CHARS",
     "SHEET_ROWS_PER_BLOCK",
     "SUPPORTED_SUFFIXES",
+    "VECTOR_RECALL",
     "Bm25Index",
     "Chunk",
     "EmbeddingRequest",
@@ -59,7 +69,9 @@ __all__ = [
     "MasterKeyError",
     "ParsedBlock",
     "ReindexPlan",
+    "RetrievalError",
     "RetrievedChunk",
+    "ScopeIndex",
     "StoreError",
     "UnsupportedFormat",
     "VectorIndex",

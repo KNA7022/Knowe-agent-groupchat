@@ -153,6 +153,16 @@ def test_a_query_of_the_wrong_dimension_is_refused() -> None:
         index.search([1.0, 0.0, 0.0], limit=1)
 
 
+def test_a_wrong_dimension_query_is_refused_even_on_an_empty_index() -> None:
+    """空索引也要校验维度。
+
+    校验写在"索引为空就返回空"之后的话，一个维度错误会伪装成一次没有命中：调用方看到的是
+    "库里没有相关内容"，于是去查库、查数据，而问题在参数上。
+    """
+    with pytest.raises(VectorIndexError):
+        VectorIndex(dimensions=3).search([1.0, 0.0], limit=1)
+
+
 def test_a_zero_dimension_index_is_refused() -> None:
     with pytest.raises(VectorIndexError):
         VectorIndex(dimensions=0)
