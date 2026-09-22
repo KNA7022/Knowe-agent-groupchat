@@ -22,6 +22,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+import uuid
 
 import httpx
 import pytest
@@ -35,7 +36,7 @@ from backend.commercial_gateway import (
 )
 from backend.groups import GroupRepository
 from backend.knowe_core.provider_client import ProviderClient
-from backend.task_runtime.contracts import TaskStatus
+from backend.task_runtime.contracts import RiskLevel, TaskStatus
 from backend.task_runtime.service import TaskRuntimeService
 
 ALIBABA = "https://dashscope.aliyuncs.com"
@@ -69,6 +70,7 @@ def _client(
     provider: str = "alibaba",
     base_url: str = ALIBABA,
     model: str = "qwen-vl-max",
+    max_retries: int = 0,
 ) -> ProviderGatewayClient:
     client = ProviderGatewayClient(
         base_url=base_url, api_key="k", model=model, provider=provider,
@@ -80,6 +82,7 @@ def _client(
             base_url=base_url,
             api_key="k",
             model=model,
+            max_retries=max_retries,
             client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
             _gateway_managed=True,
         ),
@@ -376,3 +379,244 @@ def test_a_jpeg_is_accepted_as_well_as_a_png(tmp_path: Path) -> None:
 
     url = messages[0]["content"][1]["image_url"]["url"]
     assert url.startswith("data:image/jpeg;base64,")
+
+
+# ── 成功路径（第十次复审的三条发现都指向这里） ───────────────────────
+#
+# 这一节之前**完全不存在**：文件里每一次调用都是"被拒"，`_authority(..., approval_id=...)`
+# 的两个参数从没被传过。于是 approval → claim → effect → 终态 → 对账这条链在 vision 上零
+# 端到端覆盖，第十次复审实测：把这条链上的任何一步删掉，27 个测试全绿。
+#
+# 审批准入为什么可行：`_authorize` 把自己的 `operation_scope` 交给 `prepare_tool`，而 grant
+# 的 scope 是审批时给的——两者不必逐字相同（实测：空 scope 的 grant 也能放行），所以测试
+# 不需要预知运行时算出的那串摘要。
+
+def _operation_scope_for(client, runtime, group, run, images, prompt) -> dict[str, str]:
+    """读出真正的 `_authorize` 会用的 `operation_scope`。
+
+    做法：给一对**格式合法但不存在**的 approval/grant，让流程走到 `prepare_tool` 再被拒——
+    那一步会把 scope 交出来。
+
+    为什么不在测试里把那六个 sha256 复刻一遍：`task_runtime/service.py:1101` 要求
+    `grant.operation_scope` 与请求的 scope **完全相等**，而复刻件一旦与实现漂移，失败会出现在
+    一个与原因无关的地方。从真实调用里读，漂移不可能发生。
+    """
+    captured: dict[str, str] = {}
+    original = runtime.prepare_tool
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs.get("operation_scope") or {})
+        return original(*args, **kwargs)
+
+    runtime.prepare_tool = spy
+    try:
+        authority = LegacyToolAuthority(
+            group_id=group.group_id, task_id=run.task_id, run_id=run.run_id,
+            runtime=runtime,
+            approval_id="apr_" + "0" * 32, grant_id="grant_" + "0" * 32,
+        )
+
+        async def attempt():
+            with legacy_tool_authority_context(authority):
+                await client.vision(images, prompt=prompt)
+
+        with pytest.raises(GatewayDenied):
+            asyncio.run(attempt())
+    finally:
+        runtime.prepare_tool = original
+    assert captured, "没有捕获到 operation_scope——授权流程没有走到 prepare_tool"
+    return captured
+
+
+def _approve_provider_egress(runtime, group, run, scope: dict[str, str]) -> tuple[str, str]:
+    """按给定的 scope 建一条真实的 provider_egress 审批，返回 `(approval_id, grant_id)`。"""
+    approval = runtime.request_approval(
+        group.group_id, run.run_id, kind="tool", summary="Allow one provider egress",
+        risk=RiskLevel.HIGH, request_key=f"approve-{uuid.uuid4().hex}",
+        requested_capabilities=("provider_egress",), tool_name="provider_egress",
+        operation_scope=scope, purpose="provider_egress",
+    )
+    _resolved, grant, _owner = runtime.resolve_approval(
+        group.group_id, approval.approval_id, approved=True,
+        capabilities=("provider_egress",), request_key=f"resolve-{uuid.uuid4().hex}",
+    )
+    assert grant is not None
+    return approval.approval_id, grant.grant_id
+
+
+def _vision_ok(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [{"message": {"content": "这一页讲的是二次函数"}}],
+            "usage": {"prompt_tokens": 1200, "completion_tokens": 30},
+        },
+    )
+
+
+def test_a_successful_vision_call_reaches_the_provider(tmp_path: Path) -> None:
+    """先证明这条链**能走通**，否则下面几条断言的成功路径等于没被执行过。"""
+    runtime, group, run = _runtime_with_run(tmp_path, "vision-ok")
+    probe = _client(_vision_ok)
+    scope = _operation_scope_for(probe, runtime, group, run, [_PNG_STUB], "这一页讲了什么")
+    approval_id, grant_id = _approve_provider_egress(runtime, group, run, scope)
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return _vision_ok(request)
+
+    client = _client(handler)
+    authority = _authority(runtime, group, run, approval_id=approval_id, grant_id=grant_id)
+
+    async def call():
+        with legacy_tool_authority_context(authority):
+            return await client.vision([_PNG_STUB], prompt="这一页讲了什么")
+
+    result = asyncio.run(call())
+
+    assert len(calls) == 1
+    assert result["choices"][0]["message"]["content"] == "这一页讲的是二次函数"
+    runtime.close()
+
+
+def test_a_successful_vision_call_writes_a_terminal_audit_event(tmp_path: Path) -> None:
+    """F1-1：成功路径必须写终态。
+
+    没有它，公开审计里只有 `authorized`——**这张图到底发出去了没有、什么时候结束、花了多少
+    token，事后没有任何记录可查**，而每次 vision 都会 prepare + claim 一个 HIGH risk 的
+    invocation。第十次复审实测：把这一段整段删掉，27 个测试全绿。这条测试就是为了让那种删除
+    立刻变红。
+    """
+    runtime, group, run = _runtime_with_run(tmp_path, "vision-terminal")
+    client = _client(_vision_ok)
+    scope = _operation_scope_for(client, runtime, group, run, [_PNG_STUB], "这一页讲了什么")
+    approval_id, grant_id = _approve_provider_egress(runtime, group, run, scope)
+    authority = _authority(runtime, group, run, approval_id=approval_id, grant_id=grant_id)
+
+    async def call():
+        with legacy_tool_authority_context(authority):
+            await client.vision([_PNG_STUB], prompt="这一页讲了什么")
+
+    asyncio.run(call())
+
+    statuses = _egress_statuses(runtime, run)
+    assert "authorized" in statuses, statuses
+    assert "completed" in statuses, statuses
+    terminal = next(
+        event for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "provider_egress"
+        and event.public_payload.get("status") == "completed"
+    )
+    assert "duration_ms" in terminal.public_payload
+    assert terminal.public_payload.get("actual_tokens") == 1230
+    runtime.close()
+
+
+def test_a_successful_vision_call_reconciles_the_reservation(tmp_path: Path) -> None:
+    """F1-2：成功后要按 provider 上报的用量对账。
+
+    预留是上界估计（按 `1 + max_retries` 轮计），不退回就永久多扣。第十次复审用 chat 做了
+    对照：删 chat 的同一行会让 `test_successful_first_attempt_refunds_the_unused_retry_reservation`
+    失败，删 embed/vision 的**五个分支**则全绿——同一步骤，两种调用类型一个有锁一个没有。
+    """
+    runtime, group, run = _runtime_with_run(tmp_path, "vision-settle")
+    client = _client(_vision_ok)
+    scope = _operation_scope_for(client, runtime, group, run, [_PNG_STUB], "这一页讲了什么")
+    approval_id, grant_id = _approve_provider_egress(runtime, group, run, scope)
+    authority = _authority(runtime, group, run, approval_id=approval_id, grant_id=grant_id)
+
+    async def call():
+        with legacy_tool_authority_context(authority):
+            await client.vision([_PNG_STUB], prompt="这一页讲了什么")
+
+    asyncio.run(call())
+
+    # 结算发生在 run 的预算上；这里用**公开事件**观察，因为它就是界面上能看到的那个数字。
+    budgeted = [
+        event for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "budget_updated"
+    ]
+    assert budgeted, "一次成功的调用之后没有任何预算事件——对账没有被执行"
+    # 预留按 attempts 计，实际只发了 1 次，所以轮次维度必须收敛到 1。
+    assert any(
+        event.public_payload.get("usage", {}).get("model_turns") == 1
+        for event in budgeted
+    ), [event.public_payload for event in budgeted]
+    runtime.close()
+
+
+def test_each_image_adds_its_estimated_tokens_to_the_reservation(tmp_path: Path) -> None:
+    """F1-3：每多一张图，预留就该多一份图片估算。
+
+    **不能只断言"预留 ≥ 一张图的估算"**——预留里还有输出那一份（保守上限，上千），它本来就把
+    任何图片估算盖过去了；实测那一版断言在 `extra_input_tokens` 被整个删掉之后照样通过。
+    指向这一项的只有差值。
+
+    这一条比 embedding 那条更隐蔽：值对了、用法没了。
+    """
+    from backend.commercial_gateway import VISION_TOKENS_PER_IMAGE
+
+    def reserved_for(count: int, name: str) -> int:
+        runtime, group, run = _runtime_with_run(tmp_path, name)
+        client = _client(_vision_ok)
+        images = [_PNG_STUB] * count
+        scope = _operation_scope_for(client, runtime, group, run, images, "读")
+        approval_id, grant_id = _approve_provider_egress(runtime, group, run, scope)
+        authority = _authority(runtime, group, run, approval_id=approval_id, grant_id=grant_id)
+
+        async def call():
+            with legacy_tool_authority_context(authority):
+                await client.vision(images, prompt="读")
+
+        asyncio.run(call())
+        authorized = next(
+            event for event in runtime.store.events_after(run.run_id, 0)
+            if getattr(event, "event_type", "") == "provider_egress"
+            and event.public_payload.get("status") == "authorized"
+        )
+        reserved = int(authorized.public_payload["usage"]["tokens"])
+        runtime.close()
+        return reserved
+
+    single = reserved_for(1, "vision-one-image")
+    triple = reserved_for(3, "vision-three-images")
+
+    difference = triple - single
+    # 两张图的差就是两份估算；payload 里图片只记 mime 与长度，序列化本身的增长可以忽略。
+    assert difference >= 2 * VISION_TOKENS_PER_IMAGE - 200, (
+        f"一张图预留 {single}、三张图 {triple}，差值 {difference} 明显小于两份图片估算"
+        f"（{2 * VISION_TOKENS_PER_IMAGE}）——图片 token 没有被计入预留"
+    )
+
+def test_a_failed_vision_call_reconciles_the_attempt_dimensions(tmp_path: Path) -> None:
+    """失败时同样要结算轮次/成本——这是复审所列五个分支里 vision 的最后那一个。
+
+    至此五个分支各自有测试：embed 成功/失败/取消、vision 成功/失败。
+    """
+    runtime, group, run = _runtime_with_run(tmp_path, "vision-fail-settle")
+    client = _client(
+        lambda request: httpx.Response(400, json={"error": "bad"}),
+        max_retries=3,
+    )
+    scope = _operation_scope_for(client, runtime, group, run, [_PNG_STUB], "读")
+    approval_id, grant_id = _approve_provider_egress(runtime, group, run, scope)
+    authority = _authority(runtime, group, run, approval_id=approval_id, grant_id=grant_id)
+
+    async def call():
+        with legacy_tool_authority_context(authority):
+            await client.vision([_PNG_STUB], prompt="读")
+
+    with pytest.raises(Exception):
+        asyncio.run(call())
+
+    budgeted = [
+        event for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "budget_updated"
+    ]
+    assert budgeted, "失败的 vision 调用之后没有任何预算事件——失败路径没有结算"
+    assert any(
+        event.public_payload.get("usage", {}).get("model_turns") == 1
+        for event in budgeted
+    ), [event.public_payload for event in budgeted]
+    runtime.close()

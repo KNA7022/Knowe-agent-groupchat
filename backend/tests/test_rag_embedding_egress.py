@@ -56,6 +56,7 @@ def _client(
     provider: str = "alibaba",
     base_url: str = ALIBABA,
     model: str = "text-embedding-v4",
+    max_retries: int = 0,
 ) -> ProviderGatewayClient:
     client = ProviderGatewayClient(
         base_url=base_url, api_key="k", model=model, provider=provider,
@@ -67,6 +68,7 @@ def _client(
             base_url=base_url,
             api_key="k",
             model=model,
+            max_retries=max_retries,
             client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
             _gateway_managed=True,
         ),
@@ -438,4 +440,110 @@ def test_chat_still_works_after_authorization_learned_a_second_shape(tmp_path: P
     assert result["choices"][0]["message"]["content"] == "ok"
     assert "authorized" in _statuses(runtime, run)
     assert "completed" in _statuses(runtime, run)
+    runtime.close()
+
+
+def test_a_successful_embedding_reconciles_the_reservation(tmp_path: Path) -> None:
+    """F1-2：embed 成功后要按实际尝试次数对账。
+
+    第十次复审实测：把 embed 与 vision 的**五个** `_reconcile_provider_usage` 分支全删掉，
+    测试全绿；而删 chat 的同一行会让 Task 2 的
+    `test_successful_first_attempt_refunds_the_unused_retry_reservation` 失败。同一步骤、
+    同一个共享函数，两种新调用类型没有锁。
+
+    预留按 `1 + max_retries` 轮计，实际只发一次，所以轮次维度必须收敛到 1——不收敛就是**永久
+    多扣**，而向量化是每次导入资料都会发生的调用。
+    """
+    runtime, group, run = _runtime_with_run(tmp_path, "embed-settle")
+
+    # 预留按 `1 + max_retries` 轮计。不设重试的话预留与实际都是 1 轮，**删掉对账也看不出
+    # 差别**——第一版就是这样写的，mutation 当场指出了它（32 个测试仍然全绿）。
+    client = _client(lambda request: _vectors([0.1]), max_retries=3)
+    authority = LegacyToolAuthority(
+        group_id=group.group_id, task_id=run.task_id, run_id=run.run_id, runtime=runtime,
+    )
+
+    async def call():
+        with legacy_tool_authority_context(authority):
+            await client.embed(["一段学习笔记"])
+
+    asyncio.run(call())
+
+    budgeted = [
+        event for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "budget_updated"
+    ]
+    assert budgeted, "一次成功的调用之后没有任何预算事件——对账没有被执行"
+    assert any(
+        event.public_payload.get("usage", {}).get("model_turns") == 1
+        for event in budgeted
+    ), [event.public_payload for event in budgeted]
+    runtime.close()
+
+def test_a_failed_embedding_reconciles_the_attempt_dimensions(tmp_path: Path) -> None:
+    """失败时也要结算**轮次与成本**维度。
+
+    token 维度保持预留是故意的（失败前可能已产生输入消耗，从错误里无法得知），但轮次与成本
+    必须按实际尝试次数收敛。代码注释自己记着此前复审的实测：**"账上 4115 / 真实 0"，22 次
+    调用后 run 被判 BUDGET_EXHAUSTED，而实际只用了 27%**。
+
+    这条与 `test_a_successful_embedding_reconciles_the_reservation` 一起，才是复审所说
+    "五个分支"里属于 embed 的两个。
+    """
+    runtime, group, run = _runtime_with_run(tmp_path, "embed-fail-settle")
+
+    client = _client(
+        lambda request: httpx.Response(400, json={"error": "bad input"}), max_retries=3,
+    )
+    authority = LegacyToolAuthority(
+        group_id=group.group_id, task_id=run.task_id, run_id=run.run_id, runtime=runtime,
+    )
+
+    async def call():
+        with legacy_tool_authority_context(authority):
+            await client.embed(["甲"])
+
+    with pytest.raises(Exception):
+        asyncio.run(call())
+
+    budgeted = [
+        event for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "budget_updated"
+    ]
+    assert budgeted, "失败的调用之后没有任何预算事件——失败路径没有结算"
+    assert any(
+        event.public_payload.get("usage", {}).get("model_turns") == 1
+        for event in budgeted
+    ), [event.public_payload for event in budgeted]
+    runtime.close()
+
+
+def test_a_cancelled_embedding_reconciles_the_attempt_dimensions(tmp_path: Path) -> None:
+    """取消同样要结算——取消不是失败，但预留一样不能 100% 计入。"""
+    runtime, group, run = _runtime_with_run(tmp_path, "embed-cancel-settle")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError()
+
+    client = _client(handler, max_retries=3)
+    authority = LegacyToolAuthority(
+        group_id=group.group_id, task_id=run.task_id, run_id=run.run_id, runtime=runtime,
+    )
+
+    async def call():
+        with legacy_tool_authority_context(authority):
+            await client.embed(["甲"])
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(call())
+
+    budgeted = [
+        event for event in runtime.store.events_after(run.run_id, 0)
+        if getattr(event, "event_type", "") == "budget_updated"
+    ]
+    assert budgeted, "取消的调用之后没有任何预算事件——取消路径没有结算"
+    assert any(
+        event.public_payload.get("usage", {}).get("model_turns") == 1
+        for event in budgeted
+    ), [event.public_payload for event in budgeted]
     runtime.close()
