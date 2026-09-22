@@ -38,7 +38,11 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import backend.engine as E                                          # noqa: E402
-from backend.engine import ACTION_CONTRACT, REPORT_NOTICE, ProjectEngine   # noqa: E402
+from backend.engine import REPORT_NOTICE, ProjectEngine, _engine_block  # noqa: E402
+
+# 见 test_v10182_runtime_ui.py 的说明：`ACTION_CONTRACT` 在 upstream 基线就已外置到
+# prompts/<lang>/engine_blocks.md；按旧的模块级常量导入会让整个文件 collection error。
+ACTION_CONTRACT = _engine_block("ACTION_CONTRACT")
 
 SOUL = Path(E.__file__).parent / "souls" / "coordinator.txt"
 

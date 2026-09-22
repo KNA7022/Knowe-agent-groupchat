@@ -46,7 +46,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import backend.engine as E                                          # noqa: E402
-from backend.engine import ACTION_CONTRACT, WORK_STATUS_CONTEXT     # noqa: E402
+from backend.engine import _engine_block                            # noqa: E402
+
+# 见 test_v10182_runtime_ui.py 的说明：`ACTION_CONTRACT` 与 `WORK_STATUS_CONTEXT` 都在
+# upstream 基线 3a35d8b 就已外置到 prompts/<lang>/engine_blocks.md，按旧的模块级常量导入
+# 会让整个文件 collection error —— 默认 pytest 因此一个测试都不跑。
+ACTION_CONTRACT = _engine_block("ACTION_CONTRACT")
+WORK_STATUS_CONTEXT = _engine_block("WORK_STATUS_CONTEXT")
 
 SOUL = Path(E.__file__).parent / "souls" / "coordinator.txt"
 TOOLS = Path(E.__file__).parent / "tools_knowe.py"

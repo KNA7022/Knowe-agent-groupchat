@@ -12,8 +12,13 @@ from pathlib import Path
 import pytest
 
 import backend.engine as engine_module
-from backend.engine import ACTION_CONTRACT, COORDINATOR, COORDINATOR_ROLE, ProjectEngine
+from backend.engine import COORDINATOR, COORDINATOR_ROLE, ProjectEngine, _engine_block
 from backend.hub import Hub
+
+# 见 test_v10182_runtime_ui.py 的说明：`ACTION_CONTRACT` 在 upstream 基线 3a35d8b 就已
+# 外置到 prompts/<lang>/engine_blocks.md，按旧的模块级常量导入会让整个文件 collection
+# error —— 而默认的 `pytest backend/tests` 因此一个测试都不跑。
+ACTION_CONTRACT = _engine_block("ACTION_CONTRACT")
 
 
 class _FakeCoordinator:

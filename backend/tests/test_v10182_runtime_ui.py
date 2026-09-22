@@ -6,8 +6,15 @@ import inspect
 from types import SimpleNamespace
 
 from backend import contract, runtime_settings, tool_ledger
-from backend.engine import ACTION_CONTRACT, ProjectEngine
+from backend.engine import ProjectEngine, _engine_block
 from backend.runtime import WORKER_TOOL_NAMES
+
+# `ACTION_CONTRACT` 在 upstream 基线 3a35d8b 就已外置到 prompts/<lang>/engine_blocks.md，
+# 由 `_engine_block()` 按 `<!-- NAME -->` 切分读取。四个 v10.x / v2x 测试仍按旧的模块级
+# 常量导入它，于是 `pytest backend/tests` 直接 4 个 collection error —— 默认命令
+# **一个测试都不跑**，这正是它最坏的地方。这里改从真正的来源取块：断言的意图
+# （契约内容与长度预算）原样保留，只有来源变了。
+ACTION_CONTRACT = _engine_block("ACTION_CONTRACT")
 from backend.worker_gateway_runtime import _inject_user_address_prompt
 
 
@@ -163,7 +170,7 @@ def test_coordinator_rename_counter_is_strong_and_one_shot(monkeypatch) -> None:
 def test_coordinator_address_block_sits_immediately_before_action_contract() -> None:
     source = inspect.getsource(ProjectEngine._run_agent_turn)
     address = '+ (("\\n\\n" + user_address_block) if user_address_block else "")'
-    action = '+ "\\n\\n" + ACTION_CONTRACT'
+    action = '+ "\\n\\n" + _engine_block("ACTION_CONTRACT")'
     assert address in source
     assert action in source
     assert source.index(address) < source.index(action)
