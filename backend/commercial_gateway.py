@@ -2256,6 +2256,43 @@ def production_model_capability_registry() -> ModelCapabilityRegistry:
     return registry
 
 
+#: 一张页面图片的保守 token 估算。**这是估的，不是测的**——真实的计费取决于模型怎么切图
+#: （常见做法是按 512 像素一块，每块固定几百 token）。取一个偏大的值是为了让预算这一维度
+#: 对视觉路径保持有界；准确用量由 effect 后的 usage 对账补回来。
+VISION_TOKENS_PER_IMAGE = 1600
+
+#: 视觉路径只接受这两种图片格式：解析器产出的就是 PNG，而 JPEG 是相机与扫描仪的常见输出。
+#: 认不出来的格式直接拒绝，而不是按 PNG 发出去——provider 回的那个错会指向"图片损坏"。
+_IMAGE_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+)
+
+
+def _image_mime(image: bytes) -> str:
+    for signature, mime in _IMAGE_SIGNATURES:
+        if image.startswith(signature):
+            return mime
+    raise GatewayDenied("不认识的图片格式：只接受 PNG 或 JPEG")
+
+
+def build_vision_messages(prompt: str, images: Sequence[bytes]) -> list[dict[str, Any]]:
+    """构造一次多模态请求的消息体（OpenAI 风格）。
+
+    图片按 **data URL 内联**：不内联就得先把它传到别处再给一个 URL，那等于把用户的扫描页放
+    到了这台机器之外的第二处——而这条路径的前提是"图片只在这一次受权的请求里离开机器"。
+    """
+    content: list[dict[str, Any]] = [{"type": "text", "text": str(prompt)}]
+    for image in images:
+        payload = bytes(image)
+        encoded = base64.b64encode(payload).decode("ascii")
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{_image_mime(payload)};base64,{encoded}"},
+        })
+    return [{"role": "user", "content": content}]
+
+
 @dataclass(frozen=True, slots=True)
 class _EgressShape:
     """一次 provider egress 的"形状"：要求哪些能力、出站正文是什么、要不要预留输出。
@@ -2273,6 +2310,38 @@ class _EgressShape:
     required: frozenset[str]
     payload: Mapping[str, Any]
     reserves_output: bool
+    #: DLP 只能扫文本。出站内容里如果有它读不懂的东西（图片），就不能由"扫过了，没问题"
+    #: 来放行——这类调用**无条件**要求审批。
+    always_requires_approval: bool = False
+    #: 出站内容里 DLP 读不懂的那部分（图片）的保守 token 估算，加进输入预估。
+    #:
+    #: 不加的话，一次读图会按"提示词那几十个 token"预留预算，而实际输入是上千——预算这一
+    #: 维度对视觉路径基本是敞开的。估算值见 `VISION_TOKENS_PER_IMAGE`。
+    extra_input_tokens: int = 0
+
+
+def _vision_shape(prompt: str, payloads: Sequence[bytes]) -> _EgressShape:
+    """vision 调用的形状。
+
+    抽成函数是为了让"它预留输出、且无条件要求审批"这两件事**可以被直接断言**。写在
+    `vision()` 里面的话，测试只能自己构造一个 `_EgressShape` 再断言自己刚设的那个值——
+    那什么都没测，而它会一直通过。
+    """
+    return _EgressShape(
+        required=frozenset({"vision"}),
+        # DLP 扫的就是这一份：提示词在里面，图片不在——base64 对它没有意义。图片那一侧由
+        # always_requires_approval 把关，这两件事是配套的。
+        payload={
+            "prompt": str(prompt),
+            "images": [
+                {"mime": _image_mime(payload), "bytes": len(payload)}
+                for payload in payloads
+            ],
+        },
+        reserves_output=True,
+        always_requires_approval=True,
+        extra_input_tokens=VISION_TOKENS_PER_IMAGE * len(payloads),
+    )
 
 
 @dataclass
@@ -2551,7 +2620,10 @@ class ProviderGatewayClient:
             "transport": hashlib.sha256(self.transport.encode("utf-8")).hexdigest(),
         }
         invocation_id = ""
-        if decision.requires_approval:
+        # 审批要求来自两处：DLP 在文本里扫到了敏感内容，或者这次调用的出站内容里有 DLP 读
+        # 不懂的东西（图片）。后者不由扫描决定——扫描看不见它，所以它无条件要审批。
+        requires_approval = decision.requires_approval or shape.always_requires_approval
+        if requires_approval:
             if not authority.approval_id or not authority.grant_id:
                 raise GatewayDenied("sensitive provider outbound requires fresh Task Runtime approval")
             invocation = runtime.prepare_tool(
@@ -2574,7 +2646,9 @@ class ProviderGatewayClient:
                 raise GatewayDenied("provider egress approval was already consumed")
             invocation_id = invocation.invocation_id
 
-        estimated_input_tokens = max(1, math.ceil(len(serialized) / 4))
+        estimated_input_tokens = (
+            max(1, math.ceil(len(serialized) / 4)) + shape.extra_input_tokens
+        )
         # I-R1：`max_tokens=None`（生产 Worker 的值）时不再预留 0，而是施加一个保守
         # 上限并受剩余额度收敛；准确用量由 effect 后的 usage 对账补齐。
         #
@@ -2613,7 +2687,7 @@ class ProviderGatewayClient:
                 "capability_digest": capability_digest,
                 "privacy": capability.privacy.value,
                 "usage": budgeted.budget_usage.__dict__,
-                "approval_required": decision.requires_approval,
+                "approval_required": requires_approval,
             },
             idempotency_key=f"provider-audit:{uuid.uuid4().hex}",
             mutate=lambda current: (
@@ -2970,6 +3044,57 @@ class ProviderGatewayClient:
         except (GeneratorExit, asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             # 取消不是失败（M-6 / M-4）。第三种调用类型同样要守住这条线，否则一次"用户
             # 走开了"会在审计里记成 provider 崩了。
+            self._reconcile_provider_usage(authorization, None, failed=True)
+            self._complete_authorized_effect(authorization, error=None, cancelled=True)
+            raise
+        except BaseException as exc:
+            self._reconcile_provider_usage(authorization, None, failed=True)
+            self._complete_authorized_effect(authorization, error=exc)
+            raise
+        self._reconcile_provider_usage(authorization, result)
+        self._complete_authorized_effect(
+            authorization, error=None,
+            actual_tokens=_provider_reported_total_tokens(result),
+        )
+        return result
+
+    async def vision(
+        self,
+        images: Sequence[bytes],
+        *,
+        prompt: str,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        """把页面图片交给多模态模型读。
+
+        这是**第四种**受权调用类型。它与 embedding 有两处不同，而两处都出自同一个事实：
+        **DLP 只能扫文本，扫不了图片。**
+
+        * `always_requires_approval=True`——一段提示词可以是干净的，但附上的那张扫描页上
+          可能印着学号、成绩单或者家访记录，而正则一个都匹配不到。当一层防线看不见出站内容
+          时，就不该由它来放行。这一条对应 plan 第 40 行记下的后果："每一张扫描页都会离开
+          这台机器（在 DLP 授权之下）"。
+        * `extra_input_tokens`——`payload` 里的图片只是一个长度和格式，所以按它算出来的输入
+          token 会严重偏低；补上一份保守的每图估算，否则预算这一维度对视觉路径基本敞开。
+
+        与 chat 一样**预留输出**：视觉模型会生成 token，不预留等于让它可以任意生成。
+        """
+        if not images:
+            # 放它过去就变成一次普通文本请求，而调用方以为自己在读图——结果里出现的"描述"
+            # 其实是模型凭空写的。
+            raise GatewayDenied("vision requires at least one image")
+        payloads = [bytes(image) for image in images]
+        # 先把格式校验掉：不认识的字节不该走到"已经授权、准备发送"那一步。
+        for payload in payloads:
+            _image_mime(payload)
+        authorization = self._authorize(
+            shape=_vision_shape(prompt, payloads),
+            max_tokens=max_tokens,
+        )
+        messages = build_vision_messages(prompt, payloads)
+        try:
+            result = await object.__getattribute__(self, "_transport").chat(messages)
+        except (GeneratorExit, asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             self._reconcile_provider_usage(authorization, None, failed=True)
             self._complete_authorized_effect(authorization, error=None, cancelled=True)
             raise
