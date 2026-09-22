@@ -10,7 +10,7 @@ the project actually is** and **what order the rest has to happen in**.
 |---|---|---|
 | **1** Atomic Profile authorization | **done** | `task-1-review.md`: independent review 0 Critical / 0 Important / 0 Minor |
 | **2** Provider / Tool / MCP / PII / secret gateways | **done** | `TASK2-ROUND2-ACCEPTANCE.md`: composed verdict PASS, 9 review rounds, 0 Critical / 0 Important |
-| **3** Local-first encrypted RAG | **not started** | `git grep` over `backend src electron` returns **0 files** for `PP-OCR`, `ppocr`, `onnxruntime`, `usearch`, `e5-small`, `BGE-M3`, `AESGCM`. The 5 files matching `bm25` are the context compressor's keyword scoring, not a RAG index |
+| **3** Encrypted RAG — local parsing and storage, cloud embeddings | **not started** | measured against the **revised** spec: `git grep` over `backend src electron` returns **0 files** for every needed piece — `pdfplumber`, `pymupdf`, `python-docx`, `openpyxl`, `python-pptx` (parsers), `AESGCM`, `cryptography` (encryption), `usearch` (vector index), `text-embedding` and `def embed` (the gateway call path). `embeddings` matches one file, and only as a word in a test about secret leases |
 | **4** Governed Mem0 memory | **not started** | `git grep -li mem0 -- backend src electron docs` → **0 files** |
 | **5** Learning workflows | **not started** | **0 files** for `assessment`, `study_plan`, `mastery`, `spaced_review`, `SchoolGateway`. (`ICS` and `exam` match 37 and 25 files only as substrings of `statistics` / `example` — a false positive worth knowing about before someone reads those counts as progress) |
 | **6** Commercial release closure | **partly done** | packaging chain, `release/StudyCrew-Setup-1.0.36.exe`, install/uninstall verified in Phase 0; but the four `ACTION_CONTRACT` collection errors remain, `npm run typecheck` carries 54 diagnostics, and there are no `THIRD-PARTY` / threat-model artefacts |
@@ -51,10 +51,11 @@ The two items inside Task 6 that are **independent of everything else**, and che
 Start with those two, then Task 3's **data layer** (parsers + AES-256-GCM store) before anything
 touching models. Reasons: the collection errors are small, independent, and immediately raise how
 much the repository's own tests are worth; and within Task 3 the parsers plus encrypted store are
-what everything else — page rendering, embeddings, indexes, memories — is built on, while the
-capability-pack machinery (download, SHA-256, atomic install/rollback) depends on external
-artefacts and model licences and can be sequenced later. Dropping the local OCR engine (see below)
-removed the largest piece of that machinery.
+what everything else — page rendering, embeddings, indexes, memories — is built on. With both the
+OCR engine (2026-09-21) and the local embedding pack (2026-09-21) dropped, the capability-pack
+machinery is gone **entirely**: there is no model artefact left to download, verify, install or roll
+back, which removes the largest chunk of the original Task 3 spec. What replaces it is a new
+authorized call type on the gateway — see below.
 
 ## What I have not estimated
 
@@ -62,13 +63,20 @@ Sizes for Tasks 3–5. I have no measurement for them, and inventing a number wo
 failure this project keeps punishing. The one real datum is Task 2: ~3,200 + ~1,600 lines across
 nine review rounds.
 
-The local OCR path was **removed from the Task 3 spec on 2026-09-21** (decision recorded in
-`.superpowers/plans/studycrew-commercial-continuation.md`, including its consequences). What
-Task 3 still needs to build is: seven document parsers, local page rendering for text-layer-free
-PDFs, an ONNX embedding pack with the download/verify/install/rollback machinery, an AES-256-GCM
-store, two index types, and hybrid retrieval with RRF and MMR. What it no longer needs is an OCR
-engine or OCR capability pack — which was the single largest piece of the original spec, and the
-only one that would have shipped a second ONNX model plus a licence manifest.
+The local OCR path was **removed from the Task 3 spec on 2026-09-21**, and the local embedding pack
+on the same day (both recorded in `.superpowers/plans/studycrew-commercial-continuation.md`, with
+their consequences). What Task 3 still needs to build is: seven document parsers, local page
+rendering for text-layer-free PDFs, an **embedding call path through the Provider Gateway**
+(authorization, DLP on the outbound text, budget reservation, `provider_egress` audit — the gateway
+speaks only `chat` and `chat_stream` today), an AES-256-GCM store, two index types, and hybrid
+retrieval with RRF and MMR.
+
+What it no longer needs: an OCR engine, an OCR capability pack, a local embedding pack, and with
+them the whole download / licence-manifest / SHA-256 / atomic-install / rollback subsystem — the
+single largest piece of the original spec, and the only one that would have shipped ONNX models and
+licence manifests. That is a large simplification. The price is recorded, not hidden: retrieval now
+requires a configured BYOK provider and a network, so the product can no longer be fully offline,
+and every indexed passage as well as every query leaves the machine under DLP authorization.
 
 ## Two decisions that belong to the user, not to me
 
