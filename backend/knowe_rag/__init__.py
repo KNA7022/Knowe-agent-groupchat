@@ -7,6 +7,16 @@
 
 from __future__ import annotations
 
+from .chunks import (
+    CHILD_MAX_CHARS,
+    PARENT_MAX_CHARS,
+    Chunk,
+    EmbeddingRequest,
+    ReindexPlan,
+    build_chunks,
+    embedding_requests,
+    plan_reindex,
+)
 from .parsers import (
     LEGACY_SUFFIXES,
     SHEET_ROWS_PER_BLOCK,
@@ -17,10 +27,18 @@ from .parsers import (
 )
 
 __all__ = [
+    "CHILD_MAX_CHARS",
     "LEGACY_SUFFIXES",
+    "PARENT_MAX_CHARS",
     "SHEET_ROWS_PER_BLOCK",
     "SUPPORTED_SUFFIXES",
+    "Chunk",
+    "EmbeddingRequest",
     "ParsedBlock",
+    "ReindexPlan",
     "UnsupportedFormat",
+    "build_chunks",
+    "embedding_requests",
     "parse_document",
+    "plan_reindex",
 ]
