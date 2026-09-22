@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from typing import Mapping
 
 from .parsers import ParsedBlock
 
@@ -27,6 +28,7 @@ __all__ = [
     "EmbeddingRequest",
     "ReindexPlan",
     "build_chunks",
+    "diff_fingerprints",
     "embedding_requests",
     "plan_reindex",
 ]
@@ -249,23 +251,37 @@ def plan_reindex(
     """
     previous_by_id = {chunk.chunk_id: chunk for chunk in previous}
     current_by_id = {chunk.chunk_id: chunk for chunk in current}
-
-    added = tuple(
-        chunk
-        for chunk in current
-        if chunk.chunk_id not in previous_by_id
-        or previous_by_id[chunk.chunk_id].content_hash != chunk.content_hash
+    added_ids, removed, unchanged = diff_fingerprints(
+        {chunk_id: chunk.content_hash for chunk_id, chunk in previous_by_id.items()},
+        {chunk_id: chunk.content_hash for chunk_id, chunk in current_by_id.items()},
     )
-    removed = tuple(sorted(set(previous_by_id) - set(current_by_id)))
-    unchanged = tuple(
-        chunk.chunk_id
-        for chunk in current
-        if chunk.chunk_id in previous_by_id
-        and previous_by_id[chunk.chunk_id].content_hash == chunk.content_hash
-    )
+    added = tuple(chunk for chunk in current if chunk.chunk_id in added_ids)
     return ReindexPlan(
         added=added,
         removed=removed,
         unchanged=unchanged,
         embeddings_needed=embedding_requests(added),
     )
+
+
+def diff_fingerprints(
+    previous: Mapping[str, str], current: Mapping[str, str],
+) -> tuple[frozenset[str], tuple[str, ...], tuple[str, ...]]:
+    """比较两版的 `chunk_id -> content_hash`，返回 (要写入的, 要删除的, 原样保留的)。
+
+    单独抽出来是因为**存储层要用同一套判断**：它手上只有 id 和指纹（为了算一次差异就把整份
+    文档解密出来没有必要）。两边各写一遍的话，"哪些要重新算向量"会在两个地方有两个答案，
+    而不一致时的表现是"有些 chunk 永远没有向量"——检索不到，也不报错。
+    """
+    added = frozenset(
+        chunk_id
+        for chunk_id, content_hash in current.items()
+        if previous.get(chunk_id) != content_hash
+    )
+    removed = tuple(sorted(set(previous) - set(current)))
+    unchanged = tuple(
+        chunk_id
+        for chunk_id, content_hash in current.items()
+        if previous.get(chunk_id) == content_hash
+    )
+    return added, removed, unchanged

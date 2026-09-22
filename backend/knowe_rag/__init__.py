@@ -14,6 +14,7 @@ from .chunks import (
     EmbeddingRequest,
     ReindexPlan,
     build_chunks,
+    diff_fingerprints,
     embedding_requests,
     plan_reindex,
 )
@@ -26,6 +27,7 @@ from .parsers import (
     UnsupportedFormat,
     parse_document,
 )
+from .store import EncryptedKnowledgeStore, StoreError
 
 __all__ = [
     "CHILD_MAX_CHARS",
@@ -35,12 +37,15 @@ __all__ = [
     "SUPPORTED_SUFFIXES",
     "Chunk",
     "EmbeddingRequest",
+    "EncryptedKnowledgeStore",
     "MasterKey",
     "MasterKeyError",
     "ParsedBlock",
     "ReindexPlan",
+    "StoreError",
     "UnsupportedFormat",
     "build_chunks",
+    "diff_fingerprints",
     "embedding_requests",
     "field_aad",
     "parse_document",
