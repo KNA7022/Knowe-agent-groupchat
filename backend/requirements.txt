@@ -2,3 +2,5 @@ websockets>=14
 httpx>=0.27        # 只有真 LLM 档（KNOWE_AGENT=deepseek）才需要；Fake 档不用
 pypdfium2>=5.13    # PDF：文本层提取（本地，不上传）。许可证 BSD-3-Clause / Apache-2.0；
                    # 选择理由与体积测量见 .superpowers/plans 的 "PDF dependency decision"
+cryptography>=50   # 知识库的 AES-256-GCM；主密钥用 Windows DPAPI 保护（ctypes，无额外依赖）。
+                   # 许可证 Apache-2.0 / BSD-3-Clause，冻结后约 +3.37 MB

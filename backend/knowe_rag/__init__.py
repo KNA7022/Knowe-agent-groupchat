@@ -17,6 +17,7 @@ from .chunks import (
     embedding_requests,
     plan_reindex,
 )
+from .crypto import MasterKey, MasterKeyError, field_aad
 from .parsers import (
     LEGACY_SUFFIXES,
     SHEET_ROWS_PER_BLOCK,
@@ -34,11 +35,14 @@ __all__ = [
     "SUPPORTED_SUFFIXES",
     "Chunk",
     "EmbeddingRequest",
+    "MasterKey",
+    "MasterKeyError",
     "ParsedBlock",
     "ReindexPlan",
     "UnsupportedFormat",
     "build_chunks",
     "embedding_requests",
+    "field_aad",
     "parse_document",
     "plan_reindex",
 ]
