@@ -32,6 +32,14 @@ from .citations import (
     verify_citations,
 )
 from .crypto import MasterKey, MasterKeyError, field_aad
+from .evaluation import (
+    EvaluationCase,
+    EvaluationError,
+    EvaluationReport,
+    RetrievalOutcome,
+    evaluate_retrieval,
+    recall_at_k,
+)
 from .fusion import (
     EVIDENCE_MAXIMUM,
     EVIDENCE_MINIMUM,
@@ -82,6 +90,9 @@ __all__ = [
     "CitationReport",
     "EmbeddingRequest",
     "EncryptedKnowledgeStore",
+    "EvaluationCase",
+    "EvaluationError",
+    "EvaluationReport",
     "EvidencePack",
     "Grounding",
     "GroundingVerdict",
@@ -96,6 +107,7 @@ __all__ = [
     "RenderedPage",
     "RenderingError",
     "RetrievalError",
+    "RetrievalOutcome",
     "RetrievedChunk",
     "ScopeIndex",
     "StoreError",
@@ -105,6 +117,7 @@ __all__ = [
     "build_chunks",
     "diff_fingerprints",
     "embedding_requests",
+    "evaluate_retrieval",
     "field_aad",
     "maximal_marginal_relevance",
     "pack_evidence",
@@ -112,6 +125,7 @@ __all__ = [
     "parse_location",
     "plan_reindex",
     "reciprocal_rank_fusion",
+    "recall_at_k",
     "render_page",
     "sort_locations",
     "tokenize",
