@@ -1,2 +1,4 @@
 websockets>=14
 httpx>=0.27        # 只有真 LLM 档（KNOWE_AGENT=deepseek）才需要；Fake 档不用
+pypdfium2>=5.13    # PDF：文本层提取（本地，不上传）。许可证 BSD-3-Clause / Apache-2.0；
+                   # 选择理由与体积测量见 .superpowers/plans 的 "PDF dependency decision"

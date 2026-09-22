@@ -6,13 +6,16 @@ Task 3 的"精确引用"建立在这里，所以位置字符串有两个硬要�
 2. 它对同一份文件**可复现**——解析两次得到完全相同的位置与顺序，否则引用会
    指向别处而依然"合法"。
 
-覆盖六种格式，全部只用标准库：TXT / Markdown / HTML，以及 DOCX / PPTX / XLSX。后三种是
-ZIP + XML，`zipfile` + `ElementTree` 就够，所以不引入 python-docx / openpyxl /
-python-pptx：三个库既给 PyInstaller 产物增重，又只给对象模型、不给稳定位置。
+覆盖七种格式，全部**本地**解析。TXT / Markdown / HTML / DOCX / PPTX / XLSX 只用标准库：
+后三种是 ZIP + XML，`zipfile` + `ElementTree` 就够，所以不引入 python-docx / openpyxl /
+python-pptx——三个库既给 PyInstaller 产物增重，又只给对象模型、不给稳定位置。PDF 用
+`pypdfium2`（体积与许可证测量见 plan 的 "PDF dependency decision"；AGPL 的 PyMuPDF 被排除）。
 
-PDF 还没做（见 `PENDING_SUFFIXES`），因为"引入哪个 PDF 库"会给安装包增重，是一个要摆到
-台面上的取舍；在决定之前它**显式拒绝**而不是静默返回空列表。旧版二进制 Office 格式
-（`.doc`/`.ppt`/`.xls`）是另一套格式，永远不走这里（见 `LEGACY_SUFFIXES`）。
+旧版二进制 Office 格式（`.doc`/`.ppt`/`.xls`）是另一套格式，永远不走这里
+（见 `LEGACY_SUFFIXES`）：它们既不是"还没做"，也不该混进"不认识这种后缀"。
+
+页码语义与纯文本段落**故意相反**（`page:N` 按原文页序，没有文本层的页也占号），理由写在
+`_parse_pdf` 里：段落号是我们自己编的序号，而页码是用户在阅读器里看得见的。
 """
 
 from __future__ import annotations
@@ -25,9 +28,10 @@ import re
 import xml.etree.ElementTree as ElementTree
 import zipfile
 
+import pypdfium2 as pdfium
+
 __all__ = [
     "LEGACY_SUFFIXES",
-    "PENDING_SUFFIXES",
     "SHEET_ROWS_PER_BLOCK",
     "SUPPORTED_SUFFIXES",
     "ParsedBlock",
@@ -53,14 +57,11 @@ class ParsedBlock:
     kind: str
 
 
-#: 现在能解析的。
+#: 现在能解析的。规格里要求的七种全在这里——"待做"集合已经删掉，因为 PDF 的依赖定下来了，
+#: 一个永远为空的集合只会让人以为还有别的东西在排队。
 SUPPORTED_SUFFIXES = frozenset({
-    ".docx", ".htm", ".html", ".markdown", ".md", ".pptx", ".txt", ".xlsx",
+    ".docx", ".htm", ".html", ".markdown", ".md", ".pdf", ".pptx", ".txt", ".xlsx",
 })
-
-#: 规格里要求、但尚未决定依赖的。单独列出来是为了让"还没做"和"不管这种类型"区分开——
-#: 混在一起会让人以为 PDF 永远不支持。
-PENDING_SUFFIXES = frozenset({".pdf"})
 
 #: 旧版二进制 Office 格式。它们**不是**"还没做"：这套解析器永远不支持它们，能行动的
 #: 答复是"先另存为新格式"，所以错误消息里直接给出目标后缀。
@@ -584,6 +585,60 @@ def _parse_xlsx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBl
     return tuple(blocks)
 
 
+# ── PDF ───────────────────────────────────────────────────────────────
+
+def _normalise_pdf_text(raw: str) -> str:
+    """PDFium 用 `\\r\\n` 分行、页末附一个换行。两者都要处理。
+
+    同一个换行在不同解析器里表示不同，位置与文本的对应关系就会随来源变化，比较、切片和
+    引用回显会各错一部分。
+    """
+    return raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _parse_pdf(path: Path) -> tuple[ParsedBlock, ...]:
+    """一页一块，位置是 `page:N`。
+
+    页码按**原文页序**，没有文本层的页也占一个号——这与纯文本"/O 跳过空段"是**故意相反**的
+    规矩，因为两种编号的性质不同：段落号是我们自己编的序号，跳号只影响我们自己；页码是用户
+    在阅读器里看得见的页号。略过第 2 页，第 3 页的内容就会被标成 `page:2`，用户翻到第 2 页
+    找不到那段话——而引用看起来完全合法。
+
+    没有文本层的页（扫描件、照片）产出一个文本为空、`kind="image_page"` 的块，**不是**直接
+    丢掉：丢掉之后上层看到的是一份完整、正常、其实缺了几页的文档，而缺的是哪几页再没有人
+    知道。文本为空保证它不会被当成证据，`kind` 让上层知道"这一页有东西，只是不是文字"——
+    本地渲染 + 多模态读图那条路径落地后由它接手。
+    """
+    suffix = Path(path).suffix.casefold()
+    try:
+        document = pdfium.PdfDocument(path)
+    except (pdfium.PdfiumError, OSError) as exc:
+        # 下载中断的半份文件、把别的格式改名成 .pdf、文件被删掉，都会走到这里。
+        # 泄漏 PdfiumError（甚至 ctypes 层的异常）会让上层把它当成一次未知崩溃。
+        raise UnsupportedFormat(f"{suffix} 打不开：{exc}") from exc
+
+    blocks: list[ParsedBlock] = []
+    try:
+        for index in range(len(document)):
+            page = document[index]
+            try:
+                textpage = page.get_textpage()
+                try:
+                    text = _normalise_pdf_text(textpage.get_text_range())
+                finally:
+                    textpage.close()
+            finally:
+                page.close()
+            blocks.append(ParsedBlock(
+                text=text,
+                location=f"page:{index + 1}",
+                kind="page" if text else "image_page",
+            ))
+    finally:
+        document.close()
+    return tuple(blocks)
+
+
 # ── 入口 ──────────────────────────────────────────────────────────────
 
 def _read_text(path: Path) -> str:
@@ -605,6 +660,7 @@ _PARSERS = {
     ".docx": partial(_parse_ooxml, parse_package=_parse_docx_package),
     ".pptx": partial(_parse_ooxml, parse_package=_parse_pptx_package),
     ".xlsx": partial(_parse_ooxml, parse_package=_parse_xlsx_package),
+    ".pdf": _parse_pdf,
 }
 
 
@@ -619,11 +675,6 @@ def parse_document(path: Path) -> tuple[ParsedBlock, ...]:
     suffix = path.suffix.casefold()
     parser = _PARSERS.get(suffix)
     if parser is None:
-        if suffix in PENDING_SUFFIXES:
-            raise UnsupportedFormat(
-                f"{suffix} 还没做：要先决定引入哪个 PDF 库（会给安装包增重），"
-                "所以现在显式拒绝，而不是当成一份空文件"
-            )
         if suffix in LEGACY_SUFFIXES:
             raise UnsupportedFormat(
                 f"{suffix} 是旧版 Office 二进制格式，本产品不解析它："

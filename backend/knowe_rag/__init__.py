@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from .parsers import (
     LEGACY_SUFFIXES,
-    PENDING_SUFFIXES,
     SHEET_ROWS_PER_BLOCK,
     SUPPORTED_SUFFIXES,
     ParsedBlock,
@@ -19,7 +18,6 @@ from .parsers import (
 
 __all__ = [
     "LEGACY_SUFFIXES",
-    "PENDING_SUFFIXES",
     "SHEET_ROWS_PER_BLOCK",
     "SUPPORTED_SUFFIXES",
     "ParsedBlock",

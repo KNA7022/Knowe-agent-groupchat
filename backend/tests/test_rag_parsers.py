@@ -188,18 +188,23 @@ def test_unsupported_suffix_fails_loudly(tmp_path: Path) -> None:
         parse_document(path)
 
 
-def test_pdf_is_named_as_not_yet_supported(tmp_path: Path) -> None:
-    """PDF **必须**被明确列为"还没做"，而不是走"未知后缀"。
+def test_an_unknown_suffix_is_kept_distinct_from_a_legacy_one(tmp_path: Path) -> None:
+    """`.xyz` 与 `.doc` 都是"不支持"，但答复不能一样。
 
-    两者的运维含义不同：一个是"我们还没做"，另一个是"这个文件类型我们不管"。混在一起
-    会让人以为 PDF 永远不支持。PDF 要等一个库的取舍决定；三种 Office 格式已经用标准库
-    支持了（见 `test_rag_office_parsers.py`）。
+    "这个文件类型我们不管"和"这是旧版格式，请另存为新格式"是两件事：后者用户手里就有
+    文件，而且他能立刻做点什么。
     """
-    path = tmp_path / "a.pdf"
-    path.write_bytes(b"%PDF-1.7 stub")
-    with pytest.raises(UnsupportedFormat) as caught:
-        parse_document(path)
-    assert "还没做" in str(caught.value)
+    unknown = tmp_path / "a.xyz"
+    unknown.write_bytes(b"stub")
+    with pytest.raises(UnsupportedFormat) as unknown_caught:
+        parse_document(unknown)
+    assert "unsupported document format" in str(unknown_caught.value)
+
+    legacy = tmp_path / "a.doc"
+    legacy.write_bytes(b"\xd0\xcf\x11\xe0")
+    with pytest.raises(UnsupportedFormat) as legacy_caught:
+        parse_document(legacy)
+    assert "另存" in str(legacy_caught.value)
 
 
 def test_parsing_is_deterministic(tmp_path: Path) -> None:
