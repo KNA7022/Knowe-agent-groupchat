@@ -19,7 +19,7 @@ import struct
 
 import pytest
 
-from backend.knowe_rag import (Chunk, MasterKey, ParsedBlock, build_chunks, embedding_requests)
+from backend.knowe_rag import (Chunk, MasterKey, ParsedBlock, build_chunks)
 from backend.knowe_rag.store import EncryptedKnowledgeStore, StoreError
 
 
@@ -192,14 +192,81 @@ def test_a_tampered_ciphertext_is_rejected(tmp_path: Path) -> None:
             opened.read_chunks("doc")
 
 
-def test_a_database_written_with_another_key_cannot_be_read(tmp_path: Path) -> None:
+def test_a_database_written_with_another_key_is_refused_at_open(tmp_path: Path) -> None:
+    """换一把钥匙要**开库就拒绝**，而不是"读的时候报错、写的时候照做"。
+
+    第十一次复验实测了原来的三种表现：`read_chunks` 报认证失败（对），`missing_embeddings`
+    静默报告"全都缺向量"（说谎），`write_document` **静默成功**并按 chunk_id 就地覆盖，
+    把旧钥匙的密文和指纹一起改写掉——旧原文从此不可恢复，而写入那一刻没有任何报错。
+    判断只留一处，放在打开时。
+    """
     path = tmp_path / "rag.db"
-    with EncryptedKnowledgeStore(path, master_key=_key()) as opened:
+    doctor = _key()
+    with EncryptedKnowledgeStore(path, master_key=doctor) as opened:
         opened.write_document("doc", _chunks("甲"))
 
-    with EncryptedKnowledgeStore(path, master_key=_key()) as other:
-        with pytest.raises(StoreError):
-            other.read_chunks("doc")
+    with pytest.raises(StoreError):
+        EncryptedKnowledgeStore(path, master_key=_key())
+
+    # 关键的一半：拒绝之后，**原来那把钥匙还读得回来**。
+    # 这里断言"内容"而不是"块数"：要求是原文没被改写，块数是分块层的实现细节
+    # （一个短段落会同时产生父块与子块，两者正文相同）。
+    with EncryptedKnowledgeStore(path, master_key=doctor) as opened:
+        assert {chunk.text for chunk in opened.read_chunks("doc")} == {"甲"}
+
+
+def test_a_library_with_content_but_no_key_record_is_not_adopted(tmp_path: Path) -> None:
+    """有资料、没有校验记录 —— 不替你认领。
+
+    认领错了就是上一条测试里那件事：把别人的库就地改写成自己的密文。认领对了也只是省一次
+    手动操作，所以这里选拒绝。
+    """
+    path = tmp_path / "rag.db"
+    key = _key()
+    with EncryptedKnowledgeStore(path, master_key=key) as opened:
+        opened.write_document("doc", _chunks("甲"))
+
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    connection.execute("DELETE FROM rag_meta")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(StoreError):
+        EncryptedKnowledgeStore(path, master_key=key)
+
+
+def test_the_key_record_is_only_readable_by_its_own_key(tmp_path: Path) -> None:
+    """校验记录是**密文**，不是"这里有个库"的标记。
+
+    它要回答的是"这把钥匙是不是它的"，所以必须只有那一把钥匙解得开。这里直接对落盘的那一行
+    做这件事——用另一把钥匙去开它。行为层面的那一半（换钥匙必须被拒）由上面两条测试盯着。
+    """
+    from backend.knowe_rag.crypto import MasterKeyError, field_aad
+    from backend.knowe_rag.store import _KEY_VERIFIER_NAME, _KEY_VERIFIER_PLAINTEXT
+
+    path = tmp_path / "rag.db"
+    key = _key()
+    with EncryptedKnowledgeStore(path, master_key=key) as opened:
+        opened.write_document("doc", _chunks("甲"))
+
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    row = connection.execute(
+        "SELECT value FROM rag_meta WHERE name=?", (_KEY_VERIFIER_NAME,)
+    ).fetchone()
+    connection.close()
+
+    assert row is not None, "库里应当有一条主密钥校验记录"
+    stored = row[0]
+    aad = field_aad("rag_meta", _KEY_VERIFIER_NAME)
+    # 正反两面都要判，缺一半就不是这条要求：只判"别的钥匙打不开"，一个明文标记也能满足
+    # （它谁都打不开）；只判"自己的钥匙打得开"，就等于在测 AES 本身。
+    assert key.open(stored, aad=aad) == _KEY_VERIFIER_PLAINTEXT
+    with pytest.raises(MasterKeyError):
+        _key().open(stored, aad=aad)
 
 
 # ── 增量写入 ──────────────────────────────────────────────────────────
@@ -386,3 +453,25 @@ def test_embeddings_round_trip_at_float32_precision(store: EncryptedKnowledgeSto
     store.store_embedding("hash-1", vector, model="m")
 
     assert store.load_embedding("hash-1", model="m") == tuple(expected)
+
+
+def test_the_unsalted_helpers_are_not_offered_as_package_api() -> None:
+    """无盐那一版**不能**从包顶层导出：那等于把调用方引到错的一个上。
+
+    第十一次复验实测：`from knowe_rag import embedding_requests` 存完向量之后
+    `missing_embeddings` 永远报缺、`rag_embeddings` 变成两倍行数——每次导入重复向量化、
+    重复计费，而结果看起来完全正常。要落盘就用 `store.embedding_requests`。
+    """
+    import backend.knowe_rag as rag
+    from backend.knowe_rag import chunks
+
+    assert not hasattr(rag, "embedding_requests")
+    assert not hasattr(rag, "default_content_hash")
+    assert "embedding_requests" not in rag.__all__
+    assert "default_content_hash" not in rag.__all__
+    # 它们本身还在原处，只是不再冒充"随手可用"的顶层 API。
+    assert hasattr(chunks, "embedding_requests")
+    assert hasattr(chunks, "default_content_hash")
+    # `__all__` 里的名字必须真的存在——列了一个没导入的名字，`from knowe_rag import *` 会炸。
+    for name in rag.__all__:
+        assert hasattr(rag, name), name

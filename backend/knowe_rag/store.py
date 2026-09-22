@@ -12,13 +12,18 @@ plan 第 49 行：源文件、抽取文本、chunk、向量与缓存都用 AES-2
 - `document_id` —— 调用方给的。本地优先应用里最自然的做法就是传文件路径，而文件名往往等于
   文档标题（含姓名与班级）。**必须**用 `document_identifier()` 生成不透明标识；它是约定而
   不是强制（`write_document` 不会拒绝一个像路径的 id，那会误伤合法用途）。
-- `location` —— 指向原文的结构位置。`para:`/`page:`/`h1:`/`slide:`/`code:` 只含编号与语言
-  标记；xlsx 那一支用**表在工作簿里的序号**，因为工作表名是用户敲进去的正文，已挪进块文本
-  （加密那一侧）。
+- `location` —— 指向原文的结构位置。`para:`/`page:`/`h1:`/`slide:`/`code:` 只含编号；xlsx 那一支
+  用**表在工作簿里的序号**，因为工作表名是用户敲进去的正文，已挪进块文本（加密那一侧）。
+  markdown 围栏的 info string 同理（第十一次复验的 Important-3：` ```期末成绩单 ` 这类围栏很
+  常见，而它当时既在明文列里、又不在块文本里——泄漏且检索不到）。
 - `content_hash` —— **绑定主密钥**的 HMAC（`crypto.keyed_content_hasher`）。无盐 sha256 会让
   库文件变成一台免费的确认机：这个产品的块经常很短（姓名+学号+电话、一行成绩），候选空间
   小到可以穷举，一份已知文档也能被直接确认为在库里。
+  ⚠ 它**仍然泄漏一件事**：同一份库里文字相同的两个位置共享同一个指纹（去重就是靠这个），
+  所以数一数指纹能知道"这几处文字一样"。这是去重的代价，不是可以顺手去掉的东西。
 - `chunk_id`/`parent_id` —— 位置与文档 id 的 sha256 派生值，不含原文。
+  ⚠ 它们**不绑定主密钥**：同一个文件导入两个不同主密钥的库，chunk_id 序列完全相同。所以
+  "换钥匙必须重建索引"这句话对指纹成立，对 chunk_id 不成立——跨库关联性没有被这层覆盖。
 - 其余 —— `kind`/`level`（哪些页是扫描件、文档有多少页）、`sequence`、`chunk_count`、
   `created_at`/`updated_at`（几点在学习、哪天导入的）、`rag_embeddings` 的
   `model`/`dimensions`（用了哪个模型、多少块）。
@@ -66,6 +71,11 @@ __all__ = [
 ]
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS rag_meta (
+    name TEXT PRIMARY KEY,
+    value BLOB NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS rag_documents (
     document_id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
@@ -103,6 +113,19 @@ CREATE TABLE IF NOT EXISTS rag_embeddings (
 #: 没人会去查的地方引入舍入，然后相似度慢慢偏离。
 _VECTOR_FORMAT = "<{}f"
 
+#: 主密钥的自证记录。用主密钥把一句常数封起来，能解开就说明这个库属于这把钥匙。
+#:
+#: 没有它的时候，三处表现互不一致（第十一次复验实测）：`read_chunks` 逐个字段报认证失败、
+#: `missing_embeddings` 静默报告"全都缺向量"、而 `write_document` **静默成功**——因为指纹绑了
+#: 密钥，换一把钥匙之后差异判定变成"全部新增"，于是它按 chunk_id 就地覆盖，把原来那把钥匙
+#: 的密文和指纹一起改写掉。写入那一刻没有任何报错，而旧密钥此后再也读不回原文。
+#:
+#: 所以判断只留一处，而且放在打开时：库属于谁，不该由每个方法各自猜。
+_KEY_VERIFIER_NAME = "master_key_verifier"
+
+#: 被封印的常数本身没有含义，只用来证明"这把钥匙能解开这个库"。
+_KEY_VERIFIER_PLAINTEXT = b"studycrew.rag.master-key-verifier.v1"
+
 
 class StoreError(RuntimeError):
     """存储层拒绝这次操作：数据解不开、对不上，或者不属于这里。"""
@@ -137,6 +160,51 @@ class EncryptedKnowledgeStore:
         # 连接级设置，每次打开都要重新声明，所以放在这里而不是建表脚本里。
         self._database.initialize("PRAGMA secure_delete=ON;")
         self._database.initialize(_SCHEMA)
+        self._verify_master_key()
+
+    # ── 身份 ──────────────────────────────────────────────────────────
+
+    def _verify_master_key(self) -> None:
+        """这个库是不是这把钥匙的。**打开时就判，判不过就不打开。**
+
+        两种拒绝，理由不同：
+
+        * 校验记录解不开 —— 库是别人的钥匙建的。继续用下去不会立刻出错，而是把旧资料就地
+          改写成新钥匙的密文，旧钥匙的原文永久不可读。
+        * 库里有资料却没有校验记录 —— 那是本功能之前建的库，或者是别人的库。这里**不替你
+          认领**：认领错了就是把上面那件事做一遍，而认领对了也只是省一次手动操作。
+        """
+        aad = field_aad("rag_meta", _KEY_VERIFIER_NAME)
+        with self._database.transaction() as connection:
+            row = connection.execute(
+                "SELECT value FROM rag_meta WHERE name=?", (_KEY_VERIFIER_NAME,),
+            ).fetchone()
+            if row is None:
+                occupied = connection.execute(
+                    "SELECT (SELECT COUNT(*) FROM rag_documents)"
+                    "     + (SELECT COUNT(*) FROM rag_chunks)"
+                    "     + (SELECT COUNT(*) FROM rag_embeddings) AS total"
+                ).fetchone()["total"]
+                if occupied:
+                    raise StoreError(
+                        "这个知识库里已经有资料，却没有主密钥校验记录：它可能是更早的版本"
+                        "建的，也可能不是这个库。这里不会替你认领它，因为认错了会把里面的"
+                        "资料改写成谁都读不出来的密文"
+                    )
+                connection.execute(
+                    "INSERT INTO rag_meta(name, value) VALUES (?, ?)",
+                    (_KEY_VERIFIER_NAME, self._key.seal(_KEY_VERIFIER_PLAINTEXT, aad=aad)),
+                )
+                return
+        try:
+            opened = self._key.open(row["value"], aad=aad)
+        except MasterKeyError as exc:
+            raise StoreError(
+                "这个知识库不属于当前主密钥（校验记录解不开）。拒绝打开：继续写下去会把"
+                "里面的资料静默改写成另一把钥匙的密文，而原来那把钥匙再也读不回来"
+            ) from exc
+        if opened != _KEY_VERIFIER_PLAINTEXT:
+            raise StoreError("主密钥校验记录的内容不对：这个库已经损坏或被替换过")
 
     # ── 生命周期 ──────────────────────────────────────────────────────
 

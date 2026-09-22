@@ -201,6 +201,54 @@ def test_the_location_still_points_at_the_range(tmp_path: Path) -> None:
     assert "A1:B2" in sheets[0].location, sheets[0].location
 
 
+# ── F2-1 的姊妹点：markdown 围栏的 info string ────────────────────────
+
+def test_a_markdown_fence_info_string_is_not_a_location(tmp_path: Path) -> None:
+    """围栏后面那一串也是用户正文，同样不能进明文 location。
+
+    第十一次复验实测：```` ```期末成绩单与张三的分数 ```` 会得到
+    `location='code:1:期末成绩单与张三的分数'`，父块也带着它；而围栏正文从下一行才开始，
+    所以这段文字**既泄漏、又检索不到**——与 F2-1 修掉的工作表名完全同型。
+    """
+    from backend.knowe_rag import parse_document
+
+    note = tmp_path / "笔记.md"
+    note.write_text("```期末成绩单与张三的分数\nprint(1)\n```\n", encoding="utf-8")
+
+    blocks = parse_document(note)
+
+    assert blocks, "解析应当产出块，否则这条测试什么都没测"
+    for block in blocks:
+        assert "期末成绩单" not in block.location, block.location
+        assert "张三" not in block.location, block.location
+
+
+def test_the_fence_info_string_is_still_reachable_and_searchable(tmp_path: Path) -> None:
+    """修法与表名相同：挪进块文本，而不是丢掉。"""
+    from backend.knowe_rag import parse_document
+
+    note = tmp_path / "笔记.md"
+    note.write_text("```期末成绩单与张三的分数\nprint(1)\n```\n", encoding="utf-8")
+
+    blocks = parse_document(note)
+
+    assert any("期末成绩单" in block.text for block in blocks), [b.text for b in blocks]
+
+
+def test_a_markdown_fence_still_says_what_language_it_is(tmp_path: Path) -> None:
+    """语言标注不能丢：检索时"这段是不是代码"和"是什么语言的代码"用途不同。"""
+    from backend.knowe_rag import parse_document
+
+    note = tmp_path / "code.md"
+    note.write_text("```python\nprint(1)\n```\n", encoding="utf-8")
+
+    fence = next(b for b in parse_document(note) if b.kind == "code")
+
+    assert fence.location == "code:1"
+    assert "python" in fence.text
+    assert "print(1)" in fence.text
+
+
 # ── F2-2：document_id 不能带上路径 ────────────────────────────────────
 
 def test_document_identifier_is_opaque(tmp_path: Path) -> None:

@@ -519,9 +519,16 @@ def test_a_successful_vision_call_reconciles_the_reservation(tmp_path: Path) -> 
     预留是上界估计（按 `1 + max_retries` 轮计），不退回就永久多扣。第十次复审用 chat 做了
     对照：删 chat 的同一行会让 `test_successful_first_attempt_refunds_the_unused_retry_reservation`
     失败，删 embed/vision 的**五个分支**则全绿——同一步骤，两种调用类型一个有锁一个没有。
+
+    ⚠ **第一版这条测试是空转的，第十一次复验抓到了。** 它当时用默认的 `max_retries=0`：
+    预留 `1+0 = 1` 轮，而 `_reconcile_provider_usage` 在"实际 == 预留"时直接返回，于是成功
+    调用**根本不产生 settle 事件**；断言命中的是授权期那一次 `consume_budget`，删掉对账照样
+    为真。复验实测：`max_retries=0` 时只有一条 `model_turns=1`，换成 3 就只剩 `model_turns=4`
+    那一条、断言立刻为假。embed 那条测试的 docstring 自己记着同一个坑，vision 这条当时没跟上。
     """
     runtime, group, run = _runtime_with_run(tmp_path, "vision-settle")
-    client = _client(_vision_ok)
+    # 预留按 `1 + max_retries` 轮计。不设重试的话预留与实际都是 1 轮，**删掉对账也看不出差别**。
+    client = _client(_vision_ok, max_retries=3)
     scope = _operation_scope_for(client, runtime, group, run, [_PNG_STUB], "这一页讲了什么")
     approval_id, grant_id = _approve_provider_egress(runtime, group, run, scope)
     authority = _authority(runtime, group, run, approval_id=approval_id, grant_id=grant_id)
@@ -538,11 +545,11 @@ def test_a_successful_vision_call_reconciles_the_reservation(tmp_path: Path) -> 
         if getattr(event, "event_type", "") == "budget_updated"
     ]
     assert budgeted, "一次成功的调用之后没有任何预算事件——对账没有被执行"
-    # 预留按 attempts 计，实际只发了 1 次，所以轮次维度必须收敛到 1。
-    assert any(
-        event.public_payload.get("usage", {}).get("model_turns") == 1
-        for event in budgeted
-    ), [event.public_payload for event in budgeted]
+    # 只有预留那一条时轮次是 4；对账执行之后才会出现实际轮次 1 的那一条。
+    turns = [
+        event.public_payload.get("usage", {}).get("model_turns") for event in budgeted
+    ]
+    assert 1 in turns, turns
     runtime.close()
 
 

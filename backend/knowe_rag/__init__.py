@@ -5,6 +5,12 @@
 
 还差：向量索引（USearch）与图召回、权限与课程隔离校验、精确引用与弃答。每块都按同一流程
 推进——红测 → 实现 → 独立复审达到 0 Critical / 0 Important。
+
+⚠ **有两样东西故意没有导出到这里**：`chunks.default_content_hash` 与模块级的
+`chunks.embedding_requests`。它们算的是**无盐**指纹，而库里存的是绑定主密钥的那一版；从包顶层
+导出等于把调用方引到错的那一个上——第十一次复验实测：用顶层那个存完向量之后
+`missing_embeddings` 永远报缺，`rag_embeddings` 变成两倍行数，每次导入重复向量化、重复计费，
+而结果看起来完全正常。要落盘就用 `store.embedding_requests` / `store.content_hasher`。
 """
 
 from __future__ import annotations
@@ -18,7 +24,6 @@ from .chunks import (
     ReindexPlan,
     build_chunks,
     diff_fingerprints,
-    embedding_requests,
     plan_reindex,
 )
 from .citations import (
@@ -115,9 +120,7 @@ __all__ = [
     "VectorIndex",
     "VectorIndexError",
     "build_chunks",
-    "default_content_hash",
     "diff_fingerprints",
-    "embedding_requests",
     "evaluate_retrieval",
     "document_identifier",
     "field_aad",

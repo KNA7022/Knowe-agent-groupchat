@@ -95,9 +95,12 @@ def test_markdown_code_fence_is_one_block_and_keeps_its_language(tmp_path: Path)
 
     fence = next(b for b in blocks if b.kind == "code")
     assert "print(1)" in fence.text and "print(2)" in fence.text
-    assert fence.location.startswith("code:")
     # 语言标注要留下：检索时"这段是不是代码"和"是什么语言的代码"用途不同。
-    assert "python" in fence.location
+    # 但它**不能留在 location 里**——info string 是用户敲进去的正文，可以是任意非空白 token
+    # （```期末成绩单 这类围栏很常见），而 location 是明文列。修法与 xlsx 表名相同：
+    # 只留序号，标注进块文本（于是它还能被检索到）。
+    assert fence.location == "code:1"
+    assert "python" in fence.text
 
 
 def test_markdown_table_is_one_block_not_one_per_row(tmp_path: Path) -> None:

@@ -244,6 +244,11 @@ def embedding_requests(chunks: tuple[Chunk, ...]) -> tuple[EmbeddingRequest, ...
 
     去重是纯赚的：页眉页脚、重复的表格标题、同一段话在两页上出现，都会各自变成一次网络
     请求和一份账单。顺序固定则让"重试哪一批"是可复现的。
+
+    ⚠ **这一版用的是块自带的指纹。** 块来自 `build_chunks`（默认无盐），而库里存的是绑定主
+    密钥的那一版，两者对不上——所以要落盘就用 `EncryptedKnowledgeStore.embedding_requests`，
+    它先 `sealed_chunk` 再路由到这里。用错了不会报错，只会让 `missing_embeddings` 永远报缺：
+    每次导入都重新向量化、重复计费，而结果看起来完全正常。
     """
     seen: set[str] = set()
     requests: list[EmbeddingRequest] = []

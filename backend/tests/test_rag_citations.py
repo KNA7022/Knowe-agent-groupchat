@@ -97,11 +97,18 @@ def test_a_slide_location_parses() -> None:
     assert parse_location("slide:10").source == "10"
 
 
-def test_a_code_block_location_keeps_the_language() -> None:
+def test_a_code_block_location_parses() -> None:
+    """位置现在只留序号（`code:1`）；解析层不假设来源里有什么字符。
+
+    语言标注已挪进块文本，所以 `code:1:python` 不再是产出形态。这里保留它是因为
+    `parse_location` 的契约是"来源部分不做字符限制"——**已落库的旧引用**仍然要能解析，
+    而这个契约正是靠"来源里带 `:` 也能过"来体现的。
+    """
     parsed = parse_location("code:1:python")
 
     assert parsed.kind == "code"
     assert parsed.source == "1:python"
+    assert parse_location("code:1").source == "1"
 
 
 @pytest.mark.parametrize("value", ["", "page", "page:", ":3", "para:abc#x", "page:3#0"])

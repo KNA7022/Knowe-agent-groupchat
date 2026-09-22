@@ -112,7 +112,11 @@ def _parse_markdown(raw: str) -> tuple[ParsedBlock, ...]:
 
         fence = _MD_FENCE.match(line)
         if fence:
-            language = fence.group(1) or "text"
+            # 围栏后面那一串（info string）**是用户敲进去的正文**：```期末成绩单、```英语单词、
+            # ```第一章 都很常见，而它可以是任何非空白 token。放进 location 就是明文泄漏，
+            # 而围栏正文从下一行才开始，所以它同时还检索不到——两头都错。
+            # 修法与 xlsx 表名相同：location 只留序号，标注挪进块文本的第一行（于是它能被搜到）。
+            info = fence.group(1).strip()
             cursor += 1
             body: list[str] = []
             while cursor < len(lines) and not _MD_FENCE.match(lines[cursor]):
@@ -120,9 +124,10 @@ def _parse_markdown(raw: str) -> tuple[ParsedBlock, ...]:
                 cursor += 1
             cursor += 1  # closing fence (or end of input)
             code_index += 1
+            content = "\n".join(body).strip("\n")
             blocks.append(ParsedBlock(
-                text="\n".join(body).strip("\n"),
-                location=f"code:{code_index}:{language}",
+                text=f"{info}\n{content}" if info else content,
+                location=f"code:{code_index}",
                 kind="code",
             ))
             continue
