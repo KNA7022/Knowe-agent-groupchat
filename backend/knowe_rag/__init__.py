@@ -40,6 +40,7 @@ from .parsers import (
     parse_document,
 )
 from .store import EncryptedKnowledgeStore, StoreError
+from .vector_index import VectorIndex, VectorIndexError
 
 __all__ = [
     "CHILD_MAX_CHARS",
@@ -61,6 +62,8 @@ __all__ = [
     "RetrievedChunk",
     "StoreError",
     "UnsupportedFormat",
+    "VectorIndex",
+    "VectorIndexError",
     "build_chunks",
     "diff_fingerprints",
     "embedding_requests",
