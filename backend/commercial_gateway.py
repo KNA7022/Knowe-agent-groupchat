@@ -2256,6 +2256,25 @@ def production_model_capability_registry() -> ModelCapabilityRegistry:
     return registry
 
 
+@dataclass(frozen=True, slots=True)
+class _EgressShape:
+    """一次 provider egress 的"形状"：要求哪些能力、出站正文是什么、要不要预留输出。
+
+    `_authorize` 里绝大部分东西——authority 校验、run 绑定、DLP、审批、预算、审计——与
+    "这次调用长什么样"无关，只有这三处有关。第三种调用类型（embedding）进来时把它们参数化，
+    好过复制那一百来行安全代码：复制出来的第二份迟早会漂移，而会漂移的地方恰好是审批与审计，
+    也就是最不能少的那几步。
+
+    `payload` 必须**包含这次出站的全部文本**：它就是 DLP 扫描的对象。它不必与实际发出的
+    字节逐字相同（chat 的实际 body 由 `_build_body` 补上 model 等字段），但一旦某个字段
+    带着用户的文字却不在 `payload` 里，那些文字就绕过了 DLP。
+    """
+
+    required: frozenset[str]
+    payload: Mapping[str, Any]
+    reserves_output: bool
+
+
 @dataclass
 class _ProviderAuthorization:
     """一次 provider egress 的授权结果（I-R1）。
@@ -2448,12 +2467,11 @@ class ProviderGatewayClient:
         await transport.aclose()
 
     @staticmethod
-    def _serialized_request(
-        messages: Any, tools: Any, extra_body: Any,
-    ) -> str:
+    @staticmethod
+    def _serialized_request(payload: Mapping[str, Any]) -> str:
         try:
             return json.dumps(
-                {"messages": messages, "tools": tools, "extra_body": extra_body},
+                payload,
                 ensure_ascii=False, sort_keys=True, separators=(",", ":"),
             )
         except (TypeError, ValueError, OverflowError) as exc:
@@ -2462,11 +2480,8 @@ class ProviderGatewayClient:
     def _authorize(
         self,
         *,
-        messages: Any,
-        tools: Any,
-        extra_body: Any,
+        shape: "_EgressShape",
         max_tokens: int | None,
-        stream: bool,
     ) -> "_ProviderAuthorization | None":
         # C-R1：这里曾有 `if self._allow_ungoverned_test_transport: return None, ""`，
         # 一个构造期布尔量即可整体跳过 authority、registry、DLP、预算、审批与审计。
@@ -2512,9 +2527,7 @@ class ProviderGatewayClient:
             or run.status is not TaskStatus.RUNNING
         ):
             raise GatewayDenied("provider egress Task Runtime binding is invalid")
-        required = {"chat", "stream" if stream else "chat"}
-        if tools:
-            required.add("tools")
+        required = set(shape.required)
         capability = self.registry.authorize(
             self.provider,
             model=self.model,
@@ -2522,7 +2535,7 @@ class ProviderGatewayClient:
             transport=self.transport,
             required_capabilities=required,
         )
-        serialized = self._serialized_request(messages, tools, extra_body)
+        serialized = self._serialized_request(shape.payload)
         decision = PiiDlpGateway().decide_outbound(serialized, approved=False)
         capability_digest = _provider_capability_digest(
             capability, model=self.model, endpoint=self.base_url, transport=self.transport,
@@ -2564,8 +2577,13 @@ class ProviderGatewayClient:
         estimated_input_tokens = max(1, math.ceil(len(serialized) / 4))
         # I-R1：`max_tokens=None`（生产 Worker 的值）时不再预留 0，而是施加一个保守
         # 上限并受剩余额度收敛；准确用量由 effect 后的 usage 对账补齐。
-        output_limit = self._effective_output_limit(
-            authority, run=run, requested=max_tokens,
+        #
+        # embedding 不生成 token，所以它**不预留输出**：给一次向量化按 chat 的输出上限
+        # 扣预算不会报错，只是每次调用都白扣一大笔，然后把额度悄悄用光。
+        output_limit = (
+            self._effective_output_limit(authority, run=run, requested=max_tokens)
+            if shape.reserves_output
+            else 0
         )
         reserved_output_tokens = output_limit
         # I3：预留与 consume 必须用**同一份** BudgetUsage。旧实现声明
@@ -2886,8 +2904,12 @@ class ProviderGatewayClient:
         extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         authorization = self._authorize(
-            messages=messages, tools=tools, extra_body=extra_body,
-            max_tokens=max_tokens, stream=False,
+            shape=_EgressShape(
+                required=frozenset({"chat", "tools"} if tools else {"chat"}),
+                payload={"messages": messages, "tools": tools, "extra_body": extra_body},
+                reserves_output=True,
+            ),
+            max_tokens=max_tokens,
         )
         try:
             result = await object.__getattribute__(self, "_transport").chat(
@@ -2917,6 +2939,51 @@ class ProviderGatewayClient:
         )
         return result
 
+    async def embed(self, texts: list[str]) -> dict[str, Any]:
+        """把一批文本送去向量化。
+
+        这是**第三种**受权调用类型（前两种是 `chat` 与 `chat_stream`）。它与 chat 的差异
+        只有三点，全部由 `_EgressShape` 表达：
+
+        * 能力要求是 `embedding`，不是 `chat`——否则"这个 provider 提不提供向量化"这个
+          判断等于不存在；
+        * 出站正文是一个文本数组，而 DLP 必须扫到它；
+        * **不预留输出 token**：embedding 不生成 token。
+
+        其余每一步——authority 校验、run 绑定、审批、预算、`provider_egress` 审计、失败与
+        取消的终态——与 chat 走的是同一条路径，这是刻意的。新增一条 egress 路径最容易出的
+        事不是"发不出去"，而是它悄悄少走了其中一步，而外面看不出任何异常。
+        """
+        if not texts:
+            raise GatewayDenied("embedding requires at least one text")
+        authorization = self._authorize(
+            shape=_EgressShape(
+                required=frozenset({"embedding"}),
+                # 只放文本：DLP 扫的就是这一串，所以**凡是要出站的文字都必须在这里**。
+                payload={"input": list(texts)},
+                reserves_output=False,
+            ),
+            max_tokens=None,
+        )
+        try:
+            result = await object.__getattribute__(self, "_transport").embed(list(texts))
+        except (GeneratorExit, asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            # 取消不是失败（M-6 / M-4）。第三种调用类型同样要守住这条线，否则一次"用户
+            # 走开了"会在审计里记成 provider 崩了。
+            self._reconcile_provider_usage(authorization, None, failed=True)
+            self._complete_authorized_effect(authorization, error=None, cancelled=True)
+            raise
+        except BaseException as exc:
+            self._reconcile_provider_usage(authorization, None, failed=True)
+            self._complete_authorized_effect(authorization, error=exc)
+            raise
+        self._reconcile_provider_usage(authorization, result)
+        self._complete_authorized_effect(
+            authorization, error=None,
+            actual_tokens=_provider_reported_total_tokens(result),
+        )
+        return result
+
     async def chat_stream(
         self,
         messages: list[dict[str, Any]],
@@ -2926,8 +2993,12 @@ class ProviderGatewayClient:
         extra_body: dict[str, Any] | None = None,
     ):
         authorization = self._authorize(
-            messages=messages, tools=tools, extra_body=extra_body,
-            max_tokens=max_tokens, stream=True,
+            shape=_EgressShape(
+                required=frozenset({"chat", "stream", "tools"} if tools else {"chat", "stream"}),
+                payload={"messages": messages, "tools": tools, "extra_body": extra_body},
+                reserves_output=True,
+            ),
+            max_tokens=max_tokens,
         )
         try:
             async for event in object.__getattribute__(self, "_transport").chat_stream(

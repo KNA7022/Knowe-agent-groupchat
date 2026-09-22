@@ -1578,7 +1578,12 @@ def test_a_duck_typed_runtime_is_rejected_before_any_approval_work() -> None:
     )
 
     # 前置条件：这份 payload 必须真的要求审批，否则本测试证明不了审批路径。
-    serialized = client._serialized_request(messages, None, None)  # noqa: SLF001
+    # ⚠ 这里的 payload 形状必须与 `chat` 调用点喂给 `_authorize` 的那一份**逐字一致**：
+    #   `_serialized_request` 现在接受一个 payload 映射（第三种调用类型 embedding 进来时
+    #   参数化的），如果这里自己另造一个形状，证明的就变成"另一个 payload 要求审批"了。
+    serialized = client._serialized_request(  # noqa: SLF001
+        {"messages": messages, "tools": None, "extra_body": None},
+    )
     assert PiiDlpGateway().decide_outbound(serialized, approved=False).requires_approval, (
         "this payload must actually require approval; a test that silently takes the "
         "non-sensitive path would just repeat the test above"

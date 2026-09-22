@@ -552,8 +552,40 @@ class ProviderClient:
             body.pop("tools", None)
         return body
 
-    async def _request(self, body: dict[str, Any]) -> dict[str, Any]:
+    # ── Embeddings ──
+
+    @property
+    def _embeddings_endpoint(self) -> str:
+        """embeddings 的 URL。
+
+        构造器允许 `base_url` 自带 `/chat/completions`（见上面那段注释），所以这里要先把
+        那一段去掉再加 `/embeddings`——否则会拼出 `.../chat/completions/embeddings` 这种
+        不存在的路径，而 provider 只会回一个 404，看起来像"这个模型不支持向量化"。
+        """
+        stripped = self.base_url
+        if stripped.endswith("/embeddings"):
+            return stripped
+        if stripped.endswith("/chat/completions"):
+            stripped = stripped[: -len("/chat/completions")]
+        return f"{stripped}/embeddings"
+
+    async def embed(self, texts: list[str]) -> dict[str, Any]:
+        """把一批文本向量化。
+
+        **不走 `_build_body`**：那条路径写的是 `messages`/`tools`/`stream`，是对话的形状。
+        这里只发 `model` 与 `input`，其余保持 provider 的默认值——多塞对话字段的后果不是
+        报错，而是 provider 按对话处理这批文本（或者干脆忽略 `input`）。
+        """
+        if not texts:
+            raise ValueError("embedding requires at least one text")
+        body = {"model": self.model, "input": list(texts)}
+        return await self._request(body, endpoint=self._embeddings_endpoint)
+
+    async def _request(
+        self, body: dict[str, Any], *, endpoint: str | None = None,
+    ) -> dict[str, Any]:
         self._assert_gateway_managed()
+        target = endpoint or self._endpoint
         total_attempts = self.max_retries + 1
         # I3：记录本次真实发出的调用次数，供 Gateway 结算时退回多预留的部分。
         self.last_attempts = 0
@@ -562,7 +594,7 @@ class ProviderClient:
                 self.last_attempts = attempt + 1
                 client = self._get_client()
                 response = await client.post(
-                    self._endpoint,
+                    target,
                     headers=self._request_headers(),
                     json=body,
                     timeout=self.timeout,
