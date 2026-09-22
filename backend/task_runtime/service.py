@@ -819,7 +819,16 @@ class TaskRuntimeService:
         return durable_approval, durable_grant, self.store.get_run(run.run_id) or run
 
     def expire_pending_approvals(self, *, reschedule: bool = True) -> tuple[str, ...]:
-        """Durably remove expired approval actions without waiting for a user click."""
+        """Durably remove expired approval actions without waiting for a user click.
+
+        ⚠ 这里的失败处理捕 `Exception` 而不是 `RuntimeStoreError`，理由与
+        `commercial_gateway` 的取消守卫完全相同：`knowe_storage/_sqlite.py` 的
+        `transaction()` 在回滚后**原样重抛** `sqlite3.*`，store 层不做包装。只捕
+        `RuntimeStoreError` 时，一次 `database is locked`（busy_timeout 默认 1000ms）会从
+        **整轮**清理冒出去，而这几个分支写的都是 `continue` —— 本意是"跳过这一条"。
+        （同一个模式在 `commercial_gateway` 里的后果更重，见 `.superpowers/sdd/
+        studycrew-commercial-continuation/progress.md` 第七轮复审的 I-1。）
+        """
         expired_ids: list[str] = []
         now_dt = datetime.now(timezone.utc)
         now = self._canonical_utc(now_dt)
@@ -845,7 +854,7 @@ class TaskRuntimeService:
                         normalized = self.store.normalize_pending_approval_expiry(
                             approval.approval_id, expires_at=canonical_expiry,
                         )
-                    except RuntimeStoreError:
+                    except Exception:  # noqa: BLE001 -- 理由见方法上方注释
                         continue
                     if normalized is not None:
                         approval = normalized
@@ -853,7 +862,7 @@ class TaskRuntimeService:
                     continue
                 run = self.store.get_run(approval.run_id)
                 if run is None:
-                    with contextlib.suppress(RuntimeStoreError):
+                    with contextlib.suppress(Exception):  # noqa: BLE001 -- 同上
                         self.store.reject_pending_approval(
                             approval.approval_id,
                             resolution="invalid_expiry" if invalid_expiry else "expired",
@@ -866,7 +875,7 @@ class TaskRuntimeService:
                         durable = self.store.reject_pending_approval(
                             approval.approval_id, resolution=resolution, resolved_at=now,
                         )
-                    except RuntimeStoreError:
+                    except Exception:  # noqa: BLE001 -- 理由见方法上方注释
                         # Deletion reconciliation owns fenced Group content.
                         continue
                     if durable is not None and durable.status != "pending":
@@ -1825,7 +1834,13 @@ class TaskRuntimeService:
                 return
 
     def _schedule_under_lease(self) -> tuple[TaskRun, ...]:
-        """Dispatch queued work within all local limits using durable group rotation."""
+        """Dispatch queued work within all local limits using durable group rotation.
+
+        ⚠ 同一个理由（见 `expire_pending_approvals`）：dispatch 循环里那次 `except` 捕
+        `Exception`，因为 `sqlite3.*` 由 `_sqlite.transaction()` 原样重抛。只捕
+        `RuntimeStoreError` 时，一条 run 撞上 `database is locked` 会让**整批** run 一个都
+        起不来，而那个分支写的也是 `continue`。
+        """
         with self._lock:
             all_runs = list(self.store.list_runs())
             executing = [run for run in all_runs if run.status in _EXECUTING]
@@ -1897,7 +1912,7 @@ class TaskRuntimeService:
                         idempotency_key=f"start:{run.run_id}:{routed.version}",
                         summary="Task running",
                     )
-                except (RuntimeConflictError, RuntimeNotFoundError, RuntimeStoreError):
+                except Exception:  # noqa: BLE001 -- 理由见 _schedule_under_lease 上方注释
                     # A concurrent durable delete fence wins over dispatch.
                     continue
                 lane = "index" if run.queue_class is QueueClass.INDEX else run.kind.value

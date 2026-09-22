@@ -578,3 +578,56 @@ def test_server_boundary_accepts_legacy_alias_but_rejects_mismatched_identity(tm
         server.task_runtime.close()
         if server.store is not None:
             server.store.close(timeout=5)
+
+
+# ── 同类窄守卫：`sqlite3.*` 逃逸不该让整轮循环停摆 ──────────────────────────────
+#
+# 第七轮复审在 `commercial_gateway` 里发现的模式是"守卫只捕我们自己造的异常类型，而
+# `knowe_storage/_sqlite.py` 的 `transaction()` 在回滚后**原样重抛** `sqlite3.*`"。
+# 同一模式在这两个循环里后果轻一些（韧性而非审计失真），但没有理由留着：它们都写着
+# `continue`，意思是"跳过这一条"，而 `sqlite3.*` 逃逸时实际发生的是"整轮都没了"。
+
+
+def test_expired_approval_sweep_survives_a_real_storage_failure(runtime) -> None:
+    """一次 `database is locked` 只该跳过那一条审批，不该中断整轮过期清理。"""
+    import sqlite3
+    from types import SimpleNamespace
+
+    groups, service = runtime
+    group = make_group(groups, "expire-sweep")
+    run = submit_primary(service, group.group_id, "expire")
+    run = service.schedule()[0]
+
+    fake = SimpleNamespace(
+        approval_id="apr_" + "1" * 32,
+        run_id=run.run_id,
+        status="pending",
+        # 带 +08:00 偏移，于是与 `_canonical_utc` 的结果不同，会走 normalize 那条分支。
+        expires_at="2026-01-01T08:00:00+08:00",
+    )
+    service.store.all_pending_approvals = lambda: [fake]
+
+    def exploding(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    service.store.normalize_pending_approval_expiry = exploding
+
+    # 修复前：sqlite3.OperationalError 从整个 sweep 冒出来。
+    assert service.expire_pending_approvals() == ()
+
+
+def test_dispatch_survives_a_real_storage_failure(runtime) -> None:
+    """一条 run 撞上 `database is locked`，不该让同批的 run 一个都起不来。"""
+    import sqlite3
+
+    groups, service = runtime
+    group = make_group(groups, "dispatch-lock")
+    submit_primary(service, group.group_id, "dispatch-1")
+
+    def exploding(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    service.transition = exploding  # type: ignore[method-assign]
+
+    # 修复前：整个 schedule() 抛 sqlite3.OperationalError。
+    assert service.schedule() == ()
