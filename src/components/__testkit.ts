@@ -41,6 +41,9 @@ export function seedConv(
     members: opts.members ?? [],
     banner: opts.banner ?? null,
     draft: '',
+    // `Conv.unread` is required (store/state.ts:349) and the store's own normaliser defaults it
+    // to 0 (state.ts:1850), so fixtures match that rather than inventing a value.
+    unread: 0,
   };
   useKnoweStore.setState((s) => ({
     convs: { ...s.convs, [projectId]: conv },

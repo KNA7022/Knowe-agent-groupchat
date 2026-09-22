@@ -8,7 +8,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { render, screen, fireEvent, cleanup, act } from '@testing-library/react';
 import { useKnoweStore } from '../store/store';
 import type { ConnStatus } from '../store/state';
-import { resetStore, seedConv, activate, installSocketSpy } from './__testkit';
+import { resetStore, seedConv, activate } from './__testkit';
 
 import ConnBadge from './ConnBadge';
 import Rail from './Rail';

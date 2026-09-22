@@ -19,7 +19,7 @@ import {
 import { getZinniaDisplayName } from './avatar';
 
 function conv(): Conv {
-  return { projectId: 'p1', items: [], members: [], banner: null, draft: '' };
+  return { projectId: 'p1', items: [], members: [], banner: null, draft: '', unread: 0 };
 }
 
 describe('displayInfo · 回退链', () => {

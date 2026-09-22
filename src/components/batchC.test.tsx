@@ -120,7 +120,7 @@ describe('ApprovalCard · 任务卡', () => {
 describe('RosterPanel', () => {
   it('open=false → 面板不带 .open（收起）', () => {
     useKnoweStore.setState({
-      convs: { p1: { projectId: 'p1', items: [], members: [member('fe_1', '小前')], banner: null, draft: '' } },
+      convs: { p1: { projectId: 'p1', items: [], members: [member('fe_1', '小前')], banner: null, draft: '', unread: 0 } },
       activeProjectId: 'p1',
     });
     const { container } = render(<RosterPanel open={false} onClose={() => {}} />);
@@ -133,6 +133,7 @@ describe('RosterPanel', () => {
         p1: {
           projectId: 'p1', items: [], banner: null,
       draft: '',
+          unread: 0,
           members: [member('fe_1', '小前', '前端', 'busy'), member('be_1', '小后', '后端', 'idle')],
         },
       },

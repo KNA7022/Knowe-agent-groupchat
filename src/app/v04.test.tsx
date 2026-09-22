@@ -25,7 +25,7 @@ import {
 } from '../store/state';
 
 function conv(): Conv {
-  return { projectId: 'p1', items: [], members: [], banner: null, draft: '' };
+  return { projectId: 'p1', items: [], members: [], banner: null, draft: '', unread: 0 };
 }
 
 /** 把 store 恢复到刚打开软件的样子 */

@@ -23,7 +23,7 @@ import {
 const base = { project_id: 'p1', ts: '2026-01-01T00:00:00Z' };
 
 function conv(): Conv {
-  return { projectId: 'p1', projectName: 'p1', items: [], members: [], banner: null, draft: '' };
+  return { projectId: 'p1', projectName: 'p1', items: [], members: [], banner: null, draft: '', unread: 0 };
 }
 function apply(c: Conv, ev: unknown): void {
   applyEvent(c, ev as never, DEFAULT_AGENTS, DEFAULT_ROLE_TYPES);

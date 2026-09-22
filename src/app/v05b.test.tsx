@@ -19,7 +19,7 @@ import {
 } from '../store/state';
 
 function conv(projectId = 'p1', projectName = '官网改版'): Conv {
-  return { projectId, projectName, items: [], members: [], banner: null, draft: '' };
+  return { projectId, projectName, items: [], members: [], banner: null, draft: '', unread: 0 };
 }
 
 function resetStore(): void {

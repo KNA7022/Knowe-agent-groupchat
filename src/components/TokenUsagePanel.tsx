@@ -676,7 +676,11 @@ export const TokenUsagePanel: React.FC = () => {
   const savedChars = totals?.saved_chars ?? 0;
   // [v1.0.34-M4-v2] 瞬时组（本回合=最新一条含数据的记录）+ 投影保留条数
   const latestCompressionCount = totals?.latest_compression_count ?? null;
-  const latestSavedChars = totals?.latest_saved_chars ?? null;
+  // `latest_saved_chars` is deliberately not read here: the panel's "省字符" figure is the
+  // running total (`savedChars` below), which is what the m4 test asserts. The field is still
+  // produced by token_usage.py and parsed by store/tokenUsage.ts, so wiring a "last round"
+  // figure later needs no backend change — it just was never wired, and reading it without
+  // using it was the only thing making this line exist.
   const latestProjectedCount = totals?.latest_projected_count ?? null;
   const projectedCount = totals?.projected_count ?? 0;
   const hasContextData = hasUsage || compressionCount > 0 || savedChars > 0
