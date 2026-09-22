@@ -72,15 +72,25 @@ environment allowlist.
 
 1. **Per-model privacy and price (I-R1's remaining half).** `models=("*",)` means any model name
    passes for a registered provider, with `privacy=STANDARD` and `estimated_cost_usd=0.01` at the
-   **provider** level. Measured (this is the number the ninth review was asked to check): the
-   repository's sourced pricing catalogue `backend/token_pricing.py` holds 17 providers and covers
-   **14 of the registry's 19** — it has **no entry at all** for `copilot`, `gmi`, `huggingface`,
-   `kimi-coding` and `kimi-coding-cn`. So keying `models` off the catalogue would leave those five
-   with an empty model set (fail-closed, i.e. unusable) and would also reject any new model a user
-   configures. And the catalogue carries **no privacy data whatsoever** — per-model privacy cannot be
-   derived from it. Recommendation on record: keep the wildcard until a verified per-model privacy
-   list exists, then make **privacy** per-model (the part with real user consequence) and leave price
-   at provider level. This is a product decision, not an oversight.
+   **provider** level. Two measurements now back this, and the second one is why the obvious fix
+   was abandoned:
+   - The sourced pricing catalogue `backend/token_pricing.py` holds 17 providers and covers **14
+     of the registry's 19** — it has no entry at all for `copilot`, `gmi`, `huggingface`,
+     `kimi-coding`, `kimi-coding-cn`. Keying `models` off it would leave those five with an empty
+     model set (fail-closed, i.e. unusable) and would reject any new model a user configures. And
+     it carries **no privacy data whatsoever**, so per-model privacy cannot be derived from it.
+   - The flat `0.01` is *also* wrong, and replacing it provider-wide is worse. `worst_case_call_cost_usd`
+     (added in `token_pricing`, deliberately **not** wired into the registry) measures one typical
+     call to each provider's priciest model: `openai-api`/`openrouter` $0.6600, `anthropic` $0.3000,
+     `zai` $0.0228, `deepseek` $0.0106, `arcee` $0.0041. Reserving $0.66 per call would exhaust a
+     declared $5 budget in eight calls while a cheap-model user in that same provider spends about
+     $0.0006 each; the flat `0.01` has the opposite defect (≈4.5x too low for `gpt-4o`). **Within
+     one provider the spread is two orders of magnitude, so no provider-wide constant is correct.**
+   - Conclusion on record: closing this half requires **per-model reservation**, not a better
+     constant, and a verified per-model privacy list before the wildcard can be tightened at all.
+     Both are product decisions plus data work. Recommendation: make **privacy** per-model first
+     (the part with real user consequence), leave price at provider level until reservation itself
+     becomes per-model.
 2. **`chat_stream` terminal event is not guaranteed.** If a consumer neither closes the generator
    nor lets the event loop run `shutdown_asyncgens`, the terminal `provider_egress` event can be
    missing entirely. Measured by the fifth review; not fixable inside that function.

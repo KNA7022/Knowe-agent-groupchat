@@ -1624,6 +1624,32 @@ def test_the_model_wildcard_is_a_recorded_limitation_not_an_oversight() -> None:
     assert capability.estimated_cost_usd == 0.01
 
 
+def test_no_provider_wide_cost_constant_can_be_correct() -> None:
+    """I-R1 的逐模型缺口有实测证据：**同一个 provider 内部的价差达两个数量级**。
+
+    这条测试钉住那个测量。`worst_case_call_cost_usd` 本来是写来替换 registry 里扁平的
+    `estimated_cost_usd = 0.01` 的，测量之后放弃了这个替换——按 provider 取最贵不是"保守"，
+    而是**不可用**：为 `openai-api` 的每次调用预留 $0.66，意味着一个声明 $5 预算的 run 在
+    8 次调用后就耗尽，而同 provider 下用便宜模型的用户每次实际只花约 $0.0006。
+
+    换句话说：扁平 0.01 偏低（对 `gpt-4o` 实测低约 4.5 倍），取最贵又高得离谱，**两者之间
+    没有正确的 provider 级常数**。要闭合这一半必须按模型预留，而不是换一个更好的常数。
+    """
+
+    from backend.token_pricing import worst_case_call_cost_usd
+
+    openai_api = worst_case_call_cost_usd("openai-api")
+    deepseek = worst_case_call_cost_usd("deepseek")
+    assert openai_api is not None and deepseek is not None
+
+    # 同一批已登记的 provider 内部差 60 倍以上 —— 这就是 provider 级常数不可能正确的原因。
+    assert openai_api > 20 * deepseek, (openai_api, deepseek)
+    assert openai_api > 0.5, "the priciest provider is far above the flat 0.01 for a reason"
+
+    # 没有 USD 价格的 provider 返回 None，而不是猜一个汇率。
+    assert worst_case_call_cost_usd("copilot") is None
+
+
 @pytest.mark.parametrize("abort", [asyncio.CancelledError, KeyboardInterrupt, SystemExit])
 def test_aborted_chat_is_audited_as_cancelled_not_failed(
     tmp_path: Any, abort: type[BaseException],

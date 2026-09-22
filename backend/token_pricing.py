@@ -486,3 +486,69 @@ def pricing_payload(
         "source": pricing.source,
         "rate_period": "peak" if _is_peak_period(now) else "off_peak",
     }
+
+
+#: One "typical call" in tokens, used only to fold per-model prices into the single
+#: per-provider figure the budget reserves. Reserving only has to be an upper bound, so
+#: these are rounded up rather than fitted to any particular workload — and saying so is
+#: the point: they are a stated assumption, not a measurement.
+TYPICAL_INPUT_TOKENS = 10_000
+TYPICAL_OUTPUT_TOKENS = 2_000
+
+
+def worst_case_call_cost_usd(
+    provider: str,
+    *,
+    input_tokens: int = TYPICAL_INPUT_TOKENS,
+    output_tokens: int = TYPICAL_OUTPUT_TOKENS,
+) -> float | None:
+    """Cost in USD of one typical call to this provider's **most expensive** model.
+
+    ⚠ **Read this before using it for anything.** It was written to replace the flat
+    `estimated_cost_usd = 0.01` in the capability registry, and that replacement was
+    abandoned after measuring what it produces — because taken provider-wide it is not
+    "conservative", it is **unusable**:
+
+        openai-api / openrouter  0.6600 USD per call
+        anthropic                0.3000
+        zai                      0.0228
+        deepseek                 0.0106
+        arcee                    0.0041
+
+    Reserving 0.66 for every call to `openai-api` means a run that declares a $5 cost budget
+    is exhausted after eight calls — while a user on a cheap model in that same provider is
+    actually spending about $0.0006 each. The flat 0.01 has the opposite defect (measured
+    ~4.5x too low for `gpt-4o`).
+
+    The pair is the point: **no provider-wide constant is right**, because the spread inside
+    a single provider is two orders of magnitude. Closing I-R1's remaining half therefore
+    requires per-model reservation, not a better constant — see the ledger.
+
+    Kept as a measurement tool: it reports the bound, and it is what produced the table above.
+    Only **USD** rows are used; folding a CNY row would need an exchange-rate assumption, and
+    an unverified rate would turn "conservative" into one more number nobody checked. Rows
+    whose source is 'unknown' carry `None` rates and are skipped rather than treated as zero,
+    because zero would silently *lower* the bound.
+    """
+
+    models = _RAW.get(str(provider))
+    if not models:
+        return None
+    worst: float | None = None
+    for currencies in models.values():
+        entry = currencies.get("USD")
+        if entry is None:
+            continue
+        _cache_hit, miss, out = entry
+        # The table deliberately allows `None` rates for rows whose source is 'unknown'
+        # (see the module docstring). They carry no price information, so they cannot
+        # contribute to a conservative bound and are skipped rather than treated as zero —
+        # zero would silently *lower* the reservation, which is the direction that overspends.
+        if miss is None or out is None:
+            continue
+        cost = (
+            (input_tokens / 1_000_000) * float(miss)
+            + (output_tokens / 1_000_000) * float(out)
+        )
+        worst = cost if worst is None else max(worst, cost)
+    return worst
