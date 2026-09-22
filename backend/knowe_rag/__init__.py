@@ -21,6 +21,16 @@ from .chunks import (
     embedding_requests,
     plan_reindex,
 )
+from .citations import (
+    CitationReport,
+    Grounding,
+    GroundingVerdict,
+    LocationError,
+    ParsedLocation,
+    parse_location,
+    sort_locations,
+    verify_citations,
+)
 from .crypto import MasterKey, MasterKeyError, field_aad
 from .fusion import (
     EVIDENCE_MAXIMUM,
@@ -62,12 +72,17 @@ __all__ = [
     "VECTOR_RECALL",
     "Bm25Index",
     "Chunk",
+    "CitationReport",
     "EmbeddingRequest",
     "EncryptedKnowledgeStore",
     "EvidencePack",
+    "Grounding",
+    "GroundingVerdict",
+    "LocationError",
     "MasterKey",
     "MasterKeyError",
     "ParsedBlock",
+    "ParsedLocation",
     "ReindexPlan",
     "RetrievalError",
     "RetrievedChunk",
@@ -83,7 +98,10 @@ __all__ = [
     "maximal_marginal_relevance",
     "pack_evidence",
     "parse_document",
+    "parse_location",
     "plan_reindex",
     "reciprocal_rank_fusion",
+    "sort_locations",
     "tokenize",
+    "verify_citations",
 ]
