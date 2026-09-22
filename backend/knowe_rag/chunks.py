@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import hashlib
 from typing import Mapping
 
+from .crypto import ContentHasher
 from .parsers import ParsedBlock
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "EmbeddingRequest",
     "ReindexPlan",
     "build_chunks",
+    "default_content_hash",
     "diff_fingerprints",
     "embedding_requests",
     "plan_reindex",
@@ -91,7 +93,15 @@ class ReindexPlan:
     embeddings_needed: tuple[EmbeddingRequest, ...]
 
 
-def _content_hash(text: str) -> str:
+def default_content_hash(text: str) -> str:
+    """无盐 `sha256`——**只适合内存里的差异比较，不要用它落盘**。
+
+    它让"这段具体文字在不在库里"变成一次免费查询：这个产品的块经常很短（姓名+学号+电话、
+    一行成绩），候选空间小到可以穷举，而对一份已知文档也能直接验证。落盘的那一版必须是
+    `crypto.keyed_content_hasher(master_key)` 算出来的；`EncryptedKnowledgeStore` 会在写入
+    前统一替换，所以调用方不需要记得——但把这条写在函数自己的 docstring 里，是因为它长得
+    太像"一个普通的哈希函数"了。
+    """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -190,8 +200,14 @@ def build_chunks(
     *,
     parent_max_chars: int = PARENT_MAX_CHARS,
     child_max_chars: int = CHILD_MAX_CHARS,
+    content_hasher: ContentHasher = default_content_hash,
 ) -> tuple[Chunk, ...]:
-    """把一份文档的块切成 parent + child，顺序是"每个 parent 后面跟它的 children"。"""
+    """把一份文档的块切成 parent + child，顺序是"每个 parent 后面跟它的 children"。
+
+    `content_hasher` 默认是无盐 sha256（见 `default_content_hash` 的说明）。**要落盘的话，
+    由存储层传入绑定主密钥的那一版**——`EncryptedKnowledgeStore` 会在写入前统一替换，调用方
+    不需要记得这件事。
+    """
     chunks: list[Chunk] = []
     for group in _group_into_parents(blocks, parent_max_chars):
         location = _parent_location(group)
@@ -203,7 +219,7 @@ def build_chunks(
             document_id=document_id,
             location=location,
             text=text,
-            content_hash=_content_hash(text),
+            content_hash=content_hasher(text),
             kind=group[0].kind,
             level=PARENT,
         ))
@@ -216,7 +232,7 @@ def build_chunks(
                 document_id=document_id,
                 location=f"{location}#{ordinal}",
                 text=child_text,
-                content_hash=_content_hash(child_text),
+                content_hash=content_hasher(child_text),
                 kind=group[0].kind,
                 level=CHILD,
             ))

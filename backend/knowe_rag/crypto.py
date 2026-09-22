@@ -18,17 +18,25 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
+import hashlib
+import hmac
 import os
 from pathlib import Path
+from typing import Callable
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 __all__ = [
+    "ContentHasher",
     "MasterKey",
     "MasterKeyError",
     "field_aad",
+    "keyed_content_hasher",
 ]
+
+#: 内容指纹函数的形状。`chunks.build_chunks` 接受一个，于是"指纹怎么算"可以由调用方决定。
+ContentHasher = Callable[[str], str]
 
 #: GCM 的 nonce 长度。随机 96 位在 2^96 的空间里碰撞概率可忽略，比计数器安全——计数器一旦
 #: 在复用密钥时归零，就是灾难性的失密。
@@ -188,3 +196,24 @@ class MasterKey:
             raise MasterKeyError(
                 "密文没有通过认证：它要么被改动过，要么不属于这个位置（记录或字段对不上）"
             ) from exc
+
+
+def keyed_content_hasher(master_key: "MasterKey") -> ContentHasher:
+    """把内容指纹**绑定到主密钥**上（HMAC-SHA256）。
+
+    无盐 `sha256(明文)` 的问题不是"能从指纹反推原文"，而是**库文件变成一台免费的确认机**：
+    这个产品的块经常很短（姓名+学号+电话、一行成绩、一句评语），候选空间很小，穷举得出来；
+    对一份已知文档也能立刻验证"这句话在不在库里"。加密保护的正是这类数据，而指纹把其中可猜
+    的那部分变回了明文。
+
+    绑密钥不削弱去重：同一个库里相同文本仍然得到同一个指纹，所以"同一段话只算一次向量"
+    照常成立。代价是**换主密钥必须重建索引**——指纹会全变，而那是正确的：换了钥匙的库本来
+    就不该被当成同一个库。
+    """
+
+    def hasher(text: str) -> str:
+        return hmac.new(
+            master_key.key_material, str(text).encode("utf-8"), hashlib.sha256,
+        ).hexdigest()
+
+    return hasher

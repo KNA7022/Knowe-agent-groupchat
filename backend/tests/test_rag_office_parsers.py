@@ -268,7 +268,7 @@ def test_pptx_empty_slides_yield_no_block(tmp_path: Path) -> None:
 
 # ── XLSX ──────────────────────────────────────────────────────────────
 
-def test_xlsx_position_names_the_sheet_and_the_cell_range(tmp_path: Path) -> None:
+def test_xlsx_position_names_the_sheet_index_and_the_cell_range(tmp_path: Path) -> None:
     """位置要能让人直接跳到那几格去核对。
 
     只写工作表名的话，一张几千行的表里"这个说法出自哪里"就没有答案了。
@@ -280,7 +280,7 @@ def test_xlsx_position_names_the_sheet_and_the_cell_range(tmp_path: Path) -> Non
 
     blocks = parse_document(path)
 
-    assert [(b.location, b.kind) for b in blocks] == [("sheet:成绩!A1:B2", "sheet")]
+    assert [(b.location, b.kind) for b in blocks] == [("sheet:1!A1:B2", "sheet")]
 
 
 def test_xlsx_resolves_shared_and_inline_strings_and_numbers(tmp_path: Path) -> None:
@@ -299,7 +299,7 @@ def test_xlsx_resolves_shared_and_inline_strings_and_numbers(tmp_path: Path) -> 
 
     blocks = parse_document(path)
 
-    assert blocks[0].text == "共享\t内联\t42"
+    assert blocks[0].text == "Sheet1\n共享\t内联\t42"
 
 
 def test_xlsx_keeps_columns_aligned_inside_the_range(tmp_path: Path) -> None:
@@ -315,8 +315,8 @@ def test_xlsx_keeps_columns_aligned_inside_the_range(tmp_path: Path) -> None:
 
     blocks = parse_document(path)
 
-    assert blocks[0].text == "甲\t\t1"
-    assert blocks[0].location == "sheet:Sheet1!A1:C1"
+    assert blocks[0].text == "Sheet1\n甲\t\t1"
+    assert blocks[0].location == "sheet:1!A1:C1"
 
 
 def test_xlsx_infers_cell_position_when_the_reference_is_missing(tmp_path: Path) -> None:
@@ -329,8 +329,8 @@ def test_xlsx_infers_cell_position_when_the_reference_is_missing(tmp_path: Path)
 
     blocks = parse_document(path)
 
-    assert blocks[0].text == "甲\t乙"
-    assert blocks[0].location == "sheet:Sheet1!A1:B1"
+    assert blocks[0].text == "Sheet1\n甲\t乙"
+    assert blocks[0].location == "sheet:1!A1:B1"
 
 
 def test_xlsx_tall_sheet_is_split_into_row_bands(tmp_path: Path) -> None:
@@ -347,10 +347,11 @@ def test_xlsx_tall_sheet_is_split_into_row_bands(tmp_path: Path) -> None:
     blocks = parse_document(path)
 
     assert [b.location for b in blocks] == [
-        f"sheet:Sheet1!A1:A{SHEET_ROWS_PER_BLOCK}",
-        f"sheet:Sheet1!A{SHEET_ROWS_PER_BLOCK + 1}:A{SHEET_ROWS_PER_BLOCK + 1}",
+        f"sheet:1!A1:A{SHEET_ROWS_PER_BLOCK}",
+        f"sheet:1!A{SHEET_ROWS_PER_BLOCK + 1}:A{SHEET_ROWS_PER_BLOCK + 1}",
     ]
-    assert sum(len(b.text.splitlines()) for b in blocks) == SHEET_ROWS_PER_BLOCK + 1
+    # 每个 band 的第一行是工作表名（表名挪进文本那一侧），所以减掉它才是数据行数。
+    assert sum(len(b.text.splitlines()) - 1 for b in blocks) == SHEET_ROWS_PER_BLOCK + 1
 
 
 def test_xlsx_empty_sheet_yields_no_block(tmp_path: Path) -> None:
@@ -358,7 +359,8 @@ def test_xlsx_empty_sheet_yields_no_block(tmp_path: Path) -> None:
 
     blocks = parse_document(path)
 
-    assert [b.location for b in blocks] == ["sheet:有表!A1:A1"]
+    # 序号是**工作簿里**的位置：空表是第 1 张、有表是第 2 张，所以这里写 2。
+    assert [b.location for b in blocks] == ["sheet:2!A1:A1"]
 
 
 def test_xlsx_blank_rows_are_dropped_from_the_band(tmp_path: Path) -> None:
@@ -369,7 +371,7 @@ def test_xlsx_blank_rows_are_dropped_from_the_band(tmp_path: Path) -> None:
     blocks = parse_document(path)
 
     assert len(blocks) == 2
-    assert [b.location for b in blocks] == ["sheet:Sheet1!A1:A1", "sheet:Sheet1!A3:A3"]
+    assert [b.location for b in blocks] == ["sheet:1!A1:A1", "sheet:1!A3:A3"]
 
 
 # ── 失败要响 ──────────────────────────────────────────────────────────

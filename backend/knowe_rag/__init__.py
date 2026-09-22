@@ -31,7 +31,7 @@ from .citations import (
     sort_locations,
     verify_citations,
 )
-from .crypto import MasterKey, MasterKeyError, field_aad
+from .crypto import MasterKey, MasterKeyError, field_aad, keyed_content_hasher
 from .evaluation import (
     EvaluationCase,
     EvaluationError,
@@ -71,7 +71,7 @@ from .retrieval import (
     RetrievalError,
     ScopeIndex,
 )
-from .store import EncryptedKnowledgeStore, StoreError
+from .store import EncryptedKnowledgeStore, StoreError, document_identifier
 from .vector_index import VectorIndex, VectorIndexError
 
 __all__ = [
@@ -115,10 +115,13 @@ __all__ = [
     "VectorIndex",
     "VectorIndexError",
     "build_chunks",
+    "default_content_hash",
     "diff_fingerprints",
     "embedding_requests",
     "evaluate_retrieval",
+    "document_identifier",
     "field_aad",
+    "keyed_content_hasher",
     "maximal_marginal_relevance",
     "pack_evidence",
     "parse_document",

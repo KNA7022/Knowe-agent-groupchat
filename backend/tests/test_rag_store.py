@@ -71,7 +71,10 @@ def test_written_chunks_read_back_unchanged(store: EncryptedKnowledgeStore) -> N
 
     store.write_document("doc", written)
 
-    assert store.read_chunks("doc") == written
+    # 读回来的块的指纹是**绑定密钥**的那一版（库里的事实），而 `written` 来自
+    # `build_chunks`（无盐）。两者不同是刻意的，所以用 `sealed_chunk` 对齐。
+    expected = tuple(store.sealed_chunk(chunk) for chunk in written)
+    assert store.read_chunks("doc") == expected
 
 
 def test_a_second_store_on_the_same_files_reads_the_same_data(tmp_path: Path) -> None:
@@ -83,7 +86,8 @@ def test_a_second_store_on_the_same_files_reads_the_same_data(tmp_path: Path) ->
         first.write_document("doc", written)
 
     with EncryptedKnowledgeStore(path, master_key=key) as second:
-        assert second.read_chunks("doc") == written
+        expected = tuple(second.sealed_chunk(chunk) for chunk in written)
+        assert second.read_chunks("doc") == expected
 
 
 def test_the_chunk_order_is_preserved(store: EncryptedKnowledgeStore) -> None:
@@ -279,7 +283,8 @@ def test_deleting_one_document_leaves_the_others_alone(store: EncryptedKnowledge
 
     assert store.document_ids() == ("keep",)
     # 拿整份比对，而不是只比文本：parent 与 child 的文本相同，只比文本时"少了一条"看不出来。
-    assert store.read_chunks("keep") == kept
+    expected = tuple(store.sealed_chunk(chunk) for chunk in kept)
+    assert store.read_chunks("keep") == expected
 
 
 def test_deleting_a_document_that_does_not_exist_is_not_an_error(
@@ -336,7 +341,8 @@ def test_missing_embeddings_lists_only_the_ones_without_a_vector(
     """
     chunks = _chunks("甲", "乙")
     store.write_document("doc", chunks)
-    already = next(r for r in embedding_requests(chunks) if r.text == "甲")
+    # 用 store 自己的 `embedding_requests`：模块级那个算的是无盐指纹，与库里的对不上。
+    already = next(r for r in store.embedding_requests(chunks) if r.text == "甲")
     store.store_embedding(already.content_hash, [1.0], model="m")
 
     assert [r.text for r in store.missing_embeddings(chunks, model="m")] == ["乙"]
@@ -347,7 +353,7 @@ def test_missing_embeddings_is_empty_when_everything_is_stored(
 ) -> None:
     chunks = _chunks("甲", "乙")
     store.write_document("doc", chunks)
-    for request in embedding_requests(chunks):
+    for request in store.embedding_requests(chunks):
         store.store_embedding(request.content_hash, [1.0], model="m")
 
     assert store.missing_embeddings(chunks, model="m") == ()
@@ -359,7 +365,7 @@ def test_missing_embeddings_ignores_vectors_from_another_model(
     """别的模型算过不算数：维度与语义都不同，拿旧向量顶替只会让检索悄悄变差。"""
     chunks = _chunks("甲")
     store.write_document("doc", chunks)
-    for request in embedding_requests(chunks):
+    for request in store.embedding_requests(chunks):
         store.store_embedding(request.content_hash, [1.0], model="old-model")
 
     assert [r.text for r in store.missing_embeddings(chunks, model="new-model")] == ["甲"]

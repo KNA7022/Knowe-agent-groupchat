@@ -558,7 +558,9 @@ def _xlsx_bands(
 def _parse_xlsx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBlock, ...]:
     shared = _xlsx_shared_strings(archive)
     blocks: list[ParsedBlock] = []
-    for name, member in _xlsx_workbook_sheets(archive, suffix):
+    for sheet_number, (name, member) in enumerate(
+        _xlsx_workbook_sheets(archive, suffix), start=1,
+    ):
         sheet_root = _parse_xml(_package_member(archive, member, suffix), member, suffix)
         for band in _xlsx_bands(_xlsx_sheet_rows(sheet_root, shared)):
             first_row, last_row = band[0][0], band[-1][0]
@@ -573,10 +575,16 @@ def _parse_xlsx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBl
                 )
                 for _, values in band
             ]
+            # 表名进**文本**而不是位置：它在密文里，同时「期末成绩单」这样的词从此可被
+            # 检索（原实现把它放在 location，于是检索里根本不存在这个词）。
             blocks.append(ParsedBlock(
-                text="\n".join(lines),
+                text="\n".join([name, *lines]),
+                # 位置是**明文**存储的，所以它不能带工作表名——那是用户敲进去的正文。
+                # 复审实测：无密钥直读数据库能拿到 `sheet:期末成绩单!A1:B2`，而单元格
+                # 内容仍是密文。表名改放进块文本（加密的那一侧），于是它既能被检索，
+                # 又不留在文件里。
                 location=(
-                    f"sheet:{name}!"
+                    f"sheet:{sheet_number}!"
                     f"{_xlsx_column_name(first_column)}{first_row}:"
                     f"{_xlsx_column_name(last_column)}{last_row}"
                 ),

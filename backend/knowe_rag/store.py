@@ -3,10 +3,28 @@
 plan 第 49 行：源文件、抽取文本、chunk、向量与缓存都用 AES-256-GCM 加密，只留不透明的元数据
 明文。这里把分块层和加密层接起来，落在应用已有的 `SQLiteDatabase` 事务边界上。
 
-**明文只保留索引运转必需的东西**：`document_id`、`chunk_id`、`parent_id`、`location`、
-`kind`、`level`、`content_hash`、大小与时间戳。`location` 与 `content_hash` 会泄漏结构与
-"两行文字相同"这件事，但不泄漏内容——这正是"不透明元数据"这个取舍的内容，写在这里而不是
-留给读者去猜。
+**明文保留的东西，以及它们各自泄漏什么。**
+
+⚠ 这一段在第十次复审之后重写过。原来的说法是「`location` 与 `content_hash` 不泄漏内容」，
+那句话**不成立**：复审无密钥直读数据库拿到了 `sheet:期末成绩单!A1:B2`，并用重算哈希确认了
+任意选定句子是否在库里。逐项如实列出：
+
+- `document_id` —— 调用方给的。本地优先应用里最自然的做法就是传文件路径，而文件名往往等于
+  文档标题（含姓名与班级）。**必须**用 `document_identifier()` 生成不透明标识；它是约定而
+  不是强制（`write_document` 不会拒绝一个像路径的 id，那会误伤合法用途）。
+- `location` —— 指向原文的结构位置。`para:`/`page:`/`h1:`/`slide:`/`code:` 只含编号与语言
+  标记；xlsx 那一支用**表在工作簿里的序号**，因为工作表名是用户敲进去的正文，已挪进块文本
+  （加密那一侧）。
+- `content_hash` —— **绑定主密钥**的 HMAC（`crypto.keyed_content_hasher`）。无盐 sha256 会让
+  库文件变成一台免费的确认机：这个产品的块经常很短（姓名+学号+电话、一行成绩），候选空间
+  小到可以穷举，一份已知文档也能被直接确认为在库里。
+- `chunk_id`/`parent_id` —— 位置与文档 id 的 sha256 派生值，不含原文。
+- 其余 —— `kind`/`level`（哪些页是扫描件、文档有多少页）、`sequence`、`chunk_count`、
+  `created_at`/`updated_at`（几点在学习、哪天导入的）、`rag_embeddings` 的
+  `model`/`dimensions`（用了哪个模型、多少块）。
+
+这些合起来仍然足以还原「谁在什么时候导入了哪份资料、大概多少内容」。这是**被记录的取舍**，
+不是「已经解决了」。
 
 **连接一律设 `PRAGMA secure_delete=ON`**：SQLite 默认把删掉的内容留在空闲页里等着复用，
 谁拿到这个文件都能用普通工具捞出来。验收指标里的"删除不可恢复"在存储层就是这一条加上
@@ -15,7 +33,9 @@ plan 第 49 行：源文件、抽取文本、chunk、向量与缓存都用 AES-2
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 import sqlite3
 import struct
@@ -31,11 +51,18 @@ from .chunks import (
     diff_fingerprints,
     embedding_requests,
 )
-from .crypto import MasterKey, MasterKeyError, field_aad
+from .crypto import (
+    ContentHasher,
+    MasterKey,
+    MasterKeyError,
+    field_aad,
+    keyed_content_hasher,
+)
 
 __all__ = [
     "EncryptedKnowledgeStore",
     "StoreError",
+    "document_identifier",
 ]
 
 _SCHEMA = """
@@ -101,6 +128,10 @@ class EncryptedKnowledgeStore:
 
     def __init__(self, path: str | Path, *, master_key: MasterKey) -> None:
         self._key = master_key
+        # 落盘的指纹必须绑定主密钥。无盐 sha256 让库文件变成一台免费的确认机：
+        # 短块（姓名+学号+电话、一行成绩）候选空间小到可以穷举，而一份已知文档
+        # 也能被直接确认为「在库里」。
+        self._content_hasher: ContentHasher = keyed_content_hasher(master_key)
         self.path = Path(path)
         self._database = SQLiteDatabase(self.path)
         # 连接级设置，每次打开都要重新声明，所以放在这里而不是建表脚本里。
@@ -143,6 +174,28 @@ class EncryptedKnowledgeStore:
             return raw.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise StoreError(f"chunk {chunk_id} 的正文不是合法的 UTF-8：{exc}") from exc
+
+    @property
+    def content_hasher(self) -> ContentHasher:
+        """落盘指纹用的函数（绑定主密钥的那一版）。
+
+        暴露出来是给调用方建块时用的：`build_chunks(..., content_hasher=store.content_hasher)`
+        能让内存里的指纹与库里的从一开始就一致。**不传也不会错**——`write_document` 会在
+        写入前统一替换——但传了可以省掉一次重算。
+        """
+        return self._content_hasher
+
+    def sealed_chunk(self, chunk: Chunk) -> Chunk:
+        """把块的指纹换成绑定密钥的那一版。
+
+        调用方给的块来自 `build_chunks`，默认指纹是无盐 sha256；而库里存的是绑定密钥的那
+        一版。不统一的话两边永远不相等，于是「每次写入都认为全变了」——不报错，只是每次都
+        重算全部向量。
+        """
+        sealed = self._content_hasher(chunk.text)
+        return chunk if sealed == chunk.content_hash else replace(
+            chunk, content_hash=sealed,
+        )
 
     # ── 读 ────────────────────────────────────────────────────────────
 
@@ -193,10 +246,11 @@ class EncryptedKnowledgeStore:
         重新算向量"只有一个答案。两边各写一遍的话，不一致时的表现是"有些 chunk 永远没有
         向量"：检索不到它，也没有任何地方报错。
         """
+        sealed = tuple(self.sealed_chunk(chunk) for chunk in chunks)
         previous = self._stored_fingerprints(document_id)
-        current = {chunk.chunk_id: chunk.content_hash for chunk in chunks}
+        current = {chunk.chunk_id: chunk.content_hash for chunk in sealed}
         added_ids, removed, unchanged = diff_fingerprints(previous, current)
-        added = tuple(chunk for chunk in chunks if chunk.chunk_id in added_ids)
+        added = tuple(chunk for chunk in sealed if chunk.chunk_id in added_ids)
 
         now = _utc_now()
         with self._database.transaction() as connection:
@@ -207,11 +261,11 @@ class EncryptedKnowledgeStore:
                 " VALUES (?, ?, ?, ?)"
                 " ON CONFLICT(document_id) DO UPDATE SET"
                 "  updated_at=excluded.updated_at, chunk_count=excluded.chunk_count",
-                (document_id, now, now, len(chunks)),
+                (document_id, now, now, len(sealed)),
             )
             for chunk_id in removed:
                 connection.execute("DELETE FROM rag_chunks WHERE chunk_id=?", (chunk_id,))
-            for sequence, chunk in enumerate(chunks):
+            for sequence, chunk in enumerate(sealed):
                 if chunk.chunk_id not in added_ids:
                     continue
                 connection.execute(
@@ -311,12 +365,42 @@ class EncryptedKnowledgeStore:
             ).fetchall()
         return tuple(row["content_hash"] for row in rows)
 
+    def embedding_requests(
+        self, chunks: tuple[Chunk, ...],
+    ) -> tuple[EmbeddingRequest, ...]:
+        """这些块里要向量化的内容，**指纹与库里一致**。
+
+        调用方应该用这一个，而不是模块级的 `chunks.embedding_requests`：后者算的是无盐指纹，
+        与库里的对不上，于是 `store_embedding` 写进去的行与 `missing_embeddings` 查的行是两套
+        ——表现是"每次都缺向量"，每次导入都重新算一遍、重复计费，而结果看起来完全正常。
+        """
+        return embedding_requests(tuple(self.sealed_chunk(chunk) for chunk in chunks))
+
     def missing_embeddings(
         self, chunks: tuple[Chunk, ...], *, model: str,
     ) -> tuple[EmbeddingRequest, ...]:
         """还缺哪些向量。已经算过的不再请求——这是重复导入同一份资料时不重复付费的那一步。"""
-        wanted = embedding_requests(chunks)
+        wanted = self.embedding_requests(chunks)
         if not wanted:
             return ()
         known = set(self.embedding_hashes(model=model))
         return tuple(request for request in wanted if request.content_hash not in known)
+
+
+def document_identifier(source: str | Path) -> str:
+    r"""给一份源文件算一个**不透明**的 `document_id`。
+
+    `document_id` 是明文存储的，而本地优先应用里最自然的做法就是直接传文件路径——文件名往往
+    等于文档标题（含姓名与班级）。复审实测库里出现的是
+    `C:\Users\...\初二(3)班期末成绩单-张三.xlsx`。
+
+    这个 helper 把它换成一个不含任何原文的标识。路径先解析成绝对路径，所以同一份文件从不同
+    工作目录打开会得到同一个 id；在 Windows 上再做一次 casefold，让大小写不同的同一路径也
+    落到一起。
+
+    它是**约定**而不是强制：`write_document` 不会拒绝一个看起来像路径的 id（那会误伤合法
+    用途）。接线时用它，就是这条契约的全部执行方式。
+    """
+    resolved = Path(source).expanduser().resolve(strict=False)
+    digest = hashlib.sha256(str(resolved).casefold().encode("utf-8")).hexdigest()[:32]
+    return f"doc_{digest}"
