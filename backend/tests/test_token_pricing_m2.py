@@ -231,3 +231,40 @@ def test_deepseek_peak_payload_rate_period():
     payload = pricing_payload("kimi-k2.6", "CNY", now=_PEAK)
     assert payload["known"] and payload["rate_period"] == "peak"
     assert payload["input_cost_per_1M"] == 6.50
+
+
+# ── 云端向量模型（Task 3 的 embedding 路径） ──────────────────────────
+
+def test_cloud_embedding_model_carries_a_verified_rate():
+    """Task 3 把 embedding 放到云端，所以这个模型必须有一个**有来源**的费率。
+
+    没有它，embedding 调用只能按 provider 级估值预留，cost 维度就是猜的——而这正是
+    这轮把它查出来写进去的原因。官方只按输入计费、且写明"不支持上下文缓存"，所以
+    output 写 0.0 而**不是** None：`ModelPricing.known` 要求 output 非 None，
+    写 None 会让这个模型被静默当成"未定价"。
+    """
+    pricing = get_model_pricing("text-embedding-v4", "CNY", provider="alibaba")
+    assert pricing is not None and pricing.known
+    assert pricing.input_cost_per_1M == 0.5             # 元/百万 tokens（华北2 文本输入）
+    assert pricing.output_cost_per_1M == 0.0            # 向量模型没有输出 token
+    assert pricing.cache_hit_input_cost_per_1M is None  # 官方：不支持上下文缓存
+    assert pricing.source != "unknown"
+
+
+def test_cloud_embedding_cost_is_input_only_and_linear():
+    """计费形状也要对：按输入线性，且输出不额外收费（否则预算会凭空多算）。"""
+    assert _cost("text-embedding-v4", miss=1_000_000, currency="CNY") == 0.5
+    assert _cost("text-embedding-v4", miss=250_000, currency="CNY") == 0.125
+    assert _cost("text-embedding-v4", miss=1_000_000, out=1_000, currency="CNY") == 0.5
+
+
+def test_unverified_embedding_model_names_do_not_resolve():
+    """表是精确匹配的。这条防的是**静默按错价计费**：一个错名不命中只是"未知价格"，
+    模糊命中到邻居却会静默按别人的价算。
+
+    `text-embedding-v3` 我没有核实过它的价格页，所以它必须**不**命中——这条测试记录
+    的就是那个取舍：未核实就不写进表。
+    """
+    assert get_model_pricing("text-embedding-v3", "CNY", provider="alibaba") is None
+    assert get_model_pricing("text-embedding-v4", "USD") is None  # 只有 CNY 条目
+    assert get_model_pricing("text-embedding-v4-latest", "CNY", provider="alibaba") is None

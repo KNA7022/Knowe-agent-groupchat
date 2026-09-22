@@ -149,6 +149,18 @@ _RAW: dict[str, dict[str, dict[str, tuple[float | None, float | None, float | No
         "qwen3.5-plus":    {"CNY": (None, 0.80, 4.80), "USD": (None, 0.40, 2.40)},
         "qwen3-coder-plus": {"CNY": (0.80, 4.00, 16.00), "USD": (None, 1.00, 5.00)},
         "qwen3-coder-next": {"USD": (None, 0.30, 1.50)},  # 百炼无 → CNY 暂无价格表
+        # ── 向量模型（Task 3 的云端 embedding 路径）───────────────────────────
+        # 只有输入计费、没有输出，所以 `out` 写 0.0 而**不是** None：`ModelPricing.known`
+        # 要求 output 不为 None，写 None 会让这个模型被当成"未定价"。
+        # 官方页 2026-09-21 采集（https://help.aliyun.com/zh/model-studio/text-embedding-v4）：
+        # 华北2（北京）文本输入 0.5 元/百万 tokens（Batch File 0.25），新加坡/国际 0.514。
+        # 官方写明"不支持上下文缓存"，所以 cache_hit 为 None（= 与未命中同价）。
+        # 维度 64~2048 可调、默认 1024 —— 维度是索引身份的一部分，换模型或换维度都要重建。
+        # 只登记 v4：v3 的价格页我没有核实，未核实就不写进来（表是精确匹配的，写错名
+        # 只会静默不命中，而写错价会静默错算）。
+        # URL 只放在这里而**不**放进 `_SOURCES["alibaba"]`：`ModelPricing.source` 会作为
+        # 计价说明直接显示在用量面板上（TokenUsagePanel.tsx），塞两个 URL 进去会变成噪音。
+        "text-embedding-v4": {"CNY": (None, 0.5, 0.0)},
         # 转售模型 CNY 冲突按官方直营价（kimi-k2.5/glm-5/glm-4.7/MiniMax-M2.5 见官方组）
     },
     "minimax": {
