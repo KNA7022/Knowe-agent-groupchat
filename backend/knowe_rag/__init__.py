@@ -49,6 +49,13 @@ from .parsers import (
     UnsupportedFormat,
     parse_document,
 )
+from .rendering import (
+    MAX_PIXELS,
+    RENDER_SCALE,
+    RenderedPage,
+    RenderingError,
+    render_page,
+)
 from .retrieval import (
     BM25_RECALL,
     GRAPH_RECALL,
@@ -79,11 +86,15 @@ __all__ = [
     "Grounding",
     "GroundingVerdict",
     "LocationError",
+    "MAX_PIXELS",
     "MasterKey",
     "MasterKeyError",
     "ParsedBlock",
     "ParsedLocation",
+    "RENDER_SCALE",
     "ReindexPlan",
+    "RenderedPage",
+    "RenderingError",
     "RetrievalError",
     "RetrievedChunk",
     "ScopeIndex",
@@ -101,6 +112,7 @@ __all__ = [
     "parse_location",
     "plan_reindex",
     "reciprocal_rank_fusion",
+    "render_page",
     "sort_locations",
     "tokenize",
     "verify_citations",
