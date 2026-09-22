@@ -1,0 +1,77 @@
+# Remaining roadmap — StudyCrew commercial continuation
+
+Status of the six tasks in `.superpowers/plans/studycrew-commercial-continuation.md`, measured
+at `e1d2bd9` rather than recalled. The plan itself is unchanged; this file only records **where
+the project actually is** and **what order the rest has to happen in**.
+
+## Where things stand
+
+| task | state | evidence |
+|---|---|---|
+| **1** Atomic Profile authorization | **done** | `task-1-review.md`: independent review 0 Critical / 0 Important / 0 Minor |
+| **2** Provider / Tool / MCP / PII / secret gateways | **done** | `TASK2-ROUND2-ACCEPTANCE.md`: composed verdict PASS, 9 review rounds, 0 Critical / 0 Important |
+| **3** Local-first encrypted RAG | **not started** | `git grep` over `backend src electron` returns **0 files** for `PP-OCR`, `ppocr`, `onnxruntime`, `usearch`, `e5-small`, `BGE-M3`, `AESGCM`. The 5 files matching `bm25` are the context compressor's keyword scoring, not a RAG index |
+| **4** Governed Mem0 memory | **not started** | `git grep -li mem0 -- backend src electron docs` → **0 files** |
+| **5** Learning workflows | **not started** | **0 files** for `assessment`, `study_plan`, `mastery`, `spaced_review`, `SchoolGateway`. (`ICS` and `exam` match 37 and 25 files only as substrings of `statistics` / `example` — a false positive worth knowing about before someone reads those counts as progress) |
+| **6** Commercial release closure | **partly done** | packaging chain, `release/StudyCrew-Setup-1.0.36.exe`, install/uninstall verified in Phase 0; but the four `ACTION_CONTRACT` collection errors remain, `npm run typecheck` carries 54 diagnostics, and there are no `THIRD-PARTY` / threat-model artefacts |
+
+Base size for comparison: backend non-test **90 files / 66,157 lines**, tests **86 files /
+24,014 lines**. Task 2's gateway alone was ~3,200 lines of implementation plus ~1,600 lines of
+tests and took **nine** independent review rounds.
+
+**The honest headline:** Tasks 1 and 2 are *infrastructure*. None of it is what a user of a
+study app would recognise as the product. Tasks 3–5 are the features, and all three are at zero.
+
+## Order the rest has to happen in
+
+Dependencies, not preference:
+
+```
+Task 3 (parsers → encrypted store → indexes → retrieval → citation checks)
+   ├── Task 4 (memories live in Task 3's encrypted store; the ephemeral index is rebuilt from it)
+   │      └── Task 5 (study plans and review consume memories)
+   └── Task 6's acceptance metrics (Recall@10 ≥ 0.85, citation precision ≥ 0.95,
+          grounded-answer pass ≥ 0.90) cannot be measured without Task 3
+```
+
+The two items inside Task 6 that are **independent of everything else**, and cheap:
+
+1. **The four `ACTION_CONTRACT` collection errors.** `ImportError: cannot import name
+   'ACTION_CONTRACT' from 'backend.engine'` in `test_v10182_runtime_ui.py`,
+   `test_v22_dispatch_reliability.py`, `test_v27_weld.py`, `test_v28_weld.py`. They are not four
+   broken tests; they are why **the default `pytest backend/tests` invocation executes zero
+   tests** and why every regression claim in this repository needs
+   `--continue-on-collection-errors`. For a portfolio project that is the worst kind of defect:
+   the command everyone types first silently proves nothing.
+2. **The 54 renderer TypeScript diagnostics** (baseline as well as HEAD — see `progress.md`), so
+   `npm run typecheck` can become a gate instead of a known-red command.
+
+## Suggested starting point
+
+Start with those two, then Task 3's **data layer** (parsers + AES-256-GCM store) before anything
+touching models. Reasons: the collection errors are small, independent, and immediately raise how
+much the repository's own tests are worth; and within Task 3 the parsers plus encrypted store are
+what everything else — OCR, embeddings, indexes, memories — is built on, while the capability-pack
+machinery (download, SHA-256, atomic install/rollback) depends on external artefacts and model
+licences and can be sequenced later.
+
+## What I have not estimated
+
+Sizes for Tasks 3–5. I have no measurement for them, and inventing a number would be the same
+failure this project keeps punishing. The one real datum is Task 2: ~3,200 + ~1,600 lines across
+nine review rounds, and Task 3 is specified to be larger than Task 2 (seven document formats, an
+ONNX OCR path, an optional cloud-vision fallback, two index types, hybrid retrieval with RRF and
+MMR, and an encryption layer over five kinds of artefact).
+
+## Two decisions that belong to the user, not to me
+
+Both were recorded during Task 2 and are still open:
+
+- **Per-model privacy and price** (I-R1's remaining half). Measured this round: within a single
+  provider the per-call price spread is two orders of magnitude (`openai-api` $0.6600 vs `arcee`
+  $0.0041), so no provider-wide constant is right and the fix is per-model reservation — a data
+  structure change, plus a verified per-model privacy list that does not exist anywhere in the
+  repository. See `TASK2-ROUND2-ACCEPTANCE.md` limitation 1.
+- **The five registry providers with no pricing entry** (`copilot`, `gmi`, `huggingface`,
+  `kimi-coding`, `kimi-coding-cn`). Filling those in needs sources I would have to verify; I did
+  not guess them.
