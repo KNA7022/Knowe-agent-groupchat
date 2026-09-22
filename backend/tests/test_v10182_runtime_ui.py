@@ -81,10 +81,26 @@ def test_every_fixed_worker_tool_maps_to_one_observable_public_stage() -> None:
     }
 
 
-def test_tool_activity_detail_reuses_existing_tool_name_field() -> None:
+def test_tool_activity_token_exposes_only_the_registry_name() -> None:
+    """渲染进程可见的活动 token **只含注册表里的工具名**——这是一条隐私边界。
+
+    旧行为是把参数拼在 `␟` 之后给渲染进程看（`safe_read_file␟src/store/state.ts`），
+    那会把工作区路径、URL、检索词甚至 Shell 命令暴露到 UI 与诊断包
+    （`activity_token` 的注释写明：参数只留在私有哈希审计字段里）。所以这条断言从
+    "token 里带着 detail" 改成"token 里绝不允许有 detail"——是加强，不是放宽。
+
+    `TOOL_ACTIVITY_SEPARATOR` 本身仍在用：`base_tool_name` 与前端 `toolPhrase.ts`
+    靠它解析**历史/持久化**的 token，所以这条也要一起钉住，否则有人删掉分隔符时
+    老数据会静默解析错。
+    """
     token = tool_ledger.activity_token("safe_read_file", {"path": "src/store/state.ts"})
-    assert token == f"safe_read_file{tool_ledger.TOOL_ACTIVITY_SEPARATOR}src/store/state.ts"
+    assert token == "safe_read_file"
+    assert tool_ledger.TOOL_ACTIVITY_SEPARATOR not in token
+    assert "src/store/state.ts" not in token
     assert tool_ledger.base_tool_name(token) == "safe_read_file"
+
+    legacy = f"safe_read_file{tool_ledger.TOOL_ACTIVITY_SEPARATOR}src/store/state.ts"
+    assert tool_ledger.base_tool_name(legacy) == "safe_read_file"
 
 
 def test_existing_visible_events_accept_optional_eight_stage_projection() -> None:

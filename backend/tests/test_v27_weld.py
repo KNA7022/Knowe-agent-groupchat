@@ -47,6 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import backend.engine as E                                          # noqa: E402
 from backend.engine import _engine_block                            # noqa: E402
+from backend.i18n_backend import msg                                # noqa: E402
 
 # 见 test_v10182_runtime_ui.py 的说明：`ACTION_CONTRACT` 与 `WORK_STATUS_CONTEXT` 都在
 # upstream 基线 3a35d8b 就已外置到 prompts/<lang>/engine_blocks.md，按旧的模块级常量导入
@@ -69,10 +70,18 @@ def dispatch_result_block() -> str:
     ★ 要把 `#` 注释剔掉：注释**不进模型的上下文**。
       不剔的话会打到我自己那段「老版本长这样」的注释上——第一版就打到了。
       （v0.24 踩过同一个坑：断言打在原始源码上，抓到了自己的反例注释。）
+
+    ★ [本版修正] v1.0.x 起回执文本走 **i18n 消息目录**（`msg("tools_knowe.py.NNN")`），
+      `tools_knowe.py` 源码里只剩键名。老实现读的是源码字面量，所以这些测试在
+      collection 修好之后立刻失败——不是回执变了，是**文本搬了家**。
+      现在改为：取出那段 `message=(...)` 里的所有 `msg("…")` 键，用同一个 `msg()`
+      解析后拼起来。断言因此打在**真实回执文本**上，比打在源码字面量上更贴近意图。
     """
     src = TOOLS.read_text("utf-8")
     block = src.rsplit('engine.record_committed_action("propose_next")', 1)[1][:12000]
-    return "\n".join(l for l in block.splitlines() if not l.strip().startswith("#"))
+    code = "\n".join(l for l in block.splitlines() if not l.strip().startswith("#"))
+    keys = re.findall(r'msg\("([A-Za-z_]+\.[A-Za-z_]+\.\d+)"', code)
+    return "\n".join(msg(key, who="宋陈") for key in keys)
 
 
 # ═══════════ ① 四个源头，一个都不许留 ═══════════

@@ -129,7 +129,10 @@ def test_propose_next_has_a_note_param() -> None:
       现在只剩一条：**要说，就得穿过这个工具调用。**
     """
     from backend import tools_knowe
-    params = tools_knowe.PROPOSE_NEXT_PARAMS["properties"]
+    # `PROPOSE_NEXT_PARAMS` 这个常量从来不存在（全仓只有这一处引用）；真正提供同一份
+    # schema 的是 `_build_propose_next_params()`（tools_knowe.py:240）。测试的断言一条没改，
+    # 它们对 builder 的输出全部成立。
+    params = tools_knowe._build_propose_next_params()["properties"]
     assert "note" in params
     d = params["note"]["description"]
     assert "显示在审批卡上" in d
