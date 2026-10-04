@@ -1,5 +1,7 @@
 # P2b — real Worker, protected delivery and restart composition
 
+Split after concrete pre-code inspection: P2b1 `protected-delivery-p2b1-brief.md` establishes authoritative SQLite protected event commit/lookup/replay/admission; P2b2 will then integrate the real Worker/completion/notification path and close this whole brief. SQLite committed event is the authority; derived JSONL success is not a second mandatory commit. Old reservation+strict-JSONL proposals are superseded. No production code existed before this split.
+
 Prepared, not dispatched. Start only after P2a independent 0C/0I gate; controller supplies accepted BASE. Read protected-composition-p2-brief.md for remaining actual-chain requirements, protected-composition-p2a-report.md for implemented APIs, and latest P2a review/fix reports. The P2a policy supersedes obsolete lifecycle-chain restrictions in older notes. Do not repeat P1/P2a implementation or add signed Group transition chains.
 
 ## Current interfaces and required composition

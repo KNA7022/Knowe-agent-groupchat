@@ -2,6 +2,10 @@
 
 ## Current checkpoint — 2026-10-04, `0b9d539` (protected history/query slice independently accepted)
 
+Current working increment is P2b1 authoritative encrypted event delivery (BASE041d033, implementation not yet independently accepted). A post-HTTP full run found one asynchronous persistence-test race; a separate deterministic replay test found a committed-event cache-gap defect. Both are being fixed before a new frozen full regression. P2b2 real Worker/Gateway/completion/notification composition remains pending. See the top checkpoint in progress.md for live evidence; do not treat passing earlier runs as final acceptance.
+
+OCR and Mem0 actual SDK preflights are now complete alongside E5. These are isolated runtime experiments, not production integrations or measured RAG acceptance. Mem0 insert failures can still return ADD, and infer=False does not deduplicate; StudyCrew authority and explicit postvalidation are required. The new Group chat privacy map confirms pre-run user/coordinator plaintext sinks that must be fixed before Unit D product dispatch, without fabricating a Worker lineage before a real task exists. Current packaging still excludes NumPy; frozen runtime/dependency/license and installation gates remain open.
+
 P2a explicit private read-only history and selected-store queries are accepted at0C/0I. Frozen backend1838 passed/5existing skipped/10subtests, focused116 passed. Next P2b must complete actual Worker/Gateway/Hub/restart composition; no public protected-history/producer feature is claimed yet. Local model design and E5 isolated real-runtime preflight are complete; E5 ranking concerns remain, not a passing RAG metric. OCR isolated preflight is ongoing.
 
 P1 protected storage is accepted after two fix rounds, 0 Critical / 0 Important. Current frozen backend: 1799 passed, 5 existing skipped, 10 subtests; P1 focused: 77 passed. Next is P2 real Worker/event/restart composition, then Unit D real producer/approval/dispatch. Storage acceptance alone is not product-path or commercial acceptance. Earlier row-specific counts below are historical checkpoints.
