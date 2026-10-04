@@ -806,3 +806,86 @@ async def test_do_replay_success_and_live_handoff_remain_ordered(world, tmp_path
     await drain(client)
     assert client.ws.frames[-1]["content"] == "Next"
     store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale_failure", [False, True])
+async def test_recovery_overflow_signals_again_before_client_retries(world, tmp_path, monkeypatch, stale_failure):
+    fixture, authority, store, hub, outbox = setup_delivery(world, tmp_path)
+    project = fixture[2].project_id
+    server, client = await admitted(world, hub, monkeypatch)
+    recovery_routes(server, client, store, project)
+    await client.release_live_replay_fence()
+    await fail_committed_enqueue(hub, fixture[1], outbox)
+    await drain(client)
+    client.LIVE_REPLAY_BUFFER_MAX = 1  # Same production overflow branch as default 4096.
+    entered, release = asyncio.Event(), asyncio.Event()
+    send = client.ws.send
+    async def delayed(raw):
+        if json.loads(raw)["type"] == "state_snapshot" and not entered.is_set():
+            entered.set()
+            await release.wait()
+            if stale_failure:
+                raise OSError("older handoff failed after a newer invalidation")
+        await send(raw)
+    client.ws.send = delayed
+    try:
+        await server._on_frame(client, json.dumps({"type": "request_snapshot", "project_id": project}))
+        await asyncio.wait_for(entered.wait(), 2)
+        first = await hub.emit(project, {"type": "message", "content": "Queued before overflow"})
+        overflow = await hub.emit(project, {"type": "message", "content": "Overflowed but durable"})
+        for _ in range(3):
+            client.request_resync(project, overflow["seq"])
+        assert len(client._ordered_events) <= 1  # Repeated invalidations coalesce.
+        release.set()
+        await drain(client)
+        # Do not manually retry until the healthy client has actually learned that
+        # the first apparently successful snapshot no longer covers the stream.
+        expected = ["resync_required", "resync_required"] if stale_failure else [
+            "resync_required", "state_snapshot", "resync_required"]
+        assert [event["type"] for event in client.ws.frames] == expected
+        assert client.ws.frames[-1]["last_seq"] == overflow["seq"]
+        assert project in client._protected_resync_projects
+        assert project not in client._protected_recovery_snapshots
+        hidden = await hub.emit(project, {"type": "message", "content": "While awaiting retry"})
+        await drain(client)
+        assert len(client.ws.frames) == len(expected)
+        await server._on_frame(client, json.dumps({"type": "request_snapshot", "project_id": project}))
+        await drain(client)
+        snapshot = client.ws.frames[-1]
+        assert snapshot["type"] == "state_snapshot"
+        assert [event["content"] for event in snapshot["conversation"]] == [
+            ANSWER, "Queued before overflow", "Overflowed but durable", "While awaiting retry"]
+        assert [event["seq"] for event in snapshot["conversation"]] == [1, first["seq"], overflow["seq"], hidden["seq"]]
+        assert project not in client._protected_resync_projects
+        later = await hub.emit(project, {"type": "message", "content": "Healthy live resumed"})
+        await drain(client)
+        assert client.ws.frames[-1]["seq"] == later["seq"] > snapshot["seq"]
+        assert client.ws.frames[-1]["content"] == "Healthy live resumed"
+        assert REASONING not in repr(client.ws.frames)
+    finally:
+        release.set()
+        await drain(client)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_repeated_snapshot_hydration_denial_does_not_renew_notice(world, tmp_path, monkeypatch):
+    fixture, authority, store, hub, outbox = setup_delivery(world, tmp_path)
+    project = fixture[2].project_id
+    server, client = await admitted(world, hub, monkeypatch)
+    recovery_routes(server, client, store, project)
+    await client.release_live_replay_fence()
+    await fail_committed_enqueue(hub, fixture[1], outbox)
+    await drain(client)
+    world[1].rename(fixture[6].group_id, "Current scope denies snapshots")
+    try:
+        for _ in range(3):
+            await server._on_frame(client, json.dumps({"type": "request_snapshot", "project_id": project}))
+            await drain(client)
+            assert project in client._protected_resync_projects
+            assert project not in client._protected_recovery_snapshots
+            assert not client._ordered_events
+        assert [event["type"] for event in client.ws.frames] == ["resync_required"]
+    finally:
+        store.close()

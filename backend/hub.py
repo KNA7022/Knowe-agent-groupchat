@@ -195,18 +195,23 @@ class Client:
                     self._protected_recovery_snapshots.pop(project, None)
                     self._protected_resync_projects.discard(project)
                 else:
-                    self.request_resync(project, event.get("seq", 0))
+                    self.request_resync(project, event.get("seq", 0), failed_handoff=True)
             elif not await self.send_live(event):
                 self.request_resync(project, event.get("seq", 0))
 
-    def request_resync(self, project, seq):
+    def request_resync(self, project, seq, *, failed_handoff=False):
         already_fenced = project in self._protected_resync_projects
         self._protected_resync_projects.add(project)
-        self._protected_recovery_snapshots.pop(project, None)
+        invalidated = self._protected_recovery_snapshots.pop(project, None)
         self._ordered_events = deque(e for e in self._ordered_events
             if e.get("project_id") != project or e.get("type") == "resync_required")
         self._live_replay_buffer = deque(e for e in self._live_replay_buffer if e.get("project_id") != project)
-        if not already_fenced:
+        # Overflow/new invalidation supersedes an apparently successful in-flight
+        # snapshot: its client needs one later notice. Hydration denial must not
+        # recursively trigger automatic snapshot retries on a healthy socket.
+        notify = not already_fenced or (invalidated is not None and not failed_handoff)
+        if notify and not any(e.get("type") == "resync_required" and e.get("project_id") == project
+                              for e in self._ordered_events):
             self._ordered_events.append({"type": "resync_required", "project_id": project,
                 "last_seq": seq, "message": "Committed history requires replay"})
         self._start_ordered_drain()

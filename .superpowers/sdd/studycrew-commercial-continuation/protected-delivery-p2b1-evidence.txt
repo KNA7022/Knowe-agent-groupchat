@@ -367,3 +367,97 @@ Hash : A82D68DF5B9087C7853F32C6384F88DC6A868A2651A3931FE3810DFD2544A730
 
 Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_events.py
 Hash : 2D1EA3E2E12392C907F3B584CFF6976B127D49131373B35AF3642C43A07F5503
+
+=== Fix round 2: I3 visible retry after recovery overflow ===
+FIX_BASE: 4247eea45a7ffca0840aea153e5537a38ef904af
+Workspace D:/agentwork/StudyCrew-worktree; PYTHONUTF8=1, Python 3.12.
+Actual returned chunks concatenated; trailing blank-line whitespace normalized.
+
+=== Actual overflow RED + repeated-hydration-denial control ===
+Command: py -3.12 -m pytest backend/tests/test_protected_events.py -k 'recovery_overflow or repeated_snapshot_hydration' -q --tb=short
+F.                                                                       [100%]
+================================== FAILURES ===================================
+_________ test_recovery_overflow_signals_again_before_client_retries __________
+backend\tests\test_protected_events.py:841: in test_recovery_overflow_signals_again_before_client_retries
+    assert [event["type"] for event in client.ws.frames] == [
+E   AssertionError: assert ['resync_requ...ate_snapshot'] == ['resync_requ...ync_required']
+E
+E     Right contains one more item: 'resync_required'
+E     Use -v to get more diff
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_events.py::test_recovery_overflow_signals_again_before_client_retries
+1 failed, 1 passed, 46 deselected in 2.27s
+
+=== First GREEN recovery matrix ===
+Command: py -3.12 -m pytest backend/tests/test_protected_events.py -k 'recovery_overflow or repeated_snapshot_hydration or old_snapshot or request_snapshot or do_replay' -q --tb=short
+...........                                                              [100%]
+11 passed, 37 deselected in 5.42s
+
+=== Covering focused before adding stale-failure parameter control ===
+Command: py -3.12 -m pytest backend/tests/test_protected_events.py backend/tests/test_unit.py backend/tests/test_e2e.py backend/tests/test_v012_persistence.py backend/tests/test_task_runtime_live_event_bridge.py backend/tests/test_task_runtime_recovery_ack.py -q --tb=short
+........................................................................ [ 62%]
+............................................                             [100%]
+116 passed in 45.41s
+
+=== FINAL covering focused, including stale handoff failure preserving newer notice ===
+Same six-file focused command.
+........................................................................ [ 61%]
+.............................................                            [100%]
+117 passed in 43.04s
+
+=== Final source/test freeze ===
+Commands: py -3.12 -m compileall -q backend
+git diff --check -- backend/hub.py backend/tests/test_protected_events.py
+Get-FileHash -Algorithm SHA256 backend/hub.py,backend/tests/test_protected_events.py
+Exit 0; compileall emitted no output.
+warning: in the working copy of 'backend/hub.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/tests/test_protected_events.py', LF will be replaced by CRLF the next time Git touches it
+
+Path : D:\agentwork\StudyCrew-worktree\backend\hub.py
+Hash : 9C982C683BD9E8A2B0466762FB514E666CF33A523BE87DE582C93FA8BCEB6210
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_events.py
+Hash : 3ADE968BB76D5A429416EF798EA8F5DBEB8471B379AE608176F6847CA2DE31DB
+
+
+=== Fix round 2 FINAL frozen full, complete output ===
+Command: py -3.12 -m pytest backend/tests -q
+..........................................sss.s......................... [  3%]
+.s...................................................................... [  7%]
+........................................................................ [ 11%]
+........................................................................ [ 15%]
+........................................................................ [ 19%]
+........................................................................ [ 22%]
+........................................................................ [ 26%]
+........................................................................ [ 30%]
+........................................................................ [ 34%]
+........................................................................ [ 38%]
+........................................................................ [ 41%]
+........................................................................ [ 45%]
+........................................................................ [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 57%]
+........................................................................ [ 60%]
+........................................................................ [ 64%]
+........................................................................ [ 68%]
+........................................................................ [ 72%]
+........................................................................ [ 76%]
+........................................................................ [ 79%]
+........................................................................ [ 83%]
+........................................................................ [ 87%]
+........................................................................ [ 91%]
+........................................................................ [ 95%]
+.............................................................. [ 98%]
+..............................                                           [100%]
+1887 passed, 5 skipped, 10 subtests passed in 208.29s (0:03:28)
+
+=== Post-full hash/diff recheck, unchanged ===
+Same two-file hash and diff-check commands. Exit 0.
+warning: in the working copy of 'backend/hub.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/tests/test_protected_events.py', LF will be replaced by CRLF the next time Git touches it
+
+Path : D:\agentwork\StudyCrew-worktree\backend\hub.py
+Hash : 9C982C683BD9E8A2B0466762FB514E666CF33A523BE87DE582C93FA8BCEB6210
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_events.py
+Hash : 3ADE968BB76D5A429416EF798EA8F5DBEB8471B379AE608176F6847CA2DE31DB
