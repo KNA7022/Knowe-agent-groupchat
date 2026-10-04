@@ -1,0 +1,27 @@
+# Finding verdicts
+
+- **I1 — Clear query values can persist private text — ADDRESSED.** `backend/protected_storage.py:396` validates bounded strict integers, fixed enums, exact canonical identities and timestamps; `:451` validates delivery intent and `:373` enforces actual SQL-column coverage. This closes the two reported clear version/route leaks. `backend/tests/test_protected_storage.py:407`, `:429`, `:442`, `:462` and `:591` cover the reproduced failures and adjacent invalid-field cases. The new allowlist introduces the separate cancellation regression below.
+- **I2 — Protected collision errors disclose provenance content — ADDRESSED.** Protected collisions now raise fixed messages with suppressed chaining at `backend/knowe_harness/completion.py:1548`, `:1788`, `:1829` and `backend/knowe_storage/task_run_repository.py:73`, `:122`. `backend/tests/test_protected_storage.py:606` exercises all five public collision paths and checks both message text and formatted traceback. Legacy detailed errors remain on the unprotected branches.
+- **I3 — Acknowledgement retry accepts an unauthenticated retained receipt — ADDRESSED.** `backend/protected_storage.py:378` authenticates collision payloads and compares immutable content with keyed equality; `backend/knowe_harness/completion.py:2690` additionally compares receipt identity/effect metadata before outbox deletion. The fix applies the check to journal, outbox, history, outcome and resolved-wait IGNORE collisions too. `backend/tests/test_protected_storage.py:482`, `:524`, `:554` and `:576` cover corrupt records, differing authenticated content, valid retry preservation and receipt-column tamper.
+- **Prior M1 — Static evidence is not noise-free — accepted observation.** The appended report explicitly records accepted LF→CRLF validation noise, and raw evidence retains the warnings. This round makes no claim that the output is pristine and does not change repository newline policy.
+
+# New breakage in the fix diff
+
+- **Important R1 — Valid wait cancellation is rejected by the new enum validation.** `backend/protected_storage.py:420` permits only `open`, `resuming`, `resolved` and `superseded` for wait-token status, omitting `cancelled`. The existing public `SQLiteCompletionStore.resolve_wait` contract explicitly accepts `cancelled` at `backend/knowe_harness/completion.py:2870`; the completion wait-closing code also produces it at `:1639`. A focused real-store probe created a protected WAITING run, obtained its open token and called `resolve_wait(token_id, status='cancelled')`. It raised `ProtectedStorageError('invalid protected clear field')` and the stored token remained `open`. The new validator is also used on reads, so a legitimately sealed cancelled wait would be unreadable under this policy. Add the supported cancelled status to the allowlist and cover a successful cancellation plus normal/reopened readback, while preserving rejection of unknown values. The new tests at `backend/tests/test_protected_storage.py:462` check invalid statuses but omit this valid transition.
+- **Critical: none. New Minor: none.**
+
+# Checks and evidence
+
+- Reviewed only the original findings and supplied `review-protected-storage-p1-fix1-c019aa1-69cf2f8.diff`, FIX_BASE `c019aa118c37a3c299458516e3eb5e306321e0cc` → HEAD `69cf2f8a08aaab35eabac002ad281f11559127ff`. Read the diff in bounded chunks; an initially truncated section of diagnostic evidence was recovered from the evidence file. No changed function was separately reread for general review and no Git commands regenerated the diff.
+- Inspected appended actual RED output: I1 two failures; I2 five failures followed by five passes; I3 four failures plus the additional two outcome/wait failures. Inspected the supplied covering GREEN (231 passed, 10 subtests), frozen full result (1795 passed, 5 existing skipped, 10 subtests), static-check exit 0 and freeze hashes. These reported runs were not rerun or independently recertified.
+- Named focused contract check — **new enum allowlists may omit supported states**: inspected the existing CompletionStatus, ProjectionKind, OutboxState and DecisionType declarations and the explicit cancelled wait call sites using symbol/constant searches in `backend/knowe_harness/completion.py`. This identified R1; no broader unchanged-code review was undertaken.
+- Ran one Python 3.12 stdin probe using `protected.__wrapped__`, TemporaryDirectory and actual GroupRepository/TaskRuntimeService/MasterKey/SQLiteCompletionStore, with `PYTHONDONTWRITEBYTECODE=1`. Output: `cancelled_wait_accepted=False`, `error_type=ProtectedStorageError`, `error_message=invalid protected clear field`, `persisted_wait_status=open`. Command exited 0 because it measured the failure rather than asserting successful cancellation. No mocks, provider calls, broad test reruns, source/test edits, index mutations or subagents.
+
+# Out-of-scope observations
+
+- None newly raised. Worker/Engine/Hub/replay integration, automatic-effect acceptance and whole-app deletion remain P2 boundaries and are not certified by this storage-only review.
+
+# Verdict
+
+- **Original findings: I1 ADDRESSED / I2 ADDRESSED / I3 ADDRESSED. Fix round: Findings remain open — new R1.**
+- **Spec compliance and task quality: Needs fixes. Outstanding counts: 0 Critical / 1 Important / 0 new Minor; prior M1 accepted.** Correct and independently verify the valid cancelled-wait transition before treating P1 as the required 0 Important gate for P2.

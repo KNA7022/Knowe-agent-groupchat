@@ -1,6 +1,8 @@
 # Remaining roadmap — StudyCrew commercial continuation
 
-## Current checkpoint — 2026-10-04, `8804382` (card foundation independently accepted)
+## Current checkpoint — 2026-10-04, `4f7ee30` (card foundation and protected storage independently accepted)
+
+P1 protected storage is accepted after two fix rounds, 0 Critical / 0 Important. Current frozen backend: 1799 passed, 5 existing skipped, 10 subtests; P1 focused: 77 passed. Next is P2 real Worker/event/restart composition, then Unit D real producer/approval/dispatch. Storage acceptance alone is not product-path or commercial acceptance. Earlier row-specific counts below are historical checkpoints.
 
 This section supersedes the old `e1d2bd9` snapshot below. Do not resume from its “not started” claims.
 
@@ -19,6 +21,10 @@ Whole-backend pre-integration run had 57 failures and 16 setup errors; the froze
 The explicit user-approved Mem0-version plan controls: local ONNX OCR/default embeddings, production USearch, separately verified downloadable model packs, and optional per-source-authorized cloud processing. The on-disk plan now marks conflicting cloud-only passages historical. No silent upload or cloud fallback is authorized. Mem0 OSS reuse is explicitly authorized; dependency size alone is not a reason to omit it. Pinned-wheel design is complete, actual integration remains pending.
 
 The current controller and independent review evidence live in `progress.md`, `task-3-integration-report.md`, and `reviews/`. No commercial-release or real-student-trial claim is made.
+
+### Explicit release carry-forwards
+
+Do not restart the old Task 2 review loop or interpret its composed acceptance as a waiver of these release gates. `TASK2-ROUND2-ACCEPTANCE.md` records per-provider wildcard model policy/flat cost reservation, absent closed Electron slot catalog and eventual credential revocation. Before commercial-quality acceptance, implement and verify model-specific bounded pricing/privacy authorization and preauthorized fallback, current-key revocation/slot boundaries, and actual supported Windows Shell/network/descendant isolation. Unknown/unverified policy must not silently become permissive. Existing inert fixture success does not establish production sandbox availability. Also close deferred noisy-gate M1 and current frozen sidecar/NSIS dependency coverage; the old installer and dependency-only probe EXEs are not evidence for the new code.
 
 ## Historical snapshot (superseded)
 
