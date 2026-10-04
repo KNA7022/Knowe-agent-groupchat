@@ -253,6 +253,9 @@ class ProtectedLineages:
             events = getattr(self.runtime, "_protected_events", None)
             if events is not None:
                 events._purge_rows(task_id)
+            children = getattr(self.runtime, "_protected_children", None)
+            if children is not None:
+                children.cleanup_revoked(task_id)
         return {"task_id": task_id, "state": "revoked"}
 
 
@@ -721,22 +724,57 @@ class StoragePayloads:
         access = self.protection.access
         registry = access.registry
         registry.revoke(access.group_id, access.task_id)
+        return _purge_revoked_rows(self.db, registry, access.group_id, access.task_id,
+                                   self.protection.store_id)
+
+
+def _purge_revoked_rows(db, registry, group_id, task_id, store_id, *, strict=False):
+    """Deletion-only primitive; no live reader, seal, claim or execution authority."""
+    with registry.runtime._lock:
         with registry.db.transaction(immediate=False) as conn:
-            registry._read(conn, access.task_id, access.group_id, revoked=True)
+            registry._read(conn, task_id, group_id, revoked=True)
+            state = conn.execute("SELECT state FROM studycrew_protected_lineages WHERE task_id=?",
+                                 (task_id,)).fetchone()[0]
+            if state != "revoked":
+                raise ProtectedStorageError("protected cleanup requires durable revocation")
             claims = conn.execute("SELECT * FROM studycrew_protected_records WHERE task_id=? AND store_id=?",
-                (access.task_id, self.protection.store_id)).fetchall()
+                (task_id, store_id)).fetchall()
         # Dependents first: completion/result foreign keys survive outbox deletion.
         order = ("completion_projection_receipts_v2", "completion_outbox_v2", "wait_tokens_v2",
                  "task_journal_v1", "task_attempts_v1", "agent_completion_outcomes_v2", "task_results_v1",
                  "decision_events_v2", "task_run_history_v2", "deliveries", "completion_events_v2", "task_runs")
-        with self.db.transaction() as conn:
+        with db.transaction() as conn:
             # Use independently stored task relations as well as authenticated
             # claims: a missing child claim must not leave content behind on purge.
             completion_ids = [row[0] for row in conn.execute(
-                "SELECT completion_id FROM completion_events_v2 WHERE task_id=?", (access.task_id,)
-            ).fetchall()] if self.db.table_columns("completion_events_v2") else []
+                "SELECT completion_id FROM completion_events_v2 WHERE task_id=?", (task_id,)
+            ).fetchall()] if db.table_columns("completion_events_v2") else []
+            authenticated = set()
+            for claim in claims:
+                table = claim["table_name"]
+                mac = registry.crypto.digest("protected-record", [claim[k] for k in
+                    ("store_id", "table_name", "record_id", "task_id")])
+                if table not in ROW_KEYS or not hmac.compare_digest(mac, claim["mac"]):
+                    raise ProtectedStorageError("invalid purge claim")
+                authenticated.add((table, claim["record_id"]))
+            if strict:
+                # A clear task relation alone is not proof of ownership. Unknown
+                # rows keep the obligation pending instead of broadening deletion.
+                for table in order:
+                    columns = db.table_columns(table)
+                    if "task_id" in columns:
+                        rows = conn.execute(f"SELECT * FROM {table} WHERE task_id=?", (task_id,)).fetchall()
+                    elif table in {"completion_projection_receipts_v2", "completion_outbox_v2"} and columns:
+                        rows = [row for cid in completion_ids for row in conn.execute(
+                            f"SELECT * FROM {table} WHERE completion_id=?", (cid,)).fetchall()]
+                    else:
+                        rows = ()
+                    for row in rows:
+                        identity = ":".join(str(row[key]) for key in ROW_KEYS[table])
+                        if (table, identity) not in authenticated:
+                            raise ProtectedStorageError("protected cleanup row ownership unavailable")
             for table in ("completion_projection_receipts_v2", "completion_outbox_v2"):
-                if self.db.table_columns(table):
+                if db.table_columns(table):
                     for completion_id in completion_ids:
                         conn.execute(f"DELETE FROM {table} WHERE completion_id=?", (completion_id,))
             for claim in sorted(claims, key=lambda row: order.index(row["table_name"]) if row["table_name"] in order else -1):
@@ -747,13 +785,13 @@ class StoragePayloads:
                 if not hmac.compare_digest(mac, claim["mac"]):
                     raise ProtectedStorageError("invalid purge claim")
                 keys = ROW_KEYS[table]
-                if self.db.table_columns(table):
+                if db.table_columns(table):
                     conn.execute(f"DELETE FROM {table} WHERE " + " AND ".join(f"{k}=?" for k in keys),
                         claim["record_id"].split(":"))
             for table in order:
-                if "task_id" in self.db.table_columns(table):
-                    conn.execute(f"DELETE FROM {table} WHERE task_id=?", (access.task_id,))
-        return {"task_id": access.task_id, "state": "purged"}
+                if "task_id" in db.table_columns(table):
+                    conn.execute(f"DELETE FROM {table} WHERE task_id=?", (task_id,))
+        return {"task_id": task_id, "state": "purged"}
 
 
 # RAG package initialization imports the task-run repository. Define the explicit

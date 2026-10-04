@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -149,7 +150,20 @@ class TaskRuntimeService:
         self._deletion_reconcile_has_more = False
         self._deletion_reconcile_cursor: str | None = None
         self._closed = False
+        from backend.protected_children import ProtectedChildren
+        try:
+            children = ProtectedChildren.existing(self)
+            child_recovery = children.retry_cleanup() if children is not None else None
+        except BaseException:
+            if getattr(self, "_protected_children", None) is not None:
+                self._protected_children.close()
+            if getattr(self, "_protected_events", None) is not None:
+                self._protected_events.close()
+            self.store.close()
+            raise
         self.recovery_report = {"deletions": self.reconcile_group_deletions()}
+        if child_recovery is not None:
+            self.recovery_report["protected_children"] = child_recovery
         self.recovery_report.update(self.recover_after_restart())
         self.recovery_report["expired_approvals"] = list(
             self.expire_pending_approvals(reschedule=False)
@@ -186,6 +200,9 @@ class TaskRuntimeService:
             events = getattr(self, "_protected_events", None)
             if events is not None:
                 events.close()
+            children = getattr(self, "_protected_children", None)
+            if children is not None:
+                children.close()
             self.store.close()
 
     def _assert_group_mutable(self, group_id: str) -> None:
@@ -1339,6 +1356,10 @@ class TaskRuntimeService:
             return self.store.delete_group(str(group_id))
 
     def _purge_protected_events(self, group_id: str) -> None:
+        from backend.protected_children import ProtectedChildren
+        children = ProtectedChildren.existing(self)
+        if children is not None:
+            children.purge_group(group_id)
         from backend.protected_events import ProtectedEvents
         events = ProtectedEvents.existing(self)
         if events is not None:
@@ -2150,19 +2171,46 @@ class TaskRuntimeService:
 
     def recover_after_restart(self) -> dict[str, Any]:
         """Fence interrupted work; never execute or replay a side effect here."""
-        report: dict[str, Any] = {"paused_runs": [], "high_risk_blocked": [], "replayable_pending": []}
+        report: dict[str, Any] = {"paused_runs": [], "high_risk_blocked": [], "replayable_pending": [],
+                                "fenced_runs": []}
+
+        def fenced(run: TaskRun) -> bool:
+            # Use the same durable fence as change_run. Unknown storage/codec
+            # failures propagate; only a positively identified fence is contained.
+            intent = self.store.group_deletion_intent(run.group_id)
+            if run.group_id in self._deferred_quarantines or (intent and intent.get("stage") == "quarantined"):
+                reason = "group_quarantine_fence"
+            elif intent is not None or self.groups.delete_transaction(run.group_id) is not None:
+                reason = "group_deletion_fence"
+            else:
+                return False
+            row = {"run_id": run.run_id, "reason": reason}
+            if row not in report["fenced_runs"]:
+                report["fenced_runs"].append(row)
+                logging.getLogger(__name__).warning(
+                    "Task Runtime recovery fenced run %s: %s", run.run_id, reason,
+                )
+            return True
+
         with self._lock:
             for run in self.store.list_runs(statuses=_EXECUTING):
-                recovered, _event, _created = self.store.change_run(
-                    run.run_id, event_type="restart_recovery",
-                    public_payload={"status": TaskStatus.PAUSED.value,
-                                    "blocking_reason": "Recovered after backend restart"},
-                    idempotency_key=f"restart-recovery:{run.run_id}:{run.version}",
-                    mutate=lambda item: (
-                        setattr(item, "status", TaskStatus.PAUSED),
-                        setattr(item, "blocking_reason", "Recovered after backend restart"),
-                    ),
-                )
+                if fenced(run):
+                    continue
+                try:
+                    recovered, _event, _created = self.store.change_run(
+                        run.run_id, event_type="restart_recovery",
+                        public_payload={"status": TaskStatus.PAUSED.value,
+                                        "blocking_reason": "Recovered after backend restart"},
+                        idempotency_key=f"restart-recovery:{run.run_id}:{run.version}",
+                        mutate=lambda item: (
+                            setattr(item, "status", TaskStatus.PAUSED),
+                            setattr(item, "blocking_reason", "Recovered after backend restart"),
+                        ),
+                    )
+                except RuntimeStoreError:
+                    if fenced(run):  # A newly committed fence may win the race.
+                        continue
+                    raise
                 report["paused_runs"].append(recovered.run_id)
             for invocation in self.store.incomplete_tools():
                 if invocation.risk is RiskLevel.HIGH or not invocation.replay_allowed:
@@ -2183,17 +2231,23 @@ class TaskRuntimeService:
                     continue
                 run = self.store.get_run(str(continuation.get("run_id") or ""))
                 if run is not None and run.status is TaskStatus.QUEUED:
-                    routed = self.transition(
-                        run.group_id, run.run_id, TaskStatus.ROUTING,
-                        idempotency_key=f"continuation-recovery-route:{continuation_id}",
-                        summary="Recovered request requires explicit approval",
-                    )
-                    self.transition(
-                        routed.group_id, routed.run_id, TaskStatus.PAUSED,
-                        idempotency_key=f"continuation-recovery-pause:{continuation_id}",
-                        summary="Recovered request requires explicit approval",
-                        blocking_reason="Executor request was not replayed after restart",
-                    )
+                    if fenced(run):
+                        continue
+                    try:
+                        routed = self.transition(
+                            run.group_id, run.run_id, TaskStatus.ROUTING,
+                            idempotency_key=f"continuation-recovery-route:{continuation_id}",
+                            summary="Recovered request requires explicit approval",
+                        )
+                        self.transition(
+                            routed.group_id, routed.run_id, TaskStatus.PAUSED,
+                            idempotency_key=f"continuation-recovery-pause:{continuation_id}",
+                            summary="Recovered request requires explicit approval",
+                            blocking_reason="Executor request was not replayed after restart",
+                        )
+                    except (RuntimeStoreError, RuntimeConflictError):
+                        if not fenced(run):
+                            raise
         return report
 
     def claim_executor_continuation(
