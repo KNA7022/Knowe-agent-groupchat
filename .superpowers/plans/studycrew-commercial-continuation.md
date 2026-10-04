@@ -1,12 +1,25 @@
 # StudyCrew commercial continuation plan
 
+## Controlling user requirements — continuation clarification 2026-10-04
+
+The user's explicit approved **StudyCrew 商用品质续建计划（Mem0 集成版）** in this conversation controls over the older implementation decisions preserved below. The cloud-only OCR/embedding, dropped capability-pack and NumPy-instead-of-USearch passages below are historical rationale, not current authorization. Do not implement those conflicting passages as product requirements.
+
+- Ordinary OCR is local PP-OCRv6 Small ONNX, delivered as a separately downloaded, fixed-version capability pack with licence, SHA-256 verification, atomic install, rollback and removal. No bundled PaddlePaddle. Availability, actual size and Windows frozen compatibility must be measured, not assumed from estimates.
+- Default embeddings are local multilingual-e5-small INT8 ONNX; BGE-M3 is an optional quality pack. Cloud embeddings require explicit per-source authorization through the DLP/Provider boundary; no silent cloud fallback. Complex/low-confidence visual content may use approved BYOK multimodal processing.
+- USearch is the intended production in-memory vector adapter. Existing exact NumPy search is a reference/interim implementation, not completion of that requirement. Dependencies and frozen packaging must be verified together.
+- Offline lexical retrieval, sources, plans, history and approved local memories remain available; no-Key access must not be gated by cloud setup.
+- Mem0 OSS integration is explicitly authorized. Dependency weight alone does not require asking the user to approve Mem0 again. Pin and verify the SDK; disable and test telemetry; StudyCrew retains encrypted persistence and permission authority. See the current plan-workspace Mem0 design for actual pinned-wheel findings.
+- These clarifications add no accounts, PIN, multi-tenancy, payment or Obsidian scope. The unsigned controlled-trial boundary and independent 0 Critical / 0 Important gates remain unchanged.
+
+Historical measurements below describe the probes that were run; they are not current application installer measurements or permission to weaken the requirements above.
+
 ## Global Constraints
 
 - Continue from branch `feature/studycrew-foundation` and baseline commit `3a35d8b`.
 - Product: `StudyCrew 学伴团`; Windows x64 controlled trial built to paid-product quality.
 - Runtime: Electron 43.4.0 with Node 24, development Node 24, Python 3.12 PyInstaller sidecar, React 18.
 - Single local Windows user, many isolated Agent groups; no accounts, activation, payment, multi-tenancy, or Obsidian integration.
-- User data is local-first, with two deliberate exceptions recorded in Task 3 — page images that have no text layer, and **all** embeddings, indexing and query alike. Both require a configured BYOK provider and DLP authorization, and both are the reason the product cannot be fully offline.
+- User data is local-first under the controlling requirements above. Ordinary OCR and default embeddings run locally; optional cloud processing needs the stated specific approval and DLP authorization. Offline BM25 remains available.
 - Group and task authority are backend-owned. Retrieved content and memories are untrusted and cannot grant tools or change policy.
 - Preserve upstream MIT attribution; record Mem0 Apache-2.0 and model licenses.
 - No plaintext secrets, PII, source bodies, memories, embeddings or vision-extracted page text in logs, telemetry, diagnostics or durable indexes.
