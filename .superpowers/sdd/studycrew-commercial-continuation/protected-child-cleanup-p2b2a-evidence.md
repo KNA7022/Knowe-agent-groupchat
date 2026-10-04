@@ -99,7 +99,7 @@ Earlier same behavioral probe printed the successful assertion line but exited 1
 
 ```text
 PermissionError: [WinError 32]
-C:\Users\25977\AppData\Local\Temp\tmpqu2ebzal\project_20261004000001\runtime\runtime.sqlite3
+<TEMP>\tmpqu2ebzal\project_20261004000001\runtime\runtime.sqlite3
 ```
 
 The test helper's `with sqlite3.connect(...)` ends the transaction, not necessarily connection lifetime; explicit post-close `gc.collect()` resolved the standalone probe teardown. No production/source edits occurred after freezing. An intermediate retry without test PYTHONPATH failed immediately with `ModuleNotFoundError: No module named 'knowe_core'`; corrected invocation above passed. A requested removal of the exact leftover disposable `tmpqu2ebzal` directory was policy-rejected before execution; no bypass attempted. It may remain under the user's Temp directory, containing synthetic test data only.
@@ -109,3 +109,71 @@ The test helper's `with sqlite3.connect(...)` ends the transaction, not necessar
 Actual store/Hub/runtime close/reopen probe, both before/after DELIVERY ACK: recovered owner PAUSED, selected paused-history answer readable, child SQL unchanged, claims unchanged; absent/present delivery receipt respectively. Existing `finalize_trusted_execution` refused PAUSED. Controller chose explicit recovery without late bookkeeping.
 
 Actual FAILED/CANCELLED finalize probe: body readable before finalization; afterward `ProtectedStorageError: protected owner revoked`. Existing public TaskRuntime status is the selected future result surface; P2b2 bridge/Client integration is not claimed by these probes. They justified the bounded split and are not counted among the 39 new tests.
+
+## Review fix round 1 — actual RED → GREEN
+
+Fix base `97332fbe689289018e54e1a5fc292fd89d5e9f0d`. I1 startup composition regression added before production fix. Command (PYTHONUTF8=1):
+
+`py -3.12 -m pytest backend/tests/test_protected_children.py -q --tb=short -k restart_cleanup_cannot`
+
+Actual relevant RED output, exit 1:
+
+```text
+FFF                                                                      [100%]
+test_restart_cleanup_cannot_revoke_other_quarantined_group[revoked-False]
+test_restart_cleanup_cannot_revoke_other_quarantined_group[revoked-True]
+test_restart_cleanup_cannot_revoke_other_quarantined_group[canonical-True]
+E   AssertionError: assert 'revoked' == 'active'
+E     - active
+E     + revoked
+3 failed, 39 deselected in 3.60s
+```
+
+Each failed the same retained-lineage assertion after actual TaskRuntimeService close/reopen. A test-only capability accessor typo in a later assertion was corrected from `open` to the existing typed `access` API before GREEN; the RED above is the actual state mismatch, not that typo.
+
+Same command after narrow event retry fix, exit 0:
+
+```text
+...                                                                      [100%]
+3 passed, 39 deselected in 4.04s
+```
+
+Focused command:
+
+`py -3.12 -m pytest backend/tests/test_protected_children.py backend/tests/test_protected_events.py backend/tests/test_task_runtime_deletion_authorization.py backend/tests/test_task_runtime_quarantine_isolation.py backend/tests/test_groups.py -q --tb=short`
+
+```text
+.....................                                      [100%]
+179 passed in 62.01s (0:01:02)
+```
+
+Frozen source SHA256:
+
+```text
+CDE5032C044512BF2EA5D4BFB9DBDC71648549A48CCEA02BC7F16AE615D39063  backend/protected_events.py
+6DEE93136C3E714D30A876EB23394B4750F90F76B7987ADA35BA504225BE1E8D  backend/tests/test_protected_children.py
+```
+
+Node command: `& .\.tools\node24.ps1 -Command 'npm test -- src/contract/parity.test.ts src/contract/publicEvents.drift.test.ts src/contract/taskRuntime.test.ts'`
+
+```text
+[node24] node v24.9.0
+RUN v1.6.1
+Test Files  3 passed (3)
+Tests       25 passed (25)
+Duration    2.79s
+```
+
+Exit 0. Same expected negative-contract stderr classes documented above. `py -3.12 -m compileall -q backend` exited 0, no output. Diff check exited 0 with existing LF→CRLF advisories.
+
+I2: earlier WinError32 path prefix is intentionally redacted to `<TEMP>`; error and synthetic suffix are preserved. Both slice report/evidence scanned for profile prefixes and account identifier with no matches. No historical rewrite, prior scratch deletion or release-sanitization claim. M2: `closing(...)` and the original SQL transaction context now deterministically release each helper connection after commit/rollback; new I1 snapshots use explicit closing, not GC.
+
+Single frozen full gate for fix round 1: `py -3.12 -m pytest backend/tests -q`, PYTHONUTF8=1, session 53692, exit 0:
+
+```text
+........................................................................ [ 96%]
+.............................................................. [100%]
+1929 passed, 5 skipped, 10 subtests passed in 220.76s (0:03:40)
+```
+
+This adds three I1 restart variants to the previous 1926 full count; the five existing skips and ten subtests remain unchanged. No exclusions/xfails added. Source/test hashes remained as recorded above throughout this gate.

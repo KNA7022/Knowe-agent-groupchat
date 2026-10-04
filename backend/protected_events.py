@@ -382,10 +382,10 @@ class ProtectedEvents:
             for row in rows:
                 self.registry._read(conn, row["task_id"], row["group_id"], revoked=True)
         for row in rows:
-            deletion = self.registry.runtime.store.group_deletion_intent(row["group_id"])
-            if row["state"] == "revoked" or deletion is not None:
-                if row["state"] != "revoked":
-                    self.registry.revoke(row["group_id"], row["task_id"])
+            # Opening an event authority is not deletion authorization. Runtime
+            # Group reconciliation validates canonical proof before revocation;
+            # a deletion intent (especially quarantine) is only an access fence.
+            if row["state"] == "revoked":
                 self._purge_rows(row["task_id"])
 
     def close(self):

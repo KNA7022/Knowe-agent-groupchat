@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
@@ -94,7 +95,7 @@ def assert_clean(item):
         with children.registry.db.transaction(immediate=False) as authority:
             claims = authority.execute("SELECT table_name,record_id FROM studycrew_protected_records WHERE task_id=? AND store_id=?",
                 (access.task_id, location["completion_store"])).fetchall()
-        with sqlite3.connect(location["completion"]) as conn:
+        with closing(sqlite3.connect(location["completion"])) as conn, conn:
             for table in ROW_KEYS:
                 columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
                 if "task_id" in columns:
@@ -329,6 +330,72 @@ def test_quarantine_retains_unrevoked_body_and_revoked_cleanup_retries(world, ca
         reopened.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authorization,with_event", [("revoked", False), ("revoked", True), ("canonical", True)])
+async def test_restart_cleanup_cannot_revoke_other_quarantined_group(world, monkeypatch, authorization, with_event):
+    first = enrolled(world)
+    populate(first, "completion" if with_event else "started")
+    second = enrolled(world, project="project_20261004000002")
+    populate(second, "started")
+    children, access, envelope, owner, group, location = first
+    runtime, groups = world[2], world[1]
+    authority = ProtectedEvents(access.registry)  # Persist even an empty catalog.
+    if with_event:
+        authority.attach(access, location["completion"])
+        disk = Store(world[0] / "events")
+        try:
+            hub = Hub(disk)
+            hub.bind_protected_events(authority)
+            with SQLiteCompletionStore(location["completion"], protected=access) as selected:
+                outbox = next(row for row in selected.pending_outbox() if row.projection_kind is ProjectionKind.DELIVERY)
+            published = await hub.emit_protected(access, outbox.outbox_id)
+        finally:
+            disk.close()
+    retained_task, retained_group, retained_location = second[1].task_id, second[4], second[5]
+    runtime.store.prepare_group_deletion(retained_group.group_id, "invalid-proof",
+        group_proof_digest="invalid", confirmation_token="invalid", runtime_project_id=second[2].project_id)
+    runtime.reconcile_group_deletions()
+    assert runtime.store.group_deletion_intent(retained_group.group_id)["stage"] == "quarantined"
+    with closing(sqlite3.connect(retained_location["completion"])) as conn:
+        retained_rows = tuple(conn.iterdump())
+    retained_files = {p.name: p.read_bytes() for p in (Path(retained_location["envelopes"]) / retained_task).iterdir()}
+    with runtime.store.db.transaction(immediate=False) as conn:
+        retained_claims = tuple(conn.execute("SELECT * FROM studycrew_protected_records WHERE task_id=?", (retained_task,)))
+    if authorization == "revoked":
+        def interrupted(_task):
+            raise OSError("after durable revoke before event cleanup")
+        with monkeypatch.context() as patch:
+            patch.setattr(authority, "_purge_rows", interrupted)
+            with pytest.raises(OSError, match="after durable revoke"):
+                access.registry.revoke(group.group_id, access.task_id)
+    else:
+        tx = groups.prepare_delete(group.group_id, groups.delete_preview(group.group_id).confirmation_token)
+        runtime.prepare_group_deletion(group.group_id, tx["transaction_id"])
+    runtime.close()
+    reopened = TaskRuntimeService(world[0], GroupRepository(world[0]), card_master_key=world[3])
+    try:
+        catalog = ProtectedChildren.existing(reopened)
+        with reopened.store.db.transaction(immediate=False) as conn:
+            assert conn.execute("SELECT state FROM studycrew_protected_lineages WHERE task_id=?", (retained_task,)).fetchone()[0] == "active"
+            assert tuple(conn.execute("SELECT * FROM studycrew_protected_records WHERE task_id=?", (retained_task,))) == retained_claims
+        assert catalog._read(retained_task) == retained_location
+        with closing(sqlite3.connect(retained_location["completion"])) as conn:
+            assert tuple(conn.iterdump()) == retained_rows
+        assert {p.name: p.read_bytes() for p in (Path(retained_location["envelopes"]) / retained_task).iterdir()} == retained_files
+        assert reopened.store.get_run(second[3].run_id).status is TaskStatus.RUNNING
+        with pytest.raises(ProtectedStorageError):
+            ProtectedLineages(reopened).access(retained_group.group_id, retained_task).identity
+        assert_clean((catalog, access, envelope, owner, group, location))
+        if with_event:
+            recovered_events = ProtectedEvents.existing(reopened)
+            assert recovered_events.references(envelope.project_id) == []
+            assert recovered_events.head(envelope.project_id) == published.reference["seq"]
+            with pytest.raises(ProtectedStorageError):
+                recovered_events.hydrate(published.reference)
+    finally:
+        reopened.close()
+
+
 def test_archive_fences_without_purging_and_markers_remain_encrypted(world):
     item = enrolled(world)
     populate(item, "completion")
@@ -388,7 +455,7 @@ def test_unclaimed_sql_row_keeps_obligation_for_explicit_repair(world):
     with pytest.raises(ProtectedStorageError, match="ownership"):
         access.registry.revoke(group.group_id, access.task_id)
     assert children._read(access.task_id) == location
-    with sqlite3.connect(location["completion"]) as conn:
+    with closing(sqlite3.connect(location["completion"])) as conn, conn:
         assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (access.task_id,)).fetchone()[0] == 1
 
 
@@ -397,12 +464,12 @@ def test_partial_initialization_preserves_unrelated_sql_and_no_body_metadata(wor
     children, access, envelope, owner, group, location = item
     path = Path(location["completion"])
     path.parent.mkdir(parents=True)
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute("CREATE TABLE unrelated (content TEXT)")
         conn.execute("INSERT INTO unrelated VALUES ('Legacy')")
     access.registry.revoke(group.group_id, access.task_id)
     assert_clean(item)
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         assert conn.execute("SELECT content FROM unrelated").fetchone()[0] == "Legacy"
 
 
@@ -424,7 +491,7 @@ def test_unrevoked_reopen_only_reads_existing_children(world, stage):
     item = enrolled(world)
     populate(item, stage)
     children, access, envelope, owner, group, location = item
-    with sqlite3.connect(location["completion"]) as conn:
+    with closing(sqlite3.connect(location["completion"])) as conn, conn:
         before = tuple(conn.iterdump())
     with world[2].store.db.transaction(immediate=False) as conn:
         before_claims = [tuple(row) for row in conn.execute("SELECT * FROM studycrew_protected_records ORDER BY store_id,table_name,record_id")]
@@ -439,7 +506,7 @@ def test_unrevoked_reopen_only_reads_existing_children(world, stage):
         with SQLiteCompletionStore(location["completion"], protected=reader) as selected:
             if stage == "completion":
                 assert selected.list_active()[0].delivery_record["text"] == ANSWER
-        with sqlite3.connect(location["completion"]) as conn:
+        with closing(sqlite3.connect(location["completion"])) as conn, conn:
             assert tuple(conn.iterdump()) == before
         with runtime.store.db.transaction(immediate=False) as conn:
             assert [tuple(row) for row in conn.execute("SELECT * FROM studycrew_protected_records ORDER BY store_id,table_name,record_id")] == before_claims
@@ -458,7 +525,7 @@ def test_running_quarantine_keeps_unrevoked_content_healthy_group_recovers(world
     assert world[2].store.get_run(healthy_owner.run_id).status is TaskStatus.RUNNING
     world[2].store.prepare_group_deletion(group.group_id, "invalid-proof",
         group_proof_digest="invalid", confirmation_token="invalid", runtime_project_id=envelope.project_id)
-    with sqlite3.connect(location["completion"]) as conn:
+    with closing(sqlite3.connect(location["completion"])) as conn, conn:
         before = tuple(conn.iterdump())
     world[2].close()
     reopened = TaskRuntimeService(world[0], GroupRepository(world[0]), card_master_key=world[3])
@@ -467,7 +534,7 @@ def test_running_quarantine_keeps_unrevoked_content_healthy_group_recovers(world
         assert reopened.store.get_run(healthy_owner.run_id).status is TaskStatus.PAUSED
         assert reopened.recovery_report["fenced_runs"] == [{"run_id": owner.run_id, "reason": "group_quarantine_fence"}]
         assert reopened.recovery_report["paused_runs"] == [healthy_owner.run_id]
-        with sqlite3.connect(location["completion"]) as conn:
+        with closing(sqlite3.connect(location["completion"])) as conn, conn:
             assert tuple(conn.iterdump()) == before
         assert ProtectedChildren.existing(reopened)._read(access.task_id) == location
         with pytest.raises(ProtectedStorageError):
