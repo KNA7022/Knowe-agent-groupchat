@@ -369,8 +369,9 @@ async def test_limit_two_overflow_never_starves_valid_confirmed_deletion(
         _close_server(restarted)
 
 
+@pytest.mark.parametrize("transient_head_read_failure", (False, True))
 def test_overflow_retry_rediscovers_invalid_proofs_behind_current_page(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, transient_head_read_failure: bool,
 ) -> None:
     """Drive the real bounded retry synchronously, without timer scheduling races."""
     monkeypatch.setattr(TaskRuntimeService, "DEFERRED_QUARANTINE_LIMIT", 2)
@@ -404,9 +405,30 @@ def test_overflow_retry_rediscovers_invalid_proofs_behind_current_page(
             recovered_writes.append(group_id)
             original(group_id, audit_code)
         monkeypatch.setattr(service.store, "quarantine_group_deletion", recovered_write)
-        for _ in range(5):
+        original_page = service.store.group_deletion_intents_page
+        page_requests = []
+        failed_head_reads = []
+
+        def read_page(*, cursor, limit):
+            page_requests.append((cursor, limit))
+            if transient_head_read_failure and not failed_head_reads and cursor == "":
+                failed_head_reads.append(cursor)
+                raise RuntimeStoreError("inert single restarted-sweep read failure")
+            return original_page(cursor=cursor, limit=limit)
+
+        monkeypatch.setattr(service.store, "group_deletion_intents_page", read_page)
+        for retry_index in range(5):
             service._retry_deferred_quarantines()
             assert len(service._deferred_quarantines) <= 2
+            if transient_head_read_failure and retry_index == 0:
+                assert service.recovery_report["deletions"]["view_unavailable"] is True
+                assert not service._deferred_quarantines
+                assert not service._deferred_quarantine_overflow
+                assert service._deletion_reconcile_cursor == ""
+                assert service._deletion_reconcile_has_more is True
+                assert [service.store.group_deletion_intent(gid)["stage"] for gid in bad_ids] == [
+                    "quarantined", "quarantined", "prepared", "prepared",
+                ]
             if not (service._deferred_quarantines or service._deferred_quarantine_overflow
                     or service._deletion_reconcile_has_more):
                 break
@@ -415,8 +437,14 @@ def test_overflow_retry_rediscovers_invalid_proofs_behind_current_page(
         assert not service._deferred_quarantines and not service._deferred_quarantine_overflow
         assert not service._deletion_reconcile_has_more
         assert recovered_writes == bad_ids
+        assert failed_head_reads == ([""] if transient_head_read_failure else [])
+        assert all(limit == 2 for _, limit in page_requests)
+        if transient_head_read_failure:
+            assert [cursor for cursor, _ in page_requests[:2]] == ["", ""]
+        settled_page_requests = list(page_requests)
         service._retry_deferred_quarantines()
         assert recovered_writes == bad_ids, "Idle recovery must not repeat settled writes"
+        assert page_requests == settled_page_requests, "Idle recovery must not keep rescanning"
     finally:
         service.close()
 

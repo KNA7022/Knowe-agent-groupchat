@@ -1527,9 +1527,14 @@ class TaskRuntimeService:
                 # Overflowed intents may be behind the current page cursor. Once
                 # retry slots are freed, begin a new bounded sweep so reaching the
                 # old tail cannot silently erase their outstanding recovery debt.
-                reports = self.reconcile_group_deletions(
-                    cursor_override="" if had_overflow and made_progress else None,
-                )
+                if had_overflow and made_progress:
+                    with self._lock:
+                        # Keep the restart obligation in service-owned scan state.
+                        # A failed page read leaves this head cursor and scan debt
+                        # intact; only a successful page advances/settles them.
+                        self._deletion_reconcile_cursor = ""
+                        self._deletion_reconcile_has_more = True
+                reports = self.reconcile_group_deletions()
                 if hasattr(self, "recovery_report"):
                     self.recovery_report["deletions"] = reports
         except Exception:  # noqa: BLE001 - Timer callbacks never leak exceptions
