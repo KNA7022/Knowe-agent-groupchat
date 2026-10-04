@@ -61,6 +61,7 @@ class Client:
         self._ordered_events: deque[dict[str, Any]] = deque()
         self._ordered_task = None
         self._protected_resync_projects: set[str] = set()
+        self._protected_recovery_snapshots: dict[str, dict[str, Any]] = {}
         self.task_runtime_recovery_fenced = False
         self.task_runtime_recovery_session_id = secrets.token_urlsafe(24)
         self.task_runtime_recovery_disconnect_debt_transferred = False
@@ -160,12 +161,18 @@ class Client:
 
     def enqueue_ordered(self, event: dict[str, Any]) -> None:
         project = event.get("project_id", "")
-        if project in self._protected_resync_projects:
+        recovery = project in self._protected_resync_projects and event.get("type") == "state_snapshot"
+        if project in self._protected_resync_projects and not recovery and project not in self._protected_recovery_snapshots:
             return
         if len(self._ordered_events) >= self.LIVE_REPLAY_BUFFER_MAX:
             self.request_resync(project, event.get("seq", 0))
             return
-        self._ordered_events.append(dict(event))
+        queued = dict(event)
+        if recovery:
+            # The stream-unique snapshot seq is the recovery generation. Later live
+            # refs queue behind it; a new resync invalidates this pending handoff.
+            self._protected_recovery_snapshots.setdefault(project, queued)
+        self._ordered_events.append(queued)
         self._start_ordered_drain()
 
     def _start_ordered_drain(self):
@@ -175,23 +182,39 @@ class Client:
     async def _drain_ordered(self):
         while self._ordered_events:
             event = self._ordered_events.popleft()
+            project = event.get("project_id", "")
+            recovery = self._protected_recovery_snapshots.get(project)
             if event.get("type") == "resync_required":
                 await self.send(event)
+            elif event is recovery:
+                # Do not treat initial replay buffering as a successful handoff.
+                sent = await self.send(event)
+                if self._protected_recovery_snapshots.get(project) is not recovery:
+                    continue  # A newer failure won while the socket was awaiting.
+                if sent:
+                    self._protected_recovery_snapshots.pop(project, None)
+                    self._protected_resync_projects.discard(project)
+                else:
+                    self.request_resync(project, event.get("seq", 0))
             elif not await self.send_live(event):
-                self.request_resync(event.get("project_id", ""), event.get("seq", 0))
+                self.request_resync(project, event.get("seq", 0))
 
     def request_resync(self, project, seq):
-        if project in self._protected_resync_projects:
-            return
+        already_fenced = project in self._protected_resync_projects
         self._protected_resync_projects.add(project)
-        self._ordered_events = deque(e for e in self._ordered_events if e.get("project_id") != project)
+        self._protected_recovery_snapshots.pop(project, None)
+        self._ordered_events = deque(e for e in self._ordered_events
+            if e.get("project_id") != project or e.get("type") == "resync_required")
         self._live_replay_buffer = deque(e for e in self._live_replay_buffer if e.get("project_id") != project)
-        self._ordered_events.append({"type": "resync_required", "project_id": project,
-            "last_seq": seq, "message": "Committed history requires replay"})
+        if not already_fenced:
+            self._ordered_events.append({"type": "resync_required", "project_id": project,
+                "last_seq": seq, "message": "Committed history requires replay"})
         self._start_ordered_drain()
 
     async def send_live(self, event: dict[str, Any]) -> bool:
         """Buffer broadcasts until replay/snapshot handoff completes for this client."""
+        if event.get("project_id") in self._protected_resync_projects:
+            return False
         if self._live_replay_fenced:
             if len(self._live_replay_buffer) >= self.LIVE_REPLAY_BUFFER_MAX:
                 project_id = event.get("project_id")
@@ -206,9 +229,14 @@ class Client:
         """Drain the ordered handoff queue, then atomically switch to direct live sends."""
         while self._live_replay_buffer:
             event = self._live_replay_buffer.popleft()
+            if event.get("project_id") in self._protected_resync_projects:
+                continue
             if not await self.send(event):
-                self._live_replay_buffer.clear()
-                break
+                if self._protected_hydrate is not None:
+                    self.request_resync(event.get("project_id", ""), event.get("seq", 0))
+                else:
+                    self._live_replay_buffer.clear()
+                    break
         self._live_replay_fenced = False
         overflow = set(self._live_replay_overflow_projects)
         self._live_replay_overflow_projects.clear()
@@ -295,6 +323,9 @@ class Hub:
             if affected(project.pending_card):
                 project.pending_card = None
         for client in self.clients:
+            for project, snapshot in tuple(client._protected_recovery_snapshots.items()):
+                if affected(snapshot):
+                    client.request_resync(project, snapshot.get("seq", 0))
             client._live_replay_buffer = deque(e for e in client._live_replay_buffer if not affected(e))
             client._ordered_events = deque(e for e in client._ordered_events if not affected(e))
 
@@ -701,10 +732,7 @@ class Hub:
             event = self._filter_public_text(pid, event)
         else:
             event = sanitize_event(event, {})
-        sent = await client.send(event)
-        if sent and event.get("type") == "replay_complete":
-            client._protected_resync_projects.discard(event.get("project_id", ""))
-        return sent
+        return await client.send(event)
 
     # ── 广播 ──
     async def broadcast(self, event: dict[str, Any], targets: Iterable[Client] | None = None) -> None:

@@ -214,3 +214,156 @@ Hash : 87EF95509E825191D394BACE18595C171CF0DB6A5926B0CE3672E3C8AC37A515
 
 Path : D:\agentwork\StudyCrew-worktree\backend\task_runtime\service.py
 Hash : 08411BE0A8FD97DF34D300EFB787D57F8ED9518BA1ACEBB76D798C60FA178D92
+
+=== Fix round 1: I1 and I2 ===
+FIX_BASE: 7a4a4a0d473048d924e8073d1ec0ce8a5d41665c
+Starting HEAD: 74295c5 (controller docs only).
+All commands: PYTHONUTF8=1, worktree D:/agentwork/StudyCrew-worktree.
+Output chunks are concatenated in order; trailing blank-line whitespace normalized.
+
+=== Actual request_snapshot / _do_replay RED before production changes ===
+Command: py -3.12 -m pytest backend/tests/test_protected_events.py -k 'request_snapshot or do_replay' -q --tb=short
+F.FFFF                                                                   [100%]
+================================== FAILURES ===================================
+_______ test_request_snapshot_recovers_resync_and_orders_inflight_live ________
+backend\tests\test_protected_events.py:642: in test_request_snapshot_recovers_resync_and_orders_inflight_live
+    assert [event["type"] for event in client.ws.frames] == ["resync_required", "state_snapshot", "message"]
+E   AssertionError: assert ['resync_required'] == ['resync_requ...t', 'message']
+E
+E     Right contains 2 more items, first extra item: 'state_snapshot'
+E     Use -v to get more diff
+_______ test_request_snapshot_failed_final_hydration_keeps_resync[key] ________
+backend\tests\test_protected_events.py:687: in test_request_snapshot_failed_final_hydration_keeps_resync
+    assert client.ws.frames[-1]["type"] == "state_snapshot"
+E   AssertionError: assert 'resync_required' == 'state_snapshot'
+E
+E     - state_snapshot
+E     + resync_required
+___ test_do_replay_final_hydration_failure_never_acknowledges_cursor[scope] ___
+backend\tests\test_protected_events.py:718: in test_do_replay_final_hydration_failure_never_acknowledges_cursor
+    assert not any(event["type"] in {"message", "replay_complete"} for event in client.ws.frames)
+E   assert not True
+E    +  where True = any(<generator object test_do_replay_final_hydration_failure_never_acknowledges_cursor.<locals>.<genexpr> at 0x0000014B58C90860>)
+____ test_do_replay_final_hydration_failure_never_acknowledges_cursor[key] ____
+backend\tests\test_protected_events.py:715: in test_do_replay_final_hydration_failure_never_acknowledges_cursor
+    await pending
+backend\server.py:4786: in _do_replay
+    ) else self.hub.unread_count(project_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend\hub.py:799: in unread_count
+    return self._count_unread(proj.last_read_seq, self.durable_conversation(project_id))
+                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend\hub.py:571: in durable_conversation
+    for ev in self.store.load_all_events(project_id):
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend\persist.py:718: in load_all_events
+    return self.load_events(project_id, 0)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend\persist.py:700: in load_events
+    protected = self.protected_events.references(project_id)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend\protected_events.py:230: in references
+    return [self._reference(row) for row in rows]
+            ^^^^^^^^^^^^^^^^^^^^
+backend\protected_events.py:185: in _reference
+    or not hmac.compare_digest(row["mac"], self._digest("record", [
+backend\protected_events.py:96: in _digest
+    return self.registry.crypto.digest("protected-events-v1:" + domain,
+backend\task_runtime\card_state.py:165: in digest
+    raise CardStateError("card encryption capability unavailable")
+E   backend.task_runtime.card_state.CardStateError: card encryption capability unavailable
+_ test_do_replay_final_hydration_failure_never_acknowledges_cursor[authority] _
+backend\tests\test_protected_events.py:718: in test_do_replay_final_hydration_failure_never_acknowledges_cursor
+    assert not any(event["type"] in {"message", "replay_complete"} for event in client.ws.frames)
+E   assert not True
+E    +  where True = any(<generator object test_do_replay_final_hydration_failure_never_acknowledges_cursor.<locals>.<genexpr> at 0x0000014B59026F60>)
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_events.py::test_request_snapshot_recovers_resync_and_orders_inflight_live
+FAILED backend\tests\test_protected_events.py::test_request_snapshot_failed_final_hydration_keeps_resync[key]
+FAILED backend\tests\test_protected_events.py::test_do_replay_final_hydration_failure_never_acknowledges_cursor[scope]
+FAILED backend\tests\test_protected_events.py::test_do_replay_final_hydration_failure_never_acknowledges_cursor[key]
+FAILED backend\tests\test_protected_events.py::test_do_replay_final_hydration_failure_never_acknowledges_cursor[authority]
+5 failed, 1 passed, 37 deselected in 3.40s
+
+=== Same six cases GREEN ===
+Command: py -3.12 -m pytest backend/tests/test_protected_events.py -k 'request_snapshot or do_replay' -q --tb=short
+......                                                                   [100%]
+6 passed, 37 deselected in 3.85s
+
+=== Expanded recovery generation and successful replay controls ===
+Command: py -3.12 -m pytest backend/tests/test_protected_events.py -k 'request_snapshot or do_replay or old_snapshot' -q --tb=short
+.........                                                                [100%]
+9 passed, 37 deselected in 6.28s
+
+=== Covering focused regression, complete output ===
+Command: py -3.12 -m pytest backend/tests/test_protected_events.py backend/tests/test_unit.py backend/tests/test_e2e.py backend/tests/test_v012_persistence.py backend/tests/test_task_runtime_live_event_bridge.py backend/tests/test_task_runtime_recovery_ack.py -q --tb=short
+........................................................................ [ 63%]
+..........................................                               [100%]
+114 passed in 43.87s
+
+=== Source/test freeze ===
+Commands: py -3.12 -m compileall -q backend
+git diff --check -- backend/hub.py backend/server.py backend/tests/test_protected_events.py
+Get-FileHash -Algorithm SHA256 backend/hub.py,backend/server.py,backend/tests/test_protected_events.py
+Exit 0; compileall emitted no output.
+warning: in the working copy of 'backend/hub.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/server.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/tests/test_protected_events.py', LF will be replaced by CRLF the next time Git touches it
+
+Path : D:\agentwork\StudyCrew-worktree\backend\hub.py
+Hash : BD554D1BDCDC714102C49E52EDA7A4BB2EB35ED6DFCFBD34E9BE93C23F02CEF9
+
+Path : D:\agentwork\StudyCrew-worktree\backend\server.py
+Hash : A82D68DF5B9087C7853F32C6384F88DC6A868A2651A3931FE3810DFD2544A730
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_events.py
+Hash : 2D1EA3E2E12392C907F3B584CFF6976B127D49131373B35AF3642C43A07F5503
+
+
+=== Fix round 1 FINAL frozen full, complete output ===
+Command: py -3.12 -m pytest backend/tests -q
+..........................................sss.s......................... [  3%]
+.s...................................................................... [  7%]
+........................................................................ [ 11%]
+........................................................................ [ 15%]
+........................................................................ [ 19%]
+........................................................................ [ 22%]
+........................................................................ [ 26%]
+........................................................................ [ 30%]
+........................................................................ [ 34%]
+........................................................................ [ 38%]
+........................................................................ [ 41%]
+........................................................................ [ 45%]
+........................................................................ [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 57%]
+........................................................................ [ 60%]
+........................................................................ [ 64%]
+........................................................................ [ 68%]
+........................................................................ [ 72%]
+........................................................................ [ 76%]
+........................................................................ [ 80%]
+........................................................................ [ 83%]
+........................................................................ [ 87%]
+........................................................................ [ 91%]
+........................................................................ [ 95%]
+.............................................................. [ 98%]
+...........................                                              [100%]
+1884 passed, 5 skipped, 10 subtests passed in 195.70s (0:03:15)
+
+=== Hash/diff recheck, source/tests unchanged ===
+Same hash paths; scoped diff-check plus report path.
+Exit 0.
+warning: in the working copy of '.superpowers/sdd/studycrew-commercial-continuation/protected-delivery-p2b1-report.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/hub.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/server.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/tests/test_protected_events.py', LF will be replaced by CRLF the next time Git touches it
+
+Path : D:\agentwork\StudyCrew-worktree\backend\hub.py
+Hash : BD554D1BDCDC714102C49E52EDA7A4BB2EB35ED6DFCFBD34E9BE93C23F02CEF9
+
+Path : D:\agentwork\StudyCrew-worktree\backend\server.py
+Hash : A82D68DF5B9087C7853F32C6384F88DC6A868A2651A3931FE3810DFD2544A730
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_events.py
+Hash : 2D1EA3E2E12392C907F3B584CFF6976B127D49131373B35AF3642C43A07F5503

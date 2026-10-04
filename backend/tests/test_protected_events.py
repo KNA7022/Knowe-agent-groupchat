@@ -596,3 +596,213 @@ async def test_real_http_token_delta_history_projection_and_scope_fence(world, t
         listener.close()
         await listener.wait_closed()
         store.close()
+
+
+def recovery_routes(server, client, store, project):
+    # Only UI/Engine metadata is inert. Admission, authority, collection, dispatch,
+    # Client.send and final hydration are the actual production methods.
+    server.store = store
+    server._canonical_project_id_from_request = lambda value: value
+    server._project_dir_is_valid = lambda *args, **kwargs: False
+    server._open_activity_all = lambda: []
+    server._conversation_state = lambda project: {"muted": False, "folded": False}
+    server._record_task_runtime_snapshot_publication = lambda snapshot: None
+    client.sent_projects.add(project)
+
+
+async def fail_committed_enqueue(hub, access, outbox):
+    def fail():
+        raise OSError("committed enqueue failure")
+    hub.protected_enqueue_fault = fail
+    try:
+        with pytest.raises(OSError):
+            await hub.emit_protected(access, outbox.outbox_id)
+    finally:
+        hub.protected_enqueue_fault = None
+
+
+@pytest.mark.asyncio
+async def test_request_snapshot_recovers_resync_and_orders_inflight_live(world, tmp_path, monkeypatch):
+    fixture, authority, store, hub, outbox = setup_delivery(world, tmp_path)
+    project = fixture[2].project_id
+    server, client = await admitted(world, hub, monkeypatch)
+    recovery_routes(server, client, store, project)
+    await client.release_live_replay_fence()
+    await fail_committed_enqueue(hub, fixture[1], outbox)
+    await drain(client)
+    await client._send_lock.acquire()
+    try:
+        await server._on_frame(client, json.dumps({"type": "request_snapshot", "project_id": project}))
+        await asyncio.sleep(0)  # Recovery snapshot has reached the real send lock.
+        later = await hub.emit(project, {"type": "message", "content": "After snapshot capture"})
+        assert project in client._protected_resync_projects
+    finally:
+        client._send_lock.release()
+    await drain(client)
+    assert [event["type"] for event in client.ws.frames] == ["resync_required", "state_snapshot", "message"]
+    snapshot = client.ws.frames[1]
+    assert [event["content"] for event in snapshot["conversation"]] == [ANSWER]
+    assert client.ws.frames[2]["seq"] == later["seq"] > snapshot["seq"]
+    assert project not in client._protected_resync_projects
+    await hub.emit(project, {"type": "message", "content": "Live resumed"})
+    await drain(client)
+    assert client.ws.frames[-1]["content"] == "Live resumed"
+    assert REASONING not in repr(client.ws.frames)
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denial", ["scope", "key"])
+async def test_request_snapshot_failed_final_hydration_keeps_resync(world, tmp_path, monkeypatch, denial):
+    fixture, authority, store, hub, outbox = setup_delivery(world, tmp_path)
+    project = fixture[2].project_id
+    server, client = await admitted(world, hub, monkeypatch)
+    recovery_routes(server, client, store, project)
+    await client.release_live_replay_fence()
+    await fail_committed_enqueue(hub, fixture[1], outbox)
+    await drain(client)
+    original_key = authority.registry.crypto._key
+    await client._send_lock.acquire()
+    try:
+        await server._on_frame(client, json.dumps({"type": "request_snapshot", "project_id": project}))
+        await asyncio.sleep(0)
+        if denial == "scope":
+            world[1].rename(fixture[6].group_id, "Denied at snapshot handoff")
+        else:
+            authority.registry.crypto._key = None
+    finally:
+        client._send_lock.release()
+    try:
+        await drain(client)
+    finally:
+        authority.registry.crypto._key = original_key
+    assert project in client._protected_resync_projects
+    assert [event["type"] for event in client.ws.frames] == ["resync_required"]
+    await hub.emit(project, {"type": "message", "content": "Held until recovery"})
+    await drain(client)
+    assert len(client.ws.frames) == 1
+    if denial == "key":
+        await server._on_frame(client, json.dumps({"type": "request_snapshot", "project_id": project}))
+        await drain(client)
+        assert client.ws.frames[-1]["type"] == "state_snapshot"
+        assert ANSWER in repr(client.ws.frames[-1])
+        assert project not in client._protected_resync_projects
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("denial", ["scope", "key", "authority"])
+async def test_do_replay_final_hydration_failure_never_acknowledges_cursor(world, tmp_path, monkeypatch, denial):
+    fixture, authority, store, hub, outbox = setup_delivery(world, tmp_path)
+    project = fixture[2].project_id
+    await hub.emit_protected(fixture[1], outbox.outbox_id)
+    await hub.emit(project, {"type": "message", "content": "Later durable message"})
+    server, client = await admitted(world, hub, monkeypatch)
+    recovery_routes(server, client, store, project)
+    selected = authority._stores[project]
+    original_key = authority.registry.crypto._key
+    await client._send_lock.acquire()
+    pending = asyncio.create_task(server._do_replay(client, {"project_id": project, "since_seq": 0}))
+    await asyncio.sleep(0)  # Actual replay collection is complete, final send is blocked.
+    if denial == "scope":
+        world[1].rename(fixture[6].group_id, "Denied at replay handoff")
+    elif denial == "key":
+        authority.registry.crypto._key = None
+    else:
+        authority._stores.pop(project)
+    client._send_lock.release()
+    try:
+        await pending
+        await drain(client)
+        await client.release_live_replay_fence()
+        assert not any(event["type"] in {"message", "replay_complete"} for event in client.ws.frames)
+        assert project in client._protected_resync_projects
+    finally:
+        authority.registry.crypto._key = original_key
+        authority._stores[project] = selected
+    if denial != "scope":
+        await server._on_frame(client, json.dumps({"type": "request_snapshot", "project_id": project}))
+        await drain(client)
+        snapshot = client.ws.frames[-1]
+        assert snapshot["type"] == "state_snapshot"
+        assert [event["content"] for event in snapshot["conversation"]] == [ANSWER, "Later durable message"]
+        assert project not in client._protected_resync_projects
+        await hub.emit(project, {"type": "message", "content": "Live after retry"})
+        await drain(client)
+        assert client.ws.frames[-1]["content"] == "Live after retry"
+    assert REASONING not in repr(client.ws.frames)
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_fence", ["resync", "revoke"])
+async def test_old_snapshot_handoff_cannot_clear_newer_recovery(world, tmp_path, monkeypatch, new_fence):
+    fixture, authority, store, hub, outbox = setup_delivery(world, tmp_path)
+    project = fixture[2].project_id
+    server, client = await admitted(world, hub, monkeypatch)
+    recovery_routes(server, client, store, project)
+    await client.release_live_replay_fence()
+    await fail_committed_enqueue(hub, fixture[1], outbox)
+    await drain(client)
+    entered = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    send = client.ws.send
+    seen = 0
+    async def delayed(raw):
+        nonlocal seen
+        if json.loads(raw)["type"] == "state_snapshot" and seen < 2:
+            index = seen
+            seen += 1
+            entered[index].set()
+            await release[index].wait()
+        await send(raw)
+    client.ws.send = delayed
+    try:
+        await server._on_frame(client, json.dumps({"type": "request_snapshot", "project_id": project}))
+        await asyncio.wait_for(entered[0].wait(), 2)
+        if new_fence == "resync":
+            client.request_resync(project, hub.projects[project].seq)
+        else:
+            authority.purge(fixture[6].group_id, fixture[2].task_id)
+        await server._on_frame(client, json.dumps({"type": "request_snapshot", "project_id": project}))
+        later = await hub.emit(project, {"type": "message", "content": "After newer snapshot"})
+        release[0].set()
+        await asyncio.wait_for(entered[1].wait(), 2)
+        assert project in client._protected_resync_projects
+        assert not any(event.get("content") == "After newer snapshot" for event in client.ws.frames)
+        release[1].set()
+        await drain(client)
+        assert project not in client._protected_resync_projects
+        assert client.ws.frames[-1]["seq"] == later["seq"]
+        snapshots = [event for event in client.ws.frames if event["type"] == "state_snapshot"]
+        assert snapshots[0]["seq"] < snapshots[1]["seq"] < later["seq"]
+        if new_fence == "revoke":
+            assert ANSWER not in repr(snapshots[1])  # The earlier handoff cannot be recalled.
+    finally:
+        for gate in release:
+            gate.set()
+        await drain(client)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_do_replay_success_and_live_handoff_remain_ordered(world, tmp_path, monkeypatch):
+    fixture, authority, store, hub, outbox = setup_delivery(world, tmp_path)
+    project = fixture[2].project_id
+    commit = await hub.emit_protected(fixture[1], outbox.outbox_id)
+    legacy = await hub.emit(project, {"type": "message", "content": "Second"})
+    server, client = await admitted(world, hub, monkeypatch)
+    recovery_routes(server, client, store, project)
+    with authority._stores[project].transaction(immediate=False) as conn:
+        before = tuple(conn.iterdump())
+    await server._do_replay(client, {"project_id": project, "since_seq": 0})
+    await client.release_live_replay_fence()
+    assert [event["type"] for event in client.ws.frames] == ["message", "message", "replay_complete"]
+    assert [event["seq"] for event in client.ws.frames[:2]] == [commit.reference["seq"], legacy["seq"]]
+    assert client.ws.frames[-1]["last_seq"] == legacy["seq"]
+    with authority._stores[project].transaction(immediate=False) as conn:
+        assert tuple(conn.iterdump()) == before
+    await hub.emit(project, {"type": "message", "content": "Next"})
+    await drain(client)
+    assert client.ws.frames[-1]["content"] == "Next"
+    store.close()

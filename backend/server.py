@@ -4773,7 +4773,11 @@ class KnoweServer:
             for ev in events:
                 # Enrich legacy durable rows with canonical group_id at the final
                 # transport boundary without rewriting historical JSONL content.
-                await self.hub.send_to(client, ev)
+                if not await self.hub.send_to(client, ev):
+                    # Final hydration can deny on an otherwise healthy socket.
+                    # Never send later records or a success cursor past that gap.
+                    client.request_resync(project_id, replay_cursor)
+                    return
 
         complete: dict[str, Any] = {
             "type": "replay_complete",
