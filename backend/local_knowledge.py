@@ -15,12 +15,28 @@ from backend.knowledge_api import KnowledgeHttpResponse
 from backend.knowe_rag.bm25 import Bm25Index
 from backend.knowe_rag.chunks import CHILD, build_chunks
 from backend.knowe_rag.crypto import MasterKey, MasterKeyError
-from backend.knowe_rag.parsers import MAX_IMPORT_BYTES, SUPPORTED_SUFFIXES, UnsupportedFormat, parse_document_bytes
+from backend.knowe_rag.parsers import (
+    MAX_EXTRACTED_CHARS, MAX_IMPORT_BYTES, MAX_PARSE_BLOCKS, SUPPORTED_SUFFIXES,
+    UnsupportedFormat, parse_document_bytes, validate_parsed_output,
+)
 from backend.knowe_rag.store import EncryptedKnowledgeStore, StoreError
 
 
 class ScopeDenied(RuntimeError):
     pass
+
+
+MAX_PUBLICATION_CHUNKS = 20_000
+MAX_PUBLICATION_TEXT_CHARS = 2 * MAX_EXTRACTED_CHARS + 2 * MAX_PARSE_BLOCKS
+
+
+def _prepare_import(raw, suffix, source_id, content_hasher):
+    blocks = parse_document_bytes(raw, suffix)
+    validate_parsed_output(blocks)
+    chunks = build_chunks(source_id, blocks, content_hasher=content_hasher)
+    if len(chunks) > MAX_PUBLICATION_CHUNKS or sum(len(chunk.text) for chunk in chunks) > MAX_PUBLICATION_TEXT_CHARS:
+        raise UnsupportedFormat("chunk_output_exceeds_import_policy")
+    return blocks, chunks
 
 
 class LocalKnowledgeService:
@@ -133,12 +149,11 @@ class LocalKnowledgeService:
                     raise ValueError("invalid_import_size")
                 before = self.scope(group_id, course_id, mutation=True)
                 binding = next((b.binding_id for b in before.course_bindings if b.course_id == course_id), None)
-                blocks = await asyncio.to_thread(parse_document_bytes, raw, suffix)
+                source_id = "src_" + uuid.uuid4().hex
+                blocks, chunks = await asyncio.to_thread(_prepare_import, raw, suffix, source_id, self.store.content_hasher)
                 current = self.scope(group_id, course_id, mutation=True)
                 if binding != next((b.binding_id for b in current.course_bindings if b.course_id == course_id), None):
                     raise ScopeDenied("scope_changed_during_import")
-                source_id = "src_" + uuid.uuid4().hex
-                chunks = build_chunks(source_id, blocks, content_hasher=self.store.content_hasher)
                 needs_vision = any(block.kind == "image_page" for block in blocks)
                 metadata = {"filename": filename, "course_id": course_id, "byte_count": len(raw),
                     "chunk_count": sum(c.level == CHILD and bool(c.text) for c in chunks),
@@ -178,8 +193,8 @@ class LocalKnowledgeService:
                 result = {"deleted": True, "retained_for_other_groups": self.groups.source_reference_count(source_id) > 0}
             else:
                 return KnowledgeHttpResponse(404, {"ok": False, "error": "not_found"})
-            self.scope(group_id, course_id)
-            return KnowledgeHttpResponse(200, {"ok": True, "mode": "lexical", "degraded": True, **result})
+            group = self.scope(group_id, course_id)
+            return KnowledgeHttpResponse(200, {"ok": True, "mode": "lexical", "degraded": True, "group": group.to_dict(), **result})
         except ScopeDenied as exc:
             return KnowledgeHttpResponse(403, {"ok": False, "error": str(exc)})
         except (ValueError, UnicodeError, binascii.Error, UnsupportedFormat):

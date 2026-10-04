@@ -20,6 +20,8 @@ python-pptx——三个库既给 PyInstaller 产物增重，又只给对象模�
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 from html.parser import HTMLParser
@@ -45,6 +47,74 @@ __all__ = [
 
 class UnsupportedFormat(ValueError):
     """这份文件不能被解析成块。"""
+
+
+MAX_EXTRACTED_CHARS = 4_000_000
+MAX_PARSE_WORK_CHARS = 8_000_000
+MAX_PARSE_BLOCKS = 10_000
+MAX_PARSE_CELLS = 100_000
+MAX_PARSE_LINES = 100_000
+
+
+@dataclass
+class _ImportBudget:
+    work_chars: int = 0
+    output_chars: int = 0
+    blocks: int = 0
+    cells: int = 0
+
+    def work(self, count: int) -> None:
+        self.work_chars += count
+        if self.work_chars > MAX_PARSE_WORK_CHARS:
+            raise UnsupportedFormat("extracted_text_exceeds_import_policy")
+
+    def block(self, count: int) -> None:
+        self.blocks += 1
+        self.output_chars += count
+        if self.blocks > MAX_PARSE_BLOCKS or self.output_chars > MAX_EXTRACTED_CHARS:
+            raise UnsupportedFormat("extracted_output_exceeds_import_policy")
+
+    def cell(self) -> None:
+        self.cells += 1
+        if self.cells > MAX_PARSE_CELLS:
+            raise UnsupportedFormat("cell_count_exceeds_import_policy")
+
+
+_IMPORT_BUDGET: ContextVar[_ImportBudget | None] = ContextVar("rag_import_budget", default=None)
+
+
+def _work(count: int) -> None:
+    budget = _IMPORT_BUDGET.get()
+    if budget is not None:
+        budget.work(count)
+
+
+def _cell() -> None:
+    budget = _IMPORT_BUDGET.get()
+    if budget is not None:
+        budget.cell()
+
+
+def _join(parts: Iterable[str], separator: str = "") -> str:
+    """Charge every expanded value and separator before a concatenation allocates output."""
+    values = []
+    for part in parts:
+        _work(len(part) + (len(separator) if values else 0))
+        values.append(part)
+    return separator.join(values)
+
+
+def _block(*, text: str, location: str, kind: str) -> ParsedBlock:
+    budget = _IMPORT_BUDGET.get()
+    if budget is not None:
+        budget.block(len(text))
+    return ParsedBlock(text=text, location=location, kind=kind)
+
+
+def validate_parsed_output(blocks: tuple[ParsedBlock, ...]) -> None:
+    """Keep a final output guard independent of format-specific extraction accounting."""
+    if len(blocks) > MAX_PARSE_BLOCKS or sum(len(block.text) for block in blocks) > MAX_EXTRACTED_CHARS:
+        raise UnsupportedFormat("extracted_output_exceeds_import_policy")
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,12 +149,20 @@ _PARAGRAPH_BREAK = re.compile(r"\n\s*\n")
 def _parse_plain_text(raw: str) -> tuple[ParsedBlock, ...]:
     blocks: list[ParsedBlock] = []
     index = 0
-    for chunk in _PARAGRAPH_BREAK.split(raw):
+
+    def paragraphs():
+        start = 0
+        for match in _PARAGRAPH_BREAK.finditer(raw):
+            yield raw[start:match.start()]
+            start = match.end()
+        yield raw[start:]
+
+    for chunk in paragraphs():
         text = chunk.strip()
         if not text:
             continue
         index += 1
-        blocks.append(ParsedBlock(text=text, location=f"para:{index}", kind="paragraph"))
+        blocks.append(_block(text=text, location=f"para:{index}", kind="paragraph"))
     return tuple(blocks)
 
 
@@ -127,8 +205,8 @@ def _parse_markdown(raw: str) -> tuple[ParsedBlock, ...]:
                 cursor += 1
             cursor += 1  # closing fence (or end of input)
             code_index += 1
-            content = "\n".join(body).strip("\n")
-            blocks.append(ParsedBlock(
+            content = _join(body, "\n").strip("\n")
+            blocks.append(_block(
                 text=f"{info}\n{content}" if info else content,
                 location=f"code:{code_index}",
                 kind="code",
@@ -139,7 +217,7 @@ def _parse_markdown(raw: str) -> tuple[ParsedBlock, ...]:
         if heading:
             level = len(heading.group(1))
             heading_counts[level] = heading_counts.get(level, 0) + 1
-            blocks.append(ParsedBlock(
+            blocks.append(_block(
                 text=heading.group(2).strip(),
                 location=f"h{level}:{heading_counts[level]}",
                 kind="heading",
@@ -155,8 +233,8 @@ def _parse_markdown(raw: str) -> tuple[ParsedBlock, ...]:
                     rows.append(lines[cursor].strip())
                 cursor += 1
             table_index += 1
-            blocks.append(ParsedBlock(
-                text="\n".join(rows), location=f"table:{table_index}", kind="table",
+            blocks.append(_block(
+                text=_join(rows, "\n"), location=f"table:{table_index}", kind="table",
             ))
             continue
 
@@ -171,8 +249,8 @@ def _parse_markdown(raw: str) -> tuple[ParsedBlock, ...]:
                 body.append(lines[cursor].strip())
                 cursor += 1
             paragraph_index += 1
-            blocks.append(ParsedBlock(
-                text="\n".join(body), location=f"para:{paragraph_index}", kind="paragraph",
+            blocks.append(_block(
+                text=_join(body, "\n"), location=f"para:{paragraph_index}", kind="paragraph",
             ))
             continue
 
@@ -228,7 +306,7 @@ class _BlockExtractor(HTMLParser):
             return
         if self._capture is not None and tag in _HTML_BLOCK_TAGS:
             kind, level = self._capture
-            text = re.sub(r"\s+", " ", "".join(self._buffer)).strip()
+            text = re.sub(r"\s+", " ", _join(self._buffer)).strip()
             self._capture = None
             self._buffer = []
             if not text:
@@ -238,7 +316,7 @@ class _BlockExtractor(HTMLParser):
                 f"h{level}:{self._counts[kind]}" if kind == "heading"
                 else f"{'list' if kind == 'list' else 'para'}:{self._counts[kind]}"
             )
-            self.blocks.append(ParsedBlock(text=text, location=location, kind=kind))
+            self.blocks.append(_block(text=text, location=location, kind=kind))
 
     def handle_data(self, data: str) -> None:
         if self._skip_depth or self._capture is None:
@@ -310,7 +388,7 @@ def _docx_paragraph_text(paragraph: ElementTree.Element) -> str:
             parts.append("\t")
         elif node.tag in (f"{_W}br", f"{_W}cr"):
             parts.append("\n")
-    return "".join(parts).strip()
+    return _join(parts).strip()
 
 
 def _docx_heading_level(paragraph: ElementTree.Element) -> int | None:
@@ -327,17 +405,17 @@ def _docx_heading_level(paragraph: ElementTree.Element) -> int | None:
 def _docx_table_text(table: ElementTree.Element) -> str:
     lines: list[str] = []
     for row in table.findall(f"{_W}tr"):
-        cells = [
-            " ".join(
+        cells = []
+        for cell in row.findall(f"{_W}tc"):
+            _cell()
+            cells.append(_join((
                 text
                 for text in (_docx_paragraph_text(p) for p in cell.iter(f"{_W}p"))
                 if text
-            )
-            for cell in row.findall(f"{_W}tc")
-        ]
+            ), " "))
         if any(cells):
-            lines.append("\t".join(cells))
-    return "\n".join(lines)
+            lines.append(_join(cells, "\t"))
+    return _join(lines, "\n")
 
 
 def _parse_docx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBlock, ...]:
@@ -362,12 +440,12 @@ def _parse_docx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBl
             level = _docx_heading_level(child)
             if level is None:
                 paragraph_index += 1
-                blocks.append(ParsedBlock(
+                blocks.append(_block(
                     text=text, location=f"para:{paragraph_index}", kind="paragraph",
                 ))
             else:
                 heading_counts[level] = heading_counts.get(level, 0) + 1
-                blocks.append(ParsedBlock(
+                blocks.append(_block(
                     text=text, location=f"h{level}:{heading_counts[level]}", kind="heading",
                 ))
         elif child.tag == f"{_W}tbl":
@@ -375,7 +453,7 @@ def _parse_docx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBl
             if not text:
                 continue
             table_index += 1
-            blocks.append(ParsedBlock(text=text, location=f"table:{table_index}", kind="table"))
+            blocks.append(_block(text=text, location=f"table:{table_index}", kind="table"))
     return tuple(blocks)
 
 
@@ -401,11 +479,11 @@ def _parse_pptx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBl
         paragraphs = [
             text
             for paragraph in root.iter(f"{_A}p")
-            if (text := "".join(node.text or "" for node in paragraph.iter(f"{_A}t")).strip())
+            if (text := _join(node.text or "" for node in paragraph.iter(f"{_A}t")).strip())
         ]
         if paragraphs:
-            blocks.append(ParsedBlock(
-                text="\n".join(paragraphs), location=f"slide:{number}", kind="slide",
+            blocks.append(_block(
+                text=_join(paragraphs, "\n"), location=f"slide:{number}", kind="slide",
             ))
     return tuple(blocks)
 
@@ -486,7 +564,7 @@ def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
         return []
     root = _parse_xml(raw, "xl/sharedStrings.xml", ".xlsx")
     return [
-        "".join(node.text or "" for node in item.iter(f"{_S}t"))
+        _join(node.text or "" for node in item.iter(f"{_S}t"))
         for item in root.findall(f"{_S}si")
     ]
 
@@ -500,7 +578,7 @@ def _xlsx_cell_value(cell: ElementTree.Element, shared: list[str]) -> str:
             return ""
         return shared[int(index)]
     if kind == "inlineStr":
-        return "".join(node.text or "" for node in cell.iter(f"{_S}t")).strip()
+        return _join(node.text or "" for node in cell.iter(f"{_S}t")).strip()
     if kind == "b":
         raw = cell.find(f"{_S}v")
         return "TRUE" if (raw is not None and (raw.text or "").strip() == "1") else "FALSE"
@@ -525,6 +603,7 @@ def _xlsx_sheet_rows(
         column = -1
         values: list[tuple[int, str]] = []
         for cell in row_element.findall(f"{_S}c"):
+            _cell()
             # 单元格可以不写 `r`（有的生成器只在跳列时才写）。不推断的话格子会全挤到第一
             # 列，引用就指向错的格子；所以缺 `r` 时按同行上一个单元格右移一格。
             reference = cell.get("r")
@@ -534,6 +613,8 @@ def _xlsx_sheet_rows(
             else:
                 column += 1
             value = _xlsx_cell_value(cell, shared)
+            # Shared-string references count each time, even though they reuse one Python string.
+            _work(len(value))
             if value:
                 values.append((column, value))
         if values:
@@ -574,19 +655,21 @@ def _parse_xlsx_package(archive: zipfile.ZipFile, suffix: str) -> tuple[ParsedBl
             first_row, last_row = band[0][0], band[-1][0]
             first_column = min(column for _, values in band for column, _ in values)
             last_column = max(column for _, values in band for column, _ in values)
+            # Sparse-cell padding can amplify tiny cell values into very wide TSV rows.
+            _work(len(band) * (last_column - first_column))
             # 位置声明了列范围，文本就必须逐列对得上，所以空单元格用制表符占位——
             # 压掉它会让"B 列是空的"变成"这一行只有两列"，引用里的列号就错位了。
-            lines = [
-                "\t".join(
-                    dict(values).get(column, "")
+            lines = []
+            for _, values in band:
+                row_values = dict(values)
+                lines.append(_join((
+                    row_values.get(column, "")
                     for column in range(first_column, last_column + 1)
-                )
-                for _, values in band
-            ]
+                ), "\t"))
             # 表名进**文本**而不是位置：它在密文里，同时「期末成绩单」这样的词从此可被
             # 检索（原实现把它放在 location，于是检索里根本不存在这个词）。
-            blocks.append(ParsedBlock(
-                text="\n".join([name, *lines]),
+            blocks.append(_block(
+                text=_join([name, *lines], "\n"),
                 # 位置是**明文**存储的，所以它不能带工作表名——那是用户敲进去的正文。
                 # 复审实测：无密钥直读数据库能拿到 `sheet:期末成绩单!A1:B2`，而单元格
                 # 内容仍是密文。表名改放进块文本（加密的那一侧），于是它既能被检索，
@@ -642,12 +725,14 @@ def _parse_pdf(path: Path | bytes) -> tuple[ParsedBlock, ...]:
             try:
                 textpage = page.get_textpage()
                 try:
+                    # Check native character count before requesting a potentially expanded buffer.
+                    _work(textpage.count_chars())
                     text = _normalise_pdf_text(textpage.get_text_range())
                 finally:
                     textpage.close()
             finally:
                 page.close()
-            blocks.append(ParsedBlock(
+            blocks.append(_block(
                 text=text,
                 location=f"page:{index + 1}",
                 kind="page" if text else "image_page",
@@ -707,7 +792,7 @@ MAX_PACKAGE_BYTES = 64 * 1024 * 1024
 _PDF_IMPORT_LOCK = threading.Lock()
 
 
-def parse_document_bytes(raw: bytes, suffix: str) -> tuple[ParsedBlock, ...]:
+def _parse_document_bytes(raw: bytes, suffix: str) -> tuple[ParsedBlock, ...]:
     """Parse renderer-selected bytes in memory; never resolve a renderer filesystem path."""
     suffix = suffix.casefold()
     if len(raw) > MAX_IMPORT_BYTES:
@@ -717,7 +802,11 @@ def parse_document_bytes(raw: bytes, suffix: str) -> tuple[ParsedBlock, ...]:
         ".html": _parse_html, ".htm": _parse_html,
     }
     if suffix in text_parsers:
-        return text_parsers[suffix](raw.decode("utf-8", errors="replace"))
+        decoded = raw.decode("utf-8", errors="replace")
+        _work(len(decoded))
+        if decoded.count("\n") > MAX_PARSE_LINES:
+            raise UnsupportedFormat("line_count_exceeds_import_policy")
+        return text_parsers[suffix](decoded)
     if suffix == ".pdf":
         # PDFium is not thread-safe. Concurrent HTTP imports use worker threads.
         with _PDF_IMPORT_LOCK:
@@ -734,3 +823,13 @@ def parse_document_bytes(raw: bytes, suffix: str) -> tuple[ParsedBlock, ...]:
             return packages[suffix](archive, suffix)
     except (zipfile.BadZipFile, RuntimeError, ValueError) as exc:
         raise UnsupportedFormat("invalid_document_package") from exc
+
+
+def parse_document_bytes(raw: bytes, suffix: str) -> tuple[ParsedBlock, ...]:
+    token = _IMPORT_BUDGET.set(_ImportBudget())
+    try:
+        blocks = _parse_document_bytes(raw, suffix)
+        validate_parsed_output(blocks)
+        return blocks
+    finally:
+        _IMPORT_BUDGET.reset(token)

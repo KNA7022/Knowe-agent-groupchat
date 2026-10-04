@@ -62,3 +62,39 @@ Independent controller Chromium QA also completed no-Key entry → Group selecti
 - Whole-repository backend failures are not repaired or waived by these tests. An independent implementation review follows this scoped commit. This report establishes a usable/testable local vertical slice, not whole-product commercial acceptance.
 
 Controller-owned progress/brief/review files and unrelated changes are excluded from the implementation commit; `skills/` is untouched.
+
+## Independent review fix round 1 — base `2a51544`
+
+Scope is exactly I1 and I2 in `reviews/REVIEW-local-rag-2a51544.md`; no release, provider, Task4 contract/repository, or unrelated security changes were made. Independent re-review remains required.
+
+I1: production byte parsing now owns a reset-on-exit, worker-local cumulative budget: 4,000,000 final extracted Unicode characters, 8,000,000 decoded/intermediate concatenation character-work units, 10,000 blocks, 100,000 cells and 100,000 text lines. The work budget intentionally charges intermediate copies conservatively; it is not a promise that every format accepts exactly four million characters. Shared-string references are charged per cell before row/band joining; sparse column padding is charged before wide TSV allocation, and PDF native character count is checked before requesting the text buffer. Blocks are charged before publication into the parser result. ZIP/raw admission limits remain in place. Parsed output is independently checked before chunking; final publication is capped at 20,000 chunks and 8,020,000 parent/child text characters before any encrypted row/source link is written. Parsing **and chunk preparation** run off the listener event loop, followed by the existing lifecycle/course-binding recheck before synchronous publication. This is a bounded single-import policy, not a whole-service concurrent-upload scheduler or parser sandbox.
+
+I2: local route success responses include the authoritative canonical Group projection. The panel validates that projection and merges only source links into the existing canonical renderer Group after import/delete/list, guarded by the request epoch and the source-link identity snapshot. It does not overwrite newer course/lifecycle/roster state. A synchronous store subscription advances the operation epoch when source-link identities change and removes revoked list rows, search evidence, inspection and delete confirmation. Detail additionally checks the requested source identity; list/search/detail evidence is checked against current source links before committing and rendering. An older canonical list snapshot cannot restore an association removed while the request was in flight. Existing Group/course/deletion fences remain active.
+
+New non-vacuous tests cover the actual admitted 8,200-row × 8,192-character shared-string workbook (under all archive limits), early termination before band joins, sparse TSV allocation, cumulative block limits for all seven byte parsers, actual/empty cell budgets, final extracted output, real-listener refusal with existing encrypted evidence unchanged, each final publication guard with zero newly written rows/links, and listener responsiveness/scope revocation during paused chunk preparation. Renderer tests cover canonical import/delete synchronization, source-unlink while still mounted with late detail and search, removal of already-rendered evidence/inspection/dialog, current-source response revalidation, and rejection of older canonical list snapshots. Existing renderer fixtures now contain valid canonical source associations and valid Coordinator/Verifier rosters rather than granting visibility to unlinked mock sources.
+
+Final verification on Windows / Python 3.12 / Node 24.9.0:
+
+```text
+py -3.12 -m pytest backend/tests/test_local_knowledge_http.py backend/tests/test_rag_import_budgets.py backend/tests/test_rag_parsers.py backend/tests/test_rag_office_parsers.py backend/tests/test_rag_pdf_parser.py backend/tests/test_rag_chunks.py backend/tests/test_rag_store.py backend/tests/test_rag_store_privacy.py backend/tests/test_knowledge_group_scope.py -q
+# 158 passed, 14.44s (26 real-listener HTTP cases + 12 new budget cases included)
+
+& .\.tools\node24.ps1 -Command 'npm run typecheck; npm run lint; npm test'
+# typecheck passes renderer + Electron; lint passes; full frontend 55 files / 588 tests passed, 35.17s
+
+& .\.tools\node24.ps1 -Command 'npx vitest run --config D:/agentwork/local-rag-review-probe/probe.config.mjs; npx vitest run src/components/local-knowledge.test.tsx'
+# unchanged independent source-unlink reproduction now 1 passed, 169ms;
+# local renderer subset 11 passed, 857ms
+
+py -3.12 D:/agentwork/local-rag-review-probe/xlsx-output.py
+# unchanged independent amplification reproduction is now rejected in _xlsx_sheet_rows
+# before _xlsx_bands: UnsupportedFormat(extracted_text_exceeds_import_policy),
+# sanitized by byte-package boundary as invalid_document_package (expected exit 1).
+
+git diff --check
+# pass, CRLF normalization notices only
+```
+
+The new tests first exposed invalid test fixtures (empty roster projections and unlinked mock sources), optional-index TypeScript test errors, and assertions expecting tuple links or unsanitized parser messages; these were corrected without weakening canonical validation or parser error sanitization. The final covering gates above are green. The original independent probes supplied the pre-fix red evidence; the unchanged unlink probe now passes and the unchanged amplification probe refuses its former accepted payload. No new rendered-browser or packaged Electron acceptance run is claimed in this fix round.
+
+The controller's full-backend **base `2a51544`** terminal baseline is 56 failed / 1512 passed / 5 skipped / 16 errors / 10 subtests, 220.62s, with raw summary `backend-regression-2a51544-summary.txt`. This fix does not rerun or claim to green that unrelated whole suite. All original local-only/provider/packaging acceptance limits still apply. Python skill guidance influenced moving bounded CPU preparation off the async listener; React guidance influenced a stable canonical-link selector and narrowly scoped subscription rather than polling or broad store rewrites. Controller-owned ledger/roadmap/review reports are excluded from this fix commit.

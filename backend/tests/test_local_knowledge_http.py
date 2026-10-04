@@ -69,6 +69,8 @@ async def test_real_listener_import_search_inspect_restart_delete_and_ciphertext
     source = imported["source"]
     source_id = source["source_id"]
     assert source_id.startswith("src_") and source["status"] == "indexed"
+    assert [link["source_id"] for link in imported["group"]["source_links"]] == [source_id]
+    assert imported["group"]["group_id"] == group.group_id
     assert (await http("sources", course="calculus"))[1]["sources"] == [source]
     assert (await http("sources", group_id=other.group_id))[1]["sources"] == []
     status, result = await http("search", {"query": "导数"}, course="calculus")
@@ -90,7 +92,8 @@ async def test_real_listener_import_search_inspect_restart_delete_and_ciphertext
     server.local_knowledge.close()
     server.local_knowledge = None
     assert (await http("search", {"query": "导数"}, course="calculus"))[1]["results"] == result["results"]
-    assert (await http("delete", {"source_id": source_id}, course="calculus"))[0] == 200
+    deleted_status, deleted = await http("delete", {"source_id": source_id}, course="calculus")
+    assert deleted_status == 200 and deleted["group"]["source_links"] == []
     assert (await http("search", {"query": "导数"}))[1]["results"] == []
     with sqlite3.connect(db_path) as db:
         for table in ("rag_documents", "rag_chunks", "rag_sources", "rag_embeddings"):
@@ -314,3 +317,57 @@ async def test_local_import_keeps_real_legacy_group_assets_and_course_fence(app)
         assert (await http(broad_path + "&course_id=unbound"))[0] == 403
     finally:
         unregister_project(project_id)
+
+
+async def test_real_route_rejects_shared_string_amplification_without_any_publication(app, tmp_path):
+    from backend.tests.test_rag_import_budgets import amplified_workbook
+    server, group, _, http = app
+    existing = (await http("import", document()))[1]["source"]["source_id"]
+    before = server.groups.get(group.group_id).to_dict()
+    raw = amplified_workbook(tmp_path)
+    status, body = await http("import", {"filename": "small.xlsx", "data_base64": base64.b64encode(raw).decode("ascii")})
+    assert status == 400 and body["error"] == "invalid_local_document_or_request"
+    assert server.groups.get(group.group_id).to_dict() == before
+    assert server.local_knowledge.store.document_ids() == (existing,)
+    assert (await http("search", {"query": "导数"}))[1]["results"]
+
+
+@pytest.mark.parametrize("limit", ["parsed_text", "chunks", "chunk_text"])
+async def test_final_publication_guards_leave_no_encrypted_rows_or_source_links(app, monkeypatch, limit):
+    from backend.knowe_rag.parsers import ParsedBlock
+    server, group, _, http = app
+    if limit == "parsed_text":
+        monkeypatch.setattr(local_knowledge, "parse_document_bytes", lambda *_: (
+            ParsedBlock(text="x" * (local_knowledge.MAX_EXTRACTED_CHARS + 1), location="para:1", kind="paragraph"),))
+        monkeypatch.setattr(local_knowledge, "build_chunks", lambda *_args, **_kwargs: pytest.fail("Oversized output reached chunking"))
+    elif limit == "chunks":
+        monkeypatch.setattr(local_knowledge, "MAX_PUBLICATION_CHUNKS", 1)
+    else:
+        monkeypatch.setattr(local_knowledge, "MAX_PUBLICATION_TEXT_CHARS", 1)
+    assert (await http("import", document()))[0] == 400
+    assert server.groups.get(group.group_id).source_links == []
+    assert server.local_knowledge.store.document_ids() == ()
+    with sqlite3.connect(server.local_knowledge.store.path) as db:
+        for table in ("rag_documents", "rag_chunks", "rag_sources"):
+            assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+async def test_chunk_preparation_is_off_loop_and_scope_is_rechecked_before_publication(app, monkeypatch):
+    server, group, _, http = app
+    entered, release = threading.Event(), threading.Event()
+    real_build = local_knowledge.build_chunks
+
+    def delayed(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(local_knowledge, "build_chunks", delayed)
+    pending = asyncio.create_task(http("import", document(), course="calculus"))
+    assert await asyncio.to_thread(entered.wait, 5)
+    # A listener request must still be serviceable while chunk preparation is paused.
+    assert (await http("sources"))[0] == 200
+    server.groups.unbind_course(group.group_id, "calculus")
+    release.set()
+    assert (await pending)[0] == 403
+    assert server.local_knowledge.store.document_ids() == ()

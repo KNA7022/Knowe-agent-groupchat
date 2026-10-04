@@ -14,7 +14,10 @@ const hit = { ...source, chunk_id: 'chunk-1', location: 'para:1#1', text: '二�
 
 function group(id: string, lifecycle: 'active' | 'archived' = 'active'): Group {
   return { group_id: id, schema_version: 1, name: id === groupA ? '数学组' : '英语组', template: 'custom', lifecycle,
-    roster: [], budget: null, model_overrides: {}, tool_overrides: {}, source_links: [],
+    roster: (['coordinator', 'verifier'] as const).map((role, index) => ({ agent_id: `gag_${String(index + 1).repeat(32)}`,
+      group_id: id, role, display_name: role, tool_overrides: [], created_at: '2026-10-04T00:00:00Z', updated_at: '2026-10-04T00:00:00Z' })),
+    budget: null, model_overrides: {}, tool_overrides: {}, source_links: [
+      { link_id: `gsl_${'d'.repeat(32)}`, group_id: id, source_id: source.source_id, created_at: '2026-10-04T00:00:00Z' }],
     course_bindings: [{ binding_id: `gcb_${'c'.repeat(32)}`, group_id: id, course_id: id === groupA ? 'calculus' : 'english', created_at: '2026-10-04T00:00:00Z' }],
     created_at: '2026-10-04T00:00:00Z', updated_at: '2026-10-04T00:00:00Z', archived_at: null, legacy_project_id: null };
 }
@@ -30,15 +33,16 @@ afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe('local knowledge center', () => {
   it('imports selected bytes within selected group/course, searches and inspects exact citation, confirms deletion', async () => {
+    useGroupStore.setState({ groups: { [groupA]: { ...group(groupA), source_links: [] }, [groupB]: group(groupB) } });
     let stored = false;
     const calls: Array<{ url: URL; payload: Record<string, unknown> }> = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = new URL(input); const payload = JSON.parse(String(init?.body || '{}'));
       calls.push({ url, payload });
-      if (url.pathname.endsWith('/import')) { stored = true; return response({ source }); }
+      if (url.pathname.endsWith('/import')) { stored = true; return response({ source, group: group(groupA) }); }
       if (url.pathname.endsWith('/search')) return response({ results: [hit] });
       if (url.pathname.endsWith('/detail')) return response({ source, chunks: [hit] });
-      if (url.pathname.endsWith('/delete')) { stored = false; return response({ deleted: true }); }
+      if (url.pathname.endsWith('/delete')) { stored = false; return response({ deleted: true, group: { ...group(groupA), source_links: [] } }); }
       return response({ sources: stored ? [source] : [] });
     }));
     render(<KnowledgeScopedView />);
@@ -49,6 +53,7 @@ describe('local knowledge center', () => {
     await waitFor(() => expect(screen.getByLabelText('导入本地资料')).not.toBeDisabled());
     fireEvent.change(screen.getByLabelText('导入本地资料'), { target: { files: [new File(['二次函数导数证据'], '讲义.txt', { type: 'text/plain' })] } });
     await screen.findByRole('button', { name: '讲义.txt' });
+    expect(useGroupStore.getState().groups[groupA]!.source_links.map((link) => link.source_id)).toEqual([source.source_id]);
     const upload = calls.find((call) => call.url.pathname.endsWith('/import'))!;
     expect(upload.url.searchParams.get('group_id')).toBe(groupA);
     expect(upload.url.searchParams.get('course_id')).toBe('calculus');
@@ -70,6 +75,83 @@ describe('local knowledge center', () => {
     await waitFor(() => expect(screen.queryByRole('button', { name: '讲义.txt' })).not.toBeInTheDocument());
     expect(screen.queryByLabelText('引用文本检查')).not.toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(useGroupStore.getState().groups[groupA]!.source_links).toEqual([]);
+  });
+
+  it.each(['detail', 'search'])('rejects a late %s after canonical source unlink while the panel remains mounted', async (route) => {
+    const pending = deferred<Response>();
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => new URL(input).pathname.endsWith(`/${route}`)
+      ? pending.promise : response({ sources: [source] })));
+    render(<KnowledgeScopedView />); choose();
+    await screen.findByRole('button', { name: source.filename });
+    if (route === 'detail') fireEvent.click(screen.getByRole('button', { name: source.filename }));
+    else {
+      fireEvent.change(screen.getByLabelText('本地资料查询'), { target: { value: '导数' } });
+      fireEvent.click(screen.getByRole('button', { name: '检索证据' }));
+    }
+    act(() => useGroupStore.setState((state) => ({ groups: { ...state.groups, [groupA]: { ...state.groups[groupA]!, source_links: [] } } })));
+    await act(async () => pending.resolve(response({ source, chunks: [hit], results: [hit], group: group(groupA) })));
+    expect(screen.getByLabelText('知识群组范围')).toHaveValue(groupA);
+    expect(screen.queryByLabelText('引用文本检查')).not.toBeInTheDocument();
+    expect(screen.queryByText(hit.text)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: source.filename })).not.toBeInTheDocument();
+    expect(useGroupStore.getState().groups[groupA]!.source_links).toEqual([]);
+  });
+
+  it('removes already-rendered source, search, inspection and deletion confirmation on canonical unlink', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path.endsWith('/search')) return response({ results: [hit] });
+      if (path.endsWith('/detail')) return response({ source, chunks: [hit] });
+      return response({ sources: [source] });
+    }));
+    render(<KnowledgeScopedView />); choose();
+    await screen.findByRole('button', { name: source.filename });
+    fireEvent.change(screen.getByLabelText('本地资料查询'), { target: { value: '导数' } });
+    fireEvent.click(screen.getByRole('button', { name: '检索证据' }));
+    fireEvent.click(await screen.findByRole('button', { name: '讲义.txt · para:1#1 · 查看引用文本' }));
+    await screen.findByLabelText('引用文本检查');
+    await waitFor(() => expect(screen.getByLabelText('删除资料 讲义.txt')).not.toBeDisabled());
+    fireEvent.click(screen.getByLabelText('删除资料 讲义.txt'));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getAllByText(hit.text)).toHaveLength(2);
+    act(() => useGroupStore.setState((state) => ({ groups: { ...state.groups, [groupA]: { ...state.groups[groupA]!, source_links: [] } } })));
+    expect(screen.queryByText(hit.text)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('引用文本检查')).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: source.filename })).not.toBeInTheDocument();
+  });
+
+  it('does not restore revoked canonical links from an older list snapshot', async () => {
+    const pending = deferred<Response>();
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => ++calls === 1 ? pending.promise : response({ sources: [] })));
+    render(<KnowledgeScopedView />); choose();
+    await waitFor(() => expect(calls).toBe(1));
+    act(() => useGroupStore.setState((state) => ({ groups: { ...state.groups, [groupA]: { ...state.groups[groupA]!, source_links: [] } } })));
+    await waitFor(() => expect(calls).toBe(2));
+    await act(async () => pending.resolve(response({ group: group(groupA), sources: [source] })));
+    expect(useGroupStore.getState().groups[groupA]!.source_links).toEqual([]);
+    expect(screen.queryByRole('button', { name: source.filename })).not.toBeInTheDocument();
+  });
+
+  it('revalidates source identity for search and detail responses rather than trusting the route alone', async () => {
+    const revoked = { ...hit, source_id: `src_${'b'.repeat(32)}`, chunk_id: 'revoked', text: '越界资料' };
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const path = new URL(input).pathname;
+      if (path.endsWith('/search')) return response({ results: [hit, revoked] });
+      if (path.endsWith('/detail')) return response({ source: revoked, chunks: [revoked] });
+      return response({ sources: [source, revoked] });
+    }));
+    render(<KnowledgeScopedView />); choose();
+    await screen.findByRole('button', { name: source.filename });
+    fireEvent.change(screen.getByLabelText('本地资料查询'), { target: { value: '导数' } });
+    fireEvent.click(screen.getByRole('button', { name: '检索证据' }));
+    await screen.findByText(hit.text);
+    expect(screen.queryByText(revoked.text)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '讲义.txt · para:1#1 · 查看引用文本' }));
+    await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument());
+    expect(screen.queryByLabelText('引用文本检查')).not.toBeInTheDocument();
   });
 
   it('fences delayed A → B → A responses by mount generation', async () => {
