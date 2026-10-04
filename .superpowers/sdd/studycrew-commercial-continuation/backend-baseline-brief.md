@@ -21,6 +21,10 @@ After the local RAG integration fix is independently accepted, make the complete
 
 ## Verification and report
 
+### Controller disposition during implementation
+
+The implementer found that legacy pending-card records do not persist a backend-owned Task Runtime run association. This is not authority that may be inferred from model/renderer IDs. Do not expand that ownership architecture in this baseline-repair increment. Reproduce the real unowned-card command with an inert gateway and retain an explicit fail-closed/no-egress regression; test aux adjustment behavior separately with genuinely bound running authority and a purpose-bound opaque credential. Record unsupported real UI adjustment as a release availability gap, not a restored feature. A subsequent scoped Harness task must add durable card/run ownership and supported lifecycle handling before commercial acceptance. If a mandatory test can only pass by pretending ownership exists, report the blocker instead of weakening it.
+
 - Run focused red/green tests per cluster, then `py -3.12 -m pytest backend/tests -q --tb=short` with no collection-error escape hatch. The final command must execute the complete suite with zero failures/errors. Record actual totals and any unchanged skipped cases; do not invent expected totals.
 - Run Python compileall, Node24 typecheck, lint and full frontend suite for touched integration/prompt behavior; git diff --check. Do not rebuild installers yet.
 - Write backend-baseline-report.md in this directory: exact changes and old-to-new test-intent mapping, actual commands/results, explicit production-risk dispositions, limitations, and no waived failures. Commit only scoped source/tests/report; exclude controller ledger/roadmap/other reports and skills/.

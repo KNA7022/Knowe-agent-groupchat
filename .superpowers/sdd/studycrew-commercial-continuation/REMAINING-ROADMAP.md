@@ -1,6 +1,6 @@
 # Remaining roadmap — StudyCrew commercial continuation
 
-## Current checkpoint — 2026-10-04, `a245c9c`
+## Current checkpoint — 2026-10-04, `687dc6d` (baseline independently accepted)
 
 This section supersedes the old `e1d2bd9` snapshot below. Do not resume from its “not started” claims.
 
@@ -11,9 +11,9 @@ This section supersedes the old `e1d2bd9` snapshot below. Do not resume from its
 | RAG | Bottom-layer fixes verified; encrypted bytes import, single-group/course BM25, citation text and deletion/restart connected to real server/UI. Fixes in `a245c9c` independently accepted at 0 Critical / 0 Important | OCR/semantic capabilities, complete answer/Verifier loop, indexing UX, quantitative product evaluation |
 | Memory | Contracts and encrypted repository, 63 tests passed this turn | Actual pinned Mem0 adapter, ephemeral indexes, candidate/approval/edit/delete/UI integration |
 | Learning | Existing Today is runtime summary, not a completed student workflow | Courses/exams/plans/practice/review, read-only school mock adapter, controlled evolution |
-| Release | TypeScript and lint green; 588 frontend tests; 33 foundation tests and runtime contract green | Backend full regression failures (next increment), current sidecar/NSIS rebuild and smoke, dependency packaging, privacy/license docs, evaluation and evidence pack |
+| Release | TypeScript and lint green; 588 frontend tests; 33 foundation tests and runtime contract green; frozen complete backend 1620 passed / 5 unchanged Windows skips / 10 subtests, independent baseline review 0 Critical / 0 Important | Real card/task ownership and supported dispatch; production Windows sandbox/descendant/security checks; current sidecar/NSIS rebuild and smoke, dependency packaging, privacy/license docs, evaluation and evidence pack |
 
-Whole-backend pre-integration run: 1490 passed, 57 failed, 16 setup errors, 5 skipped, 10 subtests; no collection errors in that run. These failures are release blockers. The older “54 TypeScript diagnostics” and “default test collection executes zero tests” statements are obsolete. Existing installer artifacts do not validate current RAG or memory code. The spec still excludes NumPy and must be corrected before claiming a current packaged vector implementation.
+Whole-backend pre-integration run had 57 failures and 16 setup errors; the frozen final run at `687dc6d` has zero failures/errors. Its test-intent changes and two real production fixes passed independent review after one scoped fix round. The older “54 TypeScript diagnostics” and “default test collection executes zero tests” statements are obsolete. Existing installer artifacts do not validate current RAG or memory code. The spec still excludes NumPy and must be corrected before claiming a current packaged vector implementation.
 
 OCR/embedding policy differs between the on-disk revised plan and the user's explicit plan in this chat. A clarification was asked; current local import/BM25 is independent of that choice and never silently uploads material. Mem0 OSS reuse is explicitly authorized by the user; dependency size alone is not a reason to omit it.
 
