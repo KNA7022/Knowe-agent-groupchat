@@ -1,0 +1,67 @@
+P2a frozen validation evidence
+BASE b9feaefd3d3bf78d7dfb18cab9da332fd714858b
+Branch feature/studycrew-foundation
+PowerShell; PYTHONUTF8=1; Python 3.12
+
+Command: py -3.12 -m pytest backend/tests/test_protected_history.py backend/tests/test_protected_storage.py -q --tb=short
+Final focused output: 116 passed in 25.80s
+Exit code: 0
+
+Command: py -3.12 -m compileall -q backend
+Output: (empty)
+Exit code: 0
+
+Source/test SHA256 freeze, verified unchanged after complete regression; scoped git diff --check output (exit 0):
+
+Path : D:\agentwork\StudyCrew-worktree\backend\protected_storage.py
+Hash : 8F04B60F497F88435E47446E5C6DA61F872E3487866ED4BC992684D3335EFCD5
+
+Path : D:\agentwork\StudyCrew-worktree\backend\knowe_harness\completion.py
+Hash : 27C4931C74B4BB41E4935B1CD7A92B1093E5F49BA6635F5452FEB0A84ED9B88E
+
+Path : D:\agentwork\StudyCrew-worktree\backend\knowe_harness\store.py
+Hash : 5D84F966D1DB97ADBAB4F4ECBC3FA2C333EFA10E698B3F7FB5D845B08C8C415C
+
+Path : D:\agentwork\StudyCrew-worktree\backend\knowe_storage\task_run_repository.py
+Hash : 129DFE93C07696029F65EC481F648B6AF7157D446C5DD9793A57032B838400CB
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_history.py
+Hash : 939DF2D5FA6F84A5B587F8FB5B1FD686B987F5852158A22735B6552F3A7100F8
+
+warning: in the working copy of 'backend/knowe_harness/completion.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/knowe_harness/store.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/knowe_storage/task_run_repository.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/protected_storage.py', LF will be replaced by CRLF the next time Git touches it
+
+Command: py -3.12 -m pytest backend/tests -q
+Raw complete output:
+..........................................sss.s......................... [  3%]
+.s...................................................................... [  7%]
+........................................................................ [ 11%]
+........................................................................ [ 15%]
+........................................................................ [ 19%]
+........................................................................ [ 23%]
+........................................................................ [ 27%]
+........................................................................ [ 31%]
+........................................................................ [ 35%]
+........................................................................ [ 39%]
+........................................................................ [ 42%]
+........................................................................ [ 46%]
+........................................................................ [ 50%]
+........................................................................ [ 54%]
+........................................................................ [ 58%]
+........................................................................ [ 62%]
+........................................................................ [ 66%]
+........................................................................ [ 70%]
+........................................................................ [ 74%]
+........................................................................ [ 78%]
+........................................................................ [ 82%]
+........................................................................ [ 85%]
+........................................................................ [ 89%]
+........................................................................ [ 93%]
+...................................................................................................................                    [100%]
+1838 passed, 5 skipped, 10 subtests passed in 187.80s (0:03:07)
+
+Exit code: 0
+
+No production/test edits after freeze. Existing 5 skips retained; no new skips/xfails/exclusions. No real provider calls or frontend changes.

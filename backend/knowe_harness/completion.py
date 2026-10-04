@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from backend.protected_storage import (StoragePayloads, ProtectedStorageError, protected_id, storage_boundary)
+from backend.protected_storage import (StoragePayloads, ProtectedLineages, ProtectedStorageError, protected_id, storage_boundary, storage_write)
 
 """Completion journal, outbox, decisions, and waiting projection.
 
@@ -907,12 +907,21 @@ class SQLiteCompletionStore(StoragePayloads):
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def __init__(self, path: str | Path | SQLiteDatabase, *, protected=None) -> None:
+    def __init__(self, path: str | Path | SQLiteDatabase, *, protected=None, legacy_lineages=None) -> None:
+        if legacy_lineages is not None and not isinstance(legacy_lineages, ProtectedLineages):
+            raise ProtectedStorageError("canonical legacy selection registry required")
+        if protected is not None and legacy_lineages is not None:
+            raise ValueError("choose a protected or legacy repository view")
+        self.legacy_lineages = legacy_lineages
         if protected is not None:
             protected.identity
+            if protected.read_only and not isinstance(path, SQLiteDatabase) and not Path(path).is_file():
+                raise ProtectedStorageError("existing completion store unavailable")
         self._closed = False
         self.db = path if isinstance(path, SQLiteDatabase) else SQLiteDatabase(path)
         self.protection = protected.for_store(self.db.path) if protected is not None else None
+        if protected is not None and protected.read_only:
+            return  # No schema initialization, repair or registration on a read view.
 
         # A v2 prerelease created ``agent_completion_outcomes_v2`` without
         # ``attempt_id``.  ``CREATE TABLE IF NOT EXISTS`` does not evolve that table,
@@ -1275,6 +1284,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return entry
 
     @storage_boundary
+    @storage_write
     def create_started_run(self, run: TaskRun) -> TaskRun:
         """Atomically persist the immutable execution input and initial journal states."""
 
@@ -1308,6 +1318,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return run
 
     @storage_boundary
+    @storage_write
     def mark_started(self, run: TaskRun) -> TaskJournalEntryV1:
         entry = self._journal_for_run(run, state="STARTED", terminal=False)
         with self.db.transaction() as conn:
@@ -1315,6 +1326,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return entry
 
     @storage_boundary
+    @storage_write
     def record_progress(self, run: TaskRun) -> TaskJournalEntryV1:
         entry = self._journal_for_run(run, terminal=False)
         with self.db.transaction() as conn:
@@ -2236,6 +2248,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return event
 
     @storage_boundary
+    @storage_write
     def commit_success(
         self,
         staged_run: TaskRun,
@@ -2271,6 +2284,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return stored_event, stored_record
 
     @storage_boundary
+    @storage_write
     def commit_run(
         self,
         run: TaskRun,
@@ -2374,6 +2388,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return event
 
     @storage_boundary
+    @storage_write
     def transition_completion(
         self,
         prior: CompletionEvent,
@@ -2405,6 +2420,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return stored
 
     @storage_boundary
+    @storage_write
     def transition_with_decision(
         self,
         prior: CompletionEvent,
@@ -2463,6 +2479,7 @@ class SQLiteCompletionStore(StoragePayloads):
 
     @storage_boundary
     def active_for(self, task_id: str, attempt_id: str | None = None) -> CompletionEvent | None:
+        self._check_selected_task(task_id)
         params: list[Any] = [task_id]
         clause = "task_id=? AND active=1"
         if attempt_id is not None:
@@ -2477,6 +2494,7 @@ class SQLiteCompletionStore(StoragePayloads):
 
     @storage_boundary
     def list_for_task(self, task_id: str) -> tuple[CompletionEvent, ...]:
+        self._check_selected_task(task_id)
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(
                 "SELECT * FROM completion_events_v2 WHERE task_id=? ORDER BY created_at, completion_id",
@@ -2486,11 +2504,12 @@ class SQLiteCompletionStore(StoragePayloads):
 
     @storage_boundary
     def list_active(self, *, project_id: str = "") -> tuple[CompletionEvent, ...]:
-        query = "SELECT * FROM completion_events_v2 WHERE active=1"
-        params: tuple[Any, ...] = ()
+        selection, selected = self._task_selection()
+        query = f"SELECT * FROM completion_events_v2 WHERE active=1 AND {selection}"
+        params: tuple[Any, ...] = selected
         if project_id:
             query += " AND project_id=?"
-            params = (project_id,)
+            params = (*params, project_id)
         query += " ORDER BY created_at, completion_id"
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(query, params).fetchall()
@@ -2508,6 +2527,11 @@ class SQLiteCompletionStore(StoragePayloads):
 
         if not completion_id and not task_id:
             raise ValueError("completion_id or task_id is required")
+        self._check_selected_task(task_id)
+        if completion_id and self.protection is not None:
+            selected = self.get(completion_id)
+            if selected is None or (task_id and selected.task_id != task_id):
+                raise ProtectedStorageError("completion selection unavailable")
         with self.db.transaction(immediate=False) as conn:
             if completion_id:
                 row = conn.execute(
@@ -2535,6 +2559,7 @@ class SQLiteCompletionStore(StoragePayloads):
 
     @storage_boundary
     def journal_for(self, task_id: str, attempt_id: str = "") -> tuple[TaskJournalEntryV1, ...]:
+        self._check_selected_task(task_id)
         params: list[Any] = [str(task_id)]
         clause = "task_id=?"
         if attempt_id:
@@ -2553,6 +2578,7 @@ class SQLiteCompletionStore(StoragePayloads):
 
     @storage_boundary
     def attempt_snapshot(self, task_id: str, attempt_id: str) -> TaskJournalEntryV1 | None:
+        self._check_selected_task(task_id)
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
                 "SELECT * FROM task_attempts_v1 WHERE task_id=? AND attempt_id=?",
@@ -2562,8 +2588,9 @@ class SQLiteCompletionStore(StoragePayloads):
 
     @storage_boundary
     def active_attempts(self, *, worker_id: str = "", project_id: str = "") -> tuple[TaskJournalEntryV1, ...]:
-        query = "SELECT * FROM task_attempts_v1 WHERE terminal=0"
-        params: list[Any] = []
+        selection, selected = self._task_selection()
+        query = f"SELECT * FROM task_attempts_v1 WHERE terminal=0 AND {selection}"
+        params: list[Any] = list(selected)
         if worker_id:
             query += " AND worker_id=?"
             params.append(worker_id)
@@ -2583,20 +2610,30 @@ class SQLiteCompletionStore(StoragePayloads):
         Worker and therefore must not make this availability check return ``False``.
         """
 
+        selection, selected = self._task_selection()
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT 1 FROM task_attempts_v1
-                 WHERE worker_id=? AND terminal=0
+                 WHERE worker_id=? AND terminal=0 AND {selection}
                    AND state IN ('QUEUED','STARTED','RUNNING')
                  LIMIT 1
                 """,
-                (str(worker_id),),
+                (str(worker_id), *selected),
             ).fetchone()
         return row is None
 
     @storage_boundary
-    def pending_outbox(self, *, limit: int = 100, include_failed: bool = True) -> tuple[OutboxEntry, ...]:
+    def pending_outbox(self, *, limit: int = 100, include_failed: bool = True,
+                       completion_id: str = "") -> tuple[OutboxEntry, ...]:
+        selection, selected = self._task_selection("c.task_id")
+        if completion_id:
+            event = self.get(completion_id)
+            if event is None:
+                raise ProtectedStorageError("completion selection unavailable")
+            self._check_selected_task(event.task_id)
+            selection += " AND c.completion_id=?"
+            selected = (*selected, completion_id)
         states = (OutboxState.PENDING.value, OutboxState.PROCESSING.value)
         if include_failed:
             states = (*states, OutboxState.FAILED.value)
@@ -2605,7 +2642,8 @@ class SQLiteCompletionStore(StoragePayloads):
             rows = conn.execute(
                 f"""
                 SELECT * FROM completion_outbox_v2
-                 WHERE state IN ({placeholders})
+                 WHERE state IN ({placeholders}) AND completion_id IN (
+                    SELECT c.completion_id FROM completion_events_v2 c WHERE {selection})
                  ORDER BY CASE projection_kind
                             WHEN 'task_state' THEN 0
                             WHEN 'ui' THEN 1
@@ -2617,11 +2655,19 @@ class SQLiteCompletionStore(StoragePayloads):
                             ELSE 99 END,
                           created_at, outbox_id LIMIT ?
                 """,
-                (*states, max(1, min(int(limit), 10_000))),
+                (*states, *selected, max(1, min(int(limit), 10_000))),
             ).fetchall()
+        # Authenticate the independently selected completion/task join before
+        # decrypting its outbox; clear SQL selectors are not their own authority.
+        for identity in {row["completion_id"] for row in rows}:
+            event = self.get(identity)
+            if event is None:
+                raise ProtectedStorageError("completion selection unavailable")
+            self._check_selected_task(event.task_id)
         return tuple(OutboxEntry.from_dict(self._read_payload("completion_outbox_v2", row)) for row in rows)
 
     @storage_boundary
+    @storage_write
     def claim_outbox(self, outbox_id: str) -> OutboxEntry | None:
         now = utc_now()
         with self.db.transaction() as conn:
@@ -2658,6 +2704,7 @@ class SQLiteCompletionStore(StoragePayloads):
             return updated
 
     @storage_boundary
+    @storage_write
     def acknowledge_outbox(
         self,
         outbox_id: str,
@@ -2717,6 +2764,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return updated
 
     @storage_boundary
+    @storage_write
     def fail_outbox(self, outbox_id: str, error: BaseException | str) -> OutboxEntry:
         now = utc_now()
         message = str(error)[:4000]
@@ -2758,6 +2806,8 @@ class SQLiteCompletionStore(StoragePayloads):
 
     @storage_boundary
     def active_wait_for_completion(self, completion_id: str) -> WaitToken | None:
+        if self.protection is not None:
+            self.get(completion_id)
         """Return the open/resuming wait token for one exact CompletionEvent."""
 
         with self.db.transaction(immediate=False) as conn:
@@ -2773,6 +2823,7 @@ class SQLiteCompletionStore(StoragePayloads):
 
     @storage_boundary
     def active_wait_for_task(self, task_id: str, *, worker_id: str = "") -> WaitToken | None:
+        self._check_selected_task(task_id)
         """Return the open/resuming wait token for one exact task lineage."""
 
         query = (
@@ -2798,6 +2849,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return None if row is None else WaitToken.from_dict(self._read_payload("wait_tokens_v2", row))
 
     @storage_boundary
+    @storage_write
     def resume_wait(
         self,
         wait_token_id: str,
@@ -2866,6 +2918,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return updated
 
     @storage_boundary
+    @storage_write
     def resolve_wait(self, wait_token_id: str, *, status: str = "resolved") -> WaitToken:
         if status not in {"resolved", "cancelled", "superseded"}:
             raise ValueError(status)
@@ -2886,6 +2939,7 @@ class SQLiteCompletionStore(StoragePayloads):
         return updated
 
     @storage_boundary
+    @storage_write
     def assert_worker_available(
         self,
         worker_id: str,
@@ -2938,6 +2992,7 @@ class SQLiteCompletionStore(StoragePayloads):
         )
 
     @storage_boundary
+    @storage_write
     def reconcile_terminal_runs(self) -> dict[str, Any]:
         """Repair result-bearing TaskRuns that are missing a CompletionEvent.
 
@@ -2949,10 +3004,11 @@ class SQLiteCompletionStore(StoragePayloads):
         repaired: list[str] = []
         already_consistent: list[str] = []
         downgraded_orphans: list[str] = []
+        selection, selected = self._task_selection()
         with self.db.transaction(immediate=False) as conn:
             self._ensure_runtime_tables(conn)
             rows = conn.execute(
-                "SELECT * FROM task_runs ORDER BY updated_at, task_id"
+                f"SELECT * FROM task_runs WHERE {selection} ORDER BY updated_at, task_id", selected
             ).fetchall()
 
         candidates: list[TaskRun] = []
@@ -3041,12 +3097,14 @@ class SQLiteCompletionStore(StoragePayloads):
         return event
 
     @storage_boundary
+    @storage_write
     def record_decision(self, event: DecisionEvent) -> DecisionEvent:
         with self.db.transaction() as conn:
             return self._insert_decision(conn, event)
 
     @storage_boundary
     def decisions_for_task(self, task_id: str) -> tuple[DecisionEvent, ...]:
+        self._check_selected_task(task_id)
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(
                 "SELECT * FROM decision_events_v2 WHERE task_id=? ORDER BY created_at, decision_id",
@@ -3062,9 +3120,16 @@ class SQLiteCompletionStore(StoragePayloads):
         completion_id: str = "",
         task_id: str = "",
     ) -> tuple[DecisionEvent, ...]:
+        self._check_selected_task(task_id)
+        if completion_id:
+            event = self.get(completion_id)
+            if event is None or (task_id and event.task_id != task_id):
+                raise ProtectedStorageError("completion selection unavailable")
+            self._check_selected_task(event.task_id)
+        selection, selected = self._task_selection()
         query = "SELECT * FROM decision_events_v2"
-        clauses: list[str] = []
-        params: list[Any] = []
+        clauses: list[str] = [selection]
+        params: list[Any] = list(selected)
         if project_id:
             clauses.append("project_id=?")
             params.append(project_id)
@@ -3085,6 +3150,7 @@ class SQLiteCompletionStore(StoragePayloads):
         )
 
     @storage_boundary
+    @storage_write
     def archive_run_for_resume(self, run: TaskRun, *, reason: str = "waiting_resume") -> str:
         history_id = self._record_id("runhist_", run.envelope.task_id, _attempt_id(run), run.run_id, reason)
         payload = {"history_id": history_id, "task_id": run.envelope.task_id,
@@ -3115,6 +3181,7 @@ class SQLiteCompletionStore(StoragePayloads):
 
     @storage_boundary
     def history_for_task(self, task_id: str) -> tuple[dict[str, Any], ...]:
+        self._check_selected_task(task_id)
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute("SELECT * FROM task_run_history_v2 WHERE task_id=? ORDER BY archived_at,history_id",
                                 (task_id,)).fetchall()
@@ -3122,42 +3189,37 @@ class SQLiteCompletionStore(StoragePayloads):
 
     @storage_boundary
     def orphan_summary(self) -> dict[str, Any]:
+        selection, selected = self._task_selection()
         with self.db.transaction(immediate=False) as conn:
-            self._ensure_runtime_tables(conn)
-            open_waits = int(conn.execute(
-                "SELECT COUNT(*) AS n FROM wait_tokens_v2 WHERE status IN ('open','resuming')"
-            ).fetchone()["n"])
-            active_completions = int(conn.execute(
-                "SELECT COUNT(*) AS n FROM completion_events_v2 WHERE active=1"
-            ).fetchone()["n"])
-            pending_outbox = int(conn.execute(
-                "SELECT COUNT(*) AS n FROM completion_outbox_v2 WHERE state!='delivered'"
-            ).fetchone()["n"])
-            orphan_waits = int(conn.execute(
-                """
-                SELECT COUNT(*) AS n FROM wait_tokens_v2 w
-                 LEFT JOIN completion_events_v2 c ON c.completion_id=w.completion_id
-                 WHERE w.status IN ('open','resuming') AND (c.completion_id IS NULL OR c.active=0)
-                """
-            ).fetchone()["n"])
-            run_rows = conn.execute(
-                "SELECT * FROM task_runs"
+            if self.protection is None or not self.protection.access.read_only:
+                self._ensure_runtime_tables(conn)
+            waits = conn.execute(
+                f"SELECT * FROM wait_tokens_v2 WHERE status IN ('open','resuming') AND {selection}", selected
             ).fetchall()
-            active_task_ids = {
-                str(row["task_id"])
-                for row in conn.execute(
-                    "SELECT DISTINCT task_id FROM completion_events_v2 WHERE active=1"
-                ).fetchall()
-            }
-            active_without_run = int(conn.execute(
-                """
-                SELECT COUNT(*) AS n
-                  FROM completion_events_v2 c
-             LEFT JOIN task_runs t ON t.task_id=c.task_id
-                 WHERE c.active=1 AND t.task_id IS NULL
-                """
-            ).fetchone()["n"])
-
+            completions = conn.execute(
+                f"SELECT * FROM completion_events_v2 WHERE {selection}", selected
+            ).fetchall()
+            outbox = conn.execute(
+                f"""SELECT * FROM completion_outbox_v2 WHERE state!='delivered' AND completion_id IN
+                    (SELECT completion_id FROM completion_events_v2 WHERE {selection})""", selected
+            ).fetchall()
+            run_rows = conn.execute(
+                f"SELECT * FROM task_runs WHERE {selection}", selected
+            ).fetchall()
+        # Authenticate all selected rows before deriving a supposedly healthy
+        # recovery summary; corruption is never counted as an empty history.
+        opened = [self._read_payload("completion_events_v2", row) for row in completions]
+        active = {item["completion_id"]: item for item in opened if item["active"]}
+        wait_values = [self._read_payload("wait_tokens_v2", row) for row in waits]
+        for row in outbox:
+            self._read_payload("completion_outbox_v2", row)
+        open_waits = len(waits)
+        active_completions = len(active)
+        pending_outbox = len(outbox)
+        orphan_waits = sum(item["completion_id"] not in active for item in wait_values)
+        active_task_ids = {item["task_id"] for item in active.values()}
+        run_ids = {row["task_id"] for row in run_rows}
+        active_without_run = sum(item["task_id"] not in run_ids for item in active.values())
         result_runs = [
             (str(row["task_id"]), TaskRun.from_dict(self._read_payload("task_runs", row)))
             for row in run_rows
@@ -3186,12 +3248,13 @@ class SQLiteCompletionStore(StoragePayloads):
 class CompletionAwareTaskRunRepository:
     """TaskRun repository adapter for atomic-finalization replay and same-lineage resume."""
 
-    def __init__(self, path: str | Path | SQLiteDatabase, store: SQLiteCompletionStore | None = None, *, protected=None) -> None:
+    def __init__(self, path: str | Path | SQLiteDatabase, store: SQLiteCompletionStore | None = None, *, protected=None, legacy_lineages=None) -> None:
         self._owns_store = store is None
         self._closed = False
-        self.store = store or SQLiteCompletionStore(path, protected=protected)
+        self.store = store or SQLiteCompletionStore(path, protected=protected, legacy_lineages=legacy_lineages)
         self.protection = self.store.protection
-        self.delegate = SQLiteTaskRunRepository(self.store.db, protected=protected if protected is not None else (self.protection.access if self.protection else None))
+        self.delegate = SQLiteTaskRunRepository(self.store.db, protected=protected if protected is not None else (self.protection.access if self.protection else None),
+            legacy_lineages=legacy_lineages if legacy_lineages is not None else self.store.legacy_lineages)
         self.db = self.delegate.db
 
     def close(self) -> None:
@@ -3209,6 +3272,7 @@ class CompletionAwareTaskRunRepository:
         self.close()
 
     @storage_boundary
+    @storage_write
     def create(self, run: TaskRun) -> TaskRun:
         try:
             # Persist the immutable execution input and the QUEUED -> STARTED
@@ -3257,6 +3321,7 @@ class CompletionAwareTaskRunRepository:
             return run
 
     @storage_boundary
+    @storage_write
     def save(self, run: TaskRun, *, expected_version: int) -> TaskRun:
         # Runtime result stops are represented by an IDLE Worker plus an explicit
         # CompletionEvent status. Successful records are committed by commit_success().

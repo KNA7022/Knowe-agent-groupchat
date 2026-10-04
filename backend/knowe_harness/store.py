@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from backend.runtime import TaskEnvelope
-from backend.protected_storage import ProtectedStorageError, protected_id, storage_boundary
+from backend.protected_storage import ProtectedStorageError, protected_id, storage_boundary, storage_write
 
 
 class TaskEnvelopeStore:
@@ -17,7 +17,11 @@ class TaskEnvelopeStore:
             protected.identity
         root = Path(internal_workspace).expanduser().resolve()
         self.root = root / "runtime" / "task-envelopes"
-        self.root.mkdir(parents=True, exist_ok=True)
+        if protected is not None and protected.read_only:
+            if not self.root.is_dir():
+                raise ProtectedStorageError("existing envelope store unavailable")
+        else:
+            self.root.mkdir(parents=True, exist_ok=True)
         self.protection = protected.for_store(self.root) if protected is not None else None
 
     def envelope_path(self, task_id: str, attempt_id: str) -> Path:
@@ -49,6 +53,7 @@ class TaskEnvelopeStore:
         return True
 
     @storage_boundary
+    @storage_write
     def commit(self, envelope: TaskEnvelope) -> tuple[TaskEnvelope, str]:
         if self.protection is not None:
             self.protection.validate_envelope(envelope.to_dict())
@@ -80,6 +85,8 @@ class TaskEnvelopeStore:
         )
 
     def _read(self, path, task_id, attempt_id):
+        if self.protection is not None and task_id != self.protection.access.task_id:
+            raise ProtectedStorageError("protected TaskEnvelope selection mismatch")
         if protected_id(task_id) and path.stat().st_size > 3 * 1024 * 1024:
             raise ProtectedStorageError("TaskEnvelope storage limit exceeded")
         try:
@@ -105,6 +112,7 @@ class TaskEnvelopeStore:
     def purge_protected(self):
         if self.protection is None:
             raise ProtectedStorageError("protected purge capability required")
+        self.protection.access.require_write()
         access = self.protection.access
         # Resolve the trusted identity before revocation; on retry the private
         # task directory is fixed by the retained opaque capability identity.
@@ -129,10 +137,16 @@ class TaskEnvelopeStore:
             raise ProtectedStorageError("invalid TaskEnvelope reference")
         if raw.startswith("runtime/task-envelopes/") and raw.endswith(".json"):
             relative = raw.removeprefix("runtime/task-envelopes/")
+            if self.protection is not None and Path(relative).parent.name != self.protection.access.task_id:
+                raise ProtectedStorageError("protected TaskEnvelope selection mismatch")
             path = self.root / relative
         elif attempt_id:
+            if self.protection is not None and raw != self.protection.access.task_id:
+                raise ProtectedStorageError("protected TaskEnvelope selection mismatch")
             path = self.envelope_path(raw, attempt_id)
         else:
+            if self.protection is not None and raw != self.protection.access.task_id:
+                raise ProtectedStorageError("protected TaskEnvelope selection mismatch")
             task_dir = self.root / raw
             candidates = sorted(task_dir.glob("*.json"))
             path = candidates[-1] if candidates else Path("")

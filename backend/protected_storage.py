@@ -27,6 +27,7 @@ WIRE = "p1:"
 MAX_BYTES = 2 * 1024 * 1024
 _OPAQUE = r"p1_(?:task_|attempt_|journal_|result_|out_|aco_|wait_|cmp_|cmpkey_|effect_|dec_|decision_?|runhist_|delivery_|deliverykey_)(?:[0-9a-f]{24}|[0-9a-f]{32})"
 _ID = re.compile(_OPAQUE + r"(?::" + _OPAQUE + r")?\Z")
+_HISTORY_ISSUER = object()
 
 
 def protected_id(value: Any) -> bool:
@@ -77,6 +78,17 @@ def storage_boundary(method):
         with protection.guard() if protection is not None else nullcontext():
             return method(self, *args, **kwargs)
     return guarded
+
+
+def storage_write(method):
+    """Reject read-only capabilities even on an idempotent/no-op write path."""
+    @wraps(method)
+    def writable(self, *args, **kwargs):
+        protection = getattr(self, "protection", None)
+        if protection is not None:
+            protection.access.require_write()
+        return method(self, *args, **kwargs)
+    return writable
 
 
 class ProtectedLineages:
@@ -177,6 +189,58 @@ class ProtectedLineages:
             pass
         return access
 
+    def completed_history(self, group_id: str, task_id: str, *, completion_path):
+        """Private explicit history selection; caller owns authenticated user admission.
+
+        This is never an execution credential or an automatic replay capability.
+        Child evidence is opened read-only; absent records are not backfilled.
+        """
+        access = _ExistingRecordsRead(self, group_id, task_id, mode="completed", _issuer=_HISTORY_ISSUER)
+        import sqlite3
+        path = Path(completion_path).resolve()
+        with access.guard() as binding:
+            decoder = StoragePayloads()
+            decoder.protection = access.for_store(path)
+            try:
+                conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+                conn.row_factory = sqlite3.Row
+                try:
+                    run_row = conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_id,)).fetchone()
+                    rows = conn.execute("SELECT * FROM completion_events_v2 WHERE task_id=? AND active=1",
+                                        (task_id,)).fetchall()
+                    if run_row is None or len(rows) != 1:
+                        raise ProtectedStorageError("completed Worker evidence unavailable")
+                    run = decoder._read_payload("task_runs", run_row)
+                    event = decoder._read_payload("completion_events_v2", rows[0])
+                    if (run.get("state") != "IDLE" or not event.get("terminal")
+                            or (run.get("metadata") or {}).get("completion_status") not in
+                                _COMPLETION_STATES - {"WAITING", "BLOCKED"}
+                            or event.get("status") in {"WAITING", "BLOCKED"}
+                            or event.get("run_id") != binding["worker_run_id"]):
+                        raise ProtectedStorageError("completed Worker evidence required")
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                raise ProtectedStorageError("completed Worker evidence unavailable") from None
+        return access
+
+    def paused_history(self, group_id: str, task_id: str):
+        access = _ExistingRecordsRead(self, group_id, task_id, mode="paused", _issuer=_HISTORY_ISSUER)
+        with access.guard():
+            pass
+        return access
+
+    def classified_task_ids(self, *, limit=10000):
+        """Bounded authenticated opaque discovery, including revoked cleanup rows."""
+        with self.runtime._lock, self.db.transaction(immediate=False) as conn:
+            rows = conn.execute("SELECT task_id,group_id FROM studycrew_protected_lineages ORDER BY task_id LIMIT ?",
+                                (limit + 1,)).fetchall()
+            if len(rows) > limit:
+                raise ProtectedStorageError("protected selection capacity exceeded")
+            for row in rows:
+                self._read(conn, row["task_id"], row["group_id"], revoked=True)
+            return tuple(row["task_id"] for row in rows)
+
     def revoke(self, group_id: str, task_id: str):
         # No content reads are allowed after this durable fence. Purging dependent
         # stores is a separate idempotent step, so interrupted cleanup stays denied.
@@ -191,8 +255,12 @@ class ProtectedLineages:
 
 class ProtectedAccess:
     """Explicit same-group private capability, rechecked for every repository call."""
+    read_only = False
     def __init__(self, registry, group_id, task_id):
         self.registry, self.group_id, self.task_id = registry, group_id, task_id
+
+    def require_write(self):
+        """Live capability; the existing lifecycle/owner guards still apply."""
 
     @contextmanager
     def guard(self, *, write=False):
@@ -227,6 +295,75 @@ class ProtectedAccess:
         return PayloadCodec(self, store_id)
 
 
+class _ExistingRecordsRead(ProtectedAccess):
+    """Backend-private decoder capability. Never publish this object as authority.
+
+    P1's authenticated AAD version 1 and exact binding schema identify its sole
+    producer, which admits only source/course-free instructions. No current Group
+    resemblance or untrusted provenance flag is used to infer the original scope.
+    """
+    _P1_FIELDS = frozenset({"task_id", "attempt_id", "group_id", "project_id",
+        "owner_task_id", "owner_run_id", "approval_id", "generation", "proposal_digest",
+        "scope_revision", "worker_id", "worker_role", "goal_digest", "worker_run_id"})
+    read_only = True
+
+    def __init__(self, registry, group_id, task_id, *, mode, _issuer=None):
+        super().__init__(registry, group_id, task_id)
+        if _issuer is not _HISTORY_ISSUER or mode not in {"completed", "paused"}:
+            raise ProtectedStorageError("unknown protected history mode")
+        self._history_mode = mode
+
+    def require_write(self):
+        raise ProtectedStorageError("existing protected records are read-only")
+
+    @contextmanager
+    def guard(self, *, write=False):
+        if write:
+            self.require_write()
+        runtime = self.registry.runtime
+        from backend.groups import GroupDomainError, GroupLifecycle
+        from backend.task_runtime.service import RuntimeConflictError
+        try:
+            with runtime._lock, runtime.groups.admission_guard():
+                if runtime._closed or self._history_mode not in {"completed", "paused"}:
+                    raise ProtectedStorageError("protected history unavailable")
+                group = runtime.groups.get(self.group_id)
+                runtime._assert_group_mutable(self.group_id)
+                runtime._assert_not_deferred_quarantine(self.group_id)
+                with self.registry.db.transaction(immediate=False) as conn:
+                    data = self.registry._read(conn, self.task_id, self.group_id)
+                    if (set(data) != self._P1_FIELDS
+                            or any(type(value) is not str for name, value in data.items() if name != "generation")
+                            or type(data["generation"]) is not int or data["generation"] < 1
+                            or data["worker_role"] not in {"knowledge", "planning", "coach"}
+                            or not re.fullmatch(r"[0-9a-f]{32}", data["worker_run_id"])):
+                        raise ProtectedStorageError("unknown original protected history contract")
+                    owner = runtime.cards._owner(conn, data["owner_run_id"], self.group_id)
+                    if owner.task_id != data["owner_task_id"]:
+                        raise ProtectedStorageError("protected history owner mismatch")
+                    if self._history_mode == "completed":
+                        if owner.status not in {TaskStatus.SUCCEEDED, TaskStatus.PARTIAL}:
+                            raise ProtectedStorageError("completed protected owner required")
+                    else:
+                        revision = self.registry.crypto.digest("scope", [group.to_dict(), "no-source-content"])
+                        if (owner.status is not TaskStatus.PAUSED or group.lifecycle is not GroupLifecycle.ACTIVE
+                                or group.source_links or group.course_bindings or revision != data["scope_revision"]):
+                            raise ProtectedStorageError("paused protected scope unavailable")
+                        row = conn.execute("SELECT * FROM studycrew_approvals WHERE approval_id=?",
+                                           (data["approval_id"],)).fetchone()
+                        if row is None or (row["group_id"], row["run_id"], row["status"]) != (
+                                self.group_id, data["owner_run_id"], "approved"):
+                            raise ProtectedStorageError("paused protected card unavailable")
+                        card = runtime.cards.repository.open(conn, row, owner.task_id)
+                        runtime.cards._match(card, data["generation"], data["proposal_digest"])
+                        runtime.cards._target(group, card.proposal)
+                        if card.scope_revision != revision or runtime._is_expired(card.expires_at):
+                            raise ProtectedStorageError("paused protected card scope unavailable")
+                yield data
+        except (GroupDomainError, RuntimeConflictError, CardStateError, MasterKeyError):
+            raise ProtectedStorageError("protected history authority unavailable") from None
+
+
 class PayloadCodec:
     def __init__(self, access: ProtectedAccess, store_id: str):
         self.access, self.store_id = access, store_id
@@ -237,6 +374,12 @@ class PayloadCodec:
             yield
 
     def _binding(self, *, write=False):
+        if write:
+            self.access.require_write()
+        if isinstance(self.access, _ExistingRecordsRead):
+            with self.access.guard() as data:
+                with self.access.registry.db.transaction(immediate=False) as conn:
+                    return data, dict(self.access.registry.crypto.verify(conn))
         registry = self.access.registry
         with registry.db.transaction(immediate=False) as conn:
             data = registry._read(conn, self.access.task_id, self.access.group_id)
@@ -247,6 +390,7 @@ class PayloadCodec:
         return data, meta
 
     def bind_worker_run(self, run_id):
+        self.access.require_write()
         registry = self.access.registry
         with registry.db.transaction() as conn:
             data = registry._read(conn, self.access.task_id, self.access.group_id)
@@ -281,6 +425,8 @@ class PayloadCodec:
         return self.access.registry.crypto.digest(domain, value)
 
     def _claim(self, table, record_id, *, create):
+        if create:
+            self.access.require_write()
         if not isinstance(record_id, str) or not _ID.fullmatch(record_id) or not protected_id(record_id):
             raise ProtectedStorageError("protected record identity required")
         registry = self.access.registry
@@ -368,6 +514,21 @@ _PROVENANCE_COLUMNS = {"provenance_json", "build_id", "git_commit", "runtime_sch
 
 class StoragePayloads:
     """Explicit reusable serializers called at each repository row boundary."""
+
+    def _task_selection(self, column="task_id"):
+        # Only fixed repository column names reach this helper, never model input.
+        if self.protection is not None:
+            return f"{column}=?", (self.protection.access.task_id,)
+        registry = getattr(self, "legacy_lineages", None)
+        if registry is None:
+            return "1=1", ()
+        ids = registry.classified_task_ids()
+        return ((f"{column} NOT IN (" + ",".join("?" for _ in ids) + ")", ids)
+                if ids else ("1=1", ()))
+
+    def _check_selected_task(self, task_id):
+        if self.protection is not None and task_id and task_id != self.protection.access.task_id:
+            raise ProtectedStorageError("protected task selection mismatch")
     protection: PayloadCodec | None
 
     def _validate_clear_coverage(self, table, columns, query):
@@ -507,6 +668,8 @@ class StoragePayloads:
         raw = row["payload_json"]
         is_protected = protected_id(record_id) or ("task_id" in row.keys() and protected_id(row["task_id"]))
         if not is_protected:
+            if self.protection is not None:
+                raise ProtectedStorageError("protected repository cannot read a foreign record")
             if isinstance(raw, str) and raw.startswith(WIRE):
                 raise ProtectedStorageError("protected record identity changed")
             return json_loads(raw, {})
@@ -551,6 +714,7 @@ class StoragePayloads:
     def purge_protected(self):
         if self.protection is None:
             raise ProtectedStorageError("protected purge capability required")
+        self.protection.access.require_write()
         access = self.protection.access
         registry = access.registry
         registry.revoke(access.group_id, access.task_id)

@@ -4,7 +4,7 @@ from pathlib import Path
 
 from knowe_provenance import assert_provenance_matches
 from backend.runtime import TaskRun, utc_now
-from backend.protected_storage import StoragePayloads, protected_id, storage_boundary
+from backend.protected_storage import StoragePayloads, ProtectedLineages, ProtectedStorageError, protected_id, storage_boundary, storage_write
 
 from ._sqlite import (
     PROVENANCE_COLUMN_DEFS,
@@ -28,11 +28,20 @@ class TaskRunAlreadyExists(RuntimeError):
 class SQLiteTaskRunRepository(StoragePayloads):
     """Persists authoritative TaskRun snapshots with compare-and-swap versions."""
 
-    def __init__(self, path: str | Path | SQLiteDatabase, *, protected=None) -> None:
+    def __init__(self, path: str | Path | SQLiteDatabase, *, protected=None, legacy_lineages=None) -> None:
+        if legacy_lineages is not None and not isinstance(legacy_lineages, ProtectedLineages):
+            raise ProtectedStorageError("canonical legacy selection registry required")
+        if protected is not None and legacy_lineages is not None:
+            raise ValueError("choose a protected or legacy repository view")
+        self.legacy_lineages = legacy_lineages
         if protected is not None:
             protected.identity
+            if protected.read_only and not isinstance(path, SQLiteDatabase) and not Path(path).is_file():
+                raise ProtectedStorageError("existing task-run store unavailable")
         self.db = path if isinstance(path, SQLiteDatabase) else SQLiteDatabase(path)
         self.protection = protected.for_store(self.db.path) if protected is not None else None
+        if protected is not None and protected.read_only:
+            return  # A history reader must never create tables or run migrations.
         self.db.initialize(
             """
             CREATE TABLE IF NOT EXISTS task_runs (
@@ -52,6 +61,7 @@ class SQLiteTaskRunRepository(StoragePayloads):
         self.db.register_schema("runtime.task_run")
 
     @storage_boundary
+    @storage_write
     def create(self, run: TaskRun) -> TaskRun:
         payload = (self._write_payload("task_runs", run.to_dict()) if self.protection is not None or protected_id(run.envelope.task_id)
                    else compress_json_dumps(run.to_dict()))  # [v1.0.31 R1] 压缩存储
@@ -98,6 +108,7 @@ class SQLiteTaskRunRepository(StoragePayloads):
         return run
 
     @storage_boundary
+    @storage_write
     def save(self, run: TaskRun, *, expected_version: int) -> TaskRun:
         if expected_version < 0:
             raise ValueError("expected_version must be non-negative")
@@ -155,6 +166,7 @@ class SQLiteTaskRunRepository(StoragePayloads):
 
     @storage_boundary
     def get(self, task_id: str) -> TaskRun | None:
+        self._check_selected_task(task_id)
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_id,)).fetchone()
         if row is None:
@@ -171,10 +183,11 @@ class SQLiteTaskRunRepository(StoragePayloads):
 
     @storage_boundary
     def list_by_state(self, state: str, *, limit: int = 100) -> tuple[TaskRun, ...]:
+        selection, selected = self._task_selection()
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(
-                "SELECT * FROM task_runs WHERE state=? ORDER BY updated_at DESC LIMIT ?",
-                (str(state), max(1, min(int(limit), 10_000))),
+                f"SELECT * FROM task_runs WHERE state=? AND {selection} ORDER BY updated_at DESC LIMIT ?",
+                (str(state), *selected, max(1, min(int(limit), 10_000))),
             ).fetchall()
         return tuple(TaskRun.from_dict(self._read_payload("task_runs", row)) for row in rows)
 
