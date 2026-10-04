@@ -1,5 +1,15 @@
 # Remaining roadmap — StudyCrew commercial continuation
 
+## Accepted checkpoint — 2026-10-04, `546b43a`
+
+P2b2a early encrypted child enrollment and authorized deletion/restart cleanup passed independent fix1 re-review: 0 Critical / 0 Important, with the existing output-hygiene Minor carried forward. The quarantine cross-Group deletion bug is closed; the actual Worker composition is next, not already complete. Frozen backend evidence remains 1,929 passed / 5 existing skips / 10 subtests. See the explicit remaining areas below; no commercial-readiness claim.
+
+## Live checkpoint — 2026-10-04, `546b43a` (child cleanup fix awaiting independent re-review)
+
+The latest implementation adds early encrypted child discovery, durable revoke-before-cleanup and restart retries. Its first independent review found a cross-Group quarantine cleanup authorization error and an identifying diagnostic path; fix1 is committed and awaits scoped re-review. Frozen backend: 1,929 passed, 5 existing skips, 10 subtests. Latest independently accepted production is still `49f9c89` until that gate closes. Next: actual protected Worker/Gateway/completion/notification composition, then pre-run chat privacy and the real Coordinator proposal/approval/dispatch path. These are prerequisites, not a finished student product.
+
+The combined native preflight shutdown diagnostic has now been narrowed to a retained PyclipperOffset in the synthetic harness: explicit object teardown makes the unchanged seven-result combined scenario exit with empty stderr. This corrects the probe lifecycle only; it is not a production dependency or frozen installer certification. Model-pack integration, semantic RAG/Verifier, Mem0 product integration, learning workflows and release gates remain open. Older snapshots below are historical, not additional tasks to reimplement.
+
 ## Current checkpoint — 2026-10-04, `49f9c89` (protected event delivery independently accepted)
 
 P2b1 authoritative encrypted event delivery is accepted after two scoped fix rounds at0C/0I. Tests cover derived-cache loss, real authenticated WS/HTTP projection, ordered replay, lifecycle fences and actual recovery-snapshot/overflow protocol. Final backend1887passed/5existingSKIP/10subtests; focused117passed; controller Node24 typecheck/lint,588frontendtests and33foundationtests passed. P2b2 real Worker/Gateway/completion/notification composition remains pending. See the top checkpoint in progress.md for live evidence; delivery acceptance is not whole Unit P or commercial acceptance.
