@@ -1,5 +1,9 @@
 # P2 — real protected Worker, event and restart composition
 
+## Updated split and history policy
+
+P2a (protected-composition-p2a-brief.md) first implements explicit read-only history capabilities and pre-decode selected-store views; P2b then owes this document's actual Worker/Hub/restart chain. The later P2a policy supersedes this document's earlier safe-transition-chain prerequisite: existing authenticated source-free completed history is explicitly readable by its same-group owner despite current name/role/course changes, while execution/live replay remain scope-bound. Deletion and explicit revocation still deny. Do not implement Group transition signing or cross-file monotonic-head machinery for history reads. Read P2a's strict original binding, no-write and paused-history requirements instead of the obsolete restrictive paragraph below.
+
 ## Gate and scope
 
 Prepared while P1 is under review; DO NOT START until its independent 0 Critical / 0 Important gate passes. Controller will supply the accepted BASE and final P1 report. Read `protected-lineage-brief.md` (whole-unit requirements), `protected-lineage-discovery.md` (actual sinks) and `card-authority-design.md` section “P2 composition note” for interface mapping. This brief scopes the remaining composition; do not repeat P1's storage implementation or claim Unit D's producer feature.

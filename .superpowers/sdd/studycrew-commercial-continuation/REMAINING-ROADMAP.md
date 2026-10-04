@@ -1,6 +1,8 @@
 # Remaining roadmap — StudyCrew commercial continuation
 
-## Current checkpoint — 2026-10-04, `4f7ee30` (card foundation and protected storage independently accepted)
+## Current checkpoint — 2026-10-04, `0b9d539` (protected history/query slice independently accepted)
+
+P2a explicit private read-only history and selected-store queries are accepted at0C/0I. Frozen backend1838 passed/5existing skipped/10subtests, focused116 passed. Next P2b must complete actual Worker/Gateway/Hub/restart composition; no public protected-history/producer feature is claimed yet. Local model design and E5 isolated real-runtime preflight are complete; E5 ranking concerns remain, not a passing RAG metric. OCR isolated preflight is ongoing.
 
 P1 protected storage is accepted after two fix rounds, 0 Critical / 0 Important. Current frozen backend: 1799 passed, 5 existing skipped, 10 subtests; P1 focused: 77 passed. Next is P2 real Worker/event/restart composition, then Unit D real producer/approval/dispatch. Storage acceptance alone is not product-path or commercial acceptance. Earlier row-specific counts below are historical checkpoints.
 
