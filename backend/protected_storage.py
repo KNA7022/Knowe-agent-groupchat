@@ -250,6 +250,9 @@ class ProtectedLineages:
                 receipt = self.crypto.digest("lineage-receipt", [task_id, group_id, "revoked"])
                 conn.execute("UPDATE studycrew_protected_lineages SET state='revoked',payload=NULL,receipt=? WHERE task_id=?",
                     (receipt, task_id))
+            events = getattr(self.runtime, "_protected_events", None)
+            if events is not None:
+                events._purge_rows(task_id)
         return {"task_id": task_id, "state": "revoked"}
 
 

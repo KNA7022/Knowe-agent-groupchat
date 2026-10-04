@@ -56,6 +56,11 @@ class Client:
         self.id = f"c{Client._next_id}"
         self.connected_at_ns = time.time_ns()
         self.ws = ws
+        self._send_lock = asyncio.Lock()
+        self._protected_hydrate = None
+        self._ordered_events: deque[dict[str, Any]] = deque()
+        self._ordered_task = None
+        self._protected_resync_projects: set[str] = set()
         self.task_runtime_recovery_fenced = False
         self.task_runtime_recovery_session_id = secrets.token_urlsafe(24)
         self.task_runtime_recovery_disconnect_debt_transferred = False
@@ -130,15 +135,60 @@ class Client:
             raise RuntimeError("Task Runtime recovery key owns multiple phases")
         return len(flattened)
 
-    async def send(self, event: dict[str, Any]) -> bool:
+    async def send(self, event: dict[str, Any], *, _protected_history: bool = False) -> bool:
         if not self.alive:
             return False
+        protected_send = False
         try:
-            await self.ws.send(json.dumps(event, ensure_ascii=False))
+            async with self._send_lock:
+                from .protected_events import REF
+                def contains(value):
+                    if isinstance(value, dict):
+                        return REF in value or any(contains(child) for child in value.values())
+                    return isinstance(value, list) and any(contains(child) for child in value)
+                if contains(event):
+                    protected_send = True
+                    if self._protected_hydrate is None:
+                        return False
+                    # Hydration occurs after backpressure, never before the send lock.
+                    event = self._protected_hydrate(event, history=_protected_history)
+                await self.ws.send(json.dumps(event, ensure_ascii=False))
             return True
         except Exception as exc:  # 连接在发的过程中断了
-            log.debug("send failed to %s: %s", self.id, exc)
+            log.debug("send failed to %s: %s", self.id, type(exc).__name__ if protected_send else exc)
             return False
+
+    def enqueue_ordered(self, event: dict[str, Any]) -> None:
+        project = event.get("project_id", "")
+        if project in self._protected_resync_projects:
+            return
+        if len(self._ordered_events) >= self.LIVE_REPLAY_BUFFER_MAX:
+            self.request_resync(project, event.get("seq", 0))
+            return
+        self._ordered_events.append(dict(event))
+        self._start_ordered_drain()
+
+    def _start_ordered_drain(self):
+        if self._ordered_task is None or self._ordered_task.done():
+            self._ordered_task = asyncio.create_task(self._drain_ordered())
+
+    async def _drain_ordered(self):
+        while self._ordered_events:
+            event = self._ordered_events.popleft()
+            if event.get("type") == "resync_required":
+                await self.send(event)
+            elif not await self.send_live(event):
+                self.request_resync(event.get("project_id", ""), event.get("seq", 0))
+
+    def request_resync(self, project, seq):
+        if project in self._protected_resync_projects:
+            return
+        self._protected_resync_projects.add(project)
+        self._ordered_events = deque(e for e in self._ordered_events if e.get("project_id") != project)
+        self._live_replay_buffer = deque(e for e in self._live_replay_buffer if e.get("project_id") != project)
+        self._ordered_events.append({"type": "resync_required", "project_id": project,
+            "last_seq": seq, "message": "Committed history requires replay"})
+        self._start_ordered_drain()
 
     async def send_live(self, event: dict[str, Any]) -> bool:
         """Buffer broadcasts until replay/snapshot handoff completes for this client."""
@@ -213,6 +263,71 @@ class Hub:
         # historical project_id, while transport envelopes additionally expose the
         # canonical Group identity.  The server installs this resolver after startup.
         self.group_id_resolver: Callable[[str], str | None] | None = None
+        self.protected_events = None
+        self.protected_enqueue_fault = None
+
+    def bind_protected_events(self, authority):
+        if self.protected_events is not None and self.protected_events is not authority:
+            raise RuntimeError("protected event authority already bound")
+        self.protected_events = authority
+        if self.store is not None:
+            self.store.protected_events = authority
+        authority._invalidators.append(self._invalidate_protected_caches)
+
+    def _invalidate_protected_caches(self, task_id):
+        # References contain no content. Drop transient copies after the durable fence;
+        # authoritative replay rebuilds unaffected histories without decoding them.
+        from .protected_events import REF
+        def affected(value):
+            if isinstance(value, dict):
+                return ((REF in value and value.get("task_id") == task_id)
+                    or any(affected(child) for child in value.values()))
+            return isinstance(value, list) and any(affected(child) for child in value)
+        for cache in self._idempotent_events.values():
+            for key, value in tuple(cache.items()):
+                if affected(value):
+                    del cache[key]
+        for project in self.projects.values():
+            retained = [e for e in project.ring.events() if not affected(e)]
+            project.ring = RingBuffer(CONFIG.ring_capacity)
+            for event in retained:
+                project.ring.append(event)
+            if affected(project.pending_card):
+                project.pending_card = None
+        for client in self.clients:
+            client._live_replay_buffer = deque(e for e in client._live_replay_buffer if not affected(e))
+            client._ordered_events = deque(e for e in client._ordered_events if not affected(e))
+
+    async def emit_protected(self, access, outbox_id):
+        """Commit a completion-derived message; no notification/recipient ACK claim."""
+        authority = self.protected_events
+        if authority is None:
+            raise RuntimeError("protected event authority unavailable")
+        project_id = access.identity["project_id"]
+        async with self._seq_lock:
+            project = self.get_or_create(project_id)
+            project.seq = max(project.seq, authority.head(project_id),
+                self.store.load_seq_watermark(project_id) if self.store is not None else 0)
+            result = authority.commit(access, outbox_id, project.seq + 1)
+            project.seq = max(project.seq, result.reference["seq"])
+            if not result.created:
+                return result  # Never insert an old sequence behind newer live events.
+            try:
+                if self.protected_enqueue_fault is not None:
+                    self.protected_enqueue_fault()
+                project.ring.append(result.reference)
+                self._remember_idempotent_event(project_id, result.reference["event_id"], result.reference)
+                for client in self.clients:
+                    client.enqueue_ordered(result.reference)
+            except BaseException:
+                for client in self.clients:
+                    client.request_resync(project_id, project.seq)
+                raise
+            if self.store is not None:
+                # Derived ref failure does not invalidate the committed authority.
+                self.store.defer_bg(lambda: self.store.append_event(project_id, result.reference),
+                    description="protected event reference cache")
+            return result
 
     def _with_group_identity(self, event: dict[str, Any]) -> dict[str, Any]:
         project_id = event.get("project_id")
@@ -323,6 +438,9 @@ class Hub:
         proj = self.projects.get(project_id)
         if proj is None:
             proj = Project(project_id, name or project_id, CONFIG.ring_capacity)
+            if self.protected_events is not None:
+                proj.seq = max(self.protected_events.head(project_id),
+                    self.store.load_seq_watermark(project_id) if self.store is not None else 0)
             self.projects[project_id] = proj
             log.info("project created: %s (%s)", project_id, proj.name)
         elif name and proj.name == proj.id:
@@ -356,6 +474,8 @@ class Hub:
         for ev in events:
             proj.ring.append(ev)
         proj.seq = max(max((int(e["seq"]) for e in events), default=0), int(seq_watermark or 0))
+        if self.protected_events is not None:
+            proj.seq = max(proj.seq, self.protected_events.head(project_id))
         # v1.0.35.3: 恢复已读水位（跨重启保留未读语义）。
         # 老数据无 .read 记录 → 历史算已读并立即落盘（last_read_seq = seq），
         # 避免升级后「全部历史变未读」吓到用户，同时让升级后的新消息能正确算未读。
@@ -395,7 +515,7 @@ class Hub:
         self, project_id: str, since_seq: int,
     ) -> tuple[list[dict[str, Any]], bool, str]:
         """
-        重连回放。JSONL 是持久真源，ring 只是实时增量层。
+        重连回放。Store 合并 JSONL 与 protected SQLite 真源，ring 只是增量层。
 
         · since_seq == 0：总是把磁盘全量结构历史与 ring 合并，保证 Electron 单独重开时
           初始消息/审批卡不会因运行期 ring 淘汰而消失。
@@ -408,7 +528,8 @@ class Hub:
         if since_seq > proj.seq:
             return [], True, "client-ahead"
 
-        if self.store is not None and (since_seq == 0 or gap):
+        # Protected commit may survive a failed enqueue with no detectable ring gap.
+        if self.store is not None and (since_seq == 0 or gap or self.protected_events is not None):
             durable = self.store.load_all_events(project_id)
             merged: dict[int, dict[str, Any]] = {}
             for ev in durable:
@@ -500,6 +621,11 @@ class Hub:
         envelope.  Recovery publishers use it to avoid rebroadcasting an already-live
         RunEvent after their bounded cursor cache has evicted the run.
         """
+        from .protected_events import REF
+        from .protected_storage import ProtectedStorageError, protected_id
+        if (REF in payload or protected_id(payload.get("task_id"))
+                or str(payload.get("event_id", "")).startswith("p2evt_")):
+            raise ProtectedStorageError("protected events require explicit backend publication")
         etype = payload.get("type")
         if etype in NO_SEQ_EVENT_TYPES:
             raise ContractViolation(f"{etype} 属无 seq 白名单，不能走 emit()（会被盖上 seq）")
@@ -546,11 +672,20 @@ class Hub:
             if isinstance(event_id, str) and event_id:
                 self._remember_idempotent_event(project_id, event_id, event)
 
-        await self.broadcast(event)
+            if self.protected_events is not None:
+                for client in self.clients:
+                    client.enqueue_ordered(event)
+
+        if self.protected_events is None:
+            await self.broadcast(event)
         return event, True
 
     # ── 发事件：服务器级（无 seq，旁路） ──
     async def emit_no_seq(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from .protected_events import REF
+        from .protected_storage import ProtectedStorageError, protected_id
+        if REF in payload or protected_id(payload.get("task_id")):
+            raise ProtectedStorageError("protected events require explicit backend publication")
         event = self._with_group_identity(dict(payload))
         pid = event.get("project_id")
         if isinstance(pid, str):
@@ -566,7 +701,10 @@ class Hub:
             event = self._filter_public_text(pid, event)
         else:
             event = sanitize_event(event, {})
-        return await client.send(event)
+        sent = await client.send(event)
+        if sent and event.get("type") == "replay_complete":
+            client._protected_resync_projects.discard(event.get("project_id", ""))
+        return sent
 
     # ── 广播 ──
     async def broadcast(self, event: dict[str, Any], targets: Iterable[Client] | None = None) -> None:
@@ -639,7 +777,12 @@ class Hub:
                 _store.defer_bg(lambda: _store.save_seq_watermark(_pid, _seq),
                                 description=f"{_pid} snapshot seq 高水位")
 
-        await self.broadcast(event)
+            if self.protected_events is not None:
+                for client in self.clients:
+                    client.enqueue_ordered(event)
+
+        if self.protected_events is None:
+            await self.broadcast(event)
         return event
 
     # ── 已读水位 ──

@@ -151,11 +151,13 @@ async def test_hub_emit_writes_through_to_disk(tmp_path: Path):
     hub = Hub(store=store)
 
     await hub.emit("p1", {"type": "message", "agent_id": "a", "content": "落盘"})
+    assert store.flush()  # Hub only queues legacy writes; wait for the writer barrier.
 
     events = store.load_events("p1", limit=10)
     assert len(events) == 1
     assert events[0]["content"] == "落盘"
     assert events[0]["seq"] == 1
+    store.close()
 
 
 async def test_hub_without_store_is_pure_memory(tmp_path: Path):

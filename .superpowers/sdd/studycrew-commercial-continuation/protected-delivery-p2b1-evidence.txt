@@ -1,0 +1,216 @@
+P2b1 actual execution evidence
+Workspace: D:/agentwork/StudyCrew-worktree
+Base: 041d033d4f648e4e662c34ff11b9247f82a8058f
+Commands used PYTHONUTF8=1 and Python 3.12. No provider network.
+This file preserves actual returned output chunks; headings are explanatory.
+Trailing whitespace on blank traceback/output lines is normalized for Git checks.
+
+=== Superseded pre-HTTP full: retained excerpts (one middle chunk not retained) ===
+Command: py -3.12 -m pytest backend/tests -q
+..........................................sss.s......................... [  3%]
+.s............................................................................ [ 34%]
+........................................................................ [ 38%]
+........................................................................ [ 42%]
+........................................................................ [ 46%]
+........................................................................ [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 57%]
+........................................................................ [ 61%]
+........................................................................ [ 65%]
+........................................................................ [ 69%]
+........................................................................ [ 72%]
+........................................................................ [ 76%]
+........................................................................ [ 80%]
+........................................................................ [ 84%]
+........................................................................ [ 88%]
+........................................................................ [ 92%]
+........................................................................ [ 95%]
+.............................................................. [ 99%]
+................                                                         [100%]
+1873 passed, 5 skipped, 10 subtests passed in 196.62s (0:03:16)
+
+=== Post-HTTP focused: retained final chunk ===
+Command: py -3.12 -m pytest backend/tests/test_protected_events.py backend/tests/test_events_delta.py -q --tb=short
+........................                                 [100%]
+40 passed in 15.95s
+
+=== Post-HTTP full, FAILED: complete returned chunks ===
+Command: py -3.12 -m pytest backend/tests -q
+..........................................sss.s......................... [  3%]
+.s...................................................................... [  7%]
+........................................................................ [ 11%]
+........................................................................ [ 15%]
+........................................................................ [ 19%]
+........................................................................ [ 22%]
+........................................................................ [ 26%]
+......................................................................F. [ 30%]
+........................................................................ [ 34%]
+........................................................................ [ 38%]
+........................................................................ [ 42%]
+........................................................................ [ 45%]
+........................................................................ [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 57%]
+........................................................................ [ 61%]
+........................................................................ [ 65%]
+........................................................................ [ 68%]
+........................................................................ [ 72%]
+........................................................................ [ 76%]
+........................................................................ [ 80%]
+........................................................................ [ 84%]
+........................................................................ [ 88%]
+........................................................................ [ 91%]
+........................................................................ [ 95%]
+.............................................................. [ 99%]
+.................                                                        [100%]
+================================== FAILURES ===================================
+____________________ test_hub_emit_writes_through_to_disk _____________________
+
+tmp_path = WindowsPath('C:/Users/25977/AppData/Local/Temp/pytest-of-25977/pytest-165/test_hub_emit_writes_through_t0')
+
+    async def test_hub_emit_writes_through_to_disk(tmp_path: Path):
+        store = Store(tmp_path)
+        hub = Hub(store=store)
+
+        await hub.emit("p1", {"type": "message", "agent_id": "a", "content": "落盘"})
+
+        events = store.load_events("p1", limit=10)
+>       assert len(events) == 1
+E       assert 0 == 1
+E        +  where 0 = len([])
+
+backend\tests\test_persist.py:156: AssertionError
+=========================== short test summary info ===========================
+FAILED backend\tests\test_persist.py::test_hub_emit_writes_through_to_disk - ...
+1 failed, 1873 passed, 5 skipped, 10 subtests passed in 202.00s (0:03:22)
+
+=== Baseline/current deterministic writer barrier probe ===
+In-memory git show 041d033:backend/hub.py loaded as a distinct module; actual Store.
+A bounded threading.Event blocks the existing writer before Hub emit.
+Read before releasing barrier, then release, assert Store.flush(), read again.
+Both paths construct no Server/HTTP/protected authority. TemporaryDirectory self-cleaned.
+Initial harness import needed backend added to sys.path; below is corrected successful probe.
+BASE041d033 before_flush_count= 0
+BASE041d033 after_flush_count= 1
+current before_flush_count= 0
+current after_flush_count= 1
+
+=== Genuine protected nonzero cursor replay RED, before condition fix ===
+Command: py -3.12 -m pytest backend/tests/test_protected_events.py::test_nonzero_cursor_replay_recovers_committed_event_missing_from_ring -q --tb=short
+F                                                                        [100%]
+================================== FAILURES ===================================
+____ test_nonzero_cursor_replay_recovers_committed_event_missing_from_ring ____
+backend\tests\test_protected_events.py:184: in test_nonzero_cursor_replay_recovers_committed_event_missing_from_ring
+    assert not gap and len(replay) == 1
+E   assert (not False and 0 == 1)
+E    +  where 0 = len([])
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_events.py::test_nonzero_cursor_replay_recovers_committed_event_missing_from_ring
+1 failed in 1.21s
+
+=== Final focused after approved fixes: complete returned chunks ===
+Command: py -3.12 -m pytest backend/tests/test_protected_events.py backend/tests/test_persist.py backend/tests/test_events_delta.py -q --tb=short
+.........................................................                [100%]
+57 passed in 18.11s
+
+=== Final source/test freeze ===
+Commands: py -3.12 -m compileall -q backend
+git diff --check -- backend/hub.py backend/persist.py backend/protected_storage.py backend/server.py backend/task_runtime/service.py backend/tests/test_persist.py
+Get-FileHash -Algorithm SHA256 [eight scoped source/test paths]
+Exit 0. compileall emitted no output.
+warning: in the working copy of 'backend/hub.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/persist.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/protected_storage.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/server.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/task_runtime/service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/tests/test_persist.py', LF will be replaced by CRLF the next time Git touches it
+
+Path : D:\agentwork\StudyCrew-worktree\backend\protected_events.py
+Hash : 7506AC05FF00F1B9564CBF386F2BF6481E53B6950028D50BE368CAEF66889B8E
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_events.py
+Hash : 0EBC0BA171C2C390BC810C8DF859FAC3AD42F29BDD593552225D0C63CB708876
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_persist.py
+Hash : 84AC4884D3B6088C07502C2DD03CB726C2576BAF92ABBD1C18DC88DCC95D58D0
+
+Path : D:\agentwork\StudyCrew-worktree\backend\hub.py
+Hash : 76D6EB52361A8B5B9A00D492D615A093DE967F6075A9C28C9C5AC20D60D379F7
+
+Path : D:\agentwork\StudyCrew-worktree\backend\persist.py
+Hash : 8E4E6DA362267E25FC6082A707CA5F3A1806C556D3F1F8E4FD258B488B90A529
+
+Path : D:\agentwork\StudyCrew-worktree\backend\protected_storage.py
+Hash : CEA407D604A037CD04D9208F07D0E06F9822E28E36959052C6B7ED34A4B56D60
+
+Path : D:\agentwork\StudyCrew-worktree\backend\server.py
+Hash : 87EF95509E825191D394BACE18595C171CF0DB6A5926B0CE3672E3C8AC37A515
+
+Path : D:\agentwork\StudyCrew-worktree\backend\task_runtime\service.py
+Hash : 08411BE0A8FD97DF34D300EFB787D57F8ED9518BA1ACEBB76D798C60FA178D92
+
+
+=== FINAL full regression on frozen source/tests: complete returned chunks ===
+Command: py -3.12 -m pytest backend/tests -q
+..........................................sss.s......................... [  3%]
+.s...................................................................... [  7%]
+........................................................................ [ 11%]
+........................................................................ [ 15%]
+........................................................................ [ 19%]
+........................................................................ [ 22%]
+........................................................................ [ 26%]
+........................................................................ [ 30%]
+........................................................................ [ 34%]
+........................................................................ [ 38%]
+........................................................................ [ 42%]
+........................................................................ [ 45%]
+........................................................................ [ 49%]
+........................................................................ [ 53%]
+........................................................................ [ 57%]
+........................................................................ [ 61%]
+........................................................................ [ 65%]
+........................................................................ [ 68%]
+........................................................................ [ 72%]
+........................................................................ [ 76%]
+........................................................................ [ 80%]
+........................................................................ [ 84%]
+........................................................................ [ 88%]
+........................................................................ [ 91%]
+........................................................................ [ 95%]
+.............................................................. [ 99%]
+..................                                                       [100%]
+1875 passed, 5 skipped, 10 subtests passed in 212.86s (0:03:32)
+
+=== Freeze recheck: no source/test hash changed ===
+git diff --check [scoped paths]; Get-FileHash [same eight paths]
+Exit 0.
+warning: in the working copy of 'backend/hub.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/persist.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/protected_storage.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/server.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/task_runtime/service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/tests/test_persist.py', LF will be replaced by CRLF the next time Git touches it
+
+Path : D:\agentwork\StudyCrew-worktree\backend\protected_events.py
+Hash : 7506AC05FF00F1B9564CBF386F2BF6481E53B6950028D50BE368CAEF66889B8E
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_events.py
+Hash : 0EBC0BA171C2C390BC810C8DF859FAC3AD42F29BDD593552225D0C63CB708876
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_persist.py
+Hash : 84AC4884D3B6088C07502C2DD03CB726C2576BAF92ABBD1C18DC88DCC95D58D0
+
+Path : D:\agentwork\StudyCrew-worktree\backend\hub.py
+Hash : 76D6EB52361A8B5B9A00D492D615A093DE967F6075A9C28C9C5AC20D60D379F7
+
+Path : D:\agentwork\StudyCrew-worktree\backend\persist.py
+Hash : 8E4E6DA362267E25FC6082A707CA5F3A1806C556D3F1F8E4FD258B488B90A529
+
+Path : D:\agentwork\StudyCrew-worktree\backend\protected_storage.py
+Hash : CEA407D604A037CD04D9208F07D0E06F9822E28E36959052C6B7ED34A4B56D60
+
+Path : D:\agentwork\StudyCrew-worktree\backend\server.py
+Hash : 87EF95509E825191D394BACE18595C171CF0DB6A5926B0CE3672E3C8AC37A515
+
+Path : D:\agentwork\StudyCrew-worktree\backend\task_runtime\service.py
+Hash : 08411BE0A8FD97DF34D300EFB787D57F8ED9518BA1ACEBB76D798C60FA178D92

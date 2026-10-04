@@ -188,6 +188,8 @@ class Store:
         # 失败可见性由计数兜底：server 在握手/快照构造处读取并记入日志。
         self._disk_failures = 0
         self._disk_failures_lock = threading.Lock()
+        # Explicit backend adapter; never inferred from a JSON event flag.
+        self.protected_events = None
 
     # ═══════════════════════════════════════════════════════════
     # [v1.0.24.4] 磁盘写入走单队列，不占主循环
@@ -513,6 +515,8 @@ class Store:
                 except OSError as exc:
                     log.warning("[%s] 迁移 seq 高水位写入失败：%s", project_id, exc)
         value = max(0, value)
+        if self.protected_events is not None:
+            value = max(value, self.protected_events.head(project_id))
         self._seq_cache[project_id] = value
         return value
 
@@ -686,6 +690,19 @@ class Store:
         if bad:
             log.warning("[%s] 事件日志有 %d 行坏的，已跳过", project_id, bad)
 
+        from .protected_events import REF
+        derived = [event for event in events if REF in event]
+        if derived and self.protected_events is None:
+            from .protected_storage import ProtectedStorageError
+            raise ProtectedStorageError("protected event authority unavailable")
+        events = [event for event in events if REF not in event]
+        if self.protected_events is not None:
+            protected = self.protected_events.references(project_id)
+            protected_seqs = {event["seq"] for event in protected}
+            if any(event["seq"] in protected_seqs for event in events):
+                from .protected_storage import ProtectedStorageError
+                raise ProtectedStorageError("protected stream sequence collision")
+            events.extend(protected)
         events.sort(key=lambda e: e["seq"])
         return events[-limit:] if limit > 0 else events
 

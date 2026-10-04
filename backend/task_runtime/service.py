@@ -183,6 +183,9 @@ class TaskRuntimeService:
             if quarantine_timer is not None:
                 quarantine_timer.cancel()
             self.store.release_scheduler_lease(self._scheduler_owner)
+            events = getattr(self, "_protected_events", None)
+            if events is not None:
+                events.close()
             self.store.close()
 
     def _assert_group_mutable(self, group_id: str) -> None:
@@ -1332,7 +1335,14 @@ class TaskRuntimeService:
                 str(group_id), canonical_stages={"committed"},
                 runtime_stages={"prepared", "runtime_cleaned", "complete"},
             )
+            self._purge_protected_events(str(group_id))
             return self.store.delete_group(str(group_id))
+
+    def _purge_protected_events(self, group_id: str) -> None:
+        from backend.protected_events import ProtectedEvents
+        events = ProtectedEvents.existing(self)
+        if events is not None:
+            events.purge_group(group_id)
 
     def prepare_group_deletion(self, group_id: str, group_transaction_id: str) -> dict[str, str]:
         canonical = self._canonical_group(group_id)
@@ -1434,6 +1444,7 @@ class TaskRuntimeService:
             # The durable intent itself is the mutation fence.  Re-clean on every
             # reconciliation so a row written by an older binary or a pre-fence race
             # can never brick startup after the canonical Group commit.
+            self._purge_protected_events(group_id)
             counts = self.store.delete_group(group_id)
             if intent["stage"] != "complete":
                 self.store.set_group_deletion_stage(group_id, "runtime_cleaned")
@@ -1447,6 +1458,7 @@ class TaskRuntimeService:
                 group_id, canonical_stages={"committed"},
                 runtime_stages={"prepared", "runtime_cleaned", "complete"},
             )
+            self._purge_protected_events(group_id)
             self.store.delete_group(group_id)
             remaining = self.store.group_content_counts(group_id)
             if any(remaining.values()):

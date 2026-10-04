@@ -467,6 +467,11 @@ class KnoweServer:
         runtime_settings.set_secret_lease_broker(self.secret_leases)
         self.hub = Hub(store=self.store)
         self.hub.group_id_resolver = self._group_id_for_runtime_project
+        if self.task_runtime is not None:
+            from .protected_events import ProtectedEvents
+            protected_events = ProtectedEvents.existing(self.task_runtime)
+            if protected_events is not None:
+                self.hub.bind_protected_events(protected_events)
         # Initialize the cross-thread ingress before registering the synchronous
         # journal listener: an already-due recovered approval may fire immediately.
         self._task_runtime_event_bridge_lock = threading.Lock()
@@ -4573,6 +4578,7 @@ class KnoweServer:
     # ═══════════════════════════════════════════════════════════
     async def handle(self, ws: ServerConnection) -> None:
         client = Client(ws)
+        self._admit_protected_client(client)
         self._admit_task_runtime_client(client)  # ★ 绑定恢复纪元后立刻进广播集合（§b）
         log.info("client %s connected (total=%d)", client.id, self.hub.client_count)
 
@@ -4613,8 +4619,54 @@ class KnoweServer:
             except Exception:  # noqa: BLE001 — 认证探测失败一律按未授权处理
                 supplied = ""
         if CONFIG.runtime_token and hmac.compare_digest(supplied, CONFIG.runtime_token):
+            import weakref
+            if not hasattr(self, "_protected_authenticated_sockets"):
+                self._protected_authenticated_sockets = weakref.WeakSet()
+            self._protected_authenticated_sockets.add(connection)
             return None
         return connection.respond(HTTPStatus.UNAUTHORIZED, "unauthorized\n")
+
+    def _admit_protected_client(self, client: Client) -> None:
+        """Install hydration only for the socket accepted by the real upgrade hook."""
+        admitted = getattr(self, "_protected_authenticated_sockets", ())
+        if client.ws not in admitted:
+            return
+
+        def hydrate(event, *, history=False):
+            from .protected_storage import ProtectedStorageError
+            if client.ws not in self._protected_authenticated_sockets or not client.alive:
+                raise ProtectedStorageError("protected session unavailable")
+            return self._protected_public_projection(event, history=history)
+
+        client._protected_hydrate = hydrate
+
+    def _protected_public_projection(self, value, *, history=False):
+        """Transient projection shared by admitted socket and HTTP response boundaries."""
+        from .protected_events import REF
+        from .protected_storage import ProtectedStorageError
+        if isinstance(value, dict):
+            if REF in value:
+                authority = self.hub.protected_events
+                if (authority is None or self._group_id_for_runtime_project(
+                        value.get("project_id")) != value.get("group_id")):
+                    raise ProtectedStorageError("protected group session mismatch")
+                return authority.hydrate(value, history=history)
+            return {key: self._protected_public_projection(child, history=history)
+                for key, child in value.items()}
+        if isinstance(value, list):
+            return [self._protected_public_projection(child, history=history) for child in value]
+        return value
+
+    def _protected_http_projection(self, writer, events, project_id):
+        from .protected_events import REF
+        from .protected_storage import ProtectedStorageError
+        refs = [event for event in events if REF in event]
+        if not refs:
+            return events
+        if (writer not in getattr(self, "_protected_authenticated_http", ())
+                or writer.is_closing() or any(event.get("project_id") != project_id for event in refs)):
+            raise ProtectedStorageError("authenticated protected HTTP scope required")
+        return self._protected_public_projection(events)
 
     async def _handshake(self, client: Client) -> None:
         """等首帧 replay_request，5 秒窗口。"""
@@ -4825,6 +4877,18 @@ class KnoweServer:
     # ── ping ──
     async def _cmd_ping(self, client: Client, _msg: dict[str, Any]) -> None:
         await self.hub.send_to(client, {"type": "pong"})
+
+    async def _cmd_protected_history(self, client: Client, data: dict[str, Any]) -> None:
+        """Explicit same-group user history; never selected by reconnect machinery."""
+        from .protected_storage import ProtectedStorageError
+        if set(data) - {"type", "group_id", "project_id", "event_id"}:
+            raise ProtectedStorageError("invalid protected history request")
+        if (client._protected_hydrate is None or self.hub.protected_events is None
+                or self._group_id_for_runtime_project(data.get("project_id")) != data.get("group_id")):
+            raise ProtectedStorageError("authenticated same-group history required")
+        authority = self.hub.protected_events
+        row = authority.lookup(data["project_id"], data["event_id"])
+        await client.send(authority._reference(row), _protected_history=True)
 
     async def _cmd_task_runtime(self, client: Client, data: dict[str, Any]) -> None:
         """Versioned WS control boundary; HTTP and WS share the same dispatcher."""
@@ -6529,6 +6593,11 @@ class KnoweServer:
                 await writer.drain()
                 return
 
+            import weakref
+            if not hasattr(self, "_protected_authenticated_http"):
+                self._protected_authenticated_http = weakref.WeakSet()
+            self._protected_authenticated_http.add(writer)
+
             # The renderer can obtain the ordinary runtime token for WebSocket/control-plane
             # calls.  Credential material therefore crosses a separate main-process-only
             # capability, accepted only as a header (never a URL/query parameter).
@@ -6902,6 +6971,9 @@ class KnoweServer:
                 with contextlib.suppress(ConnectionError, OSError):
                     await writer.drain()
         finally:
+            admitted_http = getattr(self, "_protected_authenticated_http", None)
+            if admitted_http is not None:
+                admitted_http.discard(writer)
             writer.close()
 
     def _write_http(self, writer: asyncio.StreamWriter, status: bytes,
@@ -10353,6 +10425,7 @@ class KnoweServer:
     #   只读、脱敏、不外泄沙箱路径；project_id 无效一律 400。
     # ═══════════════════════════════════════════════════════════
     async def _serve_history(self, writer: asyncio.StreamWriter, query: str) -> None:
+        from .protected_storage import ProtectedStorageError
         params = parse_qs(query, keep_blank_values=False)
         project_id = unquote((params.get("project_id") or [""])[0]).strip()
         category = (params.get("category") or ["all"])[0].strip().lower()
@@ -10389,6 +10462,9 @@ class KnoweServer:
             # 私聊频道的落盘历史（键 = dm_id 本身）
             try:
                 raw = await asyncio.to_thread(self.store.load_all_events, project_id)
+            except ProtectedStorageError:
+                self._history_error(writer, b"409 Conflict", "Protected history unavailable")
+                return
             except Exception:                   # noqa: BLE001
                 raw = []
             events = _history_only(raw)
@@ -10421,6 +10497,9 @@ class KnoweServer:
             # 读盘可能阻塞 → 丢线程池
             try:
                 raw = await asyncio.to_thread(self.store.load_all_events, pid)
+            except ProtectedStorageError:
+                self._history_error(writer, b"409 Conflict", "Protected history unavailable")
+                return
             except Exception:                   # noqa: BLE001
                 raw = []
             events = _history_only(raw)
@@ -10438,6 +10517,12 @@ class KnoweServer:
                 events = list(by_seq.values())
             sanitize = getattr(eng, "_sanitize_outbound", None)
 
+        try:
+            events = self._protected_http_projection(writer, events, project_id if dm is not None else pid)
+        except ProtectedStorageError:
+            self._history_error(writer, b"409 Conflict", "Protected history unavailable")
+            return
+        # No await/cache write between hydration and the final HTTP serialization.
         # 只留会出现在时间线上的消息：message（agent）+ user_echo（用户）
         events = [e for e in events if e.get("type") in ("message", "user_echo")]
 
@@ -10574,6 +10659,7 @@ class KnoweServer:
         · 事件与 WS 实时事件同构（同一 emit 管线产物），前端走同一 applyEvent 幂等共存；
         · 空增量返回 events: []，前端据此判断「已同步到最新」。
         """
+        from .protected_storage import ProtectedStorageError
         params = parse_qs(query, keep_blank_values=False)
         project_id = unquote((params.get("project_id") or [""])[0]).strip()
         if not project_id:
@@ -10603,6 +10689,12 @@ class KnoweServer:
             )
         except ProjectClosingError as exc:
             self._history_error(writer, b"409 Conflict", str(exc))
+            return
+
+        try:
+            events = self._protected_http_projection(writer, events, pid)
+        except ProtectedStorageError:
+            self._history_error(writer, b"409 Conflict", "Protected history unavailable")
             return
 
         last_seq = events[-1].get("seq", 0) if events else after_seq
