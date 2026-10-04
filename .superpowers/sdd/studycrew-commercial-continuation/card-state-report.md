@@ -114,3 +114,41 @@ backend/tests/test_task_runtime_rereview_round2.py      6416E69539E42297DD10BDA8
 6. Renderer version/digest controls, common runtime/legacy resolution routing, source-backed workflows, end-to-end authenticated command and inert-provider tests remain unimplemented. Legacy unowned cards remain unsupported.
 
 Backend Python Expert and its testing guidance informed validated private contracts, typed denials, synchronous bounded transaction critical sections, real repository fixtures and independent concurrency tests. Existing dataclass conventions were retained without adding a Pydantic dependency solely for this internal boundary. SDD implementer self-review checked completeness, security/lifecycle ordering, minimal scope and meaningful tests; independent task review is still required before dependent integration starts.
+
+## Review fix round 1/5 — I1
+
+Fix base: `40354c7cb2994c1aff9fb0c527f73ba3432c0b99`. Independent review: `reviews/REVIEW-card-state-40354c7.md`, 0 Critical / 1 Important / 1 Minor. This fix addresses Important I1 only; noisy-gate cleanup M1 remains controller-deferred.
+
+Reviewer finding: an absent/ambiguous **incoming** amendment target raised `CardScopeRevoked` before checking the current card/version. `_admission` then irreversibly cleared the valid persisted card while leaving the approval pending and owner waiting. The reviewer's real temporary-repository diagnostic supplied generation `0`, an incorrect digest and nonexistent `gag_00000000000000000000000000000000`; it observed `ciphertext erased: True`, `original remains readable: False`, `owner state: waiting_approval`, and no grant.
+
+Reproduced before production edits with `py -3.12 -m pytest backend/tests/test_bound_cards.py -q -k invalid_incoming_amendment --tb=short`: **3 failed, 94 deselected in 1.53s**. For current, stale and conflicting-key requests, the unchanged-row assertion showed `card_state_ciphertext: None` and `card_invalidated: scope_or_expiry_revoked`. The original RED cases are recorded in `card-state-test-output.txt`.
+
+Fix: `_target` is now a non-destructive input validator raising `CardStateError`. Only `_current`, after authenticating the persisted state, converts an unavailable persisted target into `CardScopeRevoked`. Incoming amendment target binding moved into the runtime transaction after loading the authenticated current card; new request keys check pending ownership and exact generation/digest first. Existing request keys still compare canonical request fingerprints to preserve idempotent retries and reject conflicts. Invalid input cannot enter the lifecycle-erasure branch.
+
+Final added coverage includes nonexistent and ambiguous incoming targets, each with current versions, stale versions and a conflicting key from a real previously successful amendment. Every denial asserts byte-for-byte unchanged approval row (ciphertext and keyed receipts included), unchanged ApprovalRequest and TaskRun, unchanged persisted event journal, no published event, successful reread of the original exact card, and no grant/invocation/continuation/extra run. A separate amendment test proves actual removal of the original persisted target still scrubs the card and grants nothing. Existing duplicate, amendment/approval, revocation and deletion cases remain covered.
+
+Commands/results before final freeze:
+
+```
+py -3.12 -m pytest backend/tests/test_bound_cards.py -q -k 'invalid_incoming_amendment or real_scope_revocation or bounded_receipts or amend_and_exact or approved_retry' --tb=short
+12 passed, 85 deselected in 1.68s
+
+py -3.12 -m pytest backend/tests/test_bound_cards.py backend/tests/test_task_runtime.py backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_deletion_authorization.py backend/tests/test_task_runtime_quarantine_isolation.py -q --tb=short
+209 passed in 43.75s
+
+py -3.12 -m compileall -q backend
+exit 0
+git diff --check
+exit 0
+```
+
+Final frozen command: `py -3.12 -m pytest backend/tests -q`. Actual result: **1722 passed, 5 skipped, 10 subtests passed in 160.41s (0:02:40)**, exit 0. Source/tests were unchanged throughout that run. No frontend source or public contract changed, so the unchanged frontend suite was not repeated, as directed. This fix changes only `bound_cards.py`, its focused tests and the two evidence reports. Controller plan/brief/design/roadmap/ledger changes and user skills remain unstaged by the implementer.
+
+Final SHA-256 fingerprints:
+
+```
+backend/task_runtime/bound_cards.py  74BEAFEA8B6681471C71A744EB4729C58CAF70C450EBECD1F98D6D245AD17042
+backend/tests/test_bound_cards.py   B13FEC7E26048B16D20AEED4EB227EF85E6648D0426954E57926AEA72BAA5EDA
+```
+
+Self-review: the input validator has no lifecycle-erasure exception; only authenticated persisted target/scope revocation reaches invalidation. Version checks precede new-request target binding inside the same real transaction. Existing request canonicalization and idempotent retry semantics are preserved. I1 is implemented and verified; independent scoped re-review must confirm its disposition. No additional scope changes or unresolved implementation blockers were identified.

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from backend.groups import GroupRepository
+from backend.groups import ExpertTemplateConfig, GroupAgent, GroupRepository
 from backend.knowe_rag.crypto import MasterKey
 from backend.task_runtime import TaskRuntimeService
 from backend.task_runtime.bound_cards import CardProposal, CardStateError
@@ -717,3 +717,51 @@ def test_group_agent_opaque_id_exception_does_not_admit_phone_text(text):
     from backend.task_runtime.contracts import assert_public_payload
     with pytest.raises(ValueError, match="PII"):
         assert_public_payload("agent_phase_changed", {"agent_id": text})
+
+
+@pytest.mark.parametrize("request_case", ["current", "stale", "conflicting-key"])
+@pytest.mark.parametrize("invalid_target", ["missing", "ambiguous"])
+def test_invalid_incoming_amendment_preserves_current_card(cards, request_case, invalid_target):
+    groups, group, runtime, run, _ = cards
+    if invalid_target == "ambiguous":
+        experts = [GroupAgent("gag_" + digit * 32, group.group_id, "expert", name,
+            expert=ExpertTemplateConfig(name, "math")) for digit, name in (("1", "One"), ("2", "Two"))]
+        groups.update_roster(group.group_id, [*group.roster, *experts])
+    card = create(cards)
+    if request_case == "conflicting-key":
+        card = runtime.cards.amend(group.group_id, card.approval_id,
+            expected_generation=card.content_generation, expected_digest=card.proposal_digest,
+            proposal=CardProposal("planning", "valid previous amendment"), request_key="previous-amend")
+    before_row = raw_card(runtime, card)
+    before_approval = runtime.store.get_approval(card.approval_id)
+    before_owner = runtime.store.get_run(run.run_id)
+    before_events = runtime.store.events_after(run.run_id, 0)
+    events = []
+    runtime.add_event_listener(events.append)
+    with pytest.raises(CardStateError):
+        runtime.cards.amend(group.group_id, card.approval_id,
+            expected_generation=0 if request_case == "stale" else card.content_generation,
+            expected_digest="0" * 64 if request_case == "stale" else card.proposal_digest,
+            proposal=CardProposal("planning", "invalid incoming text", target_agent_id="gag_" + "0" * 32)
+                if invalid_target == "missing" else CardProposal("expert", "ambiguous incoming target"),
+            request_key="previous-amend" if request_case == "conflicting-key" else "invalid-amend")
+    assert raw_card(runtime, card) == before_row
+    assert runtime.store.get_approval(card.approval_id) == before_approval
+    assert runtime.store.get_run(run.run_id) == before_owner
+    assert runtime.store.events_after(run.run_id, 0) == before_events
+    assert events == []
+    assert runtime.cards.read(group.group_id, card.approval_id) == card
+    assert_no_effect(runtime, card)
+
+
+def test_amendment_still_revokes_when_original_persisted_target_disappears(cards):
+    groups, group, runtime, _, _ = cards
+    card = create(cards)
+    groups.update_roster(group.group_id, [agent for agent in group.roster if agent.role != "planning"])
+    with pytest.raises(CardStateError):
+        runtime.cards.amend(group.group_id, card.approval_id, expected_generation=card.content_generation,
+            expected_digest=card.proposal_digest, proposal=CardProposal("planning", "cannot-resurrect"),
+            request_key="target-removed")
+    assert raw_card(runtime, card)["card_state_ciphertext"] is None
+    assert raw_card(runtime, card)["card_invalidated"] == "scope_or_expiry_revoked"
+    assert_no_effect(runtime, card)

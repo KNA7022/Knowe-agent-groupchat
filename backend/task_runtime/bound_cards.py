@@ -133,7 +133,7 @@ class BoundCardService:
         matches = [agent for agent in group.roster if agent.role == proposal.target_role
                    and (not proposal.target_agent_id or agent.agent_id == proposal.target_agent_id)]
         if len(matches) != 1:
-            raise CardScopeRevoked("card target no longer available or ambiguous")
+            raise CardStateError("card target unavailable or ambiguous")
         return replace(proposal, target_agent_id=matches[0].agent_id)
 
     def _current(self, conn, group: Group, approval_id: str, revision: str):
@@ -156,7 +156,12 @@ class BoundCardService:
             raise CardStateError("card policy envelope mismatch")
         if self.runtime._is_expired(state.expires_at) or state.scope_revision != revision:
             raise CardScopeRevoked("card scope or expiry revoked")
-        self._target(group, state.proposal)
+        try:
+            self._target(group, state.proposal)
+        except CardStateError:
+            # Only the authenticated persisted proposal can revoke this card.
+            # Invalid incoming amendment data is a non-destructive denial.
+            raise CardScopeRevoked("persisted card target no longer available") from None
         allowed = {TaskStatus.WAITING_APPROVAL} if approval.status == "pending" else {TaskStatus.QUEUED, TaskStatus.RUNNING}
         if run.status not in allowed:
             raise CardStateError("card owner is not actionable")
@@ -268,7 +273,6 @@ class BoundCardService:
             if approved is None:
                 if not isinstance(proposal, CardProposal):
                     raise CardStateError("validated card proposal required")
-                proposal = self._target(group, proposal)
             action = "amended" if approved is None else "approved" if approved else "rejected"
             fingerprint = self.repository.digest("mutation", [approval_id, action, expected_generation,
                 expected_digest, asdict(proposal) if proposal else None])
@@ -277,6 +281,7 @@ class BoundCardService:
                 raise CardStateError("card not found in group")
             result = {}
             def guard(conn):
+                nonlocal proposal, fingerprint
                 row = conn.execute("SELECT * FROM studycrew_approvals WHERE approval_id=? AND group_id=?",
                                    (approval_id, group_id)).fetchone()
                 if row is not None and row["card_invalidated"] == "rejected" and approved is False:
@@ -288,14 +293,20 @@ class BoundCardService:
                     raise CardStateError("card rejection request conflict")
                 row, run, current, state = self._current(conn, group, approval_id, revision)
                 result.update(state=state, approval=current)
+                repeated_key = any(receipt.request_key == request_key for receipt in state.receipts)
+                if not repeated_key:
+                    if current.status != "pending" or run.status is not TaskStatus.WAITING_APPROVAL:
+                        raise CardStateError("card is no longer pending")
+                    self._match(state, expected_generation, expected_digest)
+                if approved is None:
+                    proposal = self._target(group, proposal)
+                    fingerprint = self.repository.digest("mutation", [approval_id, action, expected_generation,
+                        expected_digest, asdict(proposal)])
                 if self._duplicate(state, request_key, fingerprint, reserve_resolution=approved is None):
                     return
                 if conn.execute("SELECT 1 FROM studycrew_run_events WHERE run_id=? AND idempotency_key=?",
                     (run.run_id, "card:update:" + approval_id + ":" + request_key)).fetchone():
                     raise CardStateError("card event key has no matching receipt")
-                if current.status != "pending" or run.status is not TaskStatus.WAITING_APPROVAL:
-                    raise CardStateError("card is no longer pending")
-                self._match(state, expected_generation, expected_digest)
                 if conn.execute("SELECT 1 FROM studycrew_permission_grants WHERE approval_id=?", (approval_id,)).fetchone():
                     raise CardStateError("pending card cannot inherit a grant")
                 generation = state.content_generation + (1 if approved is None else 0)

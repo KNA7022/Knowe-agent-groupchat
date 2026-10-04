@@ -173,3 +173,46 @@ py -3.12 -m compileall -q backend
 exit 0 (no diagnostic output)
 git diff --check
 exit 0 (only configured LF-to-CRLF checkout warnings; no whitespace errors)
+
+Review fix round 1/5 — I1 — FIX_BASE 40354c7
+
+Behavior RED before production edits:
+py -3.12 -m pytest backend/tests/test_bound_cards.py -q -k invalid_incoming_amendment --tb=short
+FFF                                                                      [100%]
+Failure in each case: unchanged approval-row assertion observed card_state_ciphertext=None
+and card_invalidated='scope_or_expiry_revoked' instead of the original encrypted row.
+=========================== short test summary info ===========================
+FAILED backend\tests\test_bound_cards.py::test_invalid_incoming_amendment_preserves_current_card[current]
+FAILED backend\tests\test_bound_cards.py::test_invalid_incoming_amendment_preserves_current_card[stale]
+FAILED backend\tests\test_bound_cards.py::test_invalid_incoming_amendment_preserves_current_card[conflicting-key]
+3 failed, 94 deselected in 1.53s
+
+Focused GREEN immediately after production fix:
+py -3.12 -m pytest backend/tests/test_bound_cards.py -q -k 'invalid_incoming_amendment or real_scope_revocation or bounded_receipts or amend_and_exact or approved_retry' --tb=short
+............                                                             [100%]
+12 passed, 85 deselected in 1.68s
+
+Expanded related regression GREEN (including ambiguous targets and persisted-target removal):
+py -3.12 -m pytest backend/tests/test_bound_cards.py backend/tests/test_task_runtime.py backend/tests/test_task_runtime_rereview_round2.py backend/tests/test_task_runtime_deletion_authorization.py backend/tests/test_task_runtime_quarantine_isolation.py -q --tb=short
+........................................................................ [ 34%]
+........................................................................ [ 68%]
+.................................................................        [100%]
+209 passed in 43.75s
+
+Fix static gates:
+py -3.12 -m compileall -q backend
+exit 0
+git diff --check
+exit 0 (existing LF-to-CRLF warnings only)
+
+Fix final frozen full backend command:
+py -3.12 -m pytest backend/tests -q
+
+Actual terminal tail (exit 0):
+........................................................................ [ 83%]
+........................................................................ [ 87%]
+........................................................................ [ 91%]
+........................................................................ [ 95%]
+.............................................................. [ 99%]
+.........                                                                [100%]
+1722 passed, 5 skipped, 10 subtests passed in 160.41s (0:02:40)
