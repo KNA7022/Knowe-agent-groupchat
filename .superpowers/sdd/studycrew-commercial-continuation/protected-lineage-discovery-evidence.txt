@@ -1,0 +1,30 @@
+Discovery only; no tests or production edits.
+Command:
+git branch --show-current; git rev-parse HEAD; git status --short; rg -n 'create_started_run|CompletionAwareTaskRunRepository|commit_success\(run|commit_run\(run|on_run_started=register_active_run|def register_active_run' backend/engine.py backend/worker_gateway_runtime.py backend/knowe_harness/completion.py; git diff --check
+
+Raw output:
+feature/studycrew-foundation
+53efbb109713cbe21635fcfc3fb417238648ae4e
+ M .superpowers/sdd/studycrew-commercial-continuation/progress.md
+ M .superpowers/sdd/studycrew-commercial-continuation/protected-lineage-brief.md
+backend/worker_gateway_runtime.py:350:        def register_active_run(run: TaskRun) -> None:
+backend/worker_gateway_runtime.py:385:            on_run_started=register_active_run,
+backend/knowe_harness/completion.py:1262:    def create_started_run(self, run: TaskRun) -> TaskRun:
+backend/knowe_harness/completion.py:2888:                    self.commit_success(run, record)
+backend/knowe_harness/completion.py:3075:class CompletionAwareTaskRunRepository:
+backend/knowe_harness/completion.py:3093:    def __enter__(self) -> "CompletionAwareTaskRunRepository":
+backend/knowe_harness/completion.py:3103:            return self.store.create_started_run(run)
+backend/knowe_harness/completion.py:3115:                return self.store.create_started_run(run)
+backend/knowe_harness/completion.py:3151:            self.store.commit_run(run, status=selected)
+backend/knowe_harness/completion.py:3210:        return self.store.commit_run(run)
+backend/knowe_harness/completion.py:3321:    "CompletionAwareTaskRunRepository",
+backend/engine.py:37:    CompletionAwareTaskRunRepository,
+backend/engine.py:3240:            return CompletionAwareTaskRunRepository(root, self.completion_store).get(task_id)
+backend/engine.py:3900:            event = self.completion_store.commit_run(run)
+backend/engine.py:4065:                completion, _stored = self.completion_store.commit_success(run, record)
+backend/engine.py:4067:                completion = self.completion_store.commit_run(run)
+backend/engine.py:4103:        event = active or self.completion_store.commit_run(run, status=status)
+warning: in the working copy of '.superpowers/sdd/studycrew-commercial-continuation/progress.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of '.superpowers/sdd/studycrew-commercial-continuation/protected-lineage-brief.md', LF will be replaced by CRLF the next time Git touches it
+
+Exit code: 0
