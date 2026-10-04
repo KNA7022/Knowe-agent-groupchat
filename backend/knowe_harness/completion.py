@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from backend.protected_storage import (StoragePayloads, ProtectedStorageError, protected_id, storage_boundary)
+
 """Completion journal, outbox, decisions, and waiting projection.
 
 The Worker Runtime remains the owner of execution mechanics.  This module is the
@@ -780,7 +782,7 @@ class DecisionEvent:
 
 def _stable_id(prefix: str, *parts: Any, length: int = 24) -> str:
     raw = "\0".join(json_dumps(part) if isinstance(part, (dict, list, tuple)) else str(part) for part in parts)
-    return prefix + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:length]
+    return ("p1_" if any(protected_id(part) for part in parts) else "") + prefix + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:length]
 
 
 def _attempt_id(run: TaskRun) -> str:
@@ -884,8 +886,13 @@ def _gaps_for_run(
     return tuple(gaps)
 
 
-class SQLiteCompletionStore:
+class SQLiteCompletionStore(StoragePayloads):
     """Authoritative CompletionEvent, transactional outbox, and wait/decision store."""
+
+    def _record_id(self, prefix, *parts):
+        if self.protection is not None:
+            return "p1_" + prefix + self.protection.digest("record-id:" + prefix, list(parts))[:32]
+        return _stable_id(prefix, *parts)
 
     def close(self) -> None:
         """Release the authoritative SQLite connection explicitly and idempotently."""
@@ -900,9 +907,12 @@ class SQLiteCompletionStore:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def __init__(self, path: str | Path | SQLiteDatabase) -> None:
+    def __init__(self, path: str | Path | SQLiteDatabase, *, protected=None) -> None:
+        if protected is not None:
+            protected.identity
         self._closed = False
         self.db = path if isinstance(path, SQLiteDatabase) else SQLiteDatabase(path)
+        self.protection = protected.for_store(self.db.path) if protected is not None else None
 
         # A v2 prerelease created ``agent_completion_outcomes_v2`` without
         # ``attempt_id``.  ``CREATE TABLE IF NOT EXISTS`` does not evolve that table,
@@ -1165,7 +1175,7 @@ class SQLiteCompletionStore:
             int(run.version or 0) if sequence is None else int(sequence),
         )
         return TaskJournalEntryV1(
-            journal_entry_id=_stable_id(
+            journal_entry_id=self._record_id(
                 "journal_",
                 run.envelope.task_id,
                 attempt_id,
@@ -1191,8 +1201,7 @@ class SQLiteCompletionStore:
             metadata={"task_run_version": run.version},
         )
 
-    @staticmethod
-    def _insert_journal_entry(conn: Any, entry: TaskJournalEntryV1) -> TaskJournalEntryV1:
+    def _insert_journal_entry(self, conn: Any, entry: TaskJournalEntryV1) -> TaskJournalEntryV1:
         payload = entry.to_dict()
         conn.execute(
             """
@@ -1213,11 +1222,11 @@ class SQLiteCompletionStore:
                 entry.state,
                 entry.runtime_state,
                 1 if entry.terminal else 0,
-                entry.reason,
+                self._scalar(entry.task_id, "reason", entry.reason),
                 entry.heartbeat_at,
                 entry.completion_id,
                 entry.result_id,
-                json_dumps(payload),
+                self._write_payload("task_journal_v1", payload),
             ),
         )
         conn.execute(
@@ -1250,15 +1259,16 @@ class SQLiteCompletionStore:
                 entry.state,
                 entry.runtime_state,
                 1 if entry.terminal else 0,
-                entry.reason,
+                self._scalar(entry.task_id, "reason", entry.reason),
                 entry.heartbeat_at,
                 entry.completion_id,
                 entry.result_id,
-                json_dumps(payload),
+                self._write_payload("task_attempts_v1", payload),
             ),
         )
         return entry
 
+    @storage_boundary
     def create_started_run(self, run: TaskRun) -> TaskRun:
         """Atomically persist the immutable execution input and initial journal states."""
 
@@ -1291,33 +1301,34 @@ class SQLiteCompletionStore:
             self._insert_journal_entry(conn, started)
         return run
 
+    @storage_boundary
     def mark_started(self, run: TaskRun) -> TaskJournalEntryV1:
         entry = self._journal_for_run(run, state="STARTED", terminal=False)
         with self.db.transaction() as conn:
             self._insert_journal_entry(conn, entry)
         return entry
 
+    @storage_boundary
     def record_progress(self, run: TaskRun) -> TaskJournalEntryV1:
         entry = self._journal_for_run(run, terminal=False)
         with self.db.transaction() as conn:
             current = conn.execute(
-                "SELECT payload_json, terminal FROM task_attempts_v1 WHERE task_id=? AND attempt_id=?",
+                "SELECT * FROM task_attempts_v1 WHERE task_id=? AND attempt_id=?",
                 (entry.task_id, entry.attempt_id),
             ).fetchone()
             if current is not None and bool(current["terminal"]):
-                return TaskJournalEntryV1.from_dict(json_loads(current["payload_json"], {}))
+                return TaskJournalEntryV1.from_dict(self._read_payload("task_attempts_v1", current))
             self._insert_journal_entry(conn, entry)
         return entry
 
-    @staticmethod
-    def _insert_task_result(conn: Any, event: CompletionEvent) -> TaskResultV1:
+    def _insert_task_result(self, conn: Any, event: CompletionEvent) -> TaskResultV1:
         result = TaskResultV1.from_completion(event)
         existing = conn.execute(
-            "SELECT payload_json FROM task_results_v1 WHERE completion_id=?",
+            "SELECT * FROM task_results_v1 WHERE completion_id=?",
             (event.completion_id,),
         ).fetchone()
         if existing is not None:
-            return TaskResultV1.from_dict(json_loads(existing["payload_json"], {}))
+            return TaskResultV1.from_dict(self._read_payload("task_results_v1", existing))
         conn.execute(
             """
             INSERT INTO task_results_v1(
@@ -1336,15 +1347,16 @@ class SQLiteCompletionStore:
                 result.status.value,
                 1 if result.terminal else 0,
                 result.created_at,
-                json_dumps(result.to_dict()),
+                self._write_payload("task_results_v1", result.to_dict()),
             ),
         )
         return result
 
     @staticmethod
     def _ensure_runtime_tables(conn: Any) -> None:
-        conn.executescript(
-            """
+        # executescript implicitly commits a pending sqlite3 transaction. Execute
+        # the fixed DDL statements individually so completion rollback stays atomic.
+        script = """
             CREATE TABLE IF NOT EXISTS task_runs (
                 task_id TEXT PRIMARY KEY,
                 run_id TEXT NOT NULL UNIQUE,
@@ -1377,7 +1389,9 @@ class SQLiteCompletionStore:
                 FOREIGN KEY(delivery_id) REFERENCES deliveries(delivery_id) ON DELETE CASCADE
             );
             """
-        )
+        for statement in script.split(";"):
+            if statement.strip():
+                conn.execute(statement)
 
     def _insert_outbox(
         self,
@@ -1390,7 +1404,7 @@ class SQLiteCompletionStore:
         task_result = result or TaskResultV1.from_completion(event)
         for kind in kinds:
             route_key = self.route_key(event, kind)
-            outbox_id = _stable_id("out_", event.completion_id, kind.value, route_key)
+            outbox_id = self._record_id("out_", event.completion_id, kind.value, route_key)
             entry = OutboxEntry(
                 outbox_id=outbox_id,
                 completion_id=event.completion_id,
@@ -1429,8 +1443,8 @@ class SQLiteCompletionStore:
                     entry.route_key,
                     entry.state.value,
                     entry.attempts,
-                    entry.last_error,
-                    json_dumps(entry.to_dict()),
+                    self._scalar(entry.outbox_id, "last_error", entry.last_error),
+                    self._write_payload("completion_outbox_v2", entry.to_dict()),
                     entry.created_at,
                     entry.updated_at,
                 ),
@@ -1446,7 +1460,7 @@ class SQLiteCompletionStore:
 
         result = self._insert_task_result(conn, event)
         journal = TaskJournalEntryV1(
-            journal_entry_id=_stable_id(
+            journal_entry_id=self._record_id(
                 "journal_",
                 event.task_id,
                 event.attempt_id,
@@ -1509,11 +1523,11 @@ class SQLiteCompletionStore:
 
     def _insert_event(self, conn: Any, event: CompletionEvent) -> CompletionEvent:
         existing = conn.execute(
-            "SELECT payload_json FROM completion_events_v2 WHERE idempotency_key=?",
+            "SELECT * FROM completion_events_v2 WHERE idempotency_key=?",
             (event.idempotency_key,),
         ).fetchone()
         if existing is not None:
-            stored = CompletionEvent.from_dict(json_loads(existing["payload_json"], {}))
+            stored = CompletionEvent.from_dict(self._read_payload("completion_events_v2", existing))
             try:
                 assert_provenance_matches(stored.provenance, event.provenance, context="CompletionEvent replay")
             except ValueError as exc:
@@ -1523,7 +1537,7 @@ class SQLiteCompletionStore:
 
         active = conn.execute(
             """
-            SELECT payload_json FROM completion_events_v2
+            SELECT * FROM completion_events_v2
              WHERE task_id=? AND attempt_id=? AND active=1
              LIMIT 1
             """,
@@ -1531,7 +1545,7 @@ class SQLiteCompletionStore:
         ).fetchone()
         supersedes = event.supersedes_completion_id
         if active is not None:
-            active_event = CompletionEvent.from_dict(json_loads(active["payload_json"], {}))
+            active_event = CompletionEvent.from_dict(self._read_payload("completion_events_v2", active))
             if active_event.run_id == event.run_id and active_event.status == event.status:
                 self._ensure_result_commit(conn, active_event)
                 return active_event
@@ -1544,7 +1558,7 @@ class SQLiteCompletionStore:
             old_payload["active"] = False
             conn.execute(
                 "UPDATE completion_events_v2 SET payload_json=? WHERE completion_id=?",
-                (json_dumps(old_payload), active_event.completion_id),
+                (self._write_payload("completion_events_v2", old_payload), active_event.completion_id),
             )
             if (
                 active_event.status is CompletionStatus.WAITING
@@ -1558,7 +1572,7 @@ class SQLiteCompletionStore:
 
         effective = replace(event, supersedes_completion_id=supersedes)
         payload = effective.to_dict()
-        provenance = provenance_sql_values(effective.provenance)
+        provenance = self._provenance(effective.task_id, effective.provenance)
         conn.execute(
             """
             INSERT INTO completion_events_v2(
@@ -1586,7 +1600,7 @@ class SQLiteCompletionStore:
                 effective.rollback_of_completion_id or None,
                 effective.retry_of_completion_id or None,
                 effective.created_at,
-                json_dumps(payload),
+                self._write_payload("completion_events_v2", payload),
                 *provenance,
             ),
         )
@@ -1597,13 +1611,13 @@ class SQLiteCompletionStore:
         if effective.status is not CompletionStatus.WAITING:
             rows = conn.execute(
                 """
-                SELECT wait_token_id, payload_json FROM wait_tokens_v2
+                SELECT * FROM wait_tokens_v2
                  WHERE task_id=? AND attempt_id=? AND status IN ('open','resuming')
                 """,
                 (effective.task_id, effective.attempt_id),
             ).fetchall()
             for row in rows:
-                token = WaitToken.from_dict(json_loads(row["payload_json"], {}))
+                token = WaitToken.from_dict(self._read_payload("wait_tokens_v2", row))
                 closed = replace(
                     token,
                     status=(
@@ -1619,7 +1633,7 @@ class SQLiteCompletionStore:
                        SET status=?, updated_at=?, payload_json=?
                      WHERE wait_token_id=?
                     """,
-                    (closed.status, closed.updated_at, json_dumps(closed.to_dict()), closed.wait_token_id),
+                    (closed.status, closed.updated_at, self._write_payload("wait_tokens_v2", closed.to_dict()), closed.wait_token_id),
                 )
         self._ensure_result_commit(conn, effective)
         return effective
@@ -1631,7 +1645,7 @@ class SQLiteCompletionStore:
     ) -> None:
         """Persist one idempotent Worker/Agent stop projection in the same transaction."""
 
-        outcome_id = _stable_id("aco_", event.completion_id)
+        outcome_id = self._record_id("aco_", event.completion_id)
         payload = {
             "schema_version": "knowe.harness.agent-completion-outcome.v2",
             "outcome_id": outcome_id,
@@ -1650,7 +1664,7 @@ class SQLiteCompletionStore:
             "created_at": event.created_at,
             "provenance": dict(event.provenance),
         }
-        provenance = provenance_sql_values(event.provenance)
+        provenance = self._provenance(event.task_id, event.provenance)
         conn.execute(
             """
             INSERT OR IGNORE INTO agent_completion_outcomes_v2(
@@ -1670,16 +1684,15 @@ class SQLiteCompletionStore:
                 event.project_id,
                 event.worker_id,
                 event.status.value,
-                event.terminal_reason,
+                self._scalar(event.task_id, "terminal_reason", event.terminal_reason),
                 event.created_at,
-                json_dumps(payload),
+                self._write_payload("agent_completion_outcomes_v2", payload),
                 *provenance,
             ),
         )
 
-    @staticmethod
     def _resolve_wait_rows(
-        conn: Any,
+        self, conn: Any,
         *,
         completion_id: str,
         status: str,
@@ -1691,12 +1704,12 @@ class SQLiteCompletionStore:
         """
 
         rows = conn.execute(
-            "SELECT wait_token_id, payload_json FROM wait_tokens_v2 WHERE completion_id=?",
+            "SELECT * FROM wait_tokens_v2 WHERE completion_id=?",
             (completion_id,),
         ).fetchall()
         now = utc_now()
         for row in rows:
-            token = WaitToken.from_dict(json_loads(row["payload_json"], {}))
+            token = WaitToken.from_dict(self._read_payload("wait_tokens_v2", row))
             if token.status not in {"open", "resuming"}:
                 continue
             updated = replace(token, status=status, updated_at=now)
@@ -1706,17 +1719,17 @@ class SQLiteCompletionStore:
                    SET status=?, updated_at=?, payload_json=?
                  WHERE wait_token_id=?
                 """,
-                (status, now, json_dumps(updated.to_dict()), token.wait_token_id),
+                (status, now, self._write_payload("wait_tokens_v2", updated.to_dict()), token.wait_token_id),
             )
 
     def _upsert_task_run(self, conn: Any, run: TaskRun) -> None:
         self._ensure_runtime_tables(conn)
-        payload = json_dumps(run.to_dict())
+        payload = self._write_payload("task_runs", run.to_dict())
         row = conn.execute(
-            "SELECT run_id, version, payload_json FROM task_runs WHERE task_id=?",
+            "SELECT * FROM task_runs WHERE task_id=?",
             (run.envelope.task_id,),
         ).fetchone()
-        provenance = provenance_sql_values(run.provenance)
+        provenance = self._provenance(run.envelope.task_id, run.provenance)
         # Columns can be absent when this store is created before the regular repository.
         columns = {str(item[1]) for item in conn.execute("PRAGMA table_info(task_runs)").fetchall()}
         for name, definition in PROVENANCE_COLUMN_DEFS.items():
@@ -1747,7 +1760,7 @@ class SQLiteCompletionStore:
             raise CompletionConflict(
                 f"task {run.envelope.task_id} currently belongs to run {row['run_id']}, not {run.run_id}"
             )
-        stored = TaskRun.from_dict(json_loads(row["payload_json"], {}))
+        stored = TaskRun.from_dict(self._read_payload("task_runs", row))
         try:
             assert_provenance_matches(stored.provenance, run.provenance, context="CompletionEvent/TaskRun")
         except ValueError as exc:
@@ -1782,26 +1795,26 @@ class SQLiteCompletionStore:
             if name not in columns:
                 conn.execute(f"ALTER TABLE deliveries ADD COLUMN {name} {definition}")
         existing = conn.execute(
-            "SELECT payload_json FROM deliveries WHERE idempotency_key=?",
+            "SELECT * FROM deliveries WHERE idempotency_key=?",
             (record.idempotency_key,),
         ).fetchone()
         if existing is not None:
-            stored = DeliveryRecord.from_dict(json_loads(existing["payload_json"], {}))
+            stored = DeliveryRecord.from_dict(self._read_payload("deliveries", existing))
             try:
                 assert_provenance_matches(stored.provenance, record.provenance, context="Delivery replay")
             except ValueError as exc:
                 raise CompletionConflict(str(exc)) from exc
             return stored
         other = conn.execute(
-            "SELECT payload_json FROM deliveries WHERE task_id=? AND run_id=?",
+            "SELECT * FROM deliveries WHERE task_id=? AND run_id=?",
             (record.task_id, record.run_id),
         ).fetchone()
         if other is not None:
-            stored = DeliveryRecord.from_dict(json_loads(other["payload_json"], {}))
+            stored = DeliveryRecord.from_dict(self._read_payload("deliveries", other))
             if stored.idempotency_key != record.idempotency_key:
                 raise CompletionConflict(f"run {record.run_id} already committed a different delivery")
             return stored
-        provenance = provenance_sql_values(record.provenance)
+        provenance = self._provenance(record.task_id, record.provenance)
         conn.execute(
             """
             INSERT INTO deliveries(
@@ -1819,7 +1832,7 @@ class SQLiteCompletionStore:
                 record.project_id,
                 record.state.value,
                 record.created_at,
-                json_dumps(record.to_dict()),
+                self._write_payload("deliveries", record.to_dict()),
                 *provenance,
             ),
         )
@@ -1848,14 +1861,14 @@ class SQLiteCompletionStore:
         # the active-lineage unique index or silently creating a new task.
         prior_row = conn.execute(
             """
-            SELECT payload_json FROM wait_tokens_v2
+            SELECT * FROM wait_tokens_v2
              WHERE task_id=? AND attempt_id=? AND status IN ('open','resuming')
              ORDER BY updated_at DESC LIMIT 1
             """,
             (event.task_id, event.attempt_id),
         ).fetchone()
         if prior_row is not None:
-            prior = WaitToken.from_dict(json_loads(prior_row["payload_json"], {}))
+            prior = WaitToken.from_dict(self._read_payload("wait_tokens_v2", prior_row))
             updated = replace(
                 prior,
                 completion_id=event.completion_id,
@@ -1879,17 +1892,17 @@ class SQLiteCompletionStore:
                     updated.completion_id,
                     updated.run_id,
                     updated.status,
-                    updated.question,
-                    json_dumps(list(updated.dependencies)),
-                    updated.answer,
-                    updated.answer_ref,
+                    self._scalar(updated.task_id, "question", updated.question),
+                    self._scalar(updated.task_id, "dependencies_json", json_dumps(list(updated.dependencies))),
+                    self._scalar(updated.task_id, "answer", updated.answer),
+                    self._scalar(updated.task_id, "answer_ref", updated.answer_ref),
                     updated.updated_at,
-                    json_dumps(updated.to_dict()),
+                    self._write_payload("wait_tokens_v2", updated.to_dict()),
                     updated.wait_token_id,
                 ),
             )
             return updated
-        token_id = _stable_id("wait_", event.task_id, event.attempt_id, event.completion_id)
+        token_id = self._record_id("wait_", event.task_id, event.attempt_id, event.completion_id)
         token = WaitToken(
             wait_token_id=token_id,
             completion_id=event.completion_id,
@@ -1902,7 +1915,7 @@ class SQLiteCompletionStore:
             dependencies=tuple(x for x in (event.dependency,) if x),
             provenance=event.provenance,
         )
-        provenance = provenance_sql_values(token.provenance)
+        provenance = self._provenance(token.task_id, token.provenance)
         conn.execute(
             """
             INSERT OR IGNORE INTO wait_tokens_v2(
@@ -1922,13 +1935,13 @@ class SQLiteCompletionStore:
                 token.project_id,
                 token.worker_id,
                 token.status,
-                token.question,
-                json_dumps(list(token.dependencies)),
-                token.answer,
-                token.answer_ref,
+                self._scalar(token.task_id, "question", token.question),
+                self._scalar(token.task_id, "dependencies_json", json_dumps(list(token.dependencies))),
+                self._scalar(token.task_id, "answer", token.answer),
+                self._scalar(token.task_id, "answer_ref", token.answer_ref),
                 token.created_at,
                 token.updated_at,
-                json_dumps(token.to_dict()),
+                self._write_payload("wait_tokens_v2", token.to_dict()),
                 *provenance,
             ),
         )
@@ -2103,7 +2116,7 @@ class SQLiteCompletionStore:
         metadata: Mapping[str, Any] | None = None,
     ) -> CompletionEvent:
         attempt = _attempt_id(run)
-        base_key = idempotency_key or _stable_id(
+        base_key = idempotency_key or self._record_id(
             "cmpkey_",
             run.envelope.task_id,
             attempt,
@@ -2112,7 +2125,7 @@ class SQLiteCompletionStore:
             run.version,
             run.terminal_reason,
         )
-        completion_id = _stable_id("cmp_", base_key)
+        completion_id = self._record_id("cmp_", base_key)
         event = CompletionEvent(
             completion_id=completion_id,
             idempotency_key=base_key,
@@ -2192,6 +2205,7 @@ class SQLiteCompletionStore:
         )
         return event
 
+    @storage_boundary
     def commit_success(
         self,
         staged_run: TaskRun,
@@ -2199,6 +2213,12 @@ class SQLiteCompletionStore:
         *,
         manifest: Sequence[Mapping[str, Any]] | None = None,
     ) -> tuple[CompletionEvent, DeliveryRecord]:
+        if protected_id(staged_run.envelope.task_id):
+            if self.protection is None:
+                raise ProtectedStorageError("protected repository capability required")
+            self.protection.validate_envelope(staged_run.envelope.to_dict())
+            if record.artifacts or manifest:
+                raise ProtectedStorageError("protected file artifacts are unavailable")
         rows = tuple(manifest or self.manifest_for_task(
             staged_run.envelope.task_id,
             delivery_artifacts=record.artifacts,
@@ -2220,6 +2240,7 @@ class SQLiteCompletionStore:
             self._insert_agent_completion_outcome(conn, stored_event)
         return stored_event, stored_record
 
+    @storage_boundary
     def commit_run(
         self,
         run: TaskRun,
@@ -2228,6 +2249,12 @@ class SQLiteCompletionStore:
         manifest: Sequence[Mapping[str, Any]] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> CompletionEvent:
+        if protected_id(run.envelope.task_id):
+            if self.protection is None:
+                raise ProtectedStorageError("protected repository capability required")
+            self.protection.validate_envelope(run.envelope.to_dict())
+            if manifest:
+                raise ProtectedStorageError("protected file artifacts are unavailable")
         selected = status or CompletionStatus.from_run(run)
         run.set_completion_status(selected.value)
         if run.state is TaskState.RUNNING:
@@ -2272,7 +2299,7 @@ class SQLiteCompletionStore:
         retry_of_completion_id: str = "",
     ) -> CompletionEvent:
         status = CompletionStatus(status)
-        key = _stable_id(
+        key = self._record_id(
             "cmpkey_",
             prior.completion_id,
             status.value,
@@ -2281,7 +2308,7 @@ class SQLiteCompletionStore:
             metadata or {},
         )
         event = CompletionEvent(
-            completion_id=_stable_id("cmp_", key),
+            completion_id=self._record_id("cmp_", key),
             idempotency_key=key,
             task_id=prior.task_id,
             attempt_id=prior.attempt_id,
@@ -2316,6 +2343,7 @@ class SQLiteCompletionStore:
             raise CompletionConflict("PARTIAL requires an ArtifactManifest")
         return event
 
+    @storage_boundary
     def transition_completion(
         self,
         prior: CompletionEvent,
@@ -2346,6 +2374,7 @@ class SQLiteCompletionStore:
                 )
         return stored
 
+    @storage_boundary
     def transition_with_decision(
         self,
         prior: CompletionEvent,
@@ -2393,14 +2422,16 @@ class SQLiteCompletionStore:
                 )
         return stored, stored_decision
 
+    @storage_boundary
     def get(self, completion_id: str) -> CompletionEvent | None:
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
-                "SELECT payload_json FROM completion_events_v2 WHERE completion_id=?",
+                "SELECT * FROM completion_events_v2 WHERE completion_id=?",
                 (completion_id,),
             ).fetchone()
-        return None if row is None else CompletionEvent.from_dict(json_loads(row["payload_json"], {}))
+        return None if row is None else CompletionEvent.from_dict(self._read_payload("completion_events_v2", row))
 
+    @storage_boundary
     def active_for(self, task_id: str, attempt_id: str | None = None) -> CompletionEvent | None:
         params: list[Any] = [task_id]
         clause = "task_id=? AND active=1"
@@ -2409,21 +2440,23 @@ class SQLiteCompletionStore:
             params.append(attempt_id)
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
-                f"SELECT payload_json FROM completion_events_v2 WHERE {clause} ORDER BY created_at DESC LIMIT 1",
+                f"SELECT * FROM completion_events_v2 WHERE {clause} ORDER BY created_at DESC LIMIT 1",
                 tuple(params),
             ).fetchone()
-        return None if row is None else CompletionEvent.from_dict(json_loads(row["payload_json"], {}))
+        return None if row is None else CompletionEvent.from_dict(self._read_payload("completion_events_v2", row))
 
+    @storage_boundary
     def list_for_task(self, task_id: str) -> tuple[CompletionEvent, ...]:
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(
-                "SELECT payload_json FROM completion_events_v2 WHERE task_id=? ORDER BY created_at, completion_id",
+                "SELECT * FROM completion_events_v2 WHERE task_id=? ORDER BY created_at, completion_id",
                 (task_id,),
             ).fetchall()
-        return tuple(CompletionEvent.from_dict(json_loads(row["payload_json"], {})) for row in rows)
+        return tuple(CompletionEvent.from_dict(self._read_payload("completion_events_v2", row)) for row in rows)
 
+    @storage_boundary
     def list_active(self, *, project_id: str = "") -> tuple[CompletionEvent, ...]:
-        query = "SELECT payload_json FROM completion_events_v2 WHERE active=1"
+        query = "SELECT * FROM completion_events_v2 WHERE active=1"
         params: tuple[Any, ...] = ()
         if project_id:
             query += " AND project_id=?"
@@ -2431,8 +2464,9 @@ class SQLiteCompletionStore:
         query += " ORDER BY created_at, completion_id"
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(query, params).fetchall()
-        return tuple(CompletionEvent.from_dict(json_loads(row["payload_json"], {})) for row in rows)
+        return tuple(CompletionEvent.from_dict(self._read_payload("completion_events_v2", row)) for row in rows)
 
+    @storage_boundary
     def task_result(
         self,
         *,
@@ -2447,7 +2481,7 @@ class SQLiteCompletionStore:
         with self.db.transaction(immediate=False) as conn:
             if completion_id:
                 row = conn.execute(
-                    "SELECT payload_json FROM task_results_v1 WHERE completion_id=?",
+                    "SELECT * FROM task_results_v1 WHERE completion_id=?",
                     (completion_id,),
                 ).fetchone()
             else:
@@ -2458,7 +2492,7 @@ class SQLiteCompletionStore:
                     params.append(attempt_id)
                 row = conn.execute(
                     f"""
-                    SELECT r.payload_json
+                    SELECT r.*
                       FROM completion_events_v2 c
                       JOIN task_results_v1 r ON r.completion_id=c.completion_id
                      WHERE {clause}
@@ -2467,8 +2501,9 @@ class SQLiteCompletionStore:
                     """,
                     tuple(params),
                 ).fetchone()
-        return None if row is None else TaskResultV1.from_dict(json_loads(row["payload_json"], {}))
+        return None if row is None else TaskResultV1.from_dict(self._read_payload("task_results_v1", row))
 
+    @storage_boundary
     def journal_for(self, task_id: str, attempt_id: str = "") -> tuple[TaskJournalEntryV1, ...]:
         params: list[Any] = [str(task_id)]
         clause = "task_id=?"
@@ -2478,24 +2513,26 @@ class SQLiteCompletionStore:
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(
                 f"""
-                SELECT payload_json FROM task_journal_v1
+                SELECT * FROM task_journal_v1
                  WHERE {clause}
                  ORDER BY sequence, heartbeat_at, journal_entry_id
                 """,
                 tuple(params),
             ).fetchall()
-        return tuple(TaskJournalEntryV1.from_dict(json_loads(row["payload_json"], {})) for row in rows)
+        return tuple(TaskJournalEntryV1.from_dict(self._read_payload("task_journal_v1", row)) for row in rows)
 
+    @storage_boundary
     def attempt_snapshot(self, task_id: str, attempt_id: str) -> TaskJournalEntryV1 | None:
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
-                "SELECT payload_json FROM task_attempts_v1 WHERE task_id=? AND attempt_id=?",
+                "SELECT * FROM task_attempts_v1 WHERE task_id=? AND attempt_id=?",
                 (str(task_id), str(attempt_id)),
             ).fetchone()
-        return None if row is None else TaskJournalEntryV1.from_dict(json_loads(row["payload_json"], {}))
+        return None if row is None else TaskJournalEntryV1.from_dict(self._read_payload("task_attempts_v1", row))
 
+    @storage_boundary
     def active_attempts(self, *, worker_id: str = "", project_id: str = "") -> tuple[TaskJournalEntryV1, ...]:
-        query = "SELECT payload_json FROM task_attempts_v1 WHERE terminal=0"
+        query = "SELECT * FROM task_attempts_v1 WHERE terminal=0"
         params: list[Any] = []
         if worker_id:
             query += " AND worker_id=?"
@@ -2506,8 +2543,9 @@ class SQLiteCompletionStore:
         query += " ORDER BY heartbeat_at, task_id, attempt_id"
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(query, tuple(params)).fetchall()
-        return tuple(TaskJournalEntryV1.from_dict(json_loads(row["payload_json"], {})) for row in rows)
+        return tuple(TaskJournalEntryV1.from_dict(self._read_payload("task_attempts_v1", row)) for row in rows)
 
+    @storage_boundary
     def worker_idle(self, worker_id: str) -> bool:
         """Return whether no queued/started/running attempt currently owns the Worker.
 
@@ -2527,6 +2565,7 @@ class SQLiteCompletionStore:
             ).fetchone()
         return row is None
 
+    @storage_boundary
     def pending_outbox(self, *, limit: int = 100, include_failed: bool = True) -> tuple[OutboxEntry, ...]:
         states = (OutboxState.PENDING.value, OutboxState.PROCESSING.value)
         if include_failed:
@@ -2535,7 +2574,7 @@ class SQLiteCompletionStore:
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(
                 f"""
-                SELECT payload_json FROM completion_outbox_v2
+                SELECT * FROM completion_outbox_v2
                  WHERE state IN ({placeholders})
                  ORDER BY CASE projection_kind
                             WHEN 'task_state' THEN 0
@@ -2550,18 +2589,19 @@ class SQLiteCompletionStore:
                 """,
                 (*states, max(1, min(int(limit), 10_000))),
             ).fetchall()
-        return tuple(OutboxEntry.from_dict(json_loads(row["payload_json"], {})) for row in rows)
+        return tuple(OutboxEntry.from_dict(self._read_payload("completion_outbox_v2", row)) for row in rows)
 
+    @storage_boundary
     def claim_outbox(self, outbox_id: str) -> OutboxEntry | None:
         now = utc_now()
         with self.db.transaction() as conn:
             row = conn.execute(
-                "SELECT payload_json FROM completion_outbox_v2 WHERE outbox_id=?",
+                "SELECT * FROM completion_outbox_v2 WHERE outbox_id=?",
                 (outbox_id,),
             ).fetchone()
             if row is None:
                 return None
-            current = OutboxEntry.from_dict(json_loads(row["payload_json"], {}))
+            current = OutboxEntry.from_dict(self._read_payload("completion_outbox_v2", row))
             if current.state is OutboxState.DELIVERED:
                 return current
             updated = replace(
@@ -2579,14 +2619,15 @@ class SQLiteCompletionStore:
                 (
                     updated.state.value,
                     updated.attempts,
-                    updated.last_error,
-                    json_dumps(updated.to_dict()),
+                    self._scalar(updated.outbox_id, "last_error", updated.last_error),
+                    self._write_payload("completion_outbox_v2", updated.to_dict()),
                     updated.updated_at,
                     updated.outbox_id,
                 ),
             )
             return updated
 
+    @storage_boundary
     def acknowledge_outbox(
         self,
         outbox_id: str,
@@ -2598,15 +2639,16 @@ class SQLiteCompletionStore:
         payload = dict(effect_payload or {})
         with self.db.transaction() as conn:
             row = conn.execute(
-                "SELECT payload_json FROM completion_outbox_v2 WHERE outbox_id=?",
+                "SELECT * FROM completion_outbox_v2 WHERE outbox_id=?",
                 (outbox_id,),
             ).fetchone()
             if row is None:
                 raise KeyError(outbox_id)
-            current = OutboxEntry.from_dict(json_loads(row["payload_json"], {}))
+            current = OutboxEntry.from_dict(self._read_payload("completion_outbox_v2", row))
             updated = replace(current, state=OutboxState.DELIVERED, last_error="", updated_at=now)
-            effect_id = _stable_id("effect_", current.completion_id, current.projection_kind.value, current.route_key)
-            effect_sha = hashlib.sha256(json_dumps(payload).encode("utf-8")).hexdigest()
+            effect_id = self._record_id("effect_", current.completion_id, current.projection_kind.value, current.route_key)
+            effect_sha = (self.protection.digest("effect", payload) if protected_id(outbox_id) and self.protection is not None
+                          else hashlib.sha256(json_dumps(payload).encode("utf-8")).hexdigest())
             conn.execute(
                 """
                 INSERT OR IGNORE INTO completion_projection_receipts_v2(
@@ -2619,9 +2661,9 @@ class SQLiteCompletionStore:
                     current.outbox_id,
                     current.completion_id,
                     current.projection_kind.value,
-                    str(effect_ref),
+                    self._scalar(outbox_id, "effect_ref", str(effect_ref)),
                     effect_sha,
-                    json_dumps(payload),
+                    self._write_payload("completion_projection_receipts_v2", payload, identity=effect_id, clear={"effect_id": effect_id, "completion_id": current.completion_id, "outbox_id": outbox_id, "projection_kind": current.projection_kind.value, "effect_ref": str(effect_ref)}),
                     now,
                 ),
             )
@@ -2634,27 +2676,29 @@ class SQLiteCompletionStore:
             )
         return updated
 
+    @storage_boundary
     def fail_outbox(self, outbox_id: str, error: BaseException | str) -> OutboxEntry:
         now = utc_now()
         message = str(error)[:4000]
         with self.db.transaction() as conn:
             row = conn.execute(
-                "SELECT payload_json FROM completion_outbox_v2 WHERE outbox_id=?",
+                "SELECT * FROM completion_outbox_v2 WHERE outbox_id=?",
                 (outbox_id,),
             ).fetchone()
             if row is None:
                 raise KeyError(outbox_id)
-            current = OutboxEntry.from_dict(json_loads(row["payload_json"], {}))
+            current = OutboxEntry.from_dict(self._read_payload("completion_outbox_v2", row))
             updated = replace(current, state=OutboxState.FAILED, last_error=message, updated_at=now)
             conn.execute(
                 """
                 UPDATE completion_outbox_v2
                    SET state=?, last_error=?, payload_json=?, updated_at=? WHERE outbox_id=?
                 """,
-                (updated.state.value, message, json_dumps(updated.to_dict()), now, outbox_id),
+                (updated.state.value, self._scalar(outbox_id, "last_error", message), self._write_payload("completion_outbox_v2", updated.to_dict()), now, outbox_id),
             )
         return updated
 
+    @storage_boundary
     def projection_receipt(self, outbox_id: str) -> dict[str, Any] | None:
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
@@ -2665,31 +2709,34 @@ class SQLiteCompletionStore:
             return None
         return {
             "effect_id": str(row["effect_id"]),
-            "effect_ref": str(row["effect_ref"]),
+            "effect_ref": (self.protection.open("completion_projection_receipts_v2", row["effect_id"], row["payload_json"])["query"]["effect_ref"]
+                           if protected_id(row["effect_id"]) and self.protection is not None else str(row["effect_ref"])),
             "effect_sha256": str(row["effect_sha256"]),
-            "payload": json_loads(row["payload_json"], {}),
+            "payload": self._read_payload("completion_projection_receipts_v2", row),
             "created_at": str(row["created_at"]),
         }
 
+    @storage_boundary
     def active_wait_for_completion(self, completion_id: str) -> WaitToken | None:
         """Return the open/resuming wait token for one exact CompletionEvent."""
 
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
                 """
-                SELECT payload_json FROM wait_tokens_v2
+                SELECT * FROM wait_tokens_v2
                  WHERE completion_id=? AND status IN ('open','resuming')
                  ORDER BY updated_at DESC LIMIT 1
                 """,
                 (completion_id,),
             ).fetchone()
-        return None if row is None else WaitToken.from_dict(json_loads(row["payload_json"], {}))
+        return None if row is None else WaitToken.from_dict(self._read_payload("wait_tokens_v2", row))
 
+    @storage_boundary
     def active_wait_for_task(self, task_id: str, *, worker_id: str = "") -> WaitToken | None:
         """Return the open/resuming wait token for one exact task lineage."""
 
         query = (
-            "SELECT payload_json FROM wait_tokens_v2 "
+            "SELECT * FROM wait_tokens_v2 "
             "WHERE task_id=? AND status IN ('open','resuming')"
         )
         params: tuple[Any, ...] = (task_id,)
@@ -2699,16 +2746,18 @@ class SQLiteCompletionStore:
         query += " ORDER BY updated_at DESC LIMIT 1"
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(query, params).fetchone()
-        return None if row is None else WaitToken.from_dict(json_loads(row["payload_json"], {}))
+        return None if row is None else WaitToken.from_dict(self._read_payload("wait_tokens_v2", row))
 
+    @storage_boundary
     def get_wait_token(self, wait_token_id: str) -> WaitToken | None:
         with self.db.transaction(immediate=False) as conn:
             row = conn.execute(
-                "SELECT payload_json FROM wait_tokens_v2 WHERE wait_token_id=?",
+                "SELECT * FROM wait_tokens_v2 WHERE wait_token_id=?",
                 (wait_token_id,),
             ).fetchone()
-        return None if row is None else WaitToken.from_dict(json_loads(row["payload_json"], {}))
+        return None if row is None else WaitToken.from_dict(self._read_payload("wait_tokens_v2", row))
 
+    @storage_boundary
     def resume_wait(
         self,
         wait_token_id: str,
@@ -2724,12 +2773,12 @@ class SQLiteCompletionStore:
         now = utc_now()
         with self.db.transaction() as conn:
             row = conn.execute(
-                "SELECT payload_json FROM wait_tokens_v2 WHERE wait_token_id=?",
+                "SELECT * FROM wait_tokens_v2 WHERE wait_token_id=?",
                 (wait_token_id,),
             ).fetchone()
             if row is None:
                 raise KeyError(wait_token_id)
-            token = WaitToken.from_dict(json_loads(row["payload_json"], {}))
+            token = WaitToken.from_dict(self._read_payload("wait_tokens_v2", row))
             if token.status == "resolved":
                 return token
             if token.status not in {"open", "resuming"}:
@@ -2750,15 +2799,15 @@ class SQLiteCompletionStore:
                 """,
                 (
                     updated.status,
-                    updated.answer,
-                    updated.answer_ref,
+                    self._scalar(updated.task_id, "answer", updated.answer),
+                    self._scalar(updated.task_id, "answer_ref", updated.answer_ref),
                     updated.updated_at,
-                    json_dumps(updated.to_dict()),
+                    self._write_payload("wait_tokens_v2", updated.to_dict()),
                     wait_token_id,
                 ),
             )
             decision = DecisionEvent(
-                decision_id=_stable_id("dec_", wait_token_id, updated.answer, actor),
+                decision_id=self._record_id("dec_", wait_token_id, updated.answer, actor),
                 decision_type=DecisionType.DEPENDENCY_PROVIDED,
                 project_id=updated.project_id,
                 actor=actor,
@@ -2776,25 +2825,27 @@ class SQLiteCompletionStore:
             self._insert_decision(conn, decision)
         return updated
 
+    @storage_boundary
     def resolve_wait(self, wait_token_id: str, *, status: str = "resolved") -> WaitToken:
         if status not in {"resolved", "cancelled", "superseded"}:
             raise ValueError(status)
         now = utc_now()
         with self.db.transaction() as conn:
             row = conn.execute(
-                "SELECT payload_json FROM wait_tokens_v2 WHERE wait_token_id=?",
+                "SELECT * FROM wait_tokens_v2 WHERE wait_token_id=?",
                 (wait_token_id,),
             ).fetchone()
             if row is None:
                 raise KeyError(wait_token_id)
-            token = WaitToken.from_dict(json_loads(row["payload_json"], {}))
+            token = WaitToken.from_dict(self._read_payload("wait_tokens_v2", row))
             updated = replace(token, status=status, updated_at=now)
             conn.execute(
                 "UPDATE wait_tokens_v2 SET status=?, updated_at=?, payload_json=? WHERE wait_token_id=?",
-                (status, now, json_dumps(updated.to_dict()), wait_token_id),
+                (status, now, self._write_payload("wait_tokens_v2", updated.to_dict()), wait_token_id),
             )
         return updated
 
+    @storage_boundary
     def assert_worker_available(
         self,
         worker_id: str,
@@ -2817,7 +2868,7 @@ class SQLiteCompletionStore:
                 f"active wait token {token.wait_token_id} has no CompletionEvent"
             )
         decision = DecisionEvent(
-            decision_id=_stable_id(
+            decision_id=self._record_id(
                 "decision",
                 DecisionType.SUPERSEDE_REQUESTED.value,
                 prior.completion_id,
@@ -2846,6 +2897,7 @@ class SQLiteCompletionStore:
             metadata={"superseded_by_dispatch": True},
         )
 
+    @storage_boundary
     def reconcile_terminal_runs(self) -> dict[str, Any]:
         """Repair result-bearing TaskRuns that are missing a CompletionEvent.
 
@@ -2860,12 +2912,12 @@ class SQLiteCompletionStore:
         with self.db.transaction(immediate=False) as conn:
             self._ensure_runtime_tables(conn)
             rows = conn.execute(
-                "SELECT payload_json FROM task_runs ORDER BY updated_at, task_id"
+                "SELECT * FROM task_runs ORDER BY updated_at, task_id"
             ).fetchall()
 
         candidates: list[TaskRun] = []
         for row in rows:
-            run = TaskRun.from_dict(json_loads(row["payload_json"], {}))
+            run = TaskRun.from_dict(self._read_payload("task_runs", row))
             if run.stopped:
                 candidates.append(run)
 
@@ -2878,12 +2930,12 @@ class SQLiteCompletionStore:
             if status is CompletionStatus.SUCCEEDED:
                 with self.db.transaction(immediate=False) as conn:
                     delivery_row = conn.execute(
-                        "SELECT payload_json FROM deliveries WHERE task_id=? AND run_id=? LIMIT 1",
+                        "SELECT * FROM deliveries WHERE task_id=? AND run_id=? LIMIT 1",
                         (run.envelope.task_id, run.run_id),
                     ).fetchone()
                 if delivery_row is not None:
                     record = DeliveryRecord.from_dict(
-                        json_loads(delivery_row["payload_json"], {})
+                        self._read_payload("deliveries", delivery_row)
                     )
                     self.commit_success(run, record)
                     repaired.append(run.envelope.task_id)
@@ -2918,12 +2970,12 @@ class SQLiteCompletionStore:
 
     def _insert_decision(self, conn: Any, event: DecisionEvent) -> DecisionEvent:
         existing = conn.execute(
-            "SELECT payload_json FROM decision_events_v2 WHERE decision_id=?",
+            "SELECT * FROM decision_events_v2 WHERE decision_id=?",
             (event.decision_id,),
         ).fetchone()
         if existing is not None:
-            return DecisionEvent.from_dict(json_loads(existing["payload_json"], {}))
-        provenance = provenance_sql_values(event.provenance)
+            return DecisionEvent.from_dict(self._read_payload("decision_events_v2", existing))
+        provenance = self._provenance(event.task_id, event.provenance)
         conn.execute(
             """
             INSERT INTO decision_events_v2(
@@ -2937,29 +2989,32 @@ class SQLiteCompletionStore:
                 event.decision_id,
                 event.decision_type.value,
                 event.project_id,
-                event.actor,
+                self._scalar(event.task_id, "actor", event.actor),
                 event.task_id,
                 event.attempt_id,
                 event.completion_id,
                 event.created_at,
-                json_dumps(event.to_dict()),
+                self._write_payload("decision_events_v2", event.to_dict()),
                 *provenance,
             ),
         )
         return event
 
+    @storage_boundary
     def record_decision(self, event: DecisionEvent) -> DecisionEvent:
         with self.db.transaction() as conn:
             return self._insert_decision(conn, event)
 
+    @storage_boundary
     def decisions_for_task(self, task_id: str) -> tuple[DecisionEvent, ...]:
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(
-                "SELECT payload_json FROM decision_events_v2 WHERE task_id=? ORDER BY created_at, decision_id",
+                "SELECT * FROM decision_events_v2 WHERE task_id=? ORDER BY created_at, decision_id",
                 (task_id,),
             ).fetchall()
-        return tuple(DecisionEvent.from_dict(json_loads(row["payload_json"], {})) for row in rows)
+        return tuple(DecisionEvent.from_dict(self._read_payload("decision_events_v2", row)) for row in rows)
 
+    @storage_boundary
     def list_decisions(
         self,
         *,
@@ -2967,7 +3022,7 @@ class SQLiteCompletionStore:
         completion_id: str = "",
         task_id: str = "",
     ) -> tuple[DecisionEvent, ...]:
-        query = "SELECT payload_json FROM decision_events_v2"
+        query = "SELECT * FROM decision_events_v2"
         clauses: list[str] = []
         params: list[Any] = []
         if project_id:
@@ -2985,12 +3040,13 @@ class SQLiteCompletionStore:
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(query, tuple(params)).fetchall()
         return tuple(
-            DecisionEvent.from_dict(json_loads(row["payload_json"], {}))
+            DecisionEvent.from_dict(self._read_payload("decision_events_v2", row))
             for row in rows
         )
 
+    @storage_boundary
     def archive_run_for_resume(self, run: TaskRun, *, reason: str = "waiting_resume") -> str:
-        history_id = _stable_id("runhist_", run.envelope.task_id, _attempt_id(run), run.run_id, reason)
+        history_id = self._record_id("runhist_", run.envelope.task_id, _attempt_id(run), run.run_id, reason)
         with self.db.transaction() as conn:
             conn.execute(
                 """
@@ -3003,13 +3059,24 @@ class SQLiteCompletionStore:
                     run.envelope.task_id,
                     _attempt_id(run),
                     run.run_id,
-                    reason,
-                    json_dumps(run.to_dict()),
+                    self._scalar(run.envelope.task_id, "reason", reason),
+                    self._write_payload("task_run_history_v2", {"history_id": history_id,
+                        "task_id": run.envelope.task_id, "attempt_id": _attempt_id(run), "run_id": run.run_id,
+                        "reason": reason, "run": run.to_dict()} if protected_id(run.envelope.task_id)
+                        else run.to_dict(), identity=history_id),
                     utc_now(),
                 ),
             )
         return history_id
 
+    @storage_boundary
+    def history_for_task(self, task_id: str) -> tuple[dict[str, Any], ...]:
+        with self.db.transaction(immediate=False) as conn:
+            rows = conn.execute("SELECT * FROM task_run_history_v2 WHERE task_id=? ORDER BY archived_at,history_id",
+                                (task_id,)).fetchall()
+        return tuple(self._read_payload("task_run_history_v2", row) for row in rows)
+
+    @storage_boundary
     def orphan_summary(self) -> dict[str, Any]:
         with self.db.transaction(immediate=False) as conn:
             self._ensure_runtime_tables(conn)
@@ -3030,7 +3097,7 @@ class SQLiteCompletionStore:
                 """
             ).fetchone()["n"])
             run_rows = conn.execute(
-                "SELECT task_id, payload_json FROM task_runs"
+                "SELECT * FROM task_runs"
             ).fetchall()
             active_task_ids = {
                 str(row["task_id"])
@@ -3048,7 +3115,7 @@ class SQLiteCompletionStore:
             ).fetchone()["n"])
 
         result_runs = [
-            (str(row["task_id"]), TaskRun.from_dict(json_loads(row["payload_json"], {})))
+            (str(row["task_id"]), TaskRun.from_dict(self._read_payload("task_runs", row)))
             for row in run_rows
         ]
         terminal_without_completion = sum(
@@ -3075,11 +3142,12 @@ class SQLiteCompletionStore:
 class CompletionAwareTaskRunRepository:
     """TaskRun repository adapter for atomic-finalization replay and same-lineage resume."""
 
-    def __init__(self, path: str | Path | SQLiteDatabase, store: SQLiteCompletionStore | None = None) -> None:
+    def __init__(self, path: str | Path | SQLiteDatabase, store: SQLiteCompletionStore | None = None, *, protected=None) -> None:
         self._owns_store = store is None
         self._closed = False
-        self.store = store or SQLiteCompletionStore(path)
-        self.delegate = SQLiteTaskRunRepository(self.store.db)
+        self.store = store or SQLiteCompletionStore(path, protected=protected)
+        self.protection = self.store.protection
+        self.delegate = SQLiteTaskRunRepository(self.store.db, protected=protected if protected is not None else (self.protection.access if self.protection else None))
         self.db = self.delegate.db
 
     def close(self) -> None:
@@ -3096,12 +3164,15 @@ class CompletionAwareTaskRunRepository:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    @storage_boundary
     def create(self, run: TaskRun) -> TaskRun:
         try:
             # Persist the immutable execution input and the QUEUED -> STARTED
             # Task Journal transition in one transaction.
             return self.store.create_started_run(run)
         except TaskRunAlreadyExists:
+            if protected_id(run.envelope.task_id):
+                raise ProtectedStorageError("protected new-run resume is unavailable") from None
             token_id = str(run.envelope.metadata.get("resume_wait_token_id") or "")
             if not token_id:
                 raise
@@ -3116,7 +3187,7 @@ class CompletionAwareTaskRunRepository:
             if CompletionStatus.from_run(existing) is not CompletionStatus.WAITING:
                 raise CompletionConflict("only a WAITING task result can resume in-place")
             self.store.archive_run_for_resume(existing)
-            provenance = provenance_sql_values(run.provenance)
+            provenance = self.store._provenance(run.envelope.task_id, run.provenance)
             with self.db.transaction() as conn:
                 conn.execute(
                     """
@@ -3130,7 +3201,7 @@ class CompletionAwareTaskRunRepository:
                         run.run_id,
                         run.version,
                         run.state.value,
-                        json_dumps(run.to_dict()),
+                        self.store._write_payload("task_runs", run.to_dict()),
                         run.started_at,
                         run.updated_at,
                         *provenance,
@@ -3141,6 +3212,7 @@ class CompletionAwareTaskRunRepository:
             self.store.mark_started(run)
             return run
 
+    @storage_boundary
     def save(self, run: TaskRun, *, expected_version: int) -> TaskRun:
         # Runtime result stops are represented by an IDLE Worker plus an explicit
         # CompletionEvent status. Successful records are committed by commit_success().
@@ -3167,7 +3239,7 @@ class CompletionAwareTaskRunRepository:
                 and run.completion_status == CompletionStatus.SUCCEEDED.value
             ):
                 # Success stored the IDLE result snapshot before later projections.
-                provenance = provenance_sql_values(run.provenance)
+                provenance = self.store._provenance(run.envelope.task_id, run.provenance)
                 with self.db.transaction() as conn:
                     conn.execute(
                         """
@@ -3179,7 +3251,7 @@ class CompletionAwareTaskRunRepository:
                         """,
                         (
                             run.state.value,
-                            json_dumps(run.to_dict()),
+                            self.store._write_payload("task_runs", run.to_dict()),
                             run.updated_at,
                             *provenance,
                             run.envelope.task_id,
@@ -3190,12 +3262,15 @@ class CompletionAwareTaskRunRepository:
                 return run
             raise
 
+    @storage_boundary
     def get(self, task_id: str) -> TaskRun | None:
         return self.delegate.get(task_id)
 
+    @storage_boundary
     def get_by_run_id(self, run_id: str) -> TaskRun | None:
         return self.delegate.get_by_run_id(run_id)
 
+    @storage_boundary
     def list_by_state(self, state: str, *, limit: int = 100) -> tuple[TaskRun, ...]:
         return self.delegate.list_by_state(state, limit=limit)
 

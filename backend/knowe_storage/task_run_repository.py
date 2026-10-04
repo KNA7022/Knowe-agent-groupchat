@@ -4,10 +4,13 @@ from pathlib import Path
 
 from knowe_provenance import assert_provenance_matches
 from backend.runtime import TaskRun, utc_now
+from backend.protected_storage import StoragePayloads, protected_id, storage_boundary
 
 from ._sqlite import (
     PROVENANCE_COLUMN_DEFS,
     SQLiteDatabase,
+    compress_json_dumps,
+    payload_sha256,
     json_dumps,
     json_loads,
     provenance_sql_values,
@@ -22,11 +25,14 @@ class TaskRunAlreadyExists(RuntimeError):
     pass
 
 
-class SQLiteTaskRunRepository:
+class SQLiteTaskRunRepository(StoragePayloads):
     """Persists authoritative TaskRun snapshots with compare-and-swap versions."""
 
-    def __init__(self, path: str | Path | SQLiteDatabase) -> None:
+    def __init__(self, path: str | Path | SQLiteDatabase, *, protected=None) -> None:
+        if protected is not None:
+            protected.identity
         self.db = path if isinstance(path, SQLiteDatabase) else SQLiteDatabase(path)
+        self.protection = protected.for_store(self.db.path) if protected is not None else None
         self.db.initialize(
             """
             CREATE TABLE IF NOT EXISTS task_runs (
@@ -45,18 +51,21 @@ class SQLiteTaskRunRepository:
         self.db.ensure_columns("task_runs", {"payload_sha256": "TEXT"})  # [v1.0.31 R1] 压缩指纹
         self.db.register_schema("runtime.task_run")
 
+    @storage_boundary
     def create(self, run: TaskRun) -> TaskRun:
-        payload = compress_json_dumps(run.to_dict())  # [v1.0.31 R1] 压缩存储
-        payload_digest = payload_sha256(run.to_dict())
-        provenance = provenance_sql_values(run.provenance)
+        payload = (self._write_payload("task_runs", run.to_dict()) if self.protection is not None or protected_id(run.envelope.task_id)
+                   else compress_json_dumps(run.to_dict()))  # [v1.0.31 R1] 压缩存储
+        payload_digest = (self.protection.digest("task-run", run.to_dict()) if protected_id(run.envelope.task_id) and self.protection is not None
+                          else payload_sha256(run.to_dict()))
+        provenance = self._provenance(run.envelope.task_id, run.provenance)
         with self.db.transaction() as conn:
             existing = conn.execute(
-                "SELECT run_id, payload_json FROM task_runs WHERE task_id=?",
+                "SELECT * FROM task_runs WHERE task_id=?",
                 (run.envelope.task_id,),
             ).fetchone()
             if existing is not None:
                 if str(existing["run_id"]) == run.run_id:
-                    stored = TaskRun.from_dict(json_loads(existing["payload_json"], {}))
+                    stored = TaskRun.from_dict(self._read_payload("task_runs", existing))
                     try:
                         assert_provenance_matches(stored.provenance, run.provenance, context="TaskRun create")
                     except ValueError as exc:
@@ -86,21 +95,24 @@ class SQLiteTaskRunRepository:
             )
         return run
 
+    @storage_boundary
     def save(self, run: TaskRun, *, expected_version: int) -> TaskRun:
         if expected_version < 0:
             raise ValueError("expected_version must be non-negative")
         if run.version <= expected_version:
             raise ValueError("saved TaskRun version must advance beyond expected_version")
-        payload = compress_json_dumps(run.to_dict())  # [v1.0.31 R1] 压缩存储
-        payload_digest = payload_sha256(run.to_dict())
-        provenance = provenance_sql_values(run.provenance)
+        payload = (self._write_payload("task_runs", run.to_dict()) if self.protection is not None or protected_id(run.envelope.task_id)
+                   else compress_json_dumps(run.to_dict()))  # [v1.0.31 R1] 压缩存储
+        payload_digest = (self.protection.digest("task-run", run.to_dict()) if protected_id(run.envelope.task_id) and self.protection is not None
+                          else payload_sha256(run.to_dict()))
+        provenance = self._provenance(run.envelope.task_id, run.provenance)
         with self.db.transaction() as conn:
             current = conn.execute(
-                "SELECT payload_json FROM task_runs WHERE task_id=? AND run_id=?",
+                "SELECT * FROM task_runs WHERE task_id=? AND run_id=?",
                 (run.envelope.task_id, run.run_id),
             ).fetchone()
             if current is not None:
-                stored = TaskRun.from_dict(json_loads(current["payload_json"], {}))
+                stored = TaskRun.from_dict(self._read_payload("task_runs", current))
                 try:
                     assert_provenance_matches(stored.provenance, run.provenance, context="TaskRun save")
                 except ValueError as exc:
@@ -137,27 +149,30 @@ class SQLiteTaskRunRepository:
                 )
         return run
 
+    @storage_boundary
     def get(self, task_id: str) -> TaskRun | None:
         with self.db.transaction(immediate=False) as conn:
-            row = conn.execute("SELECT payload_json FROM task_runs WHERE task_id=?", (task_id,)).fetchone()
+            row = conn.execute("SELECT * FROM task_runs WHERE task_id=?", (task_id,)).fetchone()
         if row is None:
             return None
-        return TaskRun.from_dict(json_loads(row["payload_json"], {}))
+        return TaskRun.from_dict(self._read_payload("task_runs", row))
 
+    @storage_boundary
     def get_by_run_id(self, run_id: str) -> TaskRun | None:
         with self.db.transaction(immediate=False) as conn:
-            row = conn.execute("SELECT payload_json FROM task_runs WHERE run_id=?", (run_id,)).fetchone()
+            row = conn.execute("SELECT * FROM task_runs WHERE run_id=?", (run_id,)).fetchone()
         if row is None:
             return None
-        return TaskRun.from_dict(json_loads(row["payload_json"], {}))
+        return TaskRun.from_dict(self._read_payload("task_runs", row))
 
+    @storage_boundary
     def list_by_state(self, state: str, *, limit: int = 100) -> tuple[TaskRun, ...]:
         with self.db.transaction(immediate=False) as conn:
             rows = conn.execute(
-                "SELECT payload_json FROM task_runs WHERE state=? ORDER BY updated_at DESC LIMIT ?",
+                "SELECT * FROM task_runs WHERE state=? ORDER BY updated_at DESC LIMIT ?",
                 (str(state), max(1, min(int(limit), 10_000))),
             ).fetchall()
-        return tuple(TaskRun.from_dict(json_loads(row["payload_json"], {})) for row in rows)
+        return tuple(TaskRun.from_dict(self._read_payload("task_runs", row)) for row in rows)
 
 
 TaskRunRepository = SQLiteTaskRunRepository

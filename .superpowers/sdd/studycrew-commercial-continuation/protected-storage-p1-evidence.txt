@@ -1,0 +1,148 @@
+# P1 raw terminal evidence
+
+BASE: 7ddd4f930d8d3138fdb0b6ffe23e8940f4d8f473
+UTF-8 file; original initial terminal encoding artifacts preserved below; trailing whitespace normalized.
+
+## Initial dependency behavioral RED (pytest new dependency tests)
+F.F                                                                      [100%]
+================================== FAILURES ===================================
+___________ test_delegate_create_and_save_use_existing_compression ____________
+
+tmp_path = WindowsPath('C:/Users/25977/AppData/Local/Temp/pytest-of-25977/pytest-89/test_delegate_create_and_save_0')
+
+    def test_delegate_create_and_save_use_existing_compression(tmp_path):
+        repo = SQLiteTaskRunRepository(tmp_path / "delegate.sqlite3")
+        try:
+            run = sample_run()
+>           repo.create(run)
+
+backend\tests\test_protected_storage.py:24:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <backend.knowe_storage.task_run_repository.SQLiteTaskRunRepository object at 0x00000252B6861160>
+run = TaskRun(envelope=TaskEnvelope(task_id='legacy-task', project_id='legacy-project', goal='Storage transaction marker', w...ild_manifest_sha256': '', 'source_tree_sha256': '', 'schema_registry_sha256': '', 'startup_id': '', 'recorded_at': ''})
+
+    def create(self, run: TaskRun) -> TaskRun:
+>       payload = compress_json_dumps(run.to_dict())  # [v1.0.31 R1] ѹ���洢
+                  ^^^^^^^^^^^^^^^^^^^
+E       NameError: name 'compress_json_dumps' is not defined
+
+backend\knowe_storage\task_run_repository.py:49: NameError
+______________ test_success_fault_rolls_back_run_before_delivery ______________
+
+tmp_path = WindowsPath('C:/Users/25977/AppData/Local/Temp/pytest-of-25977/pytest-89/test_success_fault_rolls_back_0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000252B699E300>
+
+    def test_success_fault_rolls_back_run_before_delivery(tmp_path, monkeypatch):
+        store = SQLiteCompletionStore(tmp_path / "success.sqlite3")
+        try:
+            run = sample_run()
+            record = DeliveryRecord("delivery", "delivery-key", run.envelope.task_id,
+                run.run_id, run.envelope.project_id, TaskState.IDLE, "result", "done",
+                (), BudgetSummary.from_mapping({}), 1)
+
+            def fail_event(*args):
+                raise RuntimeError("injected event failure")
+
+            monkeypatch.setattr(store, "_insert_event", fail_event)
+            with pytest.raises(RuntimeError, match="injected"):
+                store.commit_success(run, record)
+            with store.db.transaction(immediate=False) as conn:
+>               assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+E               assert 1 == 0
+
+backend\tests\test_protected_storage.py:68: AssertionError
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_storage.py::test_delegate_create_and_save_use_existing_compression
+FAILED backend\tests\test_protected_storage.py::test_success_fault_rolls_back_run_before_delivery
+2 failed, 1 passed in 1.62s
+
+## Initial five-test protected boundary RED (--tb=short)
+.F...                                                                    [100%]
+================================== FAILURES ===================================
+____________________ test_protected_wait_outbox_and_reopen ____________________
+backend\tests\test_protected_storage.py:67: in test_protected_wait_outbox_and_reopen
+    assert store.active_wait_for_task(envelope.task_id).question == MARKER
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend\knowe_harness\completion.py:2705: in active_wait_for_task
+    return None if row is None else WaitToken.from_dict(self._read_payload("wait_tokens_v2", row))
+                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend\protected_storage.py:375: in _read_payload
+    raise ProtectedStorageError("protected scalar reference mismatch")
+E   backend.protected_storage.ProtectedStorageError: protected scalar reference mismatch
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_storage.py::test_protected_wait_outbox_and_reopen
+1 failed, 4 passed in 1.42s
+
+## Final identity self-review RED
+Command: py -3.12 -m pytest backend/tests/test_protected_storage.py::test_content_bearing_record_identity_is_rejected -q --tb=short
+F                                                                        [100%]
+================================== FAILURES ===================================
+______________ test_content_bearing_record_identity_is_rejected _______________
+backend\tests\test_protected_storage.py:400: in test_content_bearing_record_identity_is_rejected
+    with pytest.raises(ProtectedStorageError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ProtectedStorageError
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_storage.py::test_content_bearing_record_identity_is_rejected
+1 failed in 0.92s
+
+## Final focused GREEN
+Command: py -3.12 -m pytest backend/tests/test_protected_storage.py -q --tb=short
+.........................................                                [100%]
+41 passed in 6.11s
+## Frozen full backend
+Command: $env:PYTHONUTF8='1'; py -3.12 -m pytest backend/tests -q
+..........................................sss.s......................... [  4%]
+.s...................................................................... [  8%]
+........................................................................ [ 12%]
+........................................................................ [ 16%]
+........................................................................ [ 20%]
+........................................................................ [ 24%]
+........................................................................ [ 28%]
+........................................................................ [ 32%]
+........................................................................ [ 36%]
+........................................................................ [ 40%]
+........................................................................ [ 44%]
+........................................................................ [ 48%]
+........................................................................ [ 52%]
+........................................................................ [ 57%]
+........................................................................ [ 61%]
+........................................................................ [ 65%]
+........................................................................ [ 69%]
+........................................................................ [ 73%]
+........................................................................ [ 77%]
+........................................................................ [ 81%]
+........................................................................ [ 85%]
+........................................................................ [ 89%]
+........................................................................ [ 93%]
+................................................................................................................                       [100%]
+1763 passed, 5 skipped, 10 subtests passed in 166.35s (0:02:46)
+
+Exit code: 0
+
+## Frozen source/test hashes
+
+Path : D:\agentwork\StudyCrew-worktree\backend\protected_storage.py
+Hash : 275DACBAF7EE734D406589C749F186395070FDF08BBAC14993ADE08E8ED73A22
+
+Path : D:\agentwork\StudyCrew-worktree\backend\knowe_harness\completion.py
+Hash : 3C8C420C3EB758DAA31BFA01AD8C6C630AB78758DC309C503ACBE948A2F223E3
+
+Path : D:\agentwork\StudyCrew-worktree\backend\knowe_harness\store.py
+Hash : 6991B056E0CC9A98F8532173CE250EF58E738CF5B51325394AC12C776654F395
+
+Path : D:\agentwork\StudyCrew-worktree\backend\knowe_storage\task_run_repository.py
+Hash : C8E60F23E7D2438C205A7BEF800AC49D32F8D8BA48B2CB8183C5CDC82109CF66
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_storage.py
+Hash : B132BDC3FB1407E6298CDCF032EEFD81A90D285EA2A68AA6D0F0896F1394AB23
+
+
+## Final static checks
+Commands: py -3.12 -m compileall -q backend; git diff --check -- [five scoped production/test paths]
+warning: in the working copy of 'backend/knowe_harness/completion.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/knowe_harness/store.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/knowe_storage/task_run_repository.py', LF will be replaced by CRLF the next time Git touches it
+
+Exit code: 0
