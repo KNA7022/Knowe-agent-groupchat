@@ -343,3 +343,87 @@ Hash : 82E4C9CB5E784F2ABB103B96DEC095205EBCB848D3E34049FC5BA78DC9A1D8F3
 
 Exit code: 0
 M1 LF->CRLF warnings retained as accepted noise; no repository newline-policy change.
+
+## Review fix round 2 raw terminal evidence
+FIX_BASE: 69cf2f8a08aaab35eabac002ad281f11559127ff
+All commands used $env:PYTHONUTF8='1'. Trailing whitespace normalized.
+
+### R1 actual RED
+Command: py -3.12 -m pytest backend/tests/test_protected_storage.py -q --tb=short -k 'supported_wait_closure or wait_status_is_closed_enum'
+...F...                                                                  [100%]
+================================== FAILURES ===================================
+____ test_review_supported_wait_closure_survives_reopen[resolve-cancelled] ____
+backend\tests\test_protected_storage.py:487: in test_review_supported_wait_closure_survives_reopen
+    assert store.resolve_wait(token.wait_token_id, status=status).status == status
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend\protected_storage.py:78: in guarded
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend\knowe_harness\completion.py:2884: in resolve_wait
+    (status, now, self._write_payload("wait_tokens_v2", updated.to_dict()), wait_token_id),
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend\protected_storage.py:491: in _write_payload
+    self._validate_query(table, query, binding)
+backend\protected_storage.py:449: in _validate_query
+    raise ProtectedStorageError("invalid protected clear field")
+E   backend.protected_storage.ProtectedStorageError: invalid protected clear field
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_storage.py::test_review_supported_wait_closure_survives_reopen[resolve-cancelled]
+1 failed, 6 passed, 70 deselected in 2.61s
+
+### Final focused GREEN
+Command: py -3.12 -m pytest backend/tests/test_protected_storage.py -q --tb=short
+........................................................................ [ 93%]
+.....                                                                    [100%]
+77 passed in 15.56s
+
+Exit code: 0
+
+### Single frozen full backend
+Command: py -3.12 -m pytest backend/tests -q
+..........................................sss.s......................... [  3%]
+.s...................................................................... [  7%]
+........................................................................ [ 11%]
+........................................................................ [ 15%]
+........................................................................ [ 19%]
+........................................................................ [ 23%]
+........................................................................ [ 27%]
+........................................................................ [ 31%]
+........................................................................ [ 35%]
+........................................................................ [ 39%]
+........................................................................ [ 43%]
+........................................................................ [ 47%]
+........................................................................ [ 51%]
+........................................................................ [ 55%]
+........................................................................ [ 59%]
+........................................................................ [ 63%]
+........................................................................ [ 67%]
+........................................................................ [ 71%]
+........................................................................ [ 75%]
+........................................................................ [ 79%]
+........................................................................ [ 83%]
+........................................................................ [ 87%]
+........................................................................ [ 91%]
+........................................................................ [ 95%]
+.............................................................. [ 99%]
+..............                                                           [100%]
+1799 passed, 5 skipped, 10 subtests passed in 171.70s (0:02:51)
+
+Exit code: 0
+
+### Frozen static checks and hashes
+Commands: py -3.12 -m compileall -q backend
+git diff --check -- backend/protected_storage.py backend/tests/test_protected_storage.py
+Get-FileHash -Algorithm SHA256 backend/protected_storage.py,backend/tests/test_protected_storage.py | Format-List Path,Hash
+warning: in the working copy of 'backend/protected_storage.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/tests/test_protected_storage.py', LF will be replaced by CRLF the next time Git touches it
+
+Path : D:\agentwork\StudyCrew-worktree\backend\protected_storage.py
+Hash : 5B6A8577977F3C91D3144EBF7240DE4167DAE820BD29C968BCEBBA59C16AEDAC
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_storage.py
+Hash : F7D9B2DB36DE289E6D6B797A8B239D9886EEC82B8C41FDF50BAE1137A0FE1EB2
+
+
+Exit code: 0
+M1 LF->CRLF warnings retained as accepted noise; no newline-policy edits.

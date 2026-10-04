@@ -417,7 +417,7 @@ class StoragePayloads:
             elif name == "runtime_state":
                 valid = type(item) is str and item in _RUNTIME_STATES
             elif name == "status":
-                valid = type(item) is str and item in ({"open", "resuming", "resolved", "superseded"}
+                valid = type(item) is str and item in ({"open", "resuming", "resolved", "cancelled", "superseded"}
                     if table == "wait_tokens_v2" else _COMPLETION_STATES)
             elif name == "state":
                 allowed = ({"pending", "processing", "delivered", "failed"} if table == "completion_outbox_v2"

@@ -471,6 +471,34 @@ def test_review_wait_status_is_closed_enum(protected, tmp_path, status):
         assert_sealed(store)
 
 
+@pytest.mark.parametrize("operation,status", [
+    ("resolve", "cancelled"), ("completion", "resolved"),
+    ("resolve", "resolved"), ("resolve", "superseded"),
+])
+def test_review_supported_wait_closure_survives_reopen(protected, tmp_path, operation, status):
+    access, envelope, runtime, key = protected
+    path = tmp_path / "wait-closure.sqlite3"
+    with SQLiteCompletionStore(path, protected=access) as store:
+        run = TaskRun(envelope=envelope, version=1, state=TaskState.IDLE,
+            waiting_question=MARKER, dependency=MARKER)
+        event = store.commit_run(run, status=CompletionStatus.WAITING)
+        token = store.active_wait_for_task(envelope.task_id)
+        if operation == "resolve":
+            assert store.resolve_wait(token.wait_token_id, status=status).status == status
+        else:
+            # Existing completion supersession closes the old WAITING token as
+            # resolved before its generic close pass; do not redesign that here.
+            store.transition_completion(event, CompletionStatus.CANCELLED, actor="user", reason=MARKER)
+        closed = store.get_wait_token(token.wait_token_id)
+        assert closed.status == status
+        assert closed.question == MARKER
+        assert store.active_wait_for_task(envelope.task_id) is None
+        assert_sealed(store)
+    with SQLiteCompletionStore(path, protected=access) as reopened:
+        assert reopened.get_wait_token(token.wait_token_id) == closed
+        assert reopened.active_wait_for_task(envelope.task_id) is None
+
+
 def private_provenance(identity):
     from knowe_provenance import recorded_provenance
     return recorded_provenance({"build_id": "build", "git_commit": "a" * 40,
