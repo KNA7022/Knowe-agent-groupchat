@@ -1,0 +1,77 @@
+F.F.FFFFF [ 99%]
+...............                                                          [100%]
+=========================== short test summary info ===========================
+FAILED backend\tests\test_batch4_terminal.py::test_process_lifecycle - Assert...
+FAILED backend\tests\test_engine_display_name.py::test_coordinator_member_name_follows_language
+FAILED backend\tests\test_engine_display_name.py::test_coordinator_reserve_name_follows_language
+FAILED backend\tests\test_engine_display_name.py::test_coordinator_identity_follows_language
+FAILED backend\tests\test_history_trace.py::test_new_messages_carries_full_atomic_chain
+FAILED backend\tests\test_project_id_resolution_v018.py::test_create_project_retry_reconciles_to_existing_approval_binding
+FAILED backend\tests\test_runtime_impl_v10184.py::test_generic_external_read_rejects_complete_backend_data_root
+FAILED backend\tests\test_token_usage_m4.py::test_ledger_ignored_when_switch_off
+FAILED backend\tests\test_v012_memory_platform.py::test_project_memory_generated_without_llm
+FAILED backend\tests\test_v012_memory_platform.py::test_platform_manifest_lifecycle
+FAILED backend\tests\test_v1017_diagnostic_redaction.py::test_secret_fields_are_redacted_everywhere
+FAILED backend\tests\test_v1017_diagnostic_redaction.py::test_unset_secret_stays_unset
+FAILED backend\tests\test_v1017_invariants.py::test_runtime_emits_no_work_quality_verdict
+FAILED backend\tests\test_v1017_invariants.py::test_gateway_does_not_parse_the_goal
+FAILED backend\tests\test_v1017_invariants.py::test_worker_prompt_carries_no_inferred_expectations
+FAILED backend\tests\test_v1017_invariants.py::test_runtime_config_has_no_effort_knobs
+FAILED backend\tests\test_v1017_invariants.py::test_run_loop_is_unbounded - F...
+FAILED backend\tests\test_v1017_invariants.py::test_worker_text_is_passed_through_not_templated
+FAILED backend\tests\test_v1017_invariants.py::test_no_correction_injection
+FAILED backend\tests\test_v1017_invariants.py::test_single_coordinator_review_channel
+FAILED backend\tests\test_v1019_external_roots_autoauth.py::TestAutoExternalRoots::test_extracts_file_parent_from_goal
+FAILED backend\tests\test_v1019_external_roots_autoauth.py::TestAutoExternalRoots::test_accepts_backslash_paths
+FAILED backend\tests\test_v1019_external_roots_autoauth.py::TestAutoExternalRoots::test_directory_path_kept_as_is
+FAILED backend\tests\test_v21_souls.py::test_coordinator_asks_the_right_question
+FAILED backend\tests\test_v21_souls.py::test_coordinator_knows_silence_is_allowed
+FAILED backend\tests\test_v21_souls.py::test_coordinator_reads_generated_capability_context
+FAILED backend\tests\test_v21_souls.py::test_worker_soul_points_to_the_single_canonical_prompt
+FAILED backend\tests\test_v21_souls.py::test_coordinator_keeps_hard_won_rules[propose_agents]
+FAILED backend\tests\test_v21_souls.py::test_coordinator_keeps_hard_won_rules[propose_next]
+FAILED backend\tests\test_v21_souls.py::test_coordinator_keeps_hard_won_rules[propose_remove_agent]
+FAILED backend\tests\test_v21_souls.py::test_coordinator_keeps_hard_won_rules[\u6c38\u8fdc\u4e0d\u8981\u8ba9\u7528\u6237\u770b\u5230 id]
+FAILED backend\tests\test_v21_souls.py::test_coordinator_keeps_hard_won_rules[\u52a0\u4eba\u662f**\u589e\u91cf**]
+FAILED backend\tests\test_v21_souls.py::test_role_catalog_stays_out_of_the_soul
+FAILED backend\tests\test_v22_worker_voice.py::test_prompt_defines_language_following_without_runtime_translation[\u4e2d\u82f1\u6df7\u5408 task without an explicit override-primary natural language]
+FAILED backend\tests\test_v22_worker_voice.py::test_language_rule_exists_only_in_canonical_prompt_not_runtime
+FAILED backend\tests\test_v231_no_stutter.py::test_dispatch_tool_result_still_free_of_jargon
+FAILED backend\tests\test_v23_pipeline.py::test_dispatch_result_uses_card_as_the_visible_message
+FAILED backend\tests\test_v24_rejection.py::test_propose_next_checks_the_freeze_in_code
+FAILED backend\tests\test_v24_rejection.py::test_frozen_reply_tells_it_what_to_do_instead
+FAILED backend\tests\test_v26_morph.py::test_adjust_replaces_the_instruction
+FAILED backend\tests\test_v26_morph.py::test_adjust_reports_an_unchanged_instruction
+FAILED backend\tests\test_v26_morph.py::test_adjust_llm_failure_is_a_message_not_a_crash
+FAILED backend\tests\test_v26_morph.py::test_server_has_the_command - assert ...
+FAILED backend\tests\test_v26_morph.py::test_adjust_appends_feedback_history
+FAILED backend\tests\test_v26_morph.py::test_adjust_appends_multiple_rounds
+FAILED backend\tests\test_v26_morph.py::test_propose_next_receipt_carries_amendment
+FAILED backend\tests\test_zinnia.py::test_zinnia_proposes_a_create_project_card
+FAILED backend\tests\test_zinnia.py::test_zinnia_does_not_create_before_approval
+FAILED backend\tests\test_zinnia.py::test_zinnia_gets_approved_and_wraps_up
+FAILED backend\tests\test_zinnia.py::test_many_tool_rounds_continue_until_the_model_replies
+FAILED backend\tests\test_zinnia.py::test_server_side_create_project_persists_and_broadcasts
+FAILED backend\tests\test_zinnia.py::test_card_approved_creates_the_project_with_the_cards_name
+FAILED backend\tests\test_zinnia.py::test_frontend_renamed_project_wins - Val...
+FAILED backend\tests\test_zinnia.py::test_coordinator_speaks_first_in_a_new_project
+FAILED backend\tests\test_zinnia.py::test_fake_mode_does_not_kickoff_by_default
+FAILED backend\tests\test_zinnia.py::test_existing_project_does_not_kickoff_twice
+ERROR backend\tests\test_e2e.py::test_handshake_returns_replay_complete - Val...
+ERROR backend\tests\test_e2e.py::test_handshake_timeout_sends_replay_complete_zero
+ERROR backend\tests\test_e2e.py::test_replay_backfills_project_created_and_history
+ERROR backend\tests\test_e2e.py::test_incremental_replay_since_seq - ValueErr...
+ERROR backend\tests\test_e2e.py::test_BUG1_broadcast_reaches_all_clients_including_sender
+ERROR backend\tests\test_e2e.py::test_events_from_other_projects_are_also_broadcast
+ERROR backend\tests\test_e2e.py::test_fake_simple_script_message_roundtrip - ...
+ERROR backend\tests\test_e2e.py::test_full_script_approve_all_the_way - Value...
+ERROR backend\tests\test_e2e.py::test_reject_stops_the_chain - ValueError: ��...
+ERROR backend\tests\test_e2e.py::test_new_user_message_cancels_pending_approval
+ERROR backend\tests\test_e2e.py::test_only_one_resolution_per_card - ValueErr...
+ERROR backend\tests\test_e2e.py::test_request_snapshot_returns_state_snapshot
+ERROR backend\tests\test_e2e.py::test_two_projects_have_independent_seq - Val...
+ERROR backend\tests\test_e2e.py::test_ping_pong - ValueError: ��Ⱥ���ܾ�����...
+ERROR backend\tests\test_e2e.py::test_unknown_command_yields_server_level_error
+ERROR backend\tests\test_e2e.py::test_malformed_frame_does_not_kill_the_connection
+56 failed, 1512 passed, 5 skipped, 16 errors, 10 subtests passed in 220.62s (0:03:40)
+
