@@ -23,8 +23,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 from html.parser import HTMLParser
+from io import BytesIO
 from pathlib import Path
 import re
+import threading
 import xml.etree.ElementTree as ElementTree
 import zipfile
 
@@ -37,6 +39,7 @@ __all__ = [
     "ParsedBlock",
     "UnsupportedFormat",
     "parse_document",
+    "parse_document_bytes",
 ]
 
 
@@ -609,7 +612,7 @@ def _normalise_pdf_text(raw: str) -> str:
     return raw.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
-def _parse_pdf(path: Path) -> tuple[ParsedBlock, ...]:
+def _parse_pdf(path: Path | bytes) -> tuple[ParsedBlock, ...]:
     """一页一块，位置是 `page:N`。
 
     页码按**原文页序**，没有文本层的页也占一个号——这与纯文本"/O 跳过空段"是**故意相反**的
@@ -622,7 +625,7 @@ def _parse_pdf(path: Path) -> tuple[ParsedBlock, ...]:
     知道。文本为空保证它不会被当成证据，`kind` 让上层知道"这一页有东西，只是不是文字"——
     本地渲染 + 多模态读图那条路径落地后由它接手。
     """
-    suffix = Path(path).suffix.casefold()
+    suffix = ".pdf" if isinstance(path, bytes) else Path(path).suffix.casefold()
     try:
         document = pdfium.PdfDocument(path)
     except (pdfium.PdfiumError, OSError) as exc:
@@ -632,6 +635,8 @@ def _parse_pdf(path: Path) -> tuple[ParsedBlock, ...]:
 
     blocks: list[ParsedBlock] = []
     try:
+        if isinstance(path, bytes) and len(document) > 1000:
+            raise UnsupportedFormat("pdf_exceeds_page_policy")
         for index in range(len(document)):
             page = document[index]
             try:
@@ -695,3 +700,37 @@ def parse_document(path: Path) -> tuple[ParsedBlock, ...]:
             )
         raise UnsupportedFormat(f"unsupported document format: {suffix or '(no suffix)'}")
     return parser(path)
+
+
+MAX_IMPORT_BYTES = 20 * 1024 * 1024
+MAX_PACKAGE_BYTES = 64 * 1024 * 1024
+_PDF_IMPORT_LOCK = threading.Lock()
+
+
+def parse_document_bytes(raw: bytes, suffix: str) -> tuple[ParsedBlock, ...]:
+    """Parse renderer-selected bytes in memory; never resolve a renderer filesystem path."""
+    suffix = suffix.casefold()
+    if len(raw) > MAX_IMPORT_BYTES:
+        raise UnsupportedFormat("document_too_large")
+    text_parsers = {
+        ".txt": _parse_plain_text, ".md": _parse_markdown, ".markdown": _parse_markdown,
+        ".html": _parse_html, ".htm": _parse_html,
+    }
+    if suffix in text_parsers:
+        return text_parsers[suffix](raw.decode("utf-8", errors="replace"))
+    if suffix == ".pdf":
+        # PDFium is not thread-safe. Concurrent HTTP imports use worker threads.
+        with _PDF_IMPORT_LOCK:
+            return _parse_pdf(raw)
+    packages = {".docx": _parse_docx_package, ".pptx": _parse_pptx_package, ".xlsx": _parse_xlsx_package}
+    if suffix not in packages:
+        raise UnsupportedFormat("unsupported_document_format")
+    try:
+        with zipfile.ZipFile(BytesIO(raw)) as archive:
+            members = archive.infolist()
+            if (len(members) > 4096 or sum(member.file_size for member in members) > MAX_PACKAGE_BYTES
+                    or any(member.file_size > 16 * 1024 * 1024 or member.flag_bits & 1 for member in members)):
+                raise UnsupportedFormat("package_exceeds_import_policy")
+            return packages[suffix](archive, suffix)
+    except (zipfile.BadZipFile, RuntimeError, ValueError) as exc:
+        raise UnsupportedFormat("invalid_document_package") from exc

@@ -313,6 +313,7 @@ from .engine import (
 from .hub import Client, Hub
 from .knowledge_graph import KnowledgeGraphManager
 from .knowledge_api import dispatch_knowledge_http
+from .local_knowledge import LocalKnowledgeService
 from .memory_manager import MemoryManager
 from .persist import Store, legacy_display_name
 from .migrations import run_data_migrations   # [任务 1.6] 启动时数据版本检查 + 迁移
@@ -521,6 +522,7 @@ class KnoweServer:
         # [v0.19] 项目级知识图谱看门人。和 MemoryManager 一样全局复用，数据仍按
         # internal_workspace 分项目隔离；更新由各项目引擎异步串行调度。
         self.knowledge = KnowledgeGraphManager(self.data_root)
+        self.local_knowledge: LocalKnowledgeService | None = None
         #: [v0.11 C-1] Harness Memory 定时兜底任务。
         self._harness_task: asyncio.Task[Any] | None = None
         # [v0.15] 关键状态变化走事件驱动刷新；短时间内的多条事件合并成一次全局汇总。
@@ -6678,7 +6680,8 @@ class KnoweServer:
                         return
                     body_limit = (
                         self._SECRET_LEASE_BODY_MAX_BYTES
-                        if path in {"/internal/credential-lease", "/internal/credential-revoke"} else 1_000_000
+                        if path in {"/internal/credential-lease", "/internal/credential-revoke"}
+                        else 28 * 1024 * 1024 if path == "/api/knowledge/local/import" else 1_000_000
                     )
                     if content_length > body_limit:
                         self._write_http(
@@ -6686,7 +6689,7 @@ class KnoweServer:
                             b"413 Payload Too Large",
                             (
                                 b'{"error":"request body exceeds route policy"}'
-                                if path in {"/internal/credential-lease", "/internal/credential-revoke"}
+                                if path in {"/internal/credential-lease", "/internal/credential-revoke", "/api/knowledge/local/import"}
                                 else b'{"error":"request body exceeds 1000000 bytes"}'
                             ),
                             b"application/json",
@@ -6726,9 +6729,23 @@ class KnoweServer:
                     return
 
                 if path.startswith("/api/knowledge"):
-                    response = await dispatch_knowledge_http(
-                        method, path, split.query, body_bytes, self.groups,
-                    )
+                    if path.startswith("/api/knowledge/local/"):
+                        if self.groups is None:
+                            self._write_http(writer, b"503 Service Unavailable", b'{"error":"canonical_group_scope_unavailable"}', b"application/json")
+                            await writer.drain()
+                            return
+                        try:
+                            if self.local_knowledge is None:
+                                self.local_knowledge = LocalKnowledgeService(self.data_root, self.groups)
+                            response = await self.local_knowledge.dispatch(method, path, split.query, body_bytes)
+                        except Exception:
+                            # A corrupt/wrong key must never be repaired by replacing encrypted data.
+                            from .knowledge_api import KnowledgeHttpResponse
+                            response = KnowledgeHttpResponse(503, {"ok": False, "error": "encrypted_storage_unavailable"})
+                    else:
+                        response = await dispatch_knowledge_http(
+                            method, path, split.query, body_bytes, self.groups,
+                        )
                     status = {
                         200: b"200 OK", 400: b"400 Bad Request", 403: b"403 Forbidden", 404: b"404 Not Found",
                         405: b"405 Method Not Allowed", 409: b"409 Conflict",
@@ -8345,6 +8362,9 @@ class KnoweServer:
         require_current_recovery_lifecycle()
         if self.groups is None:
             raise ValueError("Group persistence is unavailable")
+        # Verify encrypted storage before committing a destructive authority change.
+        if self.local_knowledge is None and (self.data_root / "local_knowledge" / "knowledge.sqlite").exists():
+            self.local_knowledge = LocalKnowledgeService(self.data_root, self.groups)
         transaction = self.groups.prepare_delete(
             group_id, confirmation_token, runtime_project_id=runtime_project_id,
         )
@@ -8398,6 +8418,8 @@ class KnoweServer:
             require_current_recovery_lifecycle()
         require_current_recovery_lifecycle()
         receipt = self.groups.commit_delete(str(transaction["transaction_id"]))
+        if self.local_knowledge is not None:
+            self.local_knowledge.reconcile()
         await self._task_runtime_delete_boundary("after_group_commit", group_id)
         require_current_recovery_lifecycle()
         if self.task_runtime is not None:
@@ -9424,7 +9446,11 @@ class KnoweServer:
                     source_id = payload.get("source_id")
                     if not isinstance(source_id, str):
                         raise ValueError("source_id is required")
+                    if self.local_knowledge is None and (self.data_root / "local_knowledge" / "knowledge.sqlite").exists():
+                        self.local_knowledge = LocalKnowledgeService(self.data_root, self.groups)
                     removed = self.groups.unlink_source(group_id, source_id)
+                    if self.local_knowledge is not None:
+                        self.local_knowledge.reconcile()
                     result = {
                         "removed": removed,
                         "reference_count": self.groups.source_reference_count(source_id),
@@ -9458,6 +9484,8 @@ class KnoweServer:
                 result.setdefault("project_id", runtime_id)
                 if requested_project_id:
                     result["request_project_id"] = requested_project_id
+                if self.local_knowledge is not None and path not in {"/groups/runtime-summary", "/groups/delete-preview"}:
+                    self.local_knowledge.invalidate()
         except (ValueError, GroupDomainError) as exc:
             self._preview_error(writer, b"400 Bad Request", str(exc))
             return
@@ -10749,6 +10777,8 @@ class KnoweServer:
                 self.store.close(timeout=10.0)
             if self.task_runtime is not None:
                 self.task_runtime.close()
+            if self.local_knowledge is not None:
+                self.local_knowledge.close()
             self.secret_leases.close()
             runtime_settings.set_secret_lease_broker(None)
             await ProviderClient.aclose_shared_clients()

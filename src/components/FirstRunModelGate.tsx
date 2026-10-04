@@ -1,6 +1,6 @@
 /**
  * [v1.0.13][R1] First-run entry requires test→apply acknowledgement for one fingerprint.
- * FirstRunModelGate.tsx — [v0.44.1 Bug3] 首次启动·强制模型引导
+ * FirstRunModelGate.tsx — 首次启动：模型配置或本地资料入口
  *
  * 摆放位置：src/components/FirstRunModelGate.tsx
  * 挂载点：App.tsx 顶层（所有视图与浮层之上）。
@@ -8,9 +8,9 @@
  * ── 为什么有它 ──
  *   Bug3 移除了后端代码里写死的 DeepSeek 默认模型/Key，模型的唯一配置入口收敛到
  *   「设置 → 模型与提供方」。既然没有隐藏默认，那么**软件第一次打开、还没有配置全局
- *   主模型时**，必须先把用户拦在门口，强制走完一遍：
+ *   主模型时**，智能体功能需要走完一遍：
  *       选择提供商 → 选择模型 → 输入 Key → 连接测试（必须通过）→ 确认进入
- *   完成前，背景雾化、其余 UI 一律不可交互（scrim 铺满并吃掉所有指针事件）。
+ *   用户也可选择先进入本地资料检索；此入口只撤去引导，不封存模型或宣布模型就绪。
  *
  * ── UI 语言 ──
  *   雾化遮罩（backdrop-filter 毛玻璃）+ 居中弹窗卡片，与既有 .scrim/弹窗一脉相承；
@@ -35,7 +35,7 @@ import { featureEnabled } from '../shared/featureFlags';
 import { useTranslation } from 'react-i18next';
 import './first-run.css';
 
-export const FirstRunModelGate: React.FC = () => {
+export const FirstRunModelGate: React.FC<{ onContinueLocal?: () => void }> = ({ onContinueLocal }) => {
   const { t } = useTranslation();
   const mainModel = useSettingsStore((s) => s.mainModel);
   const saveMainModel = useSettingsStore((s) => s.saveMainModel);
@@ -181,6 +181,13 @@ export const FirstRunModelGate: React.FC = () => {
         </div>
 
         <div className="frg-foot">
+          <div className="frg-local-choice">
+            <button type="button" className="test-btn" disabled={testing || modelApplyState === 'pending'}
+              onClick={() => { setEntered(true); onContinueLocal?.(); }}>
+              {t('first.run.model.gate.continueLocal')}
+            </button>
+            <small>{t('first.run.model.gate.localHint')}</small>
+          </div>
           <button
             type="button"
             className="test-btn frg-enter"

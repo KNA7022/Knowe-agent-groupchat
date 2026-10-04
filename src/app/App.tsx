@@ -745,10 +745,10 @@ export const App: React.FC = () => {
       {/* [阶段一 1.5] DevDrawer 是开发走廊抽屉（Ctrl+Shift+D），正式版不挂载（组件内部亦有同款判定）。 */}
       {!isPackaged && <DevDrawer />}
       {/*
-        [v0.44.1 Bug3] 首次启动·强制模型引导。挂在最后 = z 序最高：还没配置全局主模型时
-        铺一层雾化遮罩把整屏（含浮层/DevDrawer）罩住，走完「选模型→连接测试→进入」才放行。
+        首次启动引导：可配置模型并测试/应用，或先进入无 Key 的本地资料模式。
+        本地入口不改变模型就绪状态。
       */}
-      {!demoMode && <FirstRunModelGate />}
+      {!demoMode && <FirstRunModelGate onContinueLocal={() => useKnoweStore.getState().setView('knowledge')} />}
     </>
   );
 };

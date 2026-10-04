@@ -41,6 +41,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import struct
@@ -107,6 +108,13 @@ CREATE TABLE IF NOT EXISTS rag_embeddings (
     created_at TEXT NOT NULL,
     PRIMARY KEY (model, content_hash)
 );
+
+CREATE TABLE IF NOT EXISTS rag_sources (
+    document_id TEXT PRIMARY KEY,
+    metadata BLOB NOT NULL,
+    original BLOB NOT NULL,
+    FOREIGN KEY (document_id) REFERENCES rag_documents(document_id) ON DELETE CASCADE
+);
 """
 
 #: 向量的落盘精度。embedding 服务给的就是 float32，用二进制原样存取；绕一趟十进制文本会在
@@ -160,7 +168,11 @@ class EncryptedKnowledgeStore:
         # 连接级设置，每次打开都要重新声明，所以放在这里而不是建表脚本里。
         self._database.initialize("PRAGMA secure_delete=ON;")
         self._database.initialize(_SCHEMA)
-        self._verify_master_key()
+        try:
+            self._verify_master_key()
+        except BaseException:
+            self._database.close()
+            raise
 
     # ── 身份 ──────────────────────────────────────────────────────────
 
@@ -296,6 +308,25 @@ class EncryptedKnowledgeStore:
             ).fetchall()
         return tuple(row["document_id"] for row in rows)
 
+    def write_source(self, document_id: str, metadata: dict, original: bytes) -> None:
+        """Persist filenames, course attribution and original bytes only as authenticated ciphertext."""
+        with self._database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO rag_sources(document_id, metadata, original) VALUES (?, ?, ?)",
+                (document_id, self._seal(document_id, "metadata", json.dumps(metadata, ensure_ascii=False).encode("utf-8")),
+                 self._seal(document_id, "original", original)),
+            )
+
+    def source_metadata(self, document_id: str) -> dict | None:
+        with self._database.transaction(immediate=False) as connection:
+            row = connection.execute("SELECT metadata FROM rag_sources WHERE document_id=?", (document_id,)).fetchone()
+        return json.loads(self._open(document_id, "metadata", row["metadata"]).decode("utf-8")) if row else None
+
+    def read_original(self, document_id: str) -> bytes | None:
+        with self._database.transaction(immediate=False) as connection:
+            row = connection.execute("SELECT original FROM rag_sources WHERE document_id=?", (document_id,)).fetchone()
+        return self._open(document_id, "original", row["original"]) if row else None
+
     def _stored_fingerprints(self, document_id: str) -> dict[str, str]:
         """只读 id 与指纹：算一次差异不需要把整份文档解密出来。"""
         with self._database.transaction(immediate=False) as connection:
@@ -374,10 +405,16 @@ class EncryptedKnowledgeStore:
         已经"删掉"的资料的密文。
         """
         with self._database.transaction() as connection:
+            hashes = connection.execute("SELECT DISTINCT content_hash FROM rag_chunks WHERE document_id=?", (document_id,)).fetchall()
             cursor = connection.execute(
                 "DELETE FROM rag_chunks WHERE document_id=?", (document_id,)
             )
+            connection.execute("DELETE FROM rag_sources WHERE document_id=?", (document_id,))
             connection.execute("DELETE FROM rag_documents WHERE document_id=?", (document_id,))
+            connection.executemany(
+                "DELETE FROM rag_embeddings WHERE content_hash=? AND content_hash NOT IN (SELECT content_hash FROM rag_chunks)",
+                [(row["content_hash"],) for row in hashes],
+            )
             return cursor.rowcount
 
     # ── 向量 ──────────────────────────────────────────────────────────
