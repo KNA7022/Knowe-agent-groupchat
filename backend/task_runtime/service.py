@@ -1524,7 +1524,12 @@ class TaskRuntimeService:
                 # Rediscover overflowed invalid proofs after slots become available.
                 # This scan is bounded by the durable intent table and stores only
                 # the fixed-size retry cohort above.
-                reports = self.reconcile_group_deletions()
+                # Overflowed intents may be behind the current page cursor. Once
+                # retry slots are freed, begin a new bounded sweep so reaching the
+                # old tail cannot silently erase their outstanding recovery debt.
+                reports = self.reconcile_group_deletions(
+                    cursor_override="" if had_overflow and made_progress else None,
+                )
                 if hasattr(self, "recovery_report"):
                     self.recovery_report["deletions"] = reports
         except Exception:  # noqa: BLE001 - Timer callbacks never leak exceptions

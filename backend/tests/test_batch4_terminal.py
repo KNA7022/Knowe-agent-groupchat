@@ -223,7 +223,7 @@ def test_process_lifecycle(tmp_path: Path) -> None:
     async def go() -> None:
         pool = ProcessPool("p1", max_procs=4, log_bytes=100_000)
         try:
-            cmd = "for i in 1 2 3 4 5 6 7 8 9; do echo tick-$i; sleep 0.4; done"
+            cmd = f'"{sys.executable}" -u -c "import time; [(print(\'tick-\' + str(i), flush=True), time.sleep(0.4)) for i in range(1, 10)]"'
             bp = await pool.start(cmd, agent_id="be_1", cwd=tmp_path)
             assert bp.session_id == "proc_1"
 

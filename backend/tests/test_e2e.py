@@ -71,12 +71,13 @@ class Conn:
 
 
 @pytest.fixture
-async def server():
-    srv = KnoweServer()
+async def server(tmp_path):
+    srv = KnoweServer(data_dir=str(tmp_path / "data"))
+    srv.test_project_root = tmp_path
     # Unknown replay ids are intentionally rejected by the current identity contract.
     # Seed one real canonical project so E2E tests exercise transport/replay rather than
     # relying on the retired "handshake materialises a project" side effect.
-    await srv.create_project(DEMO_ID, "端到端测试项目")
+    await srv.create_project(DEMO_ID, "端到端测试项目", str(tmp_path))
     async with serve(srv.handle, "127.0.0.1", 0) as ws_server:
         port = ws_server.sockets[0].getsockname()[1]
         srv.test_port = port  # type: ignore[attr-defined]
@@ -120,7 +121,7 @@ async def test_replay_backfills_project_created_and_history(server):
     # 第一个客户端建项目、发一条消息
     c1 = await connect(server)
     await c1.handshake(DEMO_ID)
-    await c1.send(type="create_project", project_id=PROJECT_ONE_ID, project_name="官网改版")
+    await c1.send(type="create_project", project_id=PROJECT_ONE_ID, project_name="官网改版", project_dir=str(server.test_project_root))
     await c1.wait_for("project_created", project_id=PROJECT_ONE_ID)
     await c1.send(type="user_message", project_id=PROJECT_ONE_ID, content="你好", client_msg_id="cm_1")
     await c1.wait_for("message", project_id=PROJECT_ONE_ID)
@@ -186,7 +187,7 @@ async def test_events_from_other_projects_are_also_broadcast(server):
     """所有事件广播给所有客户端（含别的项目的）——前端按 project_id 自己路由。"""
     c = await connect(server)
     await c.handshake(DEMO_ID)
-    await c.send(type="create_project", project_id=PROJECT_TWO_ID, project_name="别的项目")
+    await c.send(type="create_project", project_id=PROJECT_TWO_ID, project_name="别的项目", project_dir=str(server.test_project_root))
     await c.wait_for("project_created", project_id=PROJECT_TWO_ID)
     await c.send(type="user_message", project_id=PROJECT_TWO_ID, content="嗨", client_msg_id="cm_2")
 
@@ -338,8 +339,8 @@ async def test_request_snapshot_returns_state_snapshot(server):
 async def test_two_projects_have_independent_seq(server):
     c = await connect(server)
     await c.handshake(DEMO_ID)
-    await c.send(type="create_project", project_id=PROJECT_A_ID, project_name="甲")
-    await c.send(type="create_project", project_id=PROJECT_B_ID, project_name="乙")
+    await c.send(type="create_project", project_id=PROJECT_A_ID, project_name="甲", project_dir=str(server.test_project_root))
+    await c.send(type="create_project", project_id=PROJECT_B_ID, project_name="乙", project_dir=str(server.test_project_root))
     await c.wait_for("project_created", project_id=PROJECT_B_ID)
 
     await c.send(type="user_message", project_id=PROJECT_A_ID, content="甲的话", client_msg_id="a1")

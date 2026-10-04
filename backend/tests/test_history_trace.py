@@ -21,30 +21,42 @@ from knowe_core.tool_registry import ToolRegistry
 
 from backend.agents.knowe_agent import _history_key
 from tests._fakes import FakeProvider, text_turn, tool_turn
+from tests.support_authority import AgentProviderAuthority
+from backend.commercial_gateway import LegacyToolBoundary
 
 
-def _read_registry():
+def _read_registry(authority=None):
     reg = ToolRegistry()
     reg.register(name="safe_read_file", description="read",
                  parameters={"type": "object"},
                  handler=lambda a, **k: '{"status":"ok","content":"chapter 2 body"}')
+    if authority is not None:
+        reg.set_execution_boundary(LegacyToolBoundary(
+            authority.runtime,
+            authority_provider=lambda: authority.authority,
+            read_only_tools=frozenset({"safe_read_file"}),
+        ))
     return reg
 
 
 @pytest.mark.asyncio
-async def test_new_messages_carries_full_atomic_chain():
+async def test_new_messages_carries_full_atomic_chain(tmp_path):
     """一轮里：读文件 → 拿到回执 → 收尾。result.new_messages 必须完整保留
     assistant(tool_calls) + tool(result) + assistant(final)，而不是只有最后一句。"""
     provider = FakeProvider([
         tool_turn("safe_read_file", {"path": "index.html"}, call_id="c1"),
         text_turn("第二章读到了 chapter 2 body。"),
     ])
-    loop = AgentLoop(client=provider, registry=_read_registry())
+    authority = AgentProviderAuthority(tmp_path)
+    loop = AgentLoop(client=provider, registry=_read_registry(authority))
     cfg = AgentLoopConfig(
         system_prompt="s",
         messages=[{"role": "user", "content": "读第二章"}],
     )
-    result = await loop.run(cfg)
+    try:
+        result = await loop.run(cfg)
+    finally:
+        authority.close()
 
     roles = [m["role"] for m in result.new_messages]
     # 至少包含：assistant(带 tool_calls) → tool 回执 → assistant(final)

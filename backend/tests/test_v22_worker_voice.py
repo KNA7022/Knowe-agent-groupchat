@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,27 +98,77 @@ def test_retained_soul_points_to_canonical_prompt_and_does_not_define_another_pr
     assert "Provider-native tool calls" in soul
 
 
-@pytest.mark.parametrize(
-    ("task_context", "expected_rule"),
-    [
-        ("请用中文完成分析", "explicit output-language requirement"),
-        ("Please answer in English", "explicit output-language requirement"),
-        ("中英混合 task without an explicit override", "primary natural language"),
-    ],
-)
-def test_prompt_defines_language_following_without_runtime_translation(
-    task_context: str, expected_rule: str,
-) -> None:
-    # The matrix protects one prompt/context property; Runtime must not inspect these strings.
+def test_canonical_prompt_defines_language_policy() -> None:
     prompt = PROMPT.read_text("utf-8")
-    assert task_context
-    assert expected_rule in prompt
+    assert "explicit output-language requirement" in prompt
+    assert "active system language" in prompt
     assert "Preserve project paths, code, commands" in prompt
 
 
 def test_language_rule_exists_only_in_canonical_prompt_not_runtime() -> None:
     prompt = PROMPT.read_text("utf-8")
     runtime = (Path(tools_knowe.__file__).parent / "runtime.py").read_text("utf-8")
-    assert "## Response language" in prompt and "primary natural language" in prompt
+    assert "## Response language" in prompt and "active system language" in prompt
     for detector in ("detect_language", "language_regex", "translate_final"):
         assert detector not in runtime
+
+
+@pytest.mark.parametrize("language, label", [("zh", "Chinese (zh)"), ("en", "English (en)")])
+@pytest.mark.parametrize("override", ["", "请用中文完成分析", "Please answer in English",
+                                      "Create multilingual English / Chinese deliverables."])
+def test_complete_worker_prompt_uses_configured_language_and_preserves_override(
+    tmp_path, monkeypatch, language, label, override,
+) -> None:
+    from backend import runtime_settings
+    from backend.runtime import TaskEnvelope, RuntimeStatus
+    from backend.worker_gateway_runtime import WorkerRuntimeFactory
+    from backend.commercial_gateway import ProviderGatewayClient
+    from backend.knowe_adapters.model_adapter import ProviderAdapterConfig
+    from tests.support_authority import AgentProviderAuthority
+    import httpx
+
+    monkeypatch.setattr(runtime_settings, "language", lambda: language)
+    captured = []
+
+    def inert_transport(request):
+        import json
+        captured.extend(json.loads(request.content)["messages"])
+        return httpx.Response(200, json={"choices": [{"message": {
+            "content": "原文 / raw output"}, "finish_reason": "stop"}]})
+
+    owner = AgentProviderAuthority(tmp_path / "authority")
+    client = ProviderGatewayClient(base_url=owner.endpoint, api_key="", model=owner.model,
+        provider=owner.provider_id, transport=owner.transport,
+        credential_provider=lambda: runtime_settings.resolve_provider_credential(owner.binding),
+        client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(inert_transport)))
+    agent = SimpleNamespace(_client=client, ephemeral_system_prompt="Stable Worker identity: be_1")
+
+    envelope = TaskEnvelope(task_id="language-task", project_id="language-project",
+                            worker_id="be_1", goal="中英混合 task " + override,
+                            attempt_id="language-attempt", scope_root=str(tmp_path),
+                            metadata={"agent_memory": "Mixed 历史"})
+    engine = SimpleNamespace(workspace_root=tmp_path, internal_workspace=tmp_path / "internal")
+    runtime = WorkerRuntimeFactory().create(engine, "be_1", envelope, agent)
+    runtime.model.config = ProviderAdapterConfig(stream=False)
+
+    async def scenario():
+        try:
+            return await runtime.run(envelope)
+        finally:
+            await client.aclose()
+    try:
+        with owner.active():
+            result = asyncio.run(scenario())
+        assert owner.runtime.store.get_run(owner.run.run_id).budget_usage.model_turns == 1
+    finally:
+        owner.close()
+    system = captured[0]["content"]
+    assert f"Active system language: {label}" in system
+    assert "Otherwise, reply in English (the system's active language)" not in system
+    assert "Stable Worker identity: be_1" in system
+    assert "Follow an explicit output-language requirement" in system
+    assert "requested language mix" in system
+    assert "Preserve project paths, code, commands" in system
+    assert override in captured[-1]["content"]
+    assert result.status is RuntimeStatus.SUCCEEDED
+    assert result.final_text == "原文 / raw output"

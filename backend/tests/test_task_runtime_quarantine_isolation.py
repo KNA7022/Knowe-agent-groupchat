@@ -369,6 +369,58 @@ async def test_limit_two_overflow_never_starves_valid_confirmed_deletion(
         _close_server(restarted)
 
 
+def test_overflow_retry_rediscovers_invalid_proofs_behind_current_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive the real bounded retry synchronously, without timer scheduling races."""
+    monkeypatch.setattr(TaskRuntimeService, "DEFERRED_QUARANTINE_LIMIT", 2)
+    monkeypatch.setattr(TaskRuntimeService, "DELETION_RECONCILE_BATCH_SIZE", 2)
+    monkeypatch.setattr(TaskRuntimeService, "_arm_deferred_quarantine_retry_locked", lambda self: None)
+    groups = GroupRepository(tmp_path)
+    service = TaskRuntimeService(tmp_path, groups)
+    bad_ids = ["grp_" + digit + "0" * 31 for digit in ("0", "1", "e", "f")]
+    tail_id = "grp_" + "f" * 32
+    original = service.store.quarantine_group_deletion
+    try:
+        for index, group_id in enumerate([*bad_ids, tail_id]):
+            service.store.prepare_group_deletion(
+                group_id, f"gdt_boundary_{index}", group_proof_digest=f"{index + 1:064x}",
+                confirmation_token=f"fixture-{index}", runtime_project_id=f"project_boundary_{index}",
+            )
+        original(tail_id, "already_quarantined")
+
+        def unavailable(_group_id, _audit_code):
+            raise RuntimeStoreError("inert audit write failure")
+        monkeypatch.setattr(service.store, "quarantine_group_deletion", unavailable)
+        first = service.reconcile_group_deletions()
+        overflow = service.reconcile_group_deletions()
+        assert first["processed_count"] == overflow["processed_count"] == 2
+        assert overflow["cursor"] == bad_ids[-1] and overflow["has_more"] is True
+        assert len(service._deferred_quarantines) == 2
+        assert service._deferred_quarantine_overflow is True
+
+        recovered_writes = []
+        def recovered_write(group_id, audit_code):
+            recovered_writes.append(group_id)
+            original(group_id, audit_code)
+        monkeypatch.setattr(service.store, "quarantine_group_deletion", recovered_write)
+        for _ in range(5):
+            service._retry_deferred_quarantines()
+            assert len(service._deferred_quarantines) <= 2
+            if not (service._deferred_quarantines or service._deferred_quarantine_overflow
+                    or service._deletion_reconcile_has_more):
+                break
+        assert all(service.store.group_deletion_intent(gid)["stage"] == "quarantined"
+                   for gid in bad_ids)
+        assert not service._deferred_quarantines and not service._deferred_quarantine_overflow
+        assert not service._deletion_reconcile_has_more
+        assert recovered_writes == bad_ids
+        service._retry_deferred_quarantines()
+        assert recovered_writes == bad_ids, "Idle recovery must not repeat settled writes"
+    finally:
+        service.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("batch", (1, 2))
 async def test_complete_runtime_page_cannot_starve_canonical_only_prepared_delete(

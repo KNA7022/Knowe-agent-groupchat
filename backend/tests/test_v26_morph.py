@@ -36,6 +36,19 @@ import backend.tools_knowe as TK                                    # noqa: E402
 from backend.engine import ProjectEngine, _strip_instruction_fence  # noqa: E402
 from backend.gate import Gate                                       # noqa: E402
 from backend.hub import Hub                                         # noqa: E402
+from tests.support_authority import AgentProviderAuthority          # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def governed_aux_behavior(tmp_path, monkeypatch):
+    """Behavior fixtures inherit a real run; the control-command gap is tested separately."""
+    authority = AgentProviderAuthority(tmp_path / "authority", slot="aux")
+    monkeypatch.setattr(E.runtime_settings, "aux_effective", lambda: dict(authority.binding))
+    try:
+        with authority.active():
+            yield authority
+    finally:
+        authority.close()
 
 OLD = "用 React 做一个番外展示页，包含标题、正文和返回按钮。"
 NEW = "用**纯 HTML**（不要 React）做一个番外展示页，包含标题、正文和返回按钮。"
@@ -322,15 +335,71 @@ def _aio(v):
 
 # ═══════════ ④ server 接线 ═══════════
 
-def test_server_has_the_command() -> None:
-    src = Path(Path(E.__file__).parent / "server.py").read_text("utf-8") \
-        if (Path(E.__file__).parent / "server.py").exists() else None
-    if src is None:
-        pytest.skip("server.py 不在这棵树里")
-    assert "async def _cmd_feedback_instruction" in src
-    assert "eng.adjust_instruction(approval_id, feedback)" in src
-    # 失败要出声：静默 = 卡永远转圈，比报错难受得多
-    assert "没能按你的意见调整指令" in src
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_server_feedback_unowned_card_fails_closed_with_observable_receipt(
+    tmp_path, monkeypatch, governed_aux_behavior, language,
+) -> None:
+    """Real control command + valid lease + real gateway, with an inert transport."""
+    import httpx
+    from backend.server import KnoweServer
+    from backend.commercial_gateway import ProviderGatewayClient, legacy_tool_authority_context
+    from backend.i18n_backend import msg
+    monkeypatch.setattr(E.runtime_settings, "language", lambda: language)
+    outbound = []
+
+    def inert_transport(request):
+        outbound.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": NEW}}]})
+
+    def governed_client(**kwargs):
+        return ProviderGatewayClient(**kwargs, client_factory=lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(inert_transport),
+        ))
+    monkeypatch.setattr(E.aux_client, "ProviderGatewayClient", governed_client)
+
+    async def scenario():
+        server = KnoweServer(data_dir=str(tmp_path / "server-data"))
+        pid = server._allocate_canonical_project_id()
+        await server.create_project(pid, "Feedback boundary", str(tmp_path))
+        engine = server.engines[pid]
+        task = asyncio.create_task(engine.gate.propose(
+            tool="propose_next", agent_id="coordinator",
+            card_body={"target_id": "writer_1", "instruction": OLD,
+                       # Even real-looking model/renderer run ids are not ownership.
+                       "group_id": governed_aux_behavior.group.group_id,
+                       "task_id": governed_aux_behavior.run.task_id,
+                       "run_id": governed_aux_behavior.run.run_id}, timeout_s=30,
+        ))
+        await asyncio.sleep(0)
+        card_id = engine.gate.pending_cards[0]["approval_id"]
+        try:
+            with legacy_tool_authority_context(None):
+                await server._cmd_feedback_instruction(None, {
+                    "project_id": pid, "approval_id": card_id, "feedback": FEEDBACK,
+                    "run_id": governed_aux_behavior.run.run_id,
+                })
+            pending = engine.gate.pending_of(card_id)
+            assert pending is not None and pending.card["instruction"] == OLD
+            assert not pending.future.done() and "feedback_history" not in pending.card
+            events = server.hub.projects[pid].ring.events()
+            errors = [event for event in events if event["type"] == "error"]
+            assert len(errors) == 1
+            assert errors[0]["message"] == msg("server.py.337", reason=msg("engine.186") + "调用失败：GatewayDenied")
+            assert len([event for event in events if event["type"] == "approval_card"]) == 2
+            assert outbound == []
+            engine.gate.resolve(card_id, "approved")
+            await task
+            with legacy_tool_authority_context(None):
+                stale = await engine.adjust_instruction(card_id, FEEDBACK)
+            assert stale["ok"] is False and outbound == []
+        finally:
+            if not task.done():
+                engine.gate.resolve(card_id, "rejected")
+                await task
+            await engine.stop(immediate=True)
+            server.task_runtime.close()
+            server.store.close()
+    asyncio.run(scenario())
 
 
 # ═══════════ ⑤ 别打破 approve / reject ═══════════

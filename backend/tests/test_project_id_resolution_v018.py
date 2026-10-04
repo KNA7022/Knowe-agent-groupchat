@@ -32,6 +32,9 @@ class _HubStub:
     def has(self, project_id: str) -> bool:
         return project_id in self.projects
 
+    def unread_count(self, project_id: str) -> int:
+        return self.projects[project_id].unread_count
+
     async def emit_no_seq(self, event: dict[str, object]) -> None:
         self.no_seq_events.append(event)
 
@@ -43,6 +46,7 @@ def server(monkeypatch: pytest.MonkeyPatch):
     srv.project_card_ids = {}
     srv.hub = _HubStub()
     srv.engines = {}
+    srv.groups = None
     srv.project_dirs = {}
     srv.project_dir_status = {}
     srv._persisted_project_ids = set()
@@ -115,7 +119,7 @@ def test_old_p_ap_client_maps_to_one_canonical_project(server) -> None:
     assert server._canonical_project_id_from_request(request_id) == canonical
 
 
-def test_create_project_retry_reconciles_to_existing_approval_binding(server) -> None:
+def test_create_project_retry_reconciles_to_existing_approval_binding(server, tmp_path) -> None:
     approval_id = "ap_retry"
     canonical = "project_20260715123000"
     retry_id = "project_20260715123001"
@@ -130,6 +134,7 @@ def test_create_project_retry_reconciles_to_existing_approval_binding(server) ->
         project_dir: str | None = None,
         *,
         request_project_id: str | None = None,
+        roles: list[str] | None = None,
     ) -> str:
         created.append((project_id, project_name, project_dir, request_project_id))
         server.hub.projects[project_id] = SimpleNamespace(name=project_name, unread_count=0)
@@ -141,17 +146,17 @@ def test_create_project_retry_reconciles_to_existing_approval_binding(server) ->
         "type": "create_project",
         "project_id": canonical,
         "project_name": "唯一群",
-        "project_dir": "/tmp/work",
+        "project_dir": str(tmp_path),
         "approval_id": approval_id,
     }))
-    assert created == [(canonical, "唯一群", "/tmp/work", None)]
+    assert created == [(canonical, "唯一群", str(tmp_path), None)]
 
     # Simulate a renderer retry that proposes another canonical id for the same card.
     asyncio.run(server._cmd_create_project(None, {
         "type": "create_project",
         "project_id": retry_id,
         "project_name": "唯一群",
-        "project_dir": "/tmp/work",
+        "project_dir": str(tmp_path),
         "approval_id": approval_id,
     }))
 

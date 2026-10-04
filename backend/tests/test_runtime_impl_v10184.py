@@ -337,11 +337,27 @@ async def test_generic_external_read_rejects_complete_backend_data_root(tmp_path
     )
     try:
         registry = build_coordinator_registry(engine)
-        raw = await registry.execute("read_external_file", {"path": str(secret)})
+        # The external adapter is still unmigrated. Its path guard is independently
+        # exercised here; a gateway denial alone says nothing about this handler.
+        raw = await registry.get("read_external_file").handler({"path": str(secret)})
         result = json.loads(raw)
         assert result["status"] == "error"
         assert "内部工作区" in result["message"]
         assert "internal" not in result.get("content", "")
+        from backend.commercial_gateway import GatewayDenied, LegacyToolBoundary
+        from tests.support_authority import AgentProviderAuthority
+
+        authority = AgentProviderAuthority(tmp_path / "authority")
+        try:
+            registry.set_execution_boundary(LegacyToolBoundary(
+                authority.runtime, authority_provider=lambda: authority.authority,
+                read_only_tools=frozenset({"safe_read_file"}),
+            ))
+            with pytest.raises(GatewayDenied, match="migration|blocked"):
+                await registry.execute("read_external_file", {"path": str(secret)},
+                                       tool_call_id="protected-root")
+        finally:
+            authority.close()
     finally:
         await engine.stop(immediate=True)
 

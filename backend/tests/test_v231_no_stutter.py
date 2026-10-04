@@ -229,19 +229,30 @@ def test_matching_text_still_replays_once(monkeypatch) -> None:
 
 # ═══════════ ④ v0.23 里**保留**的那部分（派活话术）═══════════
 
-def test_dispatch_tool_result_still_free_of_jargon() -> None:
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_dispatch_tool_result_still_free_of_jargon(monkeypatch, language) -> None:
     """
     现行协议由可见派单卡承担“谁去做、做什么”，工具回执不得再诱导总管
     复述卡片或承诺后台报告/审阅流程。
     """
-    from backend import tools_knowe
-    src = Path(tools_knowe.__file__).read_text("utf-8")
-    assert 'message=f"任务已派给' not in src
-    block = src.rsplit('engine.record_committed_action("propose_next")', 1)[1][:12000]
-    message_block = block.split("message=(", 1)[1].split(").replace", 1)[0]
-    assert "卡把话说完了" in message_block
-    assert "NOTHING_TO_ADD" in message_block
-    assert "谁去做、做什么" not in message_block
+    import json
+    from backend import runtime_settings
+    from tests.test_v26_morph import _FakeEngine, _propose_next_receipt
+    monkeypatch.setattr(runtime_settings, "language", lambda: language)
+
+    async def scenario():
+        engine = _FakeEngine()
+        future, card_id = await _propose_next_receipt(engine)
+        assert not engine.calls, "No dispatch effect before the user approves"
+        engine.gate.resolve(card_id, "approved")
+        receipt = json.loads(await future)
+        assert receipt["status"] == "ok"
+        assert "NOTHING_TO_ADD" in receipt["message"]
+        assert ("卡把话说完了" if language == "zh" else "card") in receipt["message"]
+        for jargon in ("谁去做、做什么", "background report", "后台报告"):
+            assert jargon not in receipt["message"]
+        assert len([c for c in engine.calls if c[0] == "commit"]) == 1
+    asyncio.run(scenario())
 
 
 def test_coordinator_soul_uses_structured_state_not_a_word_blacklist() -> None:

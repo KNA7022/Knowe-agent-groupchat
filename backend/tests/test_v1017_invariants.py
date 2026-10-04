@@ -1,13 +1,11 @@
 """v1.0.17 — conformance tests for the Runtime repositioning invariants.
 
-These are *fitness functions*: they fail if anyone re-introduces a judge into the
-Runtime. Most are source-level (they read the module text and assert the presence or
-absence of a pattern), so they run without the provider/browser dependencies and act
-as durable guards against regression. One functional unit exercises the provider-
-boundary well-formedness rule directly.
+These fitness functions retain no hidden intent inference, work-quality adjudication,
+or output rewriting. The accepted Task Runtime policy adds hard budgets and bounded
+recovery; governed behavioral tests cover those rules alongside the source guards.
 
 Invariants (see design/2-PRD.md):
-  I-1 no result adjudication      I-4 no effort adjudication by proxy
+  I-1 no result adjudication      I-4 hard Task Runtime budgets
   I-2 no intent inference         I-5 no framework-authored context
   I-3 no output rewriting         I-6 provider-boundary well-formedness
 """
@@ -19,9 +17,10 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+import pytest
 
 BACKEND = Path(__file__).resolve().parents[1]          # .../known_v1.0_React/backend
-PKG = BACKEND / "backend"                               # inner main package
+PKG = BACKEND                                           # main package
 CORE = BACKEND / "knowe_core"
 HARNESS = BACKEND / "knowe_harness"
 
@@ -66,16 +65,59 @@ def test_worker_prompt_carries_no_inferred_expectations() -> None:
 
 # ── I-4 · no effort adjudication by proxy ───────────────────────────────────
 
-def test_runtime_config_has_no_effort_knobs() -> None:
-    text = _src(PKG / "runtime.py")
-    for banned in ("max_turns", "max_same_error", "max_corrections"):
-        assert banned not in text, f"[I-4] RuntimeConfig/loop still uses an effort knob: {banned}"
+@pytest.mark.parametrize("dimension", ["wall_clock_seconds", "model_turns", "tool_calls", "tokens", "cost_usd"])
+def test_task_runtime_enforces_explicit_hard_budgets(tmp_path, dimension) -> None:
+    from backend.groups import GroupRepository
+    from backend.task_runtime.service import TaskRuntimeService
+    from backend.task_runtime.contracts import BudgetLimits, BudgetUsage, TaskStatus, FailureType
+
+    groups = GroupRepository(tmp_path)
+    service = TaskRuntimeService(tmp_path, groups)
+    try:
+        group = groups.create_group("Bounded task")
+        run = service.submit(group.group_id, title="Budget", request_key="budget",
+                             budget_limits=BudgetLimits(**{dimension: 1}))
+        service.schedule()
+        exact = service.consume_budget(group.group_id, run.run_id,
+                                       BudgetUsage(**{dimension: 1}), request_key="exact")
+        assert exact.status is TaskStatus.RUNNING
+        exhausted = service.consume_budget(group.group_id, run.run_id,
+                                           BudgetUsage(**{dimension: 1}), request_key="crossed")
+        assert exhausted.status is TaskStatus.FAILED
+        assert exhausted.failure_type is FailureType.BUDGET_EXHAUSTED
+        events = service.replay(group.group_id, run.run_id, after_seq=0)["events"]
+        assert events[-1]["public_payload"]["exhausted_dimension"] == dimension
+    finally:
+        service.close()
 
 
-def test_run_loop_is_unbounded() -> None:
-    text = _src(PKG / "runtime.py")
-    assert "while True:" in text, "[I-4] run() is no longer an unbounded carrier loop"
-    assert "for turn in range(" not in text, "[I-4] run() still caps turns with a range()"
+def test_exhausted_run_cannot_continue_governed_effects(tmp_path) -> None:
+    from backend.commercial_gateway import GatewayDenied, LegacyToolBoundary
+    from backend.knowe_core.tool_registry import ToolRegistry
+    from backend.task_runtime.contracts import BudgetUsage, FailureType
+    from tests.support_authority import AgentProviderAuthority
+
+    owner = AgentProviderAuthority(tmp_path)
+    effects = []
+    registry = ToolRegistry()
+    registry.register("safe_read_file", "read", {"type": "object"},
+                      lambda args, **_: effects.append(args) or "private data")
+    registry.set_execution_boundary(LegacyToolBoundary(
+        owner.runtime, authority_provider=lambda: owner.authority,
+        read_only_tools=frozenset({"safe_read_file"}),
+    ))
+    try:
+        exhausted = owner.runtime.consume_budget(
+            owner.group.group_id, owner.run.run_id, BudgetUsage(model_turns=21),
+            request_key="exhaust",
+        )
+        assert exhausted.failure_type is FailureType.BUDGET_EXHAUSTED
+        with pytest.raises(GatewayDenied):
+            asyncio.run(registry.execute("safe_read_file", {"path": "secret"},
+                                         tool_call_id="after-budget"))
+        assert effects == []
+    finally:
+        owner.close()
 
 
 # ── I-3 · no output rewriting ───────────────────────────────────────────────
@@ -94,7 +136,21 @@ def test_worker_text_is_passed_through_not_templated() -> None:
 
 # ── I-5 · no framework-authored context ─────────────────────────────────────
 
-def test_no_correction_injection() -> None:
+def test_recovery_is_bounded_without_unauthorized_corrections() -> None:
+    from backend.task_runtime.contracts import FailureType
+    from backend.task_runtime.service import TaskRuntimeService
+
+    assert TaskRuntimeService.recovery_action(FailureType.PARAMETER_ERROR,
+                                             attempts=0, max_attempts=2) == "correct_parameters"
+    for failure in FailureType:
+        assert TaskRuntimeService.recovery_action(failure, attempts=2, max_attempts=2) == "stop"
+    for failure in (FailureType.PERMISSION_DENIED, FailureType.BUDGET_EXHAUSTED,
+                    FailureType.IRREVERSIBLE_SIDE_EFFECT):
+        assert TaskRuntimeService.recovery_action(failure, attempts=0, max_attempts=2) == "stop"
+    assert TaskRuntimeService.recovery_action(FailureType.TRANSIENT_PROVIDER_FAILURE,
+        attempts=0, max_attempts=2, same_privacy=False, preauthorized_fallback=True) != "provider_fallback"
+    assert TaskRuntimeService.recovery_action(FailureType.TRANSIENT_PROVIDER_FAILURE,
+        attempts=0, max_attempts=2, same_privacy=True, preauthorized_fallback=False) != "provider_fallback"
     text = _src(PKG / "runtime.py")
     assert "_correction_message" not in text, "[I-5] runtime still injects framework corrections"
 
@@ -189,18 +245,4 @@ def test_actor_scope_breaks_inherited_visible_activity_emitter() -> None:
 # ── standalone runner (offline: pytest may be unavailable) ──────────────────
 
 if __name__ == "__main__":
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-    passed = failed = 0
-    for fn in fns:
-        try:
-            fn()
-            print(f"PASS  {fn.__name__}")
-            passed += 1
-        except AssertionError as exc:
-            print(f"FAIL  {fn.__name__}: {exc}")
-            failed += 1
-        except Exception as exc:  # noqa: BLE001
-            print(f"ERROR {fn.__name__}: {type(exc).__name__}: {exc}")
-            failed += 1
-    print(f"\n{passed} passed, {failed} failed, {len(fns)} total")
-    sys.exit(1 if failed else 0)
+    sys.exit(pytest.main([__file__]))

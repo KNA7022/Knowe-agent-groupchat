@@ -393,6 +393,10 @@ class WorkerRuntimeFactory:
         identity = getattr(agent, "ephemeral_system_prompt", "") or ""
         if identity:
             runtime.prompt = identity.rstrip() + "\n\n" + runtime.prompt
+        # Language is a governed preference, never inferred from task prose or memory.
+        from . import runtime_settings
+        active_language = "Chinese (zh)" if runtime_settings.language() == "zh" else "English (en)"
+        runtime.prompt = f"Active system language: {active_language}.\n\n{runtime.prompt}"
         return _inject_user_address_prompt(runtime, metadata)
 
 

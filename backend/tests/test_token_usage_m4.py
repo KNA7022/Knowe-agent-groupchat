@@ -40,6 +40,7 @@ def test_ledger_records_and_snapshots() -> None:
 
 
 def test_ledger_ignored_when_switch_off() -> None:
+    object.__setattr__(CONFIG, "tool_compress_enabled", False)
     ccom.snapshot_compression_stats(reset=True)
     assert CONFIG.tool_compress_enabled is False
     log_text = ("ERROR retry\n" * 300) + "INFO done\n"

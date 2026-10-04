@@ -16,6 +16,7 @@ from typing import Any
 
 import asyncio
 import os
+import json
 from unittest.mock import patch
 
 import pytest
@@ -159,57 +160,84 @@ async def test_zinnia_only_has_safe_platform_tools():
     assert sent == names
 
 
-async def test_zinnia_proposes_a_create_project_card():
-    """★ [v0.5] 建群走审批卡了——知知只管提议，建不建、叫什么名，用户说了算。"""
+async def test_zinnia_legacy_create_proposal_is_explicitly_unavailable():
+    """Provider authority cannot grant an unmigrated platform creation effect."""
     h = Harness([
         tool_stream("create_project", {"project_name": "官网改版"}),
         reply_stream("建好了，接下来交给总管。"),
     ])
-    approver = asyncio.create_task(auto_approve(h.gate, "approved"))
     await h.run()
-    await approver
-
-    card = h.of("approval_card")[0]
-    assert card["tool"] == "create_project"
-    assert card["agent_id"] == ZINNIA
-    assert card["card"]["project_name"] == "官网改版"     # 卡上带着待确认的项目名
-    assert card["card"]["approval_id"] == card["card_id"]
-
-    assert h.of("approval_resolved")[0]["resolution"] == "approved"
+    assert not h.of("approval_card") and not h.of("approval_resolved")
+    assert not h.created
+    tool_msg = [m for m in h.fake.requests[1]["messages"] if m["role"] == "tool"][0]
+    assert "blocked" in tool_msg["content"] and "Task Runtime" in tool_msg["content"]
 
 
-async def test_zinnia_does_not_create_before_approval():
-    """★ 卡还挂着的时候，项目绝不能已经建出来了。"""
+async def test_zinnia_no_implicit_approval_or_creation():
+    """An inert legacy proposal has no effect and does not invent approval."""
     h = Harness([
         tool_stream("create_project", {"project_name": "官网改版"}),
         reply_stream("好。"),
     ])
-    rejecter = asyncio.create_task(auto_approve(h.gate, "rejected"))
     await h.run()
-    await rejecter
-
-    assert h.of("approval_resolved")[0]["resolution"] == "rejected"
-    # 知知拿到 rejected，自己圆场；她本来也不负责真正建项目（那是 server 在 approve 时干的）
+    assert not h.created and not h.gate.pending_cards
+    assert not h.of("approval_resolved")
     tool_msg = [m for m in h.fake.requests[1]["messages"] if m["role"] == "tool"][0]
-    assert tool_msg["content"] == "rejected"
+    assert tool_msg["content"].startswith("error:")
 
 
 # ═══════════════════════════════════════════════════════════════
 # 二、建项目：真的建出来
 # ═══════════════════════════════════════════════════════════════
 
-async def test_zinnia_gets_approved_and_wraps_up():
+async def test_zinnia_reports_legacy_denial_and_can_wrap_up():
     h = Harness([
         tool_stream("create_project", {"project_name": "公司官网改版"}),
-        reply_stream("项目已经建好了，左栏能看到。接下来总管接手。"),
+        reply_stream("请使用建群界面选择项目文件夹。"),
     ])
-    approver = asyncio.create_task(auto_approve(h.gate, "approved"))
     await h.run("就叫公司官网改版吧")
-    await approver
 
     tool_msg = [m for m in h.fake.requests[1]["messages"] if m["role"] == "tool"][0]
-    assert tool_msg["content"].startswith("approved")
-    assert "总管" in h.of("message")[-1]["content"]
+    assert "blocked" in tool_msg["content"]
+    assert not h.created and not h.of("approval_card")
+    assert "建群界面" in h.of("message")[-1]["content"]
+
+
+async def test_structured_user_creation_succeeds_at_authenticated_group_boundary(tmp_path):
+    """The explicit user creation API replaces conversational platform effects."""
+    from tests.test_runtime_impl_v10184 import _request, _raw_http, _status_and_body
+    server = KnoweServer(data_dir=str(tmp_path / "data"))
+    health = await asyncio.start_server(server._health_conn, "127.0.0.1", 0)
+    port = health.sockets[0].getsockname()[1]
+    body = json.dumps({"name": "用户选择的群", "project_dir": str(tmp_path),
+                       "template": "custom"}, ensure_ascii=False).encode("utf-8")
+    try:
+        assert server.groups.list_groups() == []
+        denied = await _raw_http(port, _request("/groups/create", method="POST", body=body))
+        assert _status_and_body(denied)[0] == 401
+        assert server.groups.list_groups() == []
+        created = await _raw_http(port, _request("/groups/create", method="POST",
+                                               body=body, token=CONFIG.runtime_token))
+        status, encoded, _headers = _status_and_body(created)
+        result = json.loads(encoded)
+        assert status == 200 and result["ok"] is True
+        group_id, project_id = result["group_id"], result["project_id"]
+        group = server.groups.get(group_id)
+        assert group.name == "用户选择的群" and group.legacy_project_id == project_id
+        assert server.groups.resolve_group_id(project_id) == group_id
+        assert server.hub.projects[project_id].name == group.name
+        assert server.engines[project_id].workspace_root.resolve() == tmp_path.resolve()
+        assert {member.role for member in group.roster} >= {"coordinator", "verifier"}
+        # Creation itself has no task/run authority; those are allocated when work starts.
+        assert server.task_runtime.store.list_runs(group_id=group_id) == ()
+        assert len(server.store.load_projects()) == 1
+    finally:
+        health.close()
+        await health.wait_closed()
+        for engine in server.engines.values():
+            await engine.stop(immediate=True)
+        server.task_runtime.close()
+        server.store.close()
 
 
 @pytest.mark.parametrize("bad", [
@@ -302,12 +330,12 @@ async def test_many_tool_rounds_continue_until_the_model_replies():
         ],
         reply_stream("这些提议都处理完了。"),
     ])
-    approver = asyncio.create_task(auto_approve(h.gate, "approved", n=rounds))
     await h.run()
-    await approver
 
-    assert len(h.of("approval_card")) == rounds
-    assert len(h.of("approval_resolved")) == rounds
+    assert not h.of("approval_card") and not h.of("approval_resolved")
+    assert not h.created
+    results = [m for m in h.fake.requests[-1]["messages"] if m["role"] == "tool"]
+    assert len(results) == rounds and all("blocked" in m["content"] for m in results)
     assert not h.of("error")
     messages = h.of("message")
     assert messages[-1]["content"] == "这些提议都处理完了。"
@@ -335,7 +363,7 @@ async def test_server_side_create_project_persists_and_broadcasts(tmp_path):
     s = KnoweServer(data_dir=str(tmp_path))
     s.start_platform()
 
-    pid, name = await s._zinnia_create_project("官网改版")
+    pid, name = await s._zinnia_create_project("官网改版", project_dir=str(tmp_path))
 
     assert s.hub.has(pid)
     assert pid in s.engines                                        # 引擎起来了
@@ -371,7 +399,7 @@ async def test_card_approved_creates_the_project_with_the_cards_name(tmp_path):
     # 手动挂一张建群卡（等价于知知调了工具）
     task = asyncio.create_task(eng.gate.propose(
         tool="create_project", agent_id=ZINNIA,
-        card_body={"project_name": "官网改版"}, timeout_s=3,
+        card_body={"project_name": "官网改版", "project_dir": str(tmp_path)}, timeout_s=3,
     ))
     await asyncio.sleep(0.02)
     card_id = eng.gate.pending_cards[0]["approval_id"]
@@ -398,14 +426,14 @@ async def test_frontend_renamed_project_wins(tmp_path):
 
     task = asyncio.create_task(eng.gate.propose(
         tool="create_project", agent_id=ZINNIA,
-        card_body={"project_name": "知知提的名字"}, timeout_s=3,
+        card_body={"project_name": "知知提的名字", "project_dir": str(tmp_path)}, timeout_s=3,
     ))
     await asyncio.sleep(0.02)
     card_id = eng.gate.pending_cards[0]["approval_id"]
     pid = s._project_id_for_approval(card_id)
 
     # 前端用它改过的名字建（id 是从 card_id 确定性算出来的，两边算得一样）
-    await s.create_project(pid, "用户改的名字")
+    await s.create_project(pid, "用户改的名字", str(tmp_path))
     await s._maybe_create_from_card(eng, card_id)      # 后端兜底：发现已存在 → 什么都不做
     eng.resolve(card_id, "approved")
     await task
@@ -426,7 +454,7 @@ async def test_coordinator_speaks_first_in_a_new_project(tmp_path):
     with patch.dict(os.environ, {"MODEL_READINESS_GATE_V1": "0"}):
         s = KnoweServer(data_dir=str(tmp_path))
         pid = s._allocate_canonical_project_id()
-        await s.create_project(pid, "官网改版")
+        await s.create_project(pid, "官网改版", str(tmp_path))
 
         eng = s.engines[pid]
         for _ in range(200):                      # 等引擎把 kickoff 那个回合跑起来
@@ -455,7 +483,7 @@ async def test_fake_mode_does_not_kickoff_by_default(tmp_path):
 
     s = KnoweServer(data_dir=str(tmp_path))
     pid = s._allocate_canonical_project_id()
-    await s.create_project(pid, "安静的项目")
+    await s.create_project(pid, "安静的项目", str(tmp_path))
     await asyncio.sleep(0.1)
 
     assert s.hub.projects[pid].seq == 0     # 一个字都没说
@@ -467,11 +495,11 @@ async def test_existing_project_does_not_kickoff_twice(tmp_path):
     object.__setattr__(CONFIG, "kickoff", True)
     s = KnoweServer(data_dir=str(tmp_path))
     pid = s._allocate_canonical_project_id()
-    await s.create_project(pid, "官网")
+    await s.create_project(pid, "官网", str(tmp_path))
     await asyncio.sleep(0.05)
     before = s.hub.projects[pid].seq
 
-    await s.create_project(pid, "官网")      # 再来一次
+    await s.create_project(pid, "官网", str(tmp_path))      # 再来一次
     await asyncio.sleep(0.05)
 
     assert s.hub.projects[pid].seq == before

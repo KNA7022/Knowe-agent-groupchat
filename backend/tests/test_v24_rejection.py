@@ -153,23 +153,27 @@ def test_propose_next_checks_the_freeze_in_code() -> None:
     assert "engine.dispatch_frozen()" in body
     # 冻结检查必须排在参数校验**之前** —— 不然它会先因为别的理由报错，
     # 模型看到「instruction 必须是非空字符串」只会重试，而不是收口。
-    assert body.index("dispatch_frozen") < body.index("instruction 必须是非空字符串")
+    assert body.index("dispatch_frozen") < body.index("if not isinstance(instruction")
 
 
-def test_frozen_reply_tells_it_what_to_do_instead() -> None:
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_frozen_reply_tells_it_what_to_do_instead(monkeypatch, language) -> None:
     """
     回执用 _ok 不用 _err：它没做错什么，是此刻不该做。
     报错会让它以为要重试；这里直接给下一步。
     """
-    from backend import tools_knowe
-    src = Path(tools_knowe.__file__).read_text("utf-8")
-    body = src.split("async def handle_propose_next")[1][:8000]
-    # 切到**下一条语句的开头**为止。切到 "instruction 必须是非空字符串" 会把
-    # 它前面那半句 `return _err(` 一起圈进来，然后误判成「冻结块里有 _err」。
-    block = body[body.index("dispatch_frozen"):body.index("if not isinstance(instruction")]
-    assert "_ok(" in block and "_err(" not in block
-    assert "不要再提案" in block
-    assert "好的，那先不派" in block          # 给个现成的句子，别让它自己发挥
+    import json
+    from backend import runtime_settings, tools_knowe
+    from tests.test_v26_morph import _FakeEngine
+    monkeypatch.setattr(runtime_settings, "language", lambda: language)
+    engine = _FakeEngine()
+    engine.dispatch_frozen = lambda: True
+    handler = tools_knowe.build_coordinator_registry(engine).get("propose_next").handler
+    result = json.loads(asyncio.run(handler({"instruction": None}, agent_id="coordinator")))
+    assert result["status"] == "ok" and result["dispatched"] is False
+    assert ("不要再提案" if language == "zh" else "not propose") in result["message"]
+    assert ("好的，那先不派" if language == "zh" else "Okay") in result["message"]
+    assert not engine.gate.pending_cards and not engine.calls
 
 
 # ═══════════ ④ 过期的卡前解说词不许再发 ═══════════

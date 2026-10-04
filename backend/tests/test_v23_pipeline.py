@@ -148,16 +148,25 @@ def test_two_agents_have_independent_buffers() -> None:
     assert deltas(engine, "be_1") == ["后端完成"]
 
 
-def test_dispatch_result_uses_card_as_the_visible_message() -> None:
-    from backend import tools_knowe
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_dispatch_result_uses_card_as_the_visible_message(monkeypatch, language) -> None:
+    import json
+    from backend import runtime_settings
+    from tests.test_v26_morph import _FakeEngine, _propose_next_receipt
+    monkeypatch.setattr(runtime_settings, "language", lambda: language)
 
-    source = Path(tools_knowe.__file__).read_text("utf-8")
-    block = source.rsplit('engine.record_committed_action("propose_next")', 1)[1][:12000]
-    message_block = block.split("message=(", 1)[1].split(").replace", 1)[0]
-    assert "卡把话说完了" in message_block
-    assert "NOTHING_TO_ADD" in message_block
-    assert "谁去做、做什么" not in message_block
-    assert 'message=f"任务已派给' not in source
+    async def scenario():
+        engine = _FakeEngine()
+        future, card_id = await _propose_next_receipt(engine)
+        pending = engine.gate.pending_of(card_id)
+        assert pending.card["instruction"]
+        engine.gate.resolve(card_id, "approved")
+        result = json.loads(await future)
+        assert result["status"] == "ok" and "NOTHING_TO_ADD" in result["message"]
+        assert ("卡把话说完了" if language == "zh" else "card") in result["message"]
+        assert len([c for c in engine.calls if c[0] == "commit"]) == 1
+        assert not engine.gate.pending_cards
+    asyncio.run(scenario())
 
 
 def test_coordinator_soul_keeps_structured_card_silence_contract() -> None:
