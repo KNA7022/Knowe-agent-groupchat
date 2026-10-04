@@ -69,6 +69,8 @@ class SQLiteTaskRunRepository(StoragePayloads):
                     try:
                         assert_provenance_matches(stored.provenance, run.provenance, context="TaskRun create")
                     except ValueError as exc:
+                        if self.protection is not None:
+                            raise TaskRunAlreadyExists("protected TaskRun provenance mismatch") from None
                         raise TaskRunAlreadyExists(str(exc)) from exc
                     return stored
                 raise TaskRunAlreadyExists(f"task already has a different run: {run.envelope.task_id}")
@@ -116,6 +118,8 @@ class SQLiteTaskRunRepository(StoragePayloads):
                 try:
                     assert_provenance_matches(stored.provenance, run.provenance, context="TaskRun save")
                 except ValueError as exc:
+                    if self.protection is not None:
+                        raise OptimisticLockError("protected TaskRun provenance mismatch") from None
                     raise OptimisticLockError(str(exc)) from exc
             cursor = conn.execute(
                 """

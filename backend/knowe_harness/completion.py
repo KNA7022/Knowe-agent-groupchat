@@ -1203,6 +1203,12 @@ class SQLiteCompletionStore(StoragePayloads):
 
     def _insert_journal_entry(self, conn: Any, entry: TaskJournalEntryV1) -> TaskJournalEntryV1:
         payload = entry.to_dict()
+        if self.protection is not None:
+            rows = conn.execute("""SELECT * FROM task_journal_v1 WHERE journal_entry_id=?
+                OR (task_id=? AND attempt_id=? AND sequence=? AND state=? AND runtime_state=?)""",
+                (entry.journal_entry_id, entry.task_id, entry.attempt_id, entry.sequence, entry.state, entry.runtime_state)).fetchall()
+            for row in rows:
+                self._authenticated_retry("task_journal_v1", row, payload)
         conn.execute(
             """
             INSERT OR IGNORE INTO task_journal_v1(
@@ -1429,6 +1435,13 @@ class SQLiteCompletionStore(StoragePayloads):
                     "delivery_intent": dict(event.delivery_intent),
                 },
             )
+            if self.protection is not None:
+                rows = conn.execute("""SELECT * FROM completion_outbox_v2 WHERE outbox_id=?
+                    OR (completion_id=? AND projection_kind=? AND route_key=?)""",
+                    (entry.outbox_id, entry.completion_id, entry.projection_kind.value, entry.route_key)).fetchall()
+                for row in rows:
+                    self._authenticated_retry("completion_outbox_v2", row, entry.to_dict(),
+                        mutable={"state", "attempts", "last_error", "created_at", "updated_at"})
             conn.execute(
                 """
                 INSERT OR IGNORE INTO completion_outbox_v2(
@@ -1531,6 +1544,8 @@ class SQLiteCompletionStore(StoragePayloads):
             try:
                 assert_provenance_matches(stored.provenance, event.provenance, context="CompletionEvent replay")
             except ValueError as exc:
+                if self.protection is not None:
+                    raise CompletionConflict("protected completion provenance mismatch") from None
                 raise CompletionConflict(str(exc)) from exc
             self._ensure_result_commit(conn, stored)
             return stored
@@ -1665,6 +1680,11 @@ class SQLiteCompletionStore(StoragePayloads):
             "provenance": dict(event.provenance),
         }
         provenance = self._provenance(event.task_id, event.provenance)
+        if self.protection is not None:
+            rows = conn.execute("SELECT * FROM agent_completion_outcomes_v2 WHERE outcome_id=? OR completion_id=?",
+                (outcome_id, event.completion_id)).fetchall()
+            for row in rows:
+                self._authenticated_retry("agent_completion_outcomes_v2", row, payload)
         conn.execute(
             """
             INSERT OR IGNORE INTO agent_completion_outcomes_v2(
@@ -1764,6 +1784,8 @@ class SQLiteCompletionStore(StoragePayloads):
         try:
             assert_provenance_matches(stored.provenance, run.provenance, context="CompletionEvent/TaskRun")
         except ValueError as exc:
+            if self.protection is not None:
+                raise CompletionConflict("protected completion provenance mismatch") from None
             raise CompletionConflict(str(exc)) from exc
         if int(row["version"]) > run.version:
             raise CompletionConflict(
@@ -1803,6 +1825,8 @@ class SQLiteCompletionStore(StoragePayloads):
             try:
                 assert_provenance_matches(stored.provenance, record.provenance, context="Delivery replay")
             except ValueError as exc:
+                if self.protection is not None:
+                    raise CompletionConflict("protected delivery provenance mismatch") from None
                 raise CompletionConflict(str(exc)) from exc
             return stored
         other = conn.execute(
@@ -1916,6 +1940,12 @@ class SQLiteCompletionStore(StoragePayloads):
             provenance=event.provenance,
         )
         provenance = self._provenance(token.task_id, token.provenance)
+        if self.protection is not None:
+            existing = conn.execute("SELECT * FROM wait_tokens_v2 WHERE wait_token_id=?", (token.wait_token_id,)).fetchone()
+            if existing is not None:
+                self._authenticated_retry("wait_tokens_v2", existing, token.to_dict(),
+                    mutable={"status", "answer", "answer_ref", "resume_run_id", "created_at", "updated_at"})
+                return WaitToken.from_dict(self._read_payload("wait_tokens_v2", existing))
         conn.execute(
             """
             INSERT OR IGNORE INTO wait_tokens_v2(
@@ -2649,6 +2679,15 @@ class SQLiteCompletionStore(StoragePayloads):
             effect_id = self._record_id("effect_", current.completion_id, current.projection_kind.value, current.route_key)
             effect_sha = (self.protection.digest("effect", payload) if protected_id(outbox_id) and self.protection is not None
                           else hashlib.sha256(json_dumps(payload).encode("utf-8")).hexdigest())
+            receipt_query = {"effect_id": effect_id, "completion_id": current.completion_id,
+                "outbox_id": outbox_id, "projection_kind": current.projection_kind.value,
+                "effect_ref": str(effect_ref), "effect_sha256": effect_sha}
+            if self.protection is not None:
+                rows = conn.execute("SELECT * FROM completion_projection_receipts_v2 WHERE effect_id=? OR outbox_id=?",
+                    (effect_id, outbox_id)).fetchall()
+                for existing in rows:
+                    self._authenticated_retry("completion_projection_receipts_v2", existing, payload,
+                        query_expected=receipt_query)
             conn.execute(
                 """
                 INSERT OR IGNORE INTO completion_projection_receipts_v2(
@@ -2663,7 +2702,8 @@ class SQLiteCompletionStore(StoragePayloads):
                     current.projection_kind.value,
                     self._scalar(outbox_id, "effect_ref", str(effect_ref)),
                     effect_sha,
-                    self._write_payload("completion_projection_receipts_v2", payload, identity=effect_id, clear={"effect_id": effect_id, "completion_id": current.completion_id, "outbox_id": outbox_id, "projection_kind": current.projection_kind.value, "effect_ref": str(effect_ref)}),
+                    self._write_payload("completion_projection_receipts_v2", payload, identity=effect_id,
+                        clear={**receipt_query, "created_at": now}),
                     now,
                 ),
             )
@@ -3047,7 +3087,14 @@ class SQLiteCompletionStore(StoragePayloads):
     @storage_boundary
     def archive_run_for_resume(self, run: TaskRun, *, reason: str = "waiting_resume") -> str:
         history_id = self._record_id("runhist_", run.envelope.task_id, _attempt_id(run), run.run_id, reason)
+        payload = {"history_id": history_id, "task_id": run.envelope.task_id,
+            "attempt_id": _attempt_id(run), "run_id": run.run_id, "reason": reason,
+            "run": run.to_dict()} if protected_id(run.envelope.task_id) else run.to_dict()
+        archived_at = utc_now()
         with self.db.transaction() as conn:
+            if self.protection is not None:
+                existing = conn.execute("SELECT * FROM task_run_history_v2 WHERE history_id=?", (history_id,)).fetchone()
+                self._authenticated_retry("task_run_history_v2", existing, payload)
             conn.execute(
                 """
                 INSERT OR IGNORE INTO task_run_history_v2(
@@ -3060,11 +3107,8 @@ class SQLiteCompletionStore(StoragePayloads):
                     _attempt_id(run),
                     run.run_id,
                     self._scalar(run.envelope.task_id, "reason", reason),
-                    self._write_payload("task_run_history_v2", {"history_id": history_id,
-                        "task_id": run.envelope.task_id, "attempt_id": _attempt_id(run), "run_id": run.run_id,
-                        "reason": reason, "run": run.to_dict()} if protected_id(run.envelope.task_id)
-                        else run.to_dict(), identity=history_id),
-                    utc_now(),
+                    self._write_payload("task_run_history_v2", payload, identity=history_id, clear={"archived_at": archived_at}),
+                    archived_at,
                 ),
             )
         return history_id

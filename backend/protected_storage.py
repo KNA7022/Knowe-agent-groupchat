@@ -270,6 +270,8 @@ class PayloadCodec:
         delivery = payload.get("delivery") or {}
         if (payload.get("context_refs") or payload.get("scope_root") or payload.get("instruction_ref")
             or payload.get("metadata") or delivery.get("metadata")
+            or delivery.get("audience") != "user" or delivery.get("step_id")
+            or delivery.get("attempt_id") not in (None, "", data["attempt_id"])
             or delivery.get("channel") not in (None, "", data["project_id"])):
             raise ProtectedStorageError("protected instruction-only envelope required")
         bounded_json(payload)
@@ -348,13 +350,110 @@ QUERY_FIELDS = (
     "status", "state", "runtime_state", "active", "terminal", "version", "sequence",
     "projection_kind", "route_key", "attempts", "result_id", "decision_type",
     "outbox_id", "idempotency_key", "supersedes_completion_id", "rollback_of_completion_id",
-    "retry_of_completion_id", "created_at", "updated_at", "heartbeat_at", "effect_ref",
+    "retry_of_completion_id", "created_at", "updated_at", "heartbeat_at", "archived_at",
+    "effect_ref", "effect_sha256", "delivery_id", "history_id", "effect_id", "wait_token_id",
+    "journal_entry_id", "outcome_id", "decision_id",
 )
+_RUNTIME_STATES = {"IDLE", "RUNNING", "WAITING", "SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"}
+_COMPLETION_STATES = {"SUCCEEDED", "PARTIAL", "FAILED", "BLOCKED", "WAITING", "CANCELLED",
+                      "SYSTEM_ERROR", "TIMED_OUT", "ROLLED_BACK", "SUPERSEDED"}
+_PROJECTIONS = {"task_state", "report", "coordinator", "ui", "memory", "knowledge", "delivery"}
+_DECISIONS = {"plan_approved", "task_dispatched", "delivery_accepted", "delivery_rejected",
+              "dependency_provided", "task_cancelled", "retry_requested", "partial_accepted",
+              "rollback_requested", "supersede_requested"}
+_OPTIONAL_IDS = {"completion_id", "result_id", "supersedes_completion_id", "rollback_of_completion_id", "retry_of_completion_id"}
+_PROVENANCE_COLUMNS = {"provenance_json", "build_id", "git_commit", "runtime_schema_version",
+    "harness_schema_version", "prompt_bundle_version", "migration_epoch"}
 
 
 class StoragePayloads:
     """Explicit reusable serializers called at each repository row boundary."""
     protection: PayloadCodec | None
+
+    def _validate_clear_coverage(self, table, columns, query):
+        clear = set(columns) - _PROVENANCE_COLUMNS - set(CONTENT_FIELDS.get(table, ())) - {"payload_json", "payload_sha256"}
+        if not clear <= query.keys():
+            raise ProtectedStorageError("unbound protected SQL column")
+
+    def _authenticated_retry(self, table, row, value, *, mutable=(), query_expected=None):
+        """Verify an actual IGNORE collision before accepting its existing truth."""
+        if self.protection is None or row is None:
+            return
+        stored = self._read_payload(table, row)
+        left = {key: item for key, item in stored.items() if key not in mutable}
+        right = {key: item for key, item in value.items() if key not in mutable}
+        if not hmac.compare_digest(self.protection.digest("retry:" + table, left),
+                                   self.protection.digest("retry:" + table, right)):
+            raise ProtectedStorageError("protected immutable retry mismatch")
+        if query_expected:
+            record_id = ":".join(str(row[key]) for key in ROW_KEYS[table])
+            opened = self.protection.open(table, record_id, row["payload_json"])
+            prior = {key: opened["query"].get(key) for key in query_expected}
+            if not hmac.compare_digest(self.protection.digest("retry-query:" + table, prior),
+                                       self.protection.digest("retry-query:" + table, query_expected)):
+                raise ProtectedStorageError("protected immutable retry mismatch")
+
+    def _validate_query(self, table, query, binding):
+        """Validate every content-free SQL value before SQLite can coerce its type."""
+        for name, item in query.items():
+            valid = False
+            if name in {"task_id", "attempt_id", "project_id", "worker_id"}:
+                valid = type(item) is str and item == binding[name]
+            elif name == "run_id":
+                valid = type(item) is str and re.fullmatch(r"[0-9a-f]{32}", item) is not None
+                valid = valid and item == binding["worker_run_id"]
+            elif name in {"version", "sequence", "attempts"}:
+                valid = type(item) is int and 0 <= item <= 2**63 - 1
+            elif name in {"terminal", "active"}:
+                valid = type(item) is bool
+            elif name in {"created_at", "updated_at", "heartbeat_at", "archived_at"}:
+                valid = type(item) is str and re.fullmatch(
+                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)", item) is not None
+                if valid:
+                    try:
+                        datetime.fromisoformat(item.replace("Z", "+00:00"))
+                    except ValueError:
+                        valid = False
+            elif name == "runtime_state":
+                valid = type(item) is str and item in _RUNTIME_STATES
+            elif name == "status":
+                valid = type(item) is str and item in ({"open", "resuming", "resolved", "superseded"}
+                    if table == "wait_tokens_v2" else _COMPLETION_STATES)
+            elif name == "state":
+                allowed = ({"pending", "processing", "delivered", "failed"} if table == "completion_outbox_v2"
+                    else _COMPLETION_STATES | {"QUEUED", "STARTED", "RUNNING"}
+                    if table in {"task_journal_v1", "task_attempts_v1"} else _RUNTIME_STATES)
+                valid = type(item) is str and item in allowed
+            elif name == "projection_kind":
+                valid = type(item) is str and item in _PROJECTIONS
+            elif name == "decision_type":
+                valid = type(item) is str and item in _DECISIONS
+            elif name == "route_key":
+                kind = query.get("projection_kind")
+                allowed = ({"user:default", "user:" + binding["project_id"]} if kind == "delivery"
+                    else {binding["project_id"]} if kind in {"memory", "knowledge"}
+                    else {binding["worker_id"]})
+                if type(item) is not str or item not in allowed:
+                    raise ProtectedStorageError("protected routing target mismatch")
+                valid = True
+            elif name == "effect_ref":
+                # This query metadata remains inside ciphertext; its SQL value
+                # is the fixed CONTENT_FIELDS reference, never this string.
+                valid = type(item) is str
+            elif name == "effect_sha256":
+                valid = type(item) is str and re.fullmatch(r"[0-9a-f]{64}", item) is not None
+            elif name.endswith("_id") or name == "idempotency_key":
+                valid = type(item) is str and (item == "" and name in _OPTIONAL_IDS
+                    or re.fullmatch(r"(?:completion:)?" + _OPAQUE, item) is not None)
+            if not valid:
+                raise ProtectedStorageError("invalid protected clear field")
+
+    def _validate_delivery_intent(self, value, binding):
+        intent = value.get("delivery_intent") or {}
+        if (type(intent) is not dict or intent.get("audience") != "user"
+            or intent.get("channel") not in ("", binding["project_id"])
+            or intent.get("attempt_id") not in (None, "", binding["attempt_id"])):
+            raise ProtectedStorageError("protected routing target mismatch")
 
     def _write_payload(self, table, value, *, identity=None, clear=None):
         from backend.knowe_storage._sqlite import json_dumps
@@ -380,23 +479,19 @@ class StoragePayloads:
             self.protection.validate_envelope(value["envelope"])
             if not re.fullmatch(r"[0-9a-f]{32}", value["run_id"]):
                 raise ProtectedStorageError("invalid Worker run identity")
-            self.protection.bind_worker_run(value["run_id"])
+            binding["worker_run_id"] = value["run_id"]
         elif "run_id" in flat and flat["run_id"] != binding["worker_run_id"]:
             raise ProtectedStorageError("protected Worker run mismatch")
         if table in ("completion_events_v2", "deliveries"):
             if value.get("artifact_manifest") or value.get("artifacts"):
                 raise ProtectedStorageError("protected file artifacts are unavailable")
+        if table == "completion_events_v2":
+            self._validate_delivery_intent(value, binding)
         query = {k: flat[k] for k in QUERY_FIELDS if k in flat}
-        for name, item in query.items():
-            if name in {"created_at", "updated_at", "heartbeat_at"}:
-                try:
-                    datetime.fromisoformat(item.replace("Z", "+00:00"))
-                except (AttributeError, ValueError, TypeError):
-                    raise ProtectedStorageError("invalid protected timestamp") from None
-            if name in {"completion_id", "result_id", "outbox_id", "supersedes_completion_id",
-                        "rollback_of_completion_id", "retry_of_completion_id", "idempotency_key"} and item:
-                if not isinstance(item, str) or re.fullmatch(r"(?:completion:)?" + _OPAQUE, item) is None:
-                    raise ProtectedStorageError("invalid protected opaque identity")
+        self._validate_query(table, query, binding)
+        self._validate_clear_coverage(table, self.db.table_columns(table), query)
+        if table == "task_runs":
+            self.protection.bind_worker_run(value["run_id"])
         # Child claims commit in runtime SQLite before this store's write. They are
         # identity reservations, not evidence that this SQL transaction committed.
         with self.db._lock:
@@ -420,6 +515,9 @@ class StoragePayloads:
         opened = self.protection.open(table, record_id, raw)
         if not isinstance(opened, dict) or set(opened) != {"query", "value"}:
             raise ProtectedStorageError("invalid protected record schema")
+        binding, _ = self.protection._binding()
+        self._validate_query(table, opened["query"], binding)
+        self._validate_clear_coverage(table, row.keys(), opened["query"])
         for name, expected in opened["query"].items():
             if name in CONTENT_FIELDS.get(table, ()):
                 continue
@@ -428,6 +526,13 @@ class StoragePayloads:
         for name in CONTENT_FIELDS.get(table, ()):
             if name in row.keys() and row[name] != WIRE + name:
                 raise ProtectedStorageError("protected scalar reference mismatch")
+        for name in _PROVENANCE_COLUMNS:
+            if name in row.keys() and row[name] != (WIRE + "provenance" if name == "provenance_json" else None):
+                raise ProtectedStorageError("protected provenance reference mismatch")
+        if "payload_sha256" in row.keys() and row["payload_sha256"] is not None:
+            digest = row["payload_sha256"]
+            if type(digest) is not str or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                raise ProtectedStorageError("invalid protected digest column")
         return opened["value"]
 
     def _scalar(self, record_id, field, value):

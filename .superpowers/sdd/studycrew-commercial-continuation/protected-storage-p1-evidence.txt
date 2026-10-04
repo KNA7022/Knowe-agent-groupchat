@@ -146,3 +146,200 @@ warning: in the working copy of 'backend/knowe_harness/store.py', LF will be rep
 warning: in the working copy of 'backend/knowe_storage/task_run_repository.py', LF will be replaced by CRLF the next time Git touches it
 
 Exit code: 0
+
+## Review fix round 1 raw terminal evidence
+
+FIX_BASE: c019aa118c37a3c299458516e3eb5e306321e0cc
+All final commands used $env:PYTHONUTF8='1'. Synthetic marker output in RED is intentional.
+
+### I1 real RED
+Command: py -3.12 -m pytest backend/tests/test_protected_storage.py -q --tb=short -k review_private_clear
+FF                                                                       [100%]
+================================== FAILURES ===================================
+_______ test_review_private_clear_fields_denied_before_storage[version] _______
+backend\tests\test_protected_storage.py:415: in test_review_private_clear_fields_denied_before_storage
+    with pytest.raises(ProtectedStorageError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ProtectedStorageError
+________ test_review_private_clear_fields_denied_before_storage[route] ________
+backend\tests\test_protected_storage.py:422: in test_review_private_clear_fields_denied_before_storage
+    with pytest.raises(ProtectedStorageError, match="routing"):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ProtectedStorageError
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_storage.py::test_review_private_clear_fields_denied_before_storage[version]
+FAILED backend\tests\test_protected_storage.py::test_review_private_clear_fields_denied_before_storage[route]
+2 failed, 41 deselected in 2.03s
+
+### I2 real RED
+Command: py -3.12 -m pytest backend/tests/test_protected_storage.py -q --tb=short -k review_provenance
+FFFFF                                                                    [100%]
+================================== FAILURES ===================================
+_ test_review_provenance_collision_diagnostics_are_content_free[delegate_create] _
+backend\tests\test_protected_storage.py:467: in test_review_provenance_collision_diagnostics_are_content_free
+    assert MARKER not in str(caught.value)
+E   AssertionError: assert '私密指令-ASCII-58192' not in 'TaskRun cre...t-provenance'
+E
+E     '私密指令-ASCII-58192' is contained here:
+E       TaskRun create provenance mismatch: 私密指令-ASCII-58192 != different-provenance
+E     ?                                     ++++++++++++++++
+_ test_review_provenance_collision_diagnostics_are_content_free[delegate_save] _
+backend\tests\test_protected_storage.py:467: in test_review_provenance_collision_diagnostics_are_content_free
+    assert MARKER not in str(caught.value)
+E   AssertionError: assert '私密指令-ASCII-58192' not in 'TaskRun sav...t-provenance'
+E
+E     '私密指令-ASCII-58192' is contained here:
+E       TaskRun save provenance mismatch: 私密指令-ASCII-58192 != different-provenance
+E     ?                                   ++++++++++++++++
+_ test_review_provenance_collision_diagnostics_are_content_free[completion_run] _
+backend\tests\test_protected_storage.py:467: in test_review_provenance_collision_diagnostics_are_content_free
+    assert MARKER not in str(caught.value)
+E   AssertionError: assert '私密指令-ASCII-58192' not in 'CompletionE...t-provenance'
+E
+E     '私密指令-ASCII-58192' is contained here:
+E       mismatch: 私密指令-ASCII-58192 != different-provenance
+E     ?           ++++++++++++++++
+_ test_review_provenance_collision_diagnostics_are_content_free[completion_event] _
+backend\tests\test_protected_storage.py:467: in test_review_provenance_collision_diagnostics_are_content_free
+    assert MARKER not in str(caught.value)
+E   AssertionError: assert '私密指令-ASCII-58192' not in 'CompletionE...t-provenance'
+E
+E     '私密指令-ASCII-58192' is contained here:
+E       mismatch: 私密指令-ASCII-58192 != different-provenance
+E     ?           ++++++++++++++++
+___ test_review_provenance_collision_diagnostics_are_content_free[delivery] ___
+backend\tests\test_protected_storage.py:467: in test_review_provenance_collision_diagnostics_are_content_free
+    assert MARKER not in str(caught.value)
+E   AssertionError: assert '私密指令-ASCII-58192' not in 'Delivery re...t-provenance'
+E
+E     '私密指令-ASCII-58192' is contained here:
+E       Delivery replay provenance mismatch: 私密指令-ASCII-58192 != different-provenance
+E     ?                                      ++++++++++++++++
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_storage.py::test_review_provenance_collision_diagnostics_are_content_free[delegate_create]
+FAILED backend\tests\test_protected_storage.py::test_review_provenance_collision_diagnostics_are_content_free[delegate_save]
+FAILED backend\tests\test_protected_storage.py::test_review_provenance_collision_diagnostics_are_content_free[completion_run]
+FAILED backend\tests\test_protected_storage.py::test_review_provenance_collision_diagnostics_are_content_free[completion_event]
+FAILED backend\tests\test_protected_storage.py::test_review_provenance_collision_diagnostics_are_content_free[delivery]
+5 failed, 43 deselected in 2.12s
+
+### I2 immediate GREEN
+.....                                                                    [100%]
+5 passed, 43 deselected in 2.14s
+
+### I3 real RED
+Command: py -3.12 -m pytest backend/tests/test_protected_storage.py -q --tb=short -k review_retry
+FFFF                                                                     [100%]
+================================== FAILURES ===================================
+__________ test_review_retry_authenticates_existing_records[receipt] __________
+backend\tests\test_protected_storage.py:463: in test_review_retry_authenticates_existing_records
+    with pytest.raises(ProtectedStorageError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ProtectedStorageError
+__________ test_review_retry_authenticates_existing_records[outbox] ___________
+backend\tests\test_protected_storage.py:463: in test_review_retry_authenticates_existing_records
+    with pytest.raises(ProtectedStorageError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ProtectedStorageError
+__________ test_review_retry_authenticates_existing_records[journal] __________
+backend\tests\test_protected_storage.py:463: in test_review_retry_authenticates_existing_records
+    with pytest.raises(ProtectedStorageError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ProtectedStorageError
+__________ test_review_retry_authenticates_existing_records[history] __________
+backend\tests\test_protected_storage.py:463: in test_review_retry_authenticates_existing_records
+    with pytest.raises(ProtectedStorageError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ProtectedStorageError
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_storage.py::test_review_retry_authenticates_existing_records[receipt]
+FAILED backend\tests\test_protected_storage.py::test_review_retry_authenticates_existing_records[outbox]
+FAILED backend\tests\test_protected_storage.py::test_review_retry_authenticates_existing_records[journal]
+FAILED backend\tests\test_protected_storage.py::test_review_retry_authenticates_existing_records[history]
+4 failed, 48 deselected in 1.26s
+
+### Remaining reachable IGNORE RED
+Command: py -3.12 -m pytest backend/tests/test_protected_storage.py -q --tb=short -k 'review_retry and (outcome or wait)'
+FF                                                                       [100%]
+================================== FAILURES ===================================
+__________ test_review_retry_authenticates_existing_records[outcome] __________
+backend\tests\test_protected_storage.py:469: in test_review_retry_authenticates_existing_records
+    with pytest.raises(ProtectedStorageError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ProtectedStorageError
+___________ test_review_retry_authenticates_existing_records[wait] ____________
+backend\tests\test_protected_storage.py:469: in test_review_retry_authenticates_existing_records
+    with pytest.raises(ProtectedStorageError):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ProtectedStorageError
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_storage.py::test_review_retry_authenticates_existing_records[outcome]
+FAILED backend\tests\test_protected_storage.py::test_review_retry_authenticates_existing_records[wait]
+2 failed, 52 deselected in 0.84s
+
+### Final covering GREEN
+Command: py -3.12 -m pytest backend/tests/test_protected_storage.py backend/tests/test_worker_completion_v1.py backend/tests/test_v1019_workspace_scan_deltas.py backend/tests/test_bound_cards.py backend/tests/test_runtime.py backend/tests/test_runtime_impl_v10184.py backend/tests/test_report_projector_idempotency.py backend/tests/test_task_runtime.py -q --tb=short
+........................................................................ [ 31%]
+.............................................................. [ 58%]
+........................................................................ [ 89%]
+.........................                                                [100%]
+231 passed, 10 subtests passed in 25.11s
+
+Exit code: 0
+
+### Single frozen full backend
+Command: py -3.12 -m pytest backend/tests -q
+..........................................sss.s......................... [  4%]
+.s...................................................................... [  8%]
+........................................................................ [ 12%]
+........................................................................ [ 16%]
+........................................................................ [ 20%]
+........................................................................ [ 24%]
+........................................................................ [ 28%]
+........................................................................ [ 32%]
+........................................................................ [ 36%]
+........................................................................ [ 40%]
+........................................................................ [ 44%]
+........................................................................ [ 48%]
+........................................................................ [ 52%]
+........................................................................ [ 56%]
+........................................................................ [ 60%]
+........................................................................ [ 64%]
+........................................................................ [ 68%]
+........................................................................ [ 72%]
+........................................................................ [ 76%]
+........................................................................ [ 80%]
+........................................................................ [ 84%]
+........................................................................ [ 88%]
+........................................................................ [ 92%]
+........................................................................ [ 96%]
+.............................................................. [ 99%]
+..........                                                               [100%]
+1795 passed, 5 skipped, 10 subtests passed in 177.13s (0:02:57)
+
+Exit code: 0
+
+### Frozen static checks and SHA-256 evidence
+Commands: py -3.12 -m compileall -q backend
+git diff --check -- backend/protected_storage.py backend/knowe_harness/completion.py backend/knowe_storage/task_run_repository.py backend/tests/test_protected_storage.py
+Get-FileHash -Algorithm SHA256 backend/protected_storage.py,backend/knowe_harness/completion.py,backend/knowe_storage/task_run_repository.py,backend/tests/test_protected_storage.py | Format-List Path,Hash
+warning: in the working copy of 'backend/knowe_harness/completion.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/knowe_storage/task_run_repository.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/protected_storage.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'backend/tests/test_protected_storage.py', LF will be replaced by CRLF the next time Git touches it
+
+Path : D:\agentwork\StudyCrew-worktree\backend\protected_storage.py
+Hash : 21B192576076C7B16662D0EC116673FDE16638D867B8104B6A2C941F6381CC13
+
+Path : D:\agentwork\StudyCrew-worktree\backend\knowe_harness\completion.py
+Hash : BE17D657C40871137FB6E6EF40160799A1824AB2341672D69FB02A392B3A0DC5
+
+Path : D:\agentwork\StudyCrew-worktree\backend\knowe_storage\task_run_repository.py
+Hash : FE7746198461F56D975F2A7183629856E9993F7602047986B4B9E2314F1E6F32
+
+Path : D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_storage.py
+Hash : 82E4C9CB5E784F2ABB103B96DEC095205EBCB848D3E34049FC5BA78DC9A1D8F3
+
+
+Exit code: 0
+M1 LF->CRLF warnings retained as accepted noise; no repository newline-policy change.

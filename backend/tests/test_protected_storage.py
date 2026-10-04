@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import os
+import traceback
 from pathlib import Path
 
 import pytest
@@ -400,6 +401,244 @@ def test_content_bearing_record_identity_is_rejected(protected, tmp_path):
         with pytest.raises(ProtectedStorageError):
             store.commit_success(run, record)
         assert store.list_active() == ()
+
+
+@pytest.mark.parametrize("field", ["version", "route"])
+def test_review_private_clear_fields_denied_before_storage(protected, tmp_path, field):
+    access, envelope, runtime, key = protected
+    path = tmp_path / "clear-fields.sqlite3"
+    with SQLiteCompletionStore(path, protected=access) as store:
+        run = TaskRun(envelope=envelope, version=1, state=TaskState.IDLE)
+        if field == "version":
+            repo = SQLiteTaskRunRepository(path, protected=access)
+            run.version = MARKER
+            try:
+                with pytest.raises(ProtectedStorageError):
+                    repo.create(run)
+            finally:
+                repo.db.close()
+        else:
+            event = store.commit_run(run, status=CompletionStatus.FAILED)
+            changed = replace(event, delivery_intent={"audience": "user", "channel": MARKER})
+            with pytest.raises(ProtectedStorageError, match="routing"):
+                store.transition_completion(changed, CompletionStatus.CANCELLED, actor="user", reason="")
+        assert_sealed(store)
+
+
+@pytest.mark.parametrize("invalid", [True, 1.5, "2", -1, 2**63])
+def test_review_version_requires_bounded_integer(protected, tmp_path, invalid):
+    access, envelope, runtime, key = protected
+    repo = SQLiteTaskRunRepository(tmp_path / "integer.sqlite3", protected=access)
+    try:
+        run = TaskRun(envelope=envelope, version=invalid, state=TaskState.IDLE)
+        with pytest.raises(ProtectedStorageError):
+            repo.create(run)
+        assert repo.get(envelope.task_id) is None
+    finally:
+        repo.db.close()
+
+
+@pytest.mark.parametrize("field", ["runtime_state", "created_at"])
+def test_review_transition_clear_types_rejected(protected, tmp_path, field):
+    access, envelope, runtime, key = protected
+    with SQLiteCompletionStore(tmp_path / "transition-types.sqlite3", protected=access) as store:
+        run = TaskRun(envelope=envelope, version=1, state=TaskState.IDLE)
+        event = store.commit_run(run, status=CompletionStatus.FAILED)
+        if field == "created_at":
+            from backend.knowe_harness.completion import DecisionEvent, DecisionType
+            decision = DecisionEvent("p1_decision_" + "e" * 32, DecisionType.TASK_CANCELLED,
+                envelope.project_id, "user", envelope.task_id, envelope.attempt_id, event.completion_id,
+                created_at=MARKER)
+            with pytest.raises(ProtectedStorageError):
+                store.record_decision(decision)
+        else:
+            changed = replace(event, runtime_state=MARKER)
+            with pytest.raises(ProtectedStorageError):
+                store.transition_completion(changed, CompletionStatus.CANCELLED, actor="user", reason="")
+        assert_sealed(store)
+
+
+@pytest.mark.parametrize("status", [MARKER, "unexpected", 1])
+def test_review_wait_status_is_closed_enum(protected, tmp_path, status):
+    access, envelope, runtime, key = protected
+    with SQLiteCompletionStore(tmp_path / "wait-status.sqlite3", protected=access) as store:
+        run = TaskRun(envelope=envelope, version=1, state=TaskState.IDLE)
+        store.commit_run(run, status=CompletionStatus.WAITING)
+        token = store.active_wait_for_task(envelope.task_id)
+        with pytest.raises(ProtectedStorageError):
+            store.resolve_wait(token.wait_token_id, status=status)
+        assert store.get_wait_token(token.wait_token_id).status == "open"
+        assert_sealed(store)
+
+
+def private_provenance(identity):
+    from knowe_provenance import recorded_provenance
+    return recorded_provenance({"build_id": "build", "git_commit": "a" * 40,
+        "runtime_schema_version": "1", "harness_schema_version": "1", "prompt_bundle_version": "1",
+        "migration_epoch": 1, "provenance_id": identity}).to_dict()
+
+
+@pytest.mark.parametrize("table", ["receipt", "outbox", "journal", "history", "outcome", "wait"])
+def test_review_retry_authenticates_existing_records(protected, tmp_path, table):
+    access, envelope, runtime, key = protected
+    with SQLiteCompletionStore(tmp_path / "retry.sqlite3", protected=access) as store:
+        run = TaskRun(envelope=envelope, version=1, state=TaskState.IDLE, terminal_reason=MARKER)
+        if table == "journal":
+            store.create_started_run(run)
+            sql_table = "task_journal_v1"
+            retry = lambda: store.create_started_run(run)
+        elif table == "history":
+            store.create_started_run(run)
+            store.archive_run_for_resume(run, reason=MARKER)
+            sql_table = "task_run_history_v2"
+            retry = lambda: store.archive_run_for_resume(run, reason=MARKER)
+        elif table == "wait":
+            event = store.commit_run(run, status=CompletionStatus.WAITING)
+            token = store.active_wait_for_task(envelope.task_id)
+            store.resolve_wait(token.wait_token_id)
+            sql_table = "wait_tokens_v2"
+            retry = lambda: store.commit_run(run, status=CompletionStatus.WAITING)
+        else:
+            event = store.commit_run(run, status=CompletionStatus.FAILED)
+            entry = store.pending_outbox()[0]
+            if table == "receipt":
+                store.acknowledge_outbox(entry.outbox_id, effect_ref=MARKER, effect_payload={"text": MARKER})
+                sql_table = "completion_projection_receipts_v2"
+                store.commit_run(run, status=CompletionStatus.FAILED)
+                assert entry.outbox_id in {item.outbox_id for item in store.pending_outbox()}
+                retry = lambda: store.acknowledge_outbox(entry.outbox_id, effect_ref=MARKER, effect_payload={"text": MARKER})
+            else:
+                sql_table = "agent_completion_outcomes_v2" if table == "outcome" else "completion_outbox_v2"
+                retry = lambda: store.commit_run(run, status=CompletionStatus.FAILED)
+        with store.db.transaction() as conn:
+            conn.execute(f"UPDATE {sql_table} SET payload_json='{{}}'")
+        with pytest.raises(ProtectedStorageError):
+            retry()
+        if table == "receipt":
+            assert entry.outbox_id in {item.outbox_id for item in store.pending_outbox()}
+        with store.db.transaction(immediate=False) as conn:
+            assert conn.execute(f"SELECT payload_json FROM {sql_table}").fetchone()[0] == "{}"
+
+
+@pytest.mark.parametrize("collision", ["receipt_body", "receipt_ref", "journal_body", "history_body"])
+def test_review_retry_rejects_different_authenticated_content(protected, tmp_path, collision):
+    access, envelope, runtime, key = protected
+    with SQLiteCompletionStore(tmp_path / "different.sqlite3", protected=access) as store:
+        run = TaskRun(envelope=envelope, version=1, state=TaskState.RUNNING, terminal_reason=MARKER)
+        if collision == "journal_body":
+            store.create_started_run(run)
+            store.record_progress(run)
+            run.terminal_reason = "different"
+            action = lambda: store.record_progress(run)
+        elif collision == "history_body":
+            store.create_started_run(run)
+            store.archive_run_for_resume(run)
+            run.final_candidate = "different"
+            action = lambda: store.archive_run_for_resume(run)
+        else:
+            store.commit_run(run, status=CompletionStatus.FAILED)
+            entry = store.pending_outbox()[0]
+            store.acknowledge_outbox(entry.outbox_id, effect_ref=MARKER, effect_payload={"body": MARKER})
+            store.commit_run(run, status=CompletionStatus.FAILED)
+            action = lambda: store.acknowledge_outbox(entry.outbox_id,
+                effect_ref="different" if collision == "receipt_ref" else MARKER,
+                effect_payload={"body": "different" if collision == "receipt_body" else MARKER})
+        with pytest.raises(ProtectedStorageError, match="immutable retry"):
+            action()
+        if collision.startswith("receipt"):
+            assert entry.outbox_id in {row.outbox_id for row in store.pending_outbox()}
+            assert store.projection_receipt(entry.outbox_id)["payload"] == {"body": MARKER}
+        assert_sealed(store)
+
+
+def test_review_valid_retry_preserves_outbox_state_and_receipt(protected, tmp_path):
+    access, envelope, runtime, key = protected
+    with SQLiteCompletionStore(tmp_path / "valid-retry.sqlite3", protected=access) as store:
+        run = TaskRun(envelope=envelope, version=1, state=TaskState.RUNNING, terminal_reason=MARKER)
+        store.create_started_run(run)
+        store.create_started_run(run)
+        store.commit_run(run, status=CompletionStatus.FAILED)
+        entry = store.pending_outbox()[0]
+        store.claim_outbox(entry.outbox_id)
+        failed = store.fail_outbox(entry.outbox_id, MARKER)
+        store.commit_run(run, status=CompletionStatus.FAILED)
+        assert next(row for row in store.pending_outbox() if row.outbox_id == entry.outbox_id) == failed
+        store.acknowledge_outbox(entry.outbox_id, effect_ref=MARKER, effect_payload={"body": MARKER})
+        receipt = store.projection_receipt(entry.outbox_id)
+        store.commit_run(run, status=CompletionStatus.FAILED)
+        store.acknowledge_outbox(entry.outbox_id, effect_ref=MARKER, effect_payload={"body": MARKER})
+        assert store.projection_receipt(entry.outbox_id) == receipt
+        assert entry.outbox_id not in {row.outbox_id for row in store.pending_outbox()}
+        assert_sealed(store)
+
+
+@pytest.mark.parametrize("field", ["effect_sha256", "outbox_id", "created_at"])
+def test_review_receipt_retry_authenticates_clear_identity_and_digest(protected, tmp_path, field):
+    access, envelope, runtime, key = protected
+    with SQLiteCompletionStore(tmp_path / "receipt-columns.sqlite3", protected=access) as store:
+        run = TaskRun(envelope=envelope, version=1, state=TaskState.IDLE)
+        store.commit_run(run, status=CompletionStatus.FAILED)
+        entry = store.pending_outbox()[0]
+        store.acknowledge_outbox(entry.outbox_id, effect_ref=MARKER, effect_payload={"body": MARKER})
+        store.commit_run(run, status=CompletionStatus.FAILED)
+        with store.db.transaction() as conn:
+            conn.execute(f"UPDATE completion_projection_receipts_v2 SET {field}=?", ("tampered",))
+        with pytest.raises(ProtectedStorageError):
+            store.acknowledge_outbox(entry.outbox_id, effect_ref=MARKER, effect_payload={"body": MARKER})
+        assert entry.outbox_id in {row.outbox_id for row in store.pending_outbox()}
+
+
+def test_review_unbound_new_clear_column_fails_closed(protected, tmp_path):
+    access, envelope, runtime, key = protected
+    repo = SQLiteTaskRunRepository(tmp_path / "schema.sqlite3", protected=access)
+    try:
+        with repo.db.transaction() as conn:
+            conn.execute("ALTER TABLE task_runs ADD COLUMN unbound_label TEXT")
+        with pytest.raises(ProtectedStorageError, match="unbound"):
+            repo.create(TaskRun(envelope=envelope, version=1, state=TaskState.IDLE))
+        assert repo.get(envelope.task_id) is None
+        assert access.identity["worker_run_id"] == ""
+    finally:
+        repo.db.close()
+
+
+@pytest.mark.parametrize("boundary", ["delegate_create", "delegate_save", "completion_run", "completion_event", "delivery"])
+def test_review_provenance_collision_diagnostics_are_content_free(protected, tmp_path, boundary):
+    access, envelope, runtime, key = protected
+    path = tmp_path / "diagnostics.sqlite3"
+    run = TaskRun(envelope=envelope, version=1, state=TaskState.IDLE,
+        provenance=private_provenance(MARKER))
+    different = private_provenance("different-provenance")
+    with SQLiteCompletionStore(path, protected=access) as store:
+        repo = SQLiteTaskRunRepository(path, protected=access)
+        try:
+            if boundary.startswith("delegate"):
+                repo.create(run)
+                run.provenance = different
+                if boundary == "delegate_save":
+                    run.version = 2
+                action = (lambda: repo.save(run, expected_version=1)) if boundary == "delegate_save" else lambda: repo.create(run)
+            elif boundary == "completion_run":
+                store.commit_run(run, status=CompletionStatus.FAILED)
+                run.provenance = different
+                action = lambda: store.commit_run(run, status=CompletionStatus.FAILED)
+            elif boundary == "completion_event":
+                event = store.commit_run(run, status=CompletionStatus.FAILED)
+                store.transition_completion(event, CompletionStatus.CANCELLED, actor="user", reason="reason")
+                altered = replace(event, provenance=different)
+                action = lambda: store.transition_completion(altered, CompletionStatus.CANCELLED, actor="user", reason="reason")
+            else:
+                record = final_record(run)
+                store.commit_success(run, record)
+                altered = replace(record, provenance=different)
+                action = lambda: store.commit_success(run, altered)
+            with pytest.raises(RuntimeError) as caught:
+                action()
+            assert MARKER not in str(caught.value)
+            assert MARKER not in "".join(traceback.format_exception(caught.value))
+            assert_sealed(store)
+        finally:
+            repo.db.close()
 
 
 @pytest.mark.parametrize("role", ["coordinator", "verifier", "expert"])
