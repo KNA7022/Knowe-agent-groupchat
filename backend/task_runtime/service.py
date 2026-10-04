@@ -128,9 +128,13 @@ class TaskRuntimeService:
         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
     )
 
-    def __init__(self, data_root: str | Path, groups: GroupRepository) -> None:
+    def __init__(self, data_root: str | Path, groups: GroupRepository, *,
+                 card_master_key=None, card_source_validator=None) -> None:
         self.groups = groups
-        self.store = TaskRuntimeStore(Path(data_root) / "runtime" / "task-runtime-v1.sqlite3")
+        self.store = TaskRuntimeStore(Path(data_root) / "runtime" / "task-runtime-v1.sqlite3",
+                                      card_master_key=card_master_key)
+        from .bound_cards import BoundCardService
+        self.cards = BoundCardService(self, card_source_validator)
         self._lock = threading.RLock()
         self._scheduler_owner = opaque_id("lease")
         self._scheduler_retry: threading.Timer | None = None
@@ -731,6 +735,9 @@ class TaskRuntimeService:
         capabilities: tuple[str, ...] = (), request_key: str,
     ) -> tuple[ApprovalRequest, PermissionGrant | None, TaskRun]:
         approval = self.store.get_approval(approval_id)
+        if approval is not None and (approval.purpose == "card_dispatch" or
+                                     self.store.approval_has_card_state(approval_id)):
+            raise RuntimeConflictError("bound card resolution requires exact version and digest")
         canonical = self._canonical_group(group_id, require_active=True)
         if approval is None or approval.group_id != canonical:
             raise RuntimeNotFoundError(f"approval not found in group: {approval_id}")

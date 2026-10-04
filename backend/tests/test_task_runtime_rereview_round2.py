@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -397,9 +398,16 @@ def test_forward_migration_backfills_old_rows_and_dedupes_pending(tmp_path: Path
     second_open.close()
 
 
+@pytest.mark.parametrize("verifier_id", [None, "gag_931dd5c0d0d14143976714bcd4f4cbd6"])
 async def test_live_engine_completion_reaches_verifier_terminal_and_dispatches_next(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, verifier_id: str | None,
 ) -> None:
+    if verifier_id is not None:
+        builtin_agent = GroupRepository._builtin_agent
+        def fixed_agent(group_id, role, display_name):
+            agent = builtin_agent(group_id, role, display_name)
+            return replace(agent, agent_id=verifier_id) if role == "verifier" else agent
+        monkeypatch.setattr(GroupRepository, "_builtin_agent", staticmethod(fixed_agent))
     server = KnoweServer(str(tmp_path))
     group = server.groups.create_group("Completion", legacy_project_id="project_completion")  # type: ignore[union-attr]
     server.hub.get_or_create("project_completion", "Completion")

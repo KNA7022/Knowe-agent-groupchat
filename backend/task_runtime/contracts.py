@@ -95,6 +95,7 @@ _PUBLIC_EVENT_FIELDS: dict[str, frozenset[str]] = {
 }
 
 _ID_PATTERNS = {
+    "group_agent_id": re.compile(r"^gag_[0-9a-f]{32}$"),
     "run_id": re.compile(r"^run_[0-9a-f]{32}$"), "task_id": re.compile(r"^task_[0-9a-f]{32}$"),
     "event_id": re.compile(r"^evt_[0-9a-f]{32}$"), "agent_run_id": re.compile(r"^arun_[0-9a-f]{32}$"),
     "approval_id": re.compile(r"^apr_[0-9a-f]{32}$"), "grant_id": re.compile(r"^grant_[0-9a-f]{32}$"),

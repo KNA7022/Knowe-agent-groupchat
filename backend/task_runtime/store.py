@@ -62,7 +62,7 @@ def _loads(value: str | None) -> dict[str, Any]:
 
 
 class TaskRuntimeStore:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, card_master_key=None) -> None:
         self.db = SQLiteDatabase(path)
         self.group_deletion_prepare_listener: Callable[[], None] | None = None
         self._event_listeners: list[Callable[[RunEvent], None]] = []
@@ -267,6 +267,8 @@ class TaskRuntimeStore:
         # Development snapshots may have been created by an earlier Task Runtime v1
         # build.  Keep this migration idempotent before enforcing new key indexes.
         self.db.ensure_columns("studycrew_approvals", {"request_key": "TEXT"})
+        from .card_state import CardStateRepository
+        self.card_states = CardStateRepository(self.db, card_master_key)
         self.db.ensure_columns("studycrew_checkpoints", {"idempotency_key": "TEXT"})
         self.db.ensure_columns("studycrew_migration_tombstones", {"winner_id": "TEXT NOT NULL DEFAULT ''"})
         self.db.ensure_columns("studycrew_group_deletions", {
@@ -864,6 +866,8 @@ class TaskRuntimeStore:
         sensitive_payload: Mapping[str, Any] | None = None,
         sensitivity: str = "public",
         transaction_hook: Callable[[Any, TaskRun, RunEvent], None] | None = None,
+        transaction_guard: Callable[[Any], None] | None = None,
+        publish: bool = True,
     ) -> tuple[TaskRun, RunEvent, bool]:
         if not idempotency_key.strip():
             raise ValueError("idempotency_key is required")
@@ -874,6 +878,8 @@ class TaskRuntimeStore:
             if owner_row is None:
                 raise RuntimeStoreError(f"run not found: {run_id}")
             self._assert_group_mutable_in_transaction(conn, str(owner_row["group_id"]))
+            if transaction_guard is not None:
+                transaction_guard(conn)
             duplicate = conn.execute(
                 "SELECT * FROM studycrew_run_events WHERE run_id=? AND idempotency_key=?",
                 (run_id, idempotency_key),
@@ -916,7 +922,8 @@ class TaskRuntimeStore:
             if transaction_hook is not None:
                 transaction_hook(conn, run, event)
             self._bump_group_snapshot_revision_in_transaction(conn, run.group_id)
-        self._publish(event)
+        if publish:
+            self._publish(event)
         return run, event, True
 
     @staticmethod
@@ -1008,6 +1015,12 @@ class TaskRuntimeStore:
         if row is None:
             return None
         return self._approval_from_raw(_loads(row["payload_json"]))
+
+    def approval_has_card_state(self, approval_id: str) -> bool:
+        with self.db.transaction(immediate=False) as conn:
+            row = conn.execute("SELECT card_key_id, card_state_ciphertext, card_crypto_version "
+                               "FROM studycrew_approvals WHERE approval_id=?", (approval_id,)).fetchone()
+        return row is not None and any(value is not None for value in row)
 
     @staticmethod
     def _approval_from_raw(raw: Mapping[str, Any]) -> ApprovalRequest:

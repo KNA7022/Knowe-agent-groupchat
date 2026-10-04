@@ -19,7 +19,10 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import uuid
+from contextlib import contextmanager
+from functools import wraps
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -379,6 +382,19 @@ class GroupDeletionReceipt:
         return row
 
 
+_REGISTRY_LOCKS: dict[str, threading.RLock] = {}
+_REGISTRY_LOCKS_GUARD = threading.Lock()
+
+
+def _registry_mutation(method):
+    """Serialize an entire JSON read/modify/write, including nested mutations."""
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self.admission_guard():
+            return method(self, *args, **kwargs)
+    return guarded
+
+
 class GroupRepository:
     """Atomic JSON repository for Group metadata and source reference ownership."""
 
@@ -386,10 +402,24 @@ class GroupRepository:
         self.data_root = Path(data_root)
         self.root = self.data_root / "groups" / f"v{GROUP_SCHEMA_VERSION}"
         self.registry_path = self.root / "registry.json"
+        registry_key = os.path.normcase(str(self.registry_path.resolve()))
+        with _REGISTRY_LOCKS_GUARD:
+            self._admission_lock = _REGISTRY_LOCKS.setdefault(registry_key, threading.RLock())
         self.receipts_path = self.root / "deletion_receipts.json"
         self.deletion_prepare_listener: Callable[[], None] | None = None
         self.root.mkdir(parents=True, exist_ok=True)
         self._normalize_duplicate_journal()
+
+    @contextmanager
+    def admission_guard(self):
+        """In-process fence shared by repositories of this canonical registry.
+
+        Card lock order is runtime service, Group guard, source guard, runtime DB.
+        Never call external listeners while holding this guard. This is not a
+        cross-process file lock; desktop composition owns a single backend process.
+        """
+        with self._admission_lock:
+            yield
 
     def _load_payload(self) -> dict[str, Any]:
         if not self.registry_path.is_file():
@@ -423,6 +453,7 @@ class GroupRepository:
         payload["revision"] = int(payload.get("revision") or 0) + 1
         _atomic_write_json(self.registry_path, payload)
 
+    @_registry_mutation
     def _normalize_duplicate_journal(self) -> None:
         """Atomically scrub full snapshots retained by the pre-fence duplicate format."""
         if not self.registry_path.is_file():
@@ -507,6 +538,7 @@ class GroupRepository:
             if source_id in locked:
                 raise GroupDomainError("source ownership is locked by a pending group deletion")
 
+    @_registry_mutation
     def create_group(
         self,
         name: str,
@@ -569,6 +601,7 @@ class GroupRepository:
             display_name=display_name, template_key=role,
         )
 
+    @_registry_mutation
     def _replace(self, updated: Group) -> Group:
         updated.validate()
         payload = self._load_payload()
@@ -581,11 +614,13 @@ class GroupRepository:
                 return updated
         raise GroupNotFoundError(f"group not found: {updated.group_id}")
 
+    @_registry_mutation
     def rename(self, group_id: str, name: str) -> Group:
         group = self.get(group_id)
         group.name = _bounded_text(name, "group name", 160)
         return self._replace(group)
 
+    @_registry_mutation
     def archive(self, group_id: str) -> Group:
         group = self.get(group_id)
         if group.lifecycle is not GroupLifecycle.ARCHIVED:
@@ -594,6 +629,7 @@ class GroupRepository:
             self._replace(group)
         return group
 
+    @_registry_mutation
     def restore(self, group_id: str) -> Group:
         group = self.get(group_id)
         if group.lifecycle is not GroupLifecycle.ACTIVE:
@@ -612,6 +648,7 @@ class GroupRepository:
         )
         return self.commit_duplicate(str(transaction["transaction_id"]))
 
+    @_registry_mutation
     def prepare_duplicate(
         self, group_id: str, *, name: str | None = None,
         legacy_project_id: str, request_id: str | None = None,
@@ -679,6 +716,7 @@ class GroupRepository:
         self._save_payload(payload)
         return dict(transaction)
 
+    @_registry_mutation
     def commit_duplicate(
         self, transaction_id: str, *, require_runtime_provisioned: bool = False,
     ) -> Group:
@@ -713,6 +751,7 @@ class GroupRepository:
             return duplicate
         raise GroupNotFoundError(f"duplicate transaction not found: {transaction_id}")
 
+    @_registry_mutation
     def mark_duplicate_runtime_provisioned(self, transaction_id: str) -> dict[str, Any]:
         payload = self._load_payload()
         for index, row in enumerate(payload["duplicate_transactions"]):
@@ -774,6 +813,7 @@ class GroupRepository:
             recovered.append(group.group_id)
         return recovered
 
+    @_registry_mutation
     def bind_course(self, group_id: str, course_id: str) -> GroupCourseBinding:
         group = self.get(group_id)
         cid = _bounded_text(course_id, "course_id", 160)
@@ -785,6 +825,7 @@ class GroupRepository:
         self._replace(group)
         return binding
 
+    @_registry_mutation
     def unbind_course(self, group_id: str, course_id: str) -> bool:
         group = self.get(group_id)
         kept = [item for item in group.course_bindings if item.course_id != course_id]
@@ -794,6 +835,7 @@ class GroupRepository:
             self._replace(group)
         return changed
 
+    @_registry_mutation
     def update_roster(self, group_id: str, agents: Sequence[GroupAgent | Mapping[str, Any]]) -> Group:
         group = self.get(group_id)
         parsed: list[GroupAgent] = []
@@ -806,6 +848,7 @@ class GroupRepository:
         group.validate()
         return self._replace(group)
 
+    @_registry_mutation
     def link_source(self, group_id: str, source_id: str | None = None) -> GroupSourceLink:
         group = self.get(group_id)
         sid = source_id or opaque_id("src")
@@ -829,6 +872,7 @@ class GroupRepository:
                 return link
         raise GroupNotFoundError(f"group not found: {group_id}")
 
+    @_registry_mutation
     def unlink_source(self, group_id: str, source_id: str) -> bool:
         group = self.get(group_id)
         payload = self._load_payload()
@@ -892,6 +936,18 @@ class GroupRepository:
     def prepare_delete(
         self, group_id: str, confirmation_token: str, *, runtime_project_id: str | None = None,
     ) -> dict[str, Any]:
+        transaction, created = self._prepare_delete(
+            group_id, confirmation_token, runtime_project_id=runtime_project_id,
+        )
+        listener = self.deletion_prepare_listener
+        if created and listener is not None:
+            listener()
+        return transaction
+
+    @_registry_mutation
+    def _prepare_delete(
+        self, group_id: str, confirmation_token: str, *, runtime_project_id: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
         """Durably record delete intent and its future content-free receipt.
 
         This is the first write in the cross-layer state machine.  Once present, all
@@ -905,7 +961,7 @@ class GroupRepository:
         if existing is not None:
             if existing.get("confirmation_token") != confirmation_token:
                 raise StaleDeletePreviewError("delete preview is stale or was not confirmed")
-            return dict(existing)
+            return dict(existing), False
 
         preview = self.delete_preview(group_id)
         if not confirmation_token or confirmation_token != preview.confirmation_token:
@@ -937,14 +993,11 @@ class GroupRepository:
         }
         payload = self._load_payload()
         if self._pending_delete(payload, group_id) is not None:
-            return dict(self._pending_delete(payload, group_id) or transaction)
+            return dict(self._pending_delete(payload, group_id) or transaction), False
         payload["deletion_transactions"].append(transaction)
         payload["deletion_revision"] = int(payload.get("deletion_revision") or 0) + 1
         self._save_payload(payload)
-        listener = self.deletion_prepare_listener
-        if listener is not None:
-            listener()
-        return dict(transaction)
+        return dict(transaction), True
 
     def delete_transaction(self, identity: str) -> dict[str, Any] | None:
         value = str(identity or "").strip()
@@ -986,6 +1039,7 @@ class GroupRepository:
             "has_more": has_more, "limit": bounded,
         }
 
+    @_registry_mutation
     def mark_runtime_deleted(self, transaction_id: str) -> dict[str, Any]:
         payload = self._load_payload()
         for index, row in enumerate(payload["deletion_transactions"]):
@@ -999,6 +1053,7 @@ class GroupRepository:
             return dict(updated)
         raise GroupNotFoundError(f"delete transaction not found: {transaction_id}")
 
+    @_registry_mutation
     def commit_delete(self, transaction_id: str) -> GroupDeletionReceipt:
         """Atomically commit Group/source removal and its durable receipt."""
         payload = self._load_payload()

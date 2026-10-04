@@ -1,0 +1,175 @@
+Initial frozen full backend command:
+py -3.12 -m pytest backend/tests -q
+
+Original terminal failure tail (exit 1):
+================================== FAILURES ===================================
+__ test_live_engine_completion_reaches_verifier_terminal_and_dispatches_next __
+
+tmp_path = WindowsPath('C:/Users/25977/AppData/Local/Temp/pytest-of-25977/pytest-77/test_live_engine_completion_re0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001DC60C0BD70>
+
+    async def test_live_engine_completion_reaches_verifier_terminal_and_dispatches_next(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        server = KnoweServer(str(tmp_path))
+        group = server.groups.create_group("Completion", legacy_project_id="project_completion")  # type: ignore[union-attr]
+        server.hub.get_or_create("project_completion", "Completion")
+
+        class TrackedEngine:
+            def __init__(self) -> None:
+                self.future: asyncio.Future[dict] | None = None
+
+            def resolve_group_mentions(self, _content: str):
+                return SimpleNamespace(worker_ids=())
+
+            async def submit_tracked(self, _content: str, attachments=None):
+                self.future = asyncio.get_running_loop().create_future()
+                return self.future
+
+        engine = TrackedEngine()
+        monkeypatch.setattr(server, "_project_dir_is_valid", lambda _project_id: True)
+        monkeypatch.setattr(server, "engine_for", lambda _project_id: engine)
+        monkeypatch.setattr(server, "_prepare_attachments", lambda *_args: asyncio.sleep(0, result=(True, [])))
+        await server._cmd_user_message(None, {  # noqa: SLF001
+            "project_id": "project_completion", "content": "Explain derivatives",
+            "client_msg_id": "completion-1", "read_only": False,
+        })
+        first = server.task_runtime.store.list_runs(group_id=group.group_id)[0]  # type: ignore[union-attr]
+        queued = server.task_runtime.submit(  # type: ignore[union-attr]
+            group.group_id, title="Next task", request_key="next-task",
+        )
+        assert engine.future is not None
+        engine.future.set_result({"outcome": "succeeded"})
+
+        deadline = asyncio.get_running_loop().time() + 2
+        while asyncio.get_running_loop().time() < deadline:
+            terminal = server.task_runtime.store.get_run(first.run_id)  # type: ignore[union-attr]
+            next_run = server.task_runtime.store.get_run(queued.run_id)  # type: ignore[union-attr]
+            if terminal and terminal.status is TaskStatus.SUCCEEDED and next_run and next_run.status is TaskStatus.RUNNING:
+                break
+            await asyncio.sleep(0.02)
+        else:
+>           raise AssertionError("trusted completion did not terminate and release capacity")
+E           AssertionError: trusted completion did not terminate and release capacity
+
+backend\tests\test_task_runtime_rereview_round2.py:441: AssertionError
+------------------------------ Captured log call ------------------------------
+ERROR    knowe.server:server.py:2992 Task Runtime execution bridge failed for run_ac088e5295624daa9f42644fac492613
+Traceback (most recent call last):
+  File "D:\agentwork\StudyCrew-worktree\backend\server.py", line 2971, in _bridge_task_runtime_execution
+    self.task_runtime.finalize_trusted_execution(
+  File "D:\agentwork\StudyCrew-worktree\backend\task_runtime\service.py", line 517, in finalize_trusted_execution
+    current = self.update_agent(
+              ^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\task_runtime\service.py", line 323, in update_agent
+    run, _event, _created = self.store.change_run(
+                            ^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\task_runtime\store.py", line 907, in change_run
+    event = RunEvent(
+            ^^^^^^^^^
+  File "<string>", line 14, in __init__
+  File "D:\agentwork\StudyCrew-worktree\backend\task_runtime\contracts.py", line 576, in __post_init__
+    assert_public_payload(self.event_type, self.public_payload)
+  File "D:\agentwork\StudyCrew-worktree\backend\task_runtime\contracts.py", line 197, in assert_public_payload
+    walk(value)
+  File "D:\agentwork\StudyCrew-worktree\backend\task_runtime\contracts.py", line 187, in walk
+    walk(child)
+  File "D:\agentwork\StudyCrew-worktree\backend\task_runtime\contracts.py", line 195, in walk
+    raise ValueError("PII or credential value is forbidden in public payload")
+ValueError: PII or credential value is forbidden in public payload
+=========================== short test summary info ===========================
+FAILED backend\tests\test_task_runtime_rereview_round2.py::test_live_engine_completion_reaches_verifier_terminal_and_dispatches_next
+1 failed, 1707 passed, 5 skipped, 10 subtests passed in 188.40s (0:03:08)
+
+Behavior RED: publication and bounded receipt resolution slot
+py -3.12 -m pytest backend/tests/test_bound_cards.py -q -k 'publication_occurs or bounded_receipts' --tb=short
+FF                                                                       [100%]
+================================== FAILURES ===================================
+_________ test_fresh_nonces_duplicate_conflicts_and_bounded_receipts __________
+backend\tests\test_bound_cards.py:254: in test_fresh_nonces_duplicate_conflicts_and_bounded_receipts
+    with pytest.raises(CardStateError, match="capacity"):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE CardStateError
+_______ test_card_publication_occurs_after_all_admission_locks_release ________
+backend\tests\test_bound_cards.py:487: in test_card_publication_occurs_after_all_admission_locks_release
+    assert acquired == [True]
+E   assert [False] == [True]
+E
+E     At index 0 diff: False != True
+E     Use -v to get more diff
+=========================== short test summary info ===========================
+FAILED backend\tests\test_bound_cards.py::test_fresh_nonces_duplicate_conflicts_and_bounded_receipts
+FAILED backend\tests\test_bound_cards.py::test_card_publication_occurs_after_all_admission_locks_release
+2 failed, 69 deselected in 3.09s
+
+Behavior RED: reject SQLite scalar before bytes(n) conversion
+py -3.12 -m pytest backend/tests/test_bound_cards.py -q -k corrupt_scalar --tb=short
+FF                                                                       [100%]
+================================== FAILURES ===================================
+_ test_corrupt_scalar_storage_is_rejected_before_blob_conversion[sentinel-0] __
+backend\tests\test_bound_cards.py:705: in test_corrupt_scalar_storage_is_rejected_before_blob_conversion
+    assert len(calls) == expected_opens
+E   assert 1 == 0
+E    +  where 1 = len([64])
+_ test_corrupt_scalar_storage_is_rejected_before_blob_conversion[card_state_ciphertext-1] _
+backend\tests\test_bound_cards.py:705: in test_corrupt_scalar_storage_is_rejected_before_blob_conversion
+    assert len(calls) == expected_opens
+E   assert 2 == 1
+E    +  where 2 = len([49, 64])
+=========================== short test summary info ===========================
+FAILED backend\tests\test_bound_cards.py::test_corrupt_scalar_storage_is_rejected_before_blob_conversion[sentinel-0]
+FAILED backend\tests\test_bound_cards.py::test_corrupt_scalar_storage_is_rejected_before_blob_conversion[card_state_ciphertext-1]
+2 failed, 88 deselected in 0.86s
+
+GREEN (same command after strict storage-type validation):
+..                                                                       [100%]
+2 passed, 88 deselected in 0.95s
+
+Fixed real Group verifier ID RED summary:
+py -3.12 -m pytest backend/tests/test_task_runtime_rereview_round2.py -q -k live_engine_completion --tb=short
+FAILED backend\tests\test_task_runtime_rereview_round2.py::test_live_engine_completion_reaches_verifier_terminal_and_dispatches_next[gag_931dd5c0d0d14143976714bcd4f4cbd6]
+1 failed, 1 passed, 9 deselected in 4.04s
+
+Final focused GREEN (including full affected rereview-round2 file):
+py -3.12 -m pytest backend/tests/test_bound_cards.py backend/tests/test_task_runtime_rereview_round2.py -q --tb=short
+........................................................................ [ 68%]
+.................................                                        [100%]
+105 passed in 9.88s
+
+Node24 full gates (exit 0):
+[node24] node v24.9.0  根目录 D:\agentwork\StudyCrew-worktree
+> studycrew-desktop@1.0.36 typecheck
+> tsc --noEmit && tsc --noEmit -p electron/tsconfig.json
+> studycrew-desktop@1.0.36 lint
+> eslint src/ electron/ --ext .ts,.tsx --max-warnings 0
+> studycrew-desktop@1.0.36 test
+> vitest run
+ Test Files  55 passed (55)
+      Tests  588 passed (588)
+   Start at  13:08:04
+   Duration  38.25s (transform 16.55s, setup 49.60s, collect 82.48s, tests 43.23s, environment 149.46s, prepare 33.69s)
+
+Targeted public contract mirror after exact opaque-ID fix (exit 0):
+. ./.tools/node24.ps1
+npm run test -- src/contract/publicEvents.drift.test.ts src/contract/taskRuntime.test.ts
+ Test Files  2 passed (2)
+      Tests  10 passed (10)
+   Start at  13:16:36
+   Duration  1.21s (transform 134ms, setup 346ms, collect 342ms, tests 24ms, environment 874ms, prepare 189ms)
+
+Final frozen full backend command:
+py -3.12 -m pytest backend/tests -q
+
+Final terminal tail (exit 0):
+........................................................................ [ 87%]
+........................................................................ [ 92%]
+........................................................................ [ 96%]
+.............................................................. [ 99%]
+..                                                                       [100%]
+1715 passed, 5 skipped, 10 subtests passed in 159.20s (0:02:39)
+
+Final static verification:
+py -3.12 -m compileall -q backend
+exit 0 (no diagnostic output)
+git diff --check
+exit 0 (only configured LF-to-CRLF checkout warnings; no whitespace errors)
