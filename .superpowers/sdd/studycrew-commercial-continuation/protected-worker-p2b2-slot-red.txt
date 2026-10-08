@@ -1,0 +1,20 @@
+FF.                                                                      [100%]
+================================== FAILURES ===================================
+_ test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback[archive] _
+backend\tests\test_protected_worker.py:703: in test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback
+    assert terminal.status is (TaskStatus.PAUSED if fence == "pause" else TaskStatus.FAILED)
+E   AssertionError: assert <TaskStatus.RUNNING: 'running'> is <TaskStatus.FAILED: 'failed'>
+E    +  where <TaskStatus.RUNNING: 'running'> = TaskRun(run_id='run_d3588ac6b146404db6ca97c893b4e06a', task_id='task_3e936cd654c64282adeceeb8bb8d04d9', group_id='grp_...updated_at='2026-10-08T04:52:33.084419Z', started_at='2026-10-08T04:52:33.061919Z', finished_at=None, schema_version=1).status
+------------------------------ Captured log call ------------------------------
+WARNING  knowe.engine:engine.py:5266 Protected Worker attempt ended without legacy fallback
+_ test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback[revoke] _
+backend\tests\test_protected_worker.py:703: in test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback
+    assert terminal.status is (TaskStatus.PAUSED if fence == "pause" else TaskStatus.FAILED)
+E   AssertionError: assert <TaskStatus.RUNNING: 'running'> is <TaskStatus.FAILED: 'failed'>
+E    +  where <TaskStatus.RUNNING: 'running'> = TaskRun(run_id='run_11843721344e44b6b5e3601711fcd220', task_id='task_2214f60cfcda4be5954adb3a5f6ea843', group_id='grp_...updated_at='2026-10-08T04:52:33.608207Z', started_at='2026-10-08T04:52:33.590370Z', finished_at=None, schema_version=1).status
+------------------------------ Captured log call ------------------------------
+WARNING  knowe.engine:engine.py:5266 Protected Worker attempt ended without legacy fallback
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_worker.py::test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback[archive]
+FAILED backend\tests\test_protected_worker.py::test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback[revoke]
+2 failed, 1 passed, 51 deselected in 2.17s

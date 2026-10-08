@@ -801,11 +801,12 @@ class WorkerRuntime:
         events: EventEmitter | None = None,
         on_run_started: Callable[[TaskRun], Any] | None = None,
         reasoning_relay: Callable[[str], Any] | None = None,  # [v1.0.23.3] 推理增量直通回调（fire-and-forget）
+        delivery_identity: Callable[[TaskRun], tuple[str, str]] | None = None,
         **compatibility: Any,
     ) -> None:
         del compatibility
         self.model = model
-        self.registry = registry or tools
+        self.registry = registry if registry is not None else tools
         if self.registry is None:
             raise TypeError("WorkerRuntime requires a ToolRegistry")
         self.config = config or RuntimeConfig()
@@ -817,6 +818,7 @@ class WorkerRuntime:
         self.events = events or EventEmitter()
         self.on_run_started = on_run_started
         self.reasoning_relay = reasoning_relay
+        self.delivery_identity = delivery_identity
         self.completion_managed = False
         self._running_task: asyncio.Task[Any] | None = None
 
@@ -1250,6 +1252,9 @@ class WorkerRuntime:
 
         assert result is not None
         delivery = self._delivery_for(result, run, started_monotonic)
+        if delivery is not None and self.delivery_identity is not None:
+            delivery_id, delivery_key = self.delivery_identity(run)
+            delivery = dataclasses.replace(delivery, delivery_id=delivery_id, idempotency_key=delivery_key)
         result = dataclasses.replace(result, task_run=run, delivery=delivery)
         run.metadata["runtime_result"] = result.to_dict()
         if result.status is RuntimeStatus.SUCCEEDED:

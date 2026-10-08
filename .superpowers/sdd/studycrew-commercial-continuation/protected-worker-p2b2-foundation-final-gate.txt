@@ -1,0 +1,50 @@
+
+> studycrew-desktop@1.0.36 test:foundation
+> node --test scripts/python-command.test.mjs scripts/packaging-contract.test.mjs scripts/spec-check.test.mjs && npm run verify:runtime
+
+✔ spec 必须通过 AST 结构检查 (1.5931ms)
+✔ spec 的 hiddenimports 生效值必须非空且每个模块全名可解析 (677.8822ms)
+✔ spec 不得要求已被移除的 dotenv 依赖 (0.2382ms)
+✔ electron-builder 的 buildVersion 必须与 package.json 同源 (0.2835ms)
+✔ electron-builder 引用的构建资源必须存在或有生成者 (0.4588ms)
+✔ NSIS 脚本必须保留 data 与 Logs（真正的反向断言） (1.5007ms)
+✔ dist:win 必须先生成 NSIS 构建资源与后端产物 (0.4246ms)
+✔ 全量门禁必须包含打包契约 (0.231ms)
+✔ 已构建的后端产物必须带正确版本资源（含 filevers/prodvers 数字字段） (752.4758ms)
+✔ spec 的版本对象必须字段齐全、数字版本正确、品牌不残留 Knowe (600.999ms)
+✔ keeps an explicit Python executable path with spaces intact (2.2649ms)
+✔ splits only the supported Windows launcher command (0.3199ms)
+✔ 真实 spec 必须通过 AST 检查 (829.3942ms)
+✔ 应接受：先置 _VERSION = None 再由 win32 分支覆盖（安全序） (971.9919ms)
+✔ 应接受：hiddenimports 用列表拼接（合法写法） (993.7981ms)
+✔ 必须拒绝：hiddenimports 用 set 字面量（PyInstaller 会崩） (894.7758ms)
+✔ 必须拒绝：hiddenimports 用 tuple 字面量（PyInstaller 会崩） (780.7748ms)
+✔ 必须拒绝：for 循环里覆写 _VERSION = None (1028.3152ms)
+✔ 应接受：版本对象由顶层 helper 函数构造 (1094.1666ms)
+✔ 必须拒绝：裸 except 吞掉版本资源（上游根因原型） (551.4172ms)
+✔ 必须拒绝：except (ImportError, Exception) 元组 (653.2275ms)
+✔ 必须拒绝：except BaseException (628.2846ms)
+✔ 必须拒绝：hiddenimports 用变量拼接偷掉 playwright (1052.632ms)
+✔ 必须拒绝：hiddenimports 整体清空 (1059.1967ms)
+✔ 必须拒绝：EXE 之前插入 _VERSION = None 覆写（文本检查看不到） (1013.5103ms)
+✔ 必须拒绝：EXE 之后覆写 _VERSION = None (882.9046ms)
+✔ 必须拒绝：删掉 version=_VERSION 接线 (868.7329ms)
+✔ 必须拒绝：globals()[_VERSION] = None（非 Assign，静态看不见） (784.4811ms)
+✔ 必须拒绝：exec 里赋 _VERSION = None (762.4684ms)
+✔ 必须拒绝：有效赋值之后补 _VERSION = None（危险序，旧规则曾反向） (828.1523ms)
+✔ 必须拒绝：异常别名 _ALIAS = Exception 吞掉版本错误 (443.6625ms)
+✔ 必须拒绝：decoy：在真 Analysis 前插一个假 Analysis (880.0599ms)
+✔ 必须拒绝：decoy：在真 EXE 前插一个假 EXE (910.5318ms)
+ℹ tests 33
+ℹ suites 0
+ℹ pass 33
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 18191.3074
+
+> studycrew-desktop@1.0.36 verify:runtime
+> node scripts/verify-runtime.mjs
+
+✅ StudyCrew runtime and Windows packaging contract verified

@@ -1499,6 +1499,7 @@ class ProjectEngine:
         self._welcomed: set[str] = set()
         self._worker_runtime_factory = worker_runtime_factory or DEFAULT_WORKER_RUNTIME_FACTORY
         self._task_runtime_service = task_runtime_service
+        self._protected_workers: dict[str, Any] = {}
         # [v0.44.8] 群聊列表偏好由 server 持久化、由 Harness 镜像到每个存活引擎。
         # 它们不改变记忆/执行语义，只决定客户端如何呈现通知与排序；保留在引擎上，
         # 让重建、热换绑和诊断都能读到同一份全局状态，而不是各窗口自说自话。
@@ -2220,8 +2221,14 @@ class ProjectEngine:
 
     async def _stop_once(self, *, immediate: bool = False) -> list[str]:
         self._stopping = True
-        project_root = self.internal_workspace
         close_issues: list[str] = []
+        for selected in tuple(self._protected_workers.values()):
+            try:
+                await selected.close()
+            except Exception:
+                close_issues.append("protected Worker close failed")
+        self._protected_workers.clear()
+        project_root = self.internal_workspace
         # Shutdown is a cleanup barrier, not a business transaction.  One malformed
         # approval callback must not abort the rest of teardown and leave browser/
         # worker/file handles alive (permanent-delete stages the directory immediately
@@ -2633,7 +2640,13 @@ class ProjectEngine:
         root = self.internal_workspace / "runtime"
         root.mkdir(parents=True, exist_ok=True)
         if self._completion_store_instance is None:
-            self._completion_store_instance = SQLiteCompletionStore(root / "runtime.sqlite3")
+            registry = None
+            service = self._task_runtime_service
+            if service is not None and service.store.db.table_columns("studycrew_protected_lineages"):
+                from .protected_storage import ProtectedLineages
+                registry = ProtectedLineages(service)
+            self._completion_store_instance = SQLiteCompletionStore(
+                root / "runtime.sqlite3", legacy_lineages=registry)
         if self._completion_projector_instance is None:
             self._completion_projector_instance = CompletionProjector(
                 self._completion_store_instance,
@@ -3911,6 +3924,15 @@ class ProjectEngine:
         internal: bool = False,
     ) -> None:
         """Run one Worker attempt inside a clean Actor and lifecycle boundary."""
+
+        from .protected_storage import protected_id, ProtectedStorageError
+        selected_envelope = task if isinstance(task, TaskEnvelope) else self._task_envelopes.get(worker_id)
+        if selected_envelope is not None and protected_id(selected_envelope.task_id):
+            selected = self._protected_workers.get(selected_envelope.task_id)
+            if selected is None or selected_envelope.worker_id != worker_id:
+                raise ProtectedStorageError("protected execution selection required")
+            await selected.run(selected_envelope)
+            return
 
         if worker_id == COORDINATOR:
             raise ValueError("Coordinator cannot enter WorkerRuntime")
@@ -5237,6 +5259,12 @@ class ProjectEngine:
                     self._governed_task_scopes[governed_scope_id].update({
                         "outcome": "failed", "error_type": "worker_runtime_exception",
                     })
+                from .protected_storage import protected_id
+                if protected_id(envelope.task_id):
+                    # The selected route owns finalization and cleanup; never feed its
+                    # envelope or errors into legacy completion/history fallbacks.
+                    log.warning("Protected Worker attempt ended without legacy fallback")
+                    return
                 log.exception("[%s] %s 的 Runtime 回合异常", self.project_id, agent_id)
                 # [v1.0.21.1 REQ-3] 回合异常=终局：落盘失败+关信封，杜绝异常静默死循环
                 try:
@@ -5313,6 +5341,9 @@ class ProjectEngine:
     ) -> None:
         """Route Worker turns directly to WorkerRuntime and retain Coordinator handling."""
         worker_id = target if target and target != COORDINATOR else None
+        from .protected_storage import protected_id
+        queued_envelope = self._task_envelopes.get(worker_id) if worker_id else None
+        protected_attempt = queued_envelope is not None and protected_id(queued_envelope.task_id)
         try:
             if worker_id is not None:
                 envelope = self._task_envelopes.get(worker_id)
@@ -5320,7 +5351,7 @@ class ProjectEngine:
             else:
                 await self._process_turn_inner(content, None, internal=internal)
         except asyncio.CancelledError:
-            if worker_id is not None and not self._stopping:
+            if worker_id is not None and not self._stopping and not protected_attempt:
                 reason = self._stop_reasons.get(worker_id) or STOP_REASON_USER
                 # [v1.0.35.2] 先清空在途流式广播（fire-and-forget 的 reasoning_delta/stream_delta），
                 #   保证 agent_idle 一定是该 worker 流式事件的最后一条——否则晚到的推理增量
@@ -5329,7 +5360,7 @@ class ProjectEngine:
                 await asyncio.shield(self.fail_task(worker_id, reason))
             raise
         except Exception as exc:
-            if worker_id is not None:
+            if worker_id is not None and not protected_attempt:
                 await self.fail_task(worker_id, msg("engine.194", **{"type(exc).__name__": type(exc).__name__, "exc": exc}))
             raise
         finally:
@@ -5806,6 +5837,17 @@ class ProjectEngine:
 
     async def stop_worker(self, agent_id: str, *, reason: str = STOP_REASON_USER) -> dict[str, Any]:
         """Cancel one authoritative Runtime task and commit its deterministic failure."""
+        for selected in self._protected_workers.values():
+            if selected.binding["worker_id"] == agent_id and not selected.closed:
+                if selected.task is not None:
+                    selected.task.cancel()
+                    await asyncio.gather(selected.task, return_exceptions=True)
+                else:
+                    selected.finalize("CANCELLED")
+                    self._close_task_envelope(agent_id)
+                    await selected.close()
+                    self._protected_workers.pop(selected.access.task_id, None)
+                return {"ok": True, "message": "Protected task cancelled"}
         if not self.worker_is_busy(agent_id):
             return {"ok": False, "reason": msg("engine.203")}
         self._stop_reasons[agent_id] = reason
@@ -8388,7 +8430,7 @@ class ProjectEngine:
             }
         return {}
 
-    def _new_agent(self, agent_id: str, role: str, temperature: float) -> KnoweAgent:
+    def _new_agent(self, agent_id: str, role: str, temperature: float, *, authority_provider=None) -> KnoweAgent:
         """Create a Coordinator loop adapter or a Worker Provider holder."""
         binding = self._effective_provider_binding(agent_id)
         uses_lease = bool(binding.get("secret_ref") and binding.get("credential_purpose"))
@@ -8417,6 +8459,7 @@ class ProjectEngine:
             role=role,
             provider_config=pc,
             client_factory=self._client_factory,
+            authority_provider=authority_provider,
         )
         agent._bound_sig = (
             pc.provider, pc.base_url, pc.model,
@@ -9192,8 +9235,20 @@ class ProjectEngine:
         )
         return self._task_envelope_store().commit(envelope)
 
-    def inject_task_envelope(self, envelope: TaskEnvelope) -> TaskEnvelope:
+    def inject_task_envelope(self, envelope: TaskEnvelope, *, protected=None) -> TaskEnvelope:
         """Queue one already-persisted TaskEnvelope for direct Runtime execution."""
+        from .protected_storage import protected_id, ProtectedStorageError
+        if protected is not None or protected_id(envelope.task_id):
+            from .protected_worker import ProtectedWorker
+            if envelope.task_id in self._protected_workers:
+                raise ProtectedStorageError("protected new-Worker resume is unavailable")
+            if self.worker_is_busy(envelope.worker_id):
+                raise ProtectedStorageError("protected Worker is busy")
+            selected = ProtectedWorker(self, envelope, protected)
+            self._protected_workers[envelope.task_id] = selected
+            self._task_envelopes[envelope.worker_id] = envelope
+            self._workers_with_open_activity.add(envelope.worker_id)
+            return envelope
         target_id = envelope.worker_id
         supersedes_task_id = str(envelope.metadata.get("supersedes_task_id") or "")
         waiting = self.completion_store.active_wait_for_task(

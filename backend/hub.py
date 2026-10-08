@@ -162,7 +162,9 @@ class Client:
     def enqueue_ordered(self, event: dict[str, Any]) -> None:
         project = event.get("project_id", "")
         recovery = project in self._protected_resync_projects and event.get("type") == "state_snapshot"
-        if project in self._protected_resync_projects and not recovery and project not in self._protected_recovery_snapshots:
+        if (project in self._protected_resync_projects and not recovery
+                and event.get("type") != "task_runtime_event"
+                and project not in self._protected_recovery_snapshots):
             return
         if len(self._ordered_events) >= self.LIVE_REPLAY_BUFFER_MAX:
             self.request_resync(project, event.get("seq", 0))
@@ -204,8 +206,9 @@ class Client:
         self._protected_resync_projects.add(project)
         invalidated = self._protected_recovery_snapshots.pop(project, None)
         self._ordered_events = deque(e for e in self._ordered_events
-            if e.get("project_id") != project or e.get("type") == "resync_required")
-        self._live_replay_buffer = deque(e for e in self._live_replay_buffer if e.get("project_id") != project)
+            if e.get("project_id") != project or e.get("type") in {"resync_required", "task_runtime_event"})
+        self._live_replay_buffer = deque(e for e in self._live_replay_buffer
+            if e.get("project_id") != project or e.get("type") == "task_runtime_event")
         # Overflow/new invalidation supersedes an apparently successful in-flight
         # snapshot: its client needs one later notice. Hydration denial must not
         # recursively trigger automatic snapshot retries on a healthy socket.
@@ -218,7 +221,10 @@ class Client:
 
     async def send_live(self, event: dict[str, Any]) -> bool:
         """Buffer broadcasts until replay/snapshot handoff completes for this client."""
-        if event.get("project_id") in self._protected_resync_projects:
+        # Task Runtime has an independent authoritative status/recovery journal.
+        # A private-history hydration fence must not hide a truthful terminal status.
+        if (event.get("project_id") in self._protected_resync_projects
+                and event.get("type") != "task_runtime_event"):
             return False
         if self._live_replay_fenced:
             if len(self._live_replay_buffer) >= self.LIVE_REPLAY_BUFFER_MAX:
@@ -234,7 +240,8 @@ class Client:
         """Drain the ordered handoff queue, then atomically switch to direct live sends."""
         while self._live_replay_buffer:
             event = self._live_replay_buffer.popleft()
-            if event.get("project_id") in self._protected_resync_projects:
+            if (event.get("project_id") in self._protected_resync_projects
+                    and event.get("type") != "task_runtime_event"):
                 continue
             if not await self.send(event):
                 if self._protected_hydrate is not None:

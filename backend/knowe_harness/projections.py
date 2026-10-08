@@ -162,6 +162,8 @@ class CompletionProjector:
         raise_errors: bool = False,
     ) -> dict[str, Any]:
         self._ensure_open()
+        if self.store.protection is not None:
+            return await self._drain_protected(completion_id=completion_id, limit=limit)
         rows = list(self.store.pending_outbox(limit=limit, include_failed=True))
         if completion_id:
             rows = [row for row in rows if row.completion_id == completion_id]
@@ -218,6 +220,32 @@ class CompletionProjector:
         result["pending"] = len(self.store.pending_outbox(limit=limit, include_failed=True))
         result["orphan_summary"] = self.store.orphan_summary()
         return result
+
+    async def _drain_protected(self, *, completion_id, limit):
+        """Commit local publication; retain encrypted review intent without consuming it."""
+        store, engine = self._ensure_open()
+        rows = store.pending_outbox(completion_id=completion_id, limit=limit)
+        processed = 0
+        for entry in rows:
+            if entry.projection_kind is ProjectionKind.COORDINATOR:
+                continue  # Its encrypted body remains pending until governed review exists.
+            event = store.get(entry.completion_id)
+            if entry.projection_kind is ProjectionKind.DELIVERY and event.status in {
+                    CompletionStatus.SUCCEEDED, CompletionStatus.PARTIAL,
+                    CompletionStatus.WAITING, CompletionStatus.BLOCKED}:
+                commit = await engine.hub.emit_protected(store.protection.access, entry.outbox_id)
+                await self._fault("after_protected_event_commit", entry, event)
+                effect = ProjectionEffect(commit.reference["event_id"], {"projection": {"status": "committed",
+                    "event_id": commit.reference["event_id"], "seq": commit.reference["seq"]}})
+            else:
+                effect = ProjectionEffect("protected:skipped", {"projection": {"status": "skipped",
+                    "reason": "protected_no_derivative_copy", "review_status": "pending_review"}})
+            store.acknowledge_outbox(entry.outbox_id,
+                effect_ref=effect.effect_ref, effect_payload=effect.payload)
+            await self._fault("after_protected_ack", entry, event)
+            processed += 1
+        return {"processed": processed, "pending_review": True,
+            "pending": len(store.pending_outbox(completion_id=completion_id, limit=limit))}
 
     def _reconcile_decisions(self) -> dict[str, Any]:
         """Persist typed Coordinator decisions without extracting secondary facts."""

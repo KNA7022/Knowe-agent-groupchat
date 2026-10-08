@@ -178,6 +178,7 @@ class KnoweAgent:
         tool_gen_callback: Callable[[str], Any] | None = None,
         tool_start_callback: Callable[[], Any] | None = None,
         tool_complete_callback: Callable[[], Any] | None = None,
+        authority_provider: Callable[[], Any] | None = None,
     ) -> None:
         self.agent_id = agent_id
         self.role = role
@@ -205,6 +206,7 @@ class KnoweAgent:
             provider=cfg.provider,
             transport=cfg.transport,
             credential_provider=cfg.credential_provider,
+            **({"authority_provider": authority_provider} if authority_provider is not None else {}),
         )
         self._tool_registry = tool_registry or ToolRegistry()
         # Only the Coordinator uses durable raw AgentLoop messages. Worker state is

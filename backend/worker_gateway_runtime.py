@@ -269,7 +269,27 @@ class WorkerRuntimeFactory:
         worker_id: str,
         envelope: TaskEnvelope,
         agent: Any,
+        *,
+        protected=None,
     ) -> WorkerRuntime:
+        if protected is not None:
+            from .protected_worker import ProtectedWorker
+            from knowe_core.tool_registry import ToolRegistry
+            if (type(protected) is not ProtectedWorker or protected.engine is not engine
+                    or protected.binding["worker_id"] != worker_id
+                    or agent.agent_id != worker_id):
+                raise RuntimeError("protected Worker holder mismatch")
+            protected.authority()
+            return WorkerRuntime(
+                model=ProviderModelAdapter.from_legacy(agent, config=ProviderAdapterConfig(
+                    stream=True, protected_wait_control=True)),
+                registry=ToolRegistry(), config=RuntimeConfig(expected_tool_names=()),
+                prompt=("Answer the user's instruction. You have no file or external tools. "
+                    "Use protected_wait_for_user only when required information is missing."),
+                events=EventEmitter(), on_run_started=protected.started,
+                reasoning_relay=lambda _text: None,
+                delivery_identity=protected.delivery_identity,
+            )
         root = self._workspace(engine, envelope)
         metadata = _normalize_task_metadata(envelope)
         if metadata != envelope.metadata:

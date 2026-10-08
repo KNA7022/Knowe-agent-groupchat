@@ -37,6 +37,7 @@ class ProviderAdapterConfig:
     temperature: float | None = None
     max_tokens: int | None = None
     extra_body: dict[str, Any] | None = None
+    protected_wait_control: bool = False
 
 
 class ProviderModelAdapter:
@@ -88,6 +89,16 @@ class ProviderModelAdapter:
         self.calls += 1
         messages = [dict(item) for item in context.messages]
         tools = [dict(item) for item in context.tool_schemas]
+        if self.config.protected_wait_control:
+            if tools:
+                raise ProviderProtocolError("protected effect tools denied")
+            tools = [{"type": "function", "function": {
+                "name": "protected_wait_for_user",
+                "description": "Pause and ask the user for information required to continue.",
+                "parameters": {"type": "object", "properties": {
+                    "question": {"type": "string", "minLength": 1, "maxLength": 8192}},
+                    "required": ["question"], "additionalProperties": False},
+            }}]
         if self.config.stream and hasattr(self.client, "chat_stream"):
             outcome = await self._stream_step(
                 messages, tools, reasoning_delta_callback=reasoning_delta_callback
@@ -103,6 +114,17 @@ class ProviderModelAdapter:
                 extra_body=dict(self.config.extra_body or {}),
             )
             outcome = self.normalize_response(response)
+        if self.config.protected_wait_control and outcome.kind is OutcomeKind.ACTIONS:
+            calls = outcome.tool_calls
+            if len(calls) != 1 or calls[0].name != "protected_wait_for_user":
+                raise ProviderProtocolError("protected native control denied")
+            args = calls[0].arguments
+            question = args.get("question")
+            if (set(args) != {"question"} or not isinstance(question, str)
+                    or not question.strip() or len(question) > 8192
+                    or len(question.encode("utf-8")) > 8192):
+                raise ProviderProtocolError("invalid protected wait control")
+            outcome = StepOutcome.waiting(question, dependency="user_input", usage=outcome.usage)
         if outcome.kind is OutcomeKind.FINAL and outcome.assistant_text and self.on_text:
             value = self.on_text(outcome.assistant_text)
             if inspect.isawaitable(value):
@@ -176,6 +198,21 @@ class ProviderModelAdapter:
                     )
             elif event_type == "error":
                 raise ProviderProtocolError(str(event.get("message") or "provider stream error"))
+        if self.config.protected_wait_control:
+            def unique_object(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ProviderProtocolError("duplicate protected control field")
+                    result[key] = value
+                return result
+            for call in calls.values():
+                raw = call["function"]["arguments"]
+                if isinstance(raw, str):
+                    try:
+                        json.loads(raw, object_pairs_hook=unique_object)
+                    except (ValueError, TypeError):
+                        raise ProviderProtocolError("invalid protected native control") from None
         native_calls = self._finalize_stream_calls(calls)
         text = "".join(content)
         reasoning_text = "".join(reasoning)

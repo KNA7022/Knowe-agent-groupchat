@@ -1,0 +1,154 @@
+FFF                                                                      [100%]
+================================== FAILURES ===================================
+_ test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback[archive] _
+backend\tests\test_protected_worker.py:687: in test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback
+    assert legacy_failures == []
+E   AssertionError: assert [('gag_7eee73...n_exception')] == []
+E
+E     Left contains 2 more items, first extra item: ('gag_7eee73bd197741c08e9eaea7ea3268e0', '执行中抛出异常：ProtectedStorageError: protected storage authority unavailable')
+E     Use -v to get more diff
+------------------------------ Captured log call ------------------------------
+ERROR    knowe.engine:engine.py:5262 [project_20261004000001] gag_7eee73bd197741c08e9eaea7ea3268e0 的 Runtime 回合异常
+Traceback (most recent call last):
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 5341, in _process_turn
+    await self._run_worker(envelope or content, worker_id, internal=internal)
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 3934, in _run_worker
+    await selected.run(selected_envelope)
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_worker.py", line 149, in run
+    self.authority()
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_worker.py", line 66, in authority
+    with self.access.guard() as binding:
+         ^^^^^^^^^^^^^^^^^^^
+  File "E:\python\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_storage.py", line 292, in guard
+    raise ProtectedStorageError("protected storage authority unavailable") from None
+backend.protected_storage.ProtectedStorageError: protected storage authority unavailable
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 5248, in run
+    await self._process_turn(envelope.goal, agent_id, internal=True)
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 5355, in _process_turn
+    await self.fail_task(worker_id, msg("engine.194", **{"type(exc).__name__": type(exc).__name__, "exc": exc}))
+  File "D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_worker.py", line 674, in record_legacy_failure
+    return await original_fail(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 4236, in fail_task
+    event = self.completion_store.commit_run(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_storage.py", line 79, in guarded
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_storage.py", line 90, in writable
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\knowe_harness\completion.py", line 2298, in commit_run
+    raise ProtectedStorageError("protected repository capability required")
+backend.protected_storage.ProtectedStorageError: protected repository capability required
+_ test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback[revoke] _
+backend\tests\test_protected_worker.py:687: in test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback
+    assert legacy_failures == []
+E   AssertionError: assert [('gag_6df14e...n_exception')] == []
+E
+E     Left contains 2 more items, first extra item: ('gag_6df14efd0ebf455699818f996a8c40c0', '执行中抛出异常：ProtectedStorageError: protected lineage revoked')
+E     Use -v to get more diff
+------------------------------ Captured log call ------------------------------
+ERROR    knowe.engine:engine.py:5262 [project_20261004000001] gag_6df14efd0ebf455699818f996a8c40c0 的 Runtime 回合异常
+Traceback (most recent call last):
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 5341, in _process_turn
+    await self._run_worker(envelope or content, worker_id, internal=internal)
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 3934, in _run_worker
+    await selected.run(selected_envelope)
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_worker.py", line 149, in run
+    self.authority()
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_worker.py", line 66, in authority
+    with self.access.guard() as binding:
+         ^^^^^^^^^^^^^^^^^^^
+  File "E:\python\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_storage.py", line 279, in guard
+    data = registry._read(conn, self.task_id, self.group_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_storage.py", line 137, in _read
+    raise ProtectedStorageError("protected lineage revoked")
+backend.protected_storage.ProtectedStorageError: protected lineage revoked
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 5248, in run
+    await self._process_turn(envelope.goal, agent_id, internal=True)
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 5355, in _process_turn
+    await self.fail_task(worker_id, msg("engine.194", **{"type(exc).__name__": type(exc).__name__, "exc": exc}))
+  File "D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_worker.py", line 674, in record_legacy_failure
+    return await original_fail(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 4236, in fail_task
+    event = self.completion_store.commit_run(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_storage.py", line 79, in guarded
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_storage.py", line 90, in writable
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\knowe_harness\completion.py", line 2298, in commit_run
+    raise ProtectedStorageError("protected repository capability required")
+backend.protected_storage.ProtectedStorageError: protected repository capability required
+_ test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback[pause] _
+backend\tests\test_protected_worker.py:687: in test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback
+    assert legacy_failures == []
+E   AssertionError: assert [('gag_489f9e...n_exception')] == []
+E
+E     Left contains 2 more items, first extra item: ('gag_489f9e76d5f144d883f2cafb7c74642b', '执行中抛出异常：ProtectedStorageError: protected storage authority unavailable')
+E     Use -v to get more diff
+------------------------------ Captured log call ------------------------------
+ERROR    knowe.engine:engine.py:5262 [project_20261004000001] gag_489f9e76d5f144d883f2cafb7c74642b 的 Runtime 回合异常
+Traceback (most recent call last):
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 5341, in _process_turn
+    await self._run_worker(envelope or content, worker_id, internal=internal)
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 3934, in _run_worker
+    await selected.run(selected_envelope)
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_worker.py", line 149, in run
+    self.authority()
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_worker.py", line 66, in authority
+    with self.access.guard() as binding:
+         ^^^^^^^^^^^^^^^^^^^
+  File "E:\python\Lib\contextlib.py", line 137, in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_storage.py", line 292, in guard
+    raise ProtectedStorageError("protected storage authority unavailable") from None
+backend.protected_storage.ProtectedStorageError: protected storage authority unavailable
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 5248, in run
+    await self._process_turn(envelope.goal, agent_id, internal=True)
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 5355, in _process_turn
+    await self.fail_task(worker_id, msg("engine.194", **{"type(exc).__name__": type(exc).__name__, "exc": exc}))
+  File "D:\agentwork\StudyCrew-worktree\backend\tests\test_protected_worker.py", line 674, in record_legacy_failure
+    return await original_fail(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\engine.py", line 4236, in fail_task
+    event = self.completion_store.commit_run(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_storage.py", line 79, in guarded
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\protected_storage.py", line 90, in writable
+    return method(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\agentwork\StudyCrew-worktree\backend\knowe_harness\completion.py", line 2298, in commit_run
+    raise ProtectedStorageError("protected repository capability required")
+backend.protected_storage.ProtectedStorageError: protected repository capability required
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_worker.py::test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback[archive]
+FAILED backend\tests\test_protected_worker.py::test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback[revoke]
+FAILED backend\tests\test_protected_worker.py::test_fence_between_injection_and_scheduler_closes_selection_without_legacy_fallback[pause]
+3 failed, 50 deselected in 2.86s
