@@ -1,0 +1,150 @@
+FFFFFFFFF                                                                [100%]
+================================== FAILURES ===================================
+____ test_first_public_phase_does_not_wait_for_authenticated_client_socket ____
+E:\python\Lib\asyncio\tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+E:\python\Lib\asyncio\locks.py:212: in wait
+    await fut
+E   asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+backend\tests\test_protected_worker.py:773: in test_first_public_phase_does_not_wait_for_authenticated_client_socket
+    await asyncio.wait_for(transport.entered.wait(), 1)
+E:\python\Lib\asyncio\tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E:\python\Lib\asyncio\timeouts.py:115: in __aexit__
+    raise TimeoutError from exc_val
+E   TimeoutError
+_ test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[archive] _
+E:\python\Lib\asyncio\tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+E   asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+backend\tests\test_protected_worker.py:848: in test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client
+    outcome = await asyncio.wait_for(asyncio.shield(
+E:\python\Lib\asyncio\tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E:\python\Lib\asyncio\timeouts.py:115: in __aexit__
+    raise TimeoutError from exc_val
+E   TimeoutError
+_ test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[revoke] _
+E:\python\Lib\asyncio\tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+E   asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+backend\tests\test_protected_worker.py:848: in test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client
+    outcome = await asyncio.wait_for(asyncio.shield(
+E:\python\Lib\asyncio\tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E:\python\Lib\asyncio\timeouts.py:115: in __aexit__
+    raise TimeoutError from exc_val
+E   TimeoutError
+_ test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[user_cancel] _
+E:\python\Lib\asyncio\tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+E   asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+backend\tests\test_protected_worker.py:848: in test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client
+    outcome = await asyncio.wait_for(asyncio.shield(
+E:\python\Lib\asyncio\tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E:\python\Lib\asyncio\timeouts.py:115: in __aexit__
+    raise TimeoutError from exc_val
+E   TimeoutError
+_ test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[shutdown] _
+E:\python\Lib\asyncio\tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+E   asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+backend\tests\test_protected_worker.py:848: in test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client
+    outcome = await asyncio.wait_for(asyncio.shield(
+E:\python\Lib\asyncio\tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E:\python\Lib\asyncio\timeouts.py:115: in __aexit__
+    raise TimeoutError from exc_val
+E   TimeoutError
+_ test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[pause] _
+E:\python\Lib\asyncio\tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+E   asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+backend\tests\test_protected_worker.py:848: in test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client
+    outcome = await asyncio.wait_for(asyncio.shield(
+E:\python\Lib\asyncio\tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E:\python\Lib\asyncio\timeouts.py:115: in __aexit__
+    raise TimeoutError from exc_val
+E   TimeoutError
+_ test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[terminal] _
+E:\python\Lib\asyncio\tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+E   asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+backend\tests\test_protected_worker.py:848: in test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client
+    outcome = await asyncio.wait_for(asyncio.shield(
+E:\python\Lib\asyncio\tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E:\python\Lib\asyncio\timeouts.py:115: in __aexit__
+    raise TimeoutError from exc_val
+E   TimeoutError
+_ test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[quarantine] _
+E:\python\Lib\asyncio\tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+E   asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+backend\tests\test_protected_worker.py:848: in test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client
+    outcome = await asyncio.wait_for(asyncio.shield(
+E:\python\Lib\asyncio\tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E:\python\Lib\asyncio\timeouts.py:115: in __aexit__
+    raise TimeoutError from exc_val
+E   TimeoutError
+_ test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[runtime_close] _
+E:\python\Lib\asyncio\tasks.py:520: in wait_for
+    return await fut
+           ^^^^^^^^^
+E   asyncio.exceptions.CancelledError
+
+The above exception was the direct cause of the following exception:
+backend\tests\test_protected_worker.py:848: in test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client
+    outcome = await asyncio.wait_for(asyncio.shield(
+E:\python\Lib\asyncio\tasks.py:519: in wait_for
+    async with timeouts.timeout(timeout):
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+E:\python\Lib\asyncio\timeouts.py:115: in __aexit__
+    raise TimeoutError from exc_val
+E   TimeoutError
+=========================== short test summary info ===========================
+FAILED backend\tests\test_protected_worker.py::test_first_public_phase_does_not_wait_for_authenticated_client_socket
+FAILED backend\tests\test_protected_worker.py::test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[archive]
+FAILED backend\tests\test_protected_worker.py::test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[revoke]
+FAILED backend\tests\test_protected_worker.py::test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[user_cancel]
+FAILED backend\tests\test_protected_worker.py::test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[shutdown]
+FAILED backend\tests\test_protected_worker.py::test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[pause]
+FAILED backend\tests\test_protected_worker.py::test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[terminal]
+FAILED backend\tests\test_protected_worker.py::test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[quarantine]
+FAILED backend\tests\test_protected_worker.py::test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client[runtime_close]
+9 failed, 54 deselected in 14.91s

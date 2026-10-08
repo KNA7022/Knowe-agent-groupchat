@@ -170,6 +170,13 @@ class ProtectedWorker:
         watcher = None
         try:
             self.authority()
+            # Install the existing bounded ordered Client handoff before any public
+            # phase. An empty authority binds no completion or execution permission.
+            authority = ProtectedEvents.existing(self.service) or ProtectedEvents(self.access.registry)
+            if self.engine.hub.protected_events is None:
+                self.engine.hub.bind_protected_events(authority)
+            elif self.engine.hub.protected_events is not authority:
+                raise ProtectedStorageError("protected publication runtime mismatch")
             from . import runtime_settings
             from .worker_gateway_runtime import WorkerContextError
             binding = self.engine._effective_provider_binding(envelope.worker_id)
@@ -197,15 +204,23 @@ class ProtectedWorker:
             else:
                 completion, _ = self.store.commit_success(run, record)
             self.checkpoint("after_completion")
-            authority = ProtectedEvents.existing(self.service) or ProtectedEvents(self.access.registry)
             authority.attach(self.access, self.store.db.path)
-            if self.engine.hub.protected_events is None:
-                self.engine.hub.bind_protected_events(authority)
-            elif self.engine.hub.protected_events is not authority:
-                raise ProtectedStorageError("protected publication runtime mismatch")
             await self.projector.drain(completion_id=completion.completion_id, raise_errors=True)
             self.checkpoint("after_ack")
             self.finalize(completion.status.value, completion)
+        except asyncio.CancelledError:
+            # Cancellation can arrive before Runtime's loop (including first phase).
+            # It is distinct from the BaseException process-interruption policy.
+            try:
+                try:
+                    self.authority()
+                except Exception as error:
+                    self.fail_closed(error)
+                else:
+                    self.finalize("CANCELLED")
+            except Exception:
+                pass  # Existing shutdown/deletion/quarantine/owner guards still win.
+            raise
         except Exception as error:
             # Content, provider exceptions and reasoning never enter the public bridge.
             # Deletion/quarantine/closed runtime still deny; paused/terminal owners stay.

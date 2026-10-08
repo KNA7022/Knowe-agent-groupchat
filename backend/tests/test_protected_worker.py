@@ -757,3 +757,161 @@ async def test_scheduler_storage_failure_keeps_selected_finalizer_and_cleanup(wo
     finally:
         await engine.stop()
         store.close()
+
+
+@pytest.mark.asyncio
+async def test_first_public_phase_does_not_wait_for_authenticated_client_socket(world, provider, monkeypatch):
+    transport = Transport("slow")
+    engine, store, access, envelope, owner, group = compose(world, transport)
+    selected = engine._protected_workers[envelope.task_id]
+    server, client = await admitted(world, engine.hub, monkeypatch)
+    await client.release_live_replay_fence()
+    assert engine.hub.protected_events is None
+    await client._send_lock.acquire()
+    worker = asyncio.create_task(engine._run_worker(envelope, envelope.worker_id))
+    try:
+        await asyncio.wait_for(transport.entered.wait(), 1)
+        assert selected.store.active_attempts()
+        assert not client.ws.frames
+        assert engine.hub.protected_events is not None
+        with closing(sqlite3.connect(selected.store.db.path)) as conn:
+            assert conn.execute("SELECT count(*) FROM completion_events_v2").fetchone()[0] == 0
+        transport.release.set()
+        await asyncio.wait_for(asyncio.shield(worker), 2)
+        assert world[2].store.get_run(owner.run_id).status is TaskStatus.SUCCEEDED
+        assert not client.ws.frames
+        client._send_lock.release()
+        await drain(client)
+        assert any(frame.get("content") == ANSWER for frame in client.ws.frames)
+        assert_idle_pair(engine, envelope)
+    finally:
+        if client._send_lock.locked():
+            client._send_lock.release()
+        if not worker.done():
+            worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await drain(client)
+        await engine.stop()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_publication_binding_failure_cleans_without_starting_worker(world, provider, monkeypatch):
+    transport = Transport()
+    engine, store, access, envelope, owner, group = compose(world, transport)
+    selected = engine._protected_workers[envelope.task_id]
+
+    def fail_binding(_authority):
+        raise OSError(FAILURE)
+
+    monkeypatch.setattr(engine.hub, "bind_protected_events", fail_binding)
+    try:
+        with pytest.raises(ProtectedStorageError, match="execution failed"):
+            await engine._run_worker(envelope, envelope.worker_id)
+        assert transport.requests == []
+        assert selected.closed and selected.store._closed and selected.agent is None
+        assert not engine._protected_workers and not engine._task_envelopes
+        assert engine.open_activity_snapshot() == []
+        assert world[2].store.get_run(owner.run_id).status is TaskStatus.FAILED
+        with closing(sqlite3.connect(selected.store.db.path)) as conn:
+            assert conn.execute("SELECT count(*) FROM task_runs").fetchone()[0] == 0
+            assert conn.execute("SELECT count(*) FROM completion_events_v2").fetchone()[0] == 0
+    finally:
+        await engine.stop()
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle", ["archive", "revoke", "user_cancel", "shutdown",
+    "pause", "terminal", "quarantine", "runtime_close"])
+async def test_first_phase_cancellation_settles_owner_without_waiting_for_slow_client(
+        world, provider, monkeypatch, lifecycle):
+    monkeypatch.setattr(world[2], "GLOBAL_PRIMARY_LIMIT", 1)
+    transport = Transport()
+    engine, store, access, envelope, owner, group = compose(world, transport)
+    selected = engine._protected_workers[envelope.task_id]
+    server, client = await admitted(world, engine.hub, monkeypatch)
+    await client.release_live_replay_fence()
+    other_group = world[1].create_group("Startup capacity")
+    other = world[2].submit(other_group.group_id, title="Next owner", request_key="startup-capacity")
+    world[2].schedule()
+    assert world[2].store.get_run(other.run_id).status is TaskStatus.QUEUED
+    await client._send_lock.acquire()
+    # A local sequence barrier gives cancellation an exact first-phase await, before send.
+    await engine.hub._seq_lock.acquire()
+    worker = asyncio.create_task(engine._run_worker(envelope, envelope.worker_id))
+    action = None
+    try:
+        async with asyncio.timeout(2):
+            while not selected._active_published:
+                await asyncio.sleep(0)
+        assert selected.store.active_attempts()
+        assert transport.requests == []
+        if lifecycle == "archive":
+            world[1].archive(group.group_id)
+        elif lifecycle == "revoke":
+            access.registry.revoke(group.group_id, access.task_id)
+        elif lifecycle == "user_cancel":
+            action = asyncio.create_task(engine.stop_worker(envelope.worker_id))
+        elif lifecycle == "shutdown":
+            action = asyncio.create_task(engine.stop(immediate=True))
+        elif lifecycle == "pause":
+            world[2].pause(group.group_id, owner.run_id, request_key="startup-pause")
+        elif lifecycle == "terminal":
+            world[2].finalize_trusted_execution(group.group_id, owner.run_id,
+                execution_key="startup-terminal", outcome=TaskStatus.FAILED)
+        elif lifecycle == "quarantine":
+            world[2].store.prepare_group_deletion(group.group_id, "invalid-proof",
+                group_proof_digest="invalid", confirmation_token="invalid",
+                runtime_project_id=envelope.project_id)
+            world[2].reconcile_group_deletions()
+        else:
+            world[2].close()
+        async with asyncio.timeout(2):
+            while not worker.cancelling():
+                await asyncio.sleep(0)
+        engine.hub._seq_lock.release()
+        outcome = await asyncio.wait_for(asyncio.shield(
+            asyncio.gather(worker, return_exceptions=True)), 1)
+        assert isinstance(outcome[0], asyncio.CancelledError)
+        if action is not None:
+            await asyncio.wait_for(action, 1)
+        assert selected.closed and selected.store._closed and selected.agent is None
+        assert not engine._protected_workers and not engine._task_envelopes
+        assert engine.open_activity_snapshot() == []
+        assert transport.requests == [] and not client.ws.frames
+        if lifecycle != "runtime_close":
+            expected = {"archive": TaskStatus.FAILED, "revoke": TaskStatus.FAILED,
+                "user_cancel": TaskStatus.CANCELLED, "pause": TaskStatus.PAUSED,
+                "terminal": TaskStatus.FAILED}.get(lifecycle, TaskStatus.RUNNING)
+            settled = world[2].store.get_run(owner.run_id)
+            assert settled.status is expected
+            if lifecycle in {"archive", "revoke"}:
+                assert settled.failure_type is FailureType.PERMISSION_DENIED
+            elif lifecycle == "terminal":
+                assert settled.failure_type is FailureType.EXECUTOR_FAILURE
+            assert world[2].store.get_run(other.run_id).status is (
+                TaskStatus.QUEUED if lifecycle in {"shutdown", "quarantine"} else TaskStatus.RUNNING)
+            if lifecycle in {"archive", "revoke", "user_cancel"}:
+                for event in world[2].store.events_after(owner.run_id, 0):
+                    assert await server._broadcast_task_runtime_event(event)
+        client._send_lock.release()
+        await drain(client)
+        if lifecycle in {"archive", "revoke", "user_cancel"}:
+            assert any(frame.get("type") == "task_runtime_event" and expected.value in json.dumps(frame)
+                for frame in client.ws.frames)
+        for marker in (INSTRUCTION, ANSWER, REASONING, FAILURE):
+            assert marker not in json.dumps(client.ws.frames, ensure_ascii=False)
+    finally:
+        if engine.hub._seq_lock.locked():
+            engine.hub._seq_lock.release()
+        if client._send_lock.locked():
+            client._send_lock.release()
+        if not worker.done():
+            worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        if action is not None:
+            await asyncio.gather(action, return_exceptions=True)
+        await drain(client)
+        await engine.stop()
+        store.close()

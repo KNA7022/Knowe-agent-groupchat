@@ -108,3 +108,45 @@ compileall=0 diff-check=0 mirrors=0 foundation=0
 Final post-run SHA256 recheck: all nine entries match exactly (`protected-worker-p2b2-post-gate-hashes.txt`), `source_test_freeze_matches=True`. The full regression adds exactly 54 Worker tests to prior accepted 1929; no skips or exclusions were introduced. Existing contract-negative stderr/newline warnings remain disclosed. The old restart evidence contains all nine phase records; only the first creates empty legacy delivery tables, all nine permit only the specifically asserted legacy registry timestamps/sequence differences. No diagnostic, numeric result or date was replaced to manufacture a cleaner result. UTF-8 scan of all current slice reports/logs found no username-bearing profile prefix/account identifier. Independent review, not this local passing gate, decides Unit P acceptance.
 
 Staging the captured text exposed four Vitest trailing blank EOF lines and three pytest RED `E` lines with trailing spaces. The four `mirrors*.txt` files and `queued-fence-red.txt` received only trailing-whitespace/EOF normalization, preserving original UTF-8/BOM status and all diagnostic text/results/dates. Thus those five files are captured output with presentation whitespace normalized, not byte-identical terminal captures. No source/test changed. The complete staged diff-check then passed without an exclusion or waiver.
+
+## Fix round 1 / I1 — 2026-10-08
+
+Fix base `0963198a0f50fbad5320ad99ec9f77f5f6ef6af8`; review `reviews/REVIEW-protected-worker-p2b2-0963198.md`. Production scope is only `backend/protected_worker.py`; tests extend only `backend/tests/test_protected_worker.py`. Controller progress/brief, skills and prior reviewer residue are untouched.
+
+RED command:
+
+```text
+py -3.12 -m pytest backend/tests/test_protected_worker.py -k 'first_public_phase or first_phase_cancellation' -q --tb=short
+```
+
+- Initial `-fix1-red.txt`: 9 failed / 54 deselected / 15.91s, exit 1. Eight failures are the intended blocked socket handoff; one existing-terminal fixture attempted success without bound Verifier evidence and is not product RED evidence.
+- Corrected fixture, unchanged production (`-fix1-red-corrected-fixture.txt`): 9 failed / 54 deselected / 14.91s, exit 1. The plain slow-client case cannot reach transport while the first phase awaits its locked Client; all eight deterministic startup cancellation cases cannot finish while that same Client lock remains held.
+- Same command after the production fix (`-fix1-green.txt`): 9 passed / 54 deselected / 9.11s, exit 0. Tests now reach and assert true terminal/status preservation, slot release, no provider send for cancellation variants, no private markers in public frames and handle cleanup before unlocking the Client. Existing-terminal control is a real FAILED owner with executor_failure retained, not a fabricated success.
+
+A tenth new test covers early public-authority binding failure: zero transport/Worker/completion, selected handles closed, owner FAILED. The module now has 64 cases. The actual first-phase barrier uses the existing Hub sequence lock only to control cancellation timing; the separate no-barrier test proves socket independence. All use real canonical runtime/card/storage/admission/Hub/Client and inert HTTP transport only. No BaseException-wide catch, private-read relaxation, new queue or timeout policy was added.
+
+The two changed source/test SHA256 values were frozen in `protected-worker-p2b2-fix1-freeze.txt` before the final focused/full runs. The original nine interruption/reopen cases remain in the full focused selection, preserving the honest PAUSED restart policy after ProcessFault.
+
+Final commands/results:
+
+```text
+py -3.12 -m pytest backend/tests/test_protected_worker.py backend/tests/test_worker_completion_v1.py backend/tests/test_protected_events.py backend/tests/test_runtime.py backend/tests/test_unit.py backend/tests/test_task_runtime_live_event_bridge.py -q --tb=short
+160 passed, 10 subtests passed in 101.65s (0:01:41); exit 0
+
+py -3.12 -m pytest backend/tests -q
+1993 passed, 5 skipped, 10 subtests passed in 317.14s (0:05:17); exit 0
+
+py -3.12 -m compileall -q backend
+exit 0; no compiler output
+git diff --check -- backend
+exit 0; existing LF-to-CRLF advisories
+
+. ./.tools/node24.ps1
+node --version
+v24.9.0
+npm run test -- src/contract/parity.test.ts src/contract/publicEvents.drift.test.ts src/contract/taskRuntime.test.ts
+3 files, 25 tests passed; duration 9.46s; exit 0
+compileall=0 diff-check=0 mirrors=0
+```
+
+The final raw focused/backend/mirror outputs use the `-fix1-` prefix. Both post-run hashes match `fix1-freeze.txt` exactly (`fix1-post-gate-hashes.txt`, `source_test_freeze_matches=True`). No source/test changed during or after the complete run. The extra blank EOF in `fix1-mirrors.txt` was presentation-whitespace normalized only, retaining original UTF-8/BOM handling, all stderr and exact results/dates. Full staged diff-check passed without exclusions. The final current slice report/evidence and fix1 logs were scanned for account-bearing profile paths, account identifier, email and token/key-shaped credentials: no matches; synthetic test IDs/markers and non-profile source paths remain. Earlier logs and failed-fixture results were retained honestly. Controller documentation commit `4f3b53d` does not modify these frozen files; no user skills or reviewer residue was changed. Independent fix-scope rereview remains pending.
