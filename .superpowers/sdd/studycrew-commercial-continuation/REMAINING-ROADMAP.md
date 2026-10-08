@@ -1,5 +1,11 @@
 # Remaining roadmap — StudyCrew commercial continuation
 
+## Accepted checkpoint — 2026-10-08, `9159a8c`
+
+Restricted real Worker composition passed independent review after one fix round: 0 Critical / 0 Important, with inherited output-hygiene Minor. Real Engine/factory/Gateway/Worker, encrypted completion and pending review, durable publication/ACK, lifecycle cancellation, capacity release and restart exclusion are exercised. Frozen backend: 1,993 passed / 5 existing skips / 10 subtests; relevant 160 passed / 10 subtests. The actual-chain fixture uses planning; the generic role factory is shared, but knowledge/coach are not separately product-validated here.
+
+Next is D0: encrypt actual new Group user/coordinator ingress before echo/routing, then Unit D real proposal/versioned approval/dispatch and controlled feedback. Worker-only encryption does not close earlier chat sinks. Full RAG/local model packs, governed Mem0, learning workflows and Windows release gates remain open. This is a completed execution-infrastructure slice, not commercial readiness. Prior snapshots below remain historical.
+
 ## Accepted checkpoint — 2026-10-04, `546b43a`
 
 P2b2a early encrypted child enrollment and authorized deletion/restart cleanup passed independent fix1 re-review: 0 Critical / 0 Important, with the existing output-hygiene Minor carried forward. The quarantine cross-Group deletion bug is closed; the actual Worker composition is next, not already complete. Frozen backend evidence remains 1,929 passed / 5 existing skips / 10 subtests. See the explicit remaining areas below; no commercial-readiness claim.
