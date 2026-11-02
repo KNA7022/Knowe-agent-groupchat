@@ -181,6 +181,7 @@ export const App: React.FC = () => {
   const isPackaged = window.knowe?.isPackaged === true;
   const demoMode = !isPackaged && new URLSearchParams(window.location.search).get('studycrew-demo') === '1';
   const activeView = useKnoweStore(selectActiveView);
+  const connection = useKnoweStore((state) => state.conn);
   const activeId = useKnoweStore(selectActiveProjectId);
   const activeCanonicalGroupId = useGroupStore((state) => {
     if (!activeId) return null;
@@ -340,13 +341,16 @@ export const App: React.FC = () => {
       seedStudyCrewDemo();
       return;
     }
+    // Desktop mounts before Python is ready. Reload canonical authority after
+    // every successful handshake, including backend restart and reconnect.
+    if (connection !== 'live') return;
     void useGroupStore.getState().load().then(async () => {
       const groups = useGroupStore.getState();
       await Promise.allSettled(groups.order.map(async (groupId) => {
         await useTaskRuntimeStore.getState().refreshGroup(groupId);
       }));
     }).catch(() => undefined);
-  }, [demoMode]);
+  }, [demoMode, connection]);
 
   /*
    * [v0.8c #5] 私聊（知知）**根本不挂花名册面板** —— 连那个 0 宽度的壳都不挂。

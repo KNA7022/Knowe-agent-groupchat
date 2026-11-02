@@ -359,6 +359,17 @@ async def test_actual_crash_reopen_engine_has_no_protected_recovery_work(world, 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal", ["failed", "cancelled"])
 async def test_unhydrated_private_ref_does_not_hide_terminal_bridge(world, provider, monkeypatch, terminal):
+    from backend import groups as groups_module
+    original_opaque_id = groups_module.opaque_id
+    agent_sequence = 0
+    def opaque_id(prefix):
+        nonlocal agent_sequence
+        if prefix == "gag":
+            agent_sequence += 1
+            if agent_sequence == 3:  # Canonical planning member, not a simulated authority.
+                return "gag_abcdefab110101199001011234abcdef"
+        return original_opaque_id(prefix)
+    monkeypatch.setattr(groups_module, "opaque_id", opaque_id)
     transport = Transport()
     engine, store, access, envelope, owner, group = compose(world, transport)
     selected = engine._protected_workers[envelope.task_id]
@@ -370,6 +381,11 @@ async def test_unhydrated_private_ref_does_not_hide_terminal_bridge(world, provi
     try:
         with pytest.raises(ProcessFault):
             await engine._run_worker(envelope, envelope.worker_id)
+        assert len(transport.requests) == 1  # The canonical opaque ID cannot cause false DLP denial.
+        wire = json.dumps(transport.requests[0], ensure_ascii=False)
+        assert envelope.worker_id not in wire
+        assert envelope.task_id not in wire
+        assert INSTRUCTION in wire  # User content was neither excluded nor rewritten for DLP.
         await drain(client)
         assert any(REF in row for row in client._live_replay_buffer)
         world[2].finalize_trusted_execution(group.group_id, owner.run_id,

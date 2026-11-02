@@ -8,3 +8,7 @@ numpy>=2.0         # 向量检索的精确余弦扫描。**这是唯一一个无
                    # wheel 只有 0.33 MB，但它 assert isinstance(vectors, np.ndarray)，
                    # 所以 numpy 是两种方案共同的前提，冻结增量实测 +14.92 MB。见 plan 的
                    # "Vector search decision"
+mem0ai==2.0.20     # Real governed SDK; unique ephemeral providers, cloud defaults denied.
+onnxruntime==1.30.0 # Local CPU E5; model bytes fixed by local_embedding.ARTIFACTS.
+tokenizers==0.23.2
+usearch==2.26.2    # In-memory semantic search; no persistent index files.

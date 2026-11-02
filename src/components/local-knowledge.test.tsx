@@ -32,6 +32,29 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 
 describe('local knowledge center', () => {
+  it('prepares a model approval and displays verified citation after approval without repeated egress', async () => {
+    const calls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = new URL(input); const body = JSON.parse(String(init?.body || '{}'));
+      calls.push({ path: url.pathname, body });
+      if (url.pathname.endsWith('/approval')) return response({ grant: { grant_id: 'grant-fixture' } });
+      if (url.pathname.endsWith('/answer') && !body.authorization) return { ok: true, status: 202, json: async () => ({ ok: true, approval_required: true, operation_id: 'rag-fixture', approval_id: 'apr-fixture', capabilities: ['provider_egress'], group_id: groupA }) } as Response;
+      if (url.pathname.endsWith('/answer')) return response({ answer: 'Verified excerpt', verification: 'exact_quotes_verified', citations: [{ ...hit, version: 1, quote: hit.text }] });
+      return response({ sources: [source] });
+    }));
+    render(<KnowledgeScopedView />); choose();
+    await screen.findByRole('button', { name: source.filename });
+    fireEvent.change(screen.getByLabelText('本地资料查询'), { target: { value: 'evidence' } });
+    fireEvent.click(screen.getByRole('button', { name: '申请模型依据资料回答' }));
+    await screen.findByRole('dialog', { name: '资料模型调用审批' });
+    expect(calls.filter((call) => call.path.endsWith('/approval'))).toHaveLength(0);
+    fireEvent.click(screen.getByRole('button', { name: '批准并执行此请求' }));
+    await screen.findByText('Verified excerpt');
+    expect(calls.find((call) => call.path.endsWith('/approval'))?.body.approved).toBe(true);
+    expect(calls.filter((call) => call.path.endsWith('/answer'))[1]?.body.authorization).toEqual({ operation_id: 'rag-fixture' });
+    expect(screen.getByRole('button', { name: /v1.*查看原文/ })).toBeInTheDocument();
+  });
+
   it('imports selected bytes within selected group/course, searches and inspects exact citation, confirms deletion', async () => {
     useGroupStore.setState({ groups: { [groupA]: { ...group(groupA), source_links: [] }, [groupB]: group(groupB) } });
     let stored = false;
@@ -205,7 +228,7 @@ describe('local knowledge center', () => {
     await screen.findByRole('button', { name: 'scan.pdf' });
     expect(screen.getByLabelText('导入本地资料')).toBeDisabled();
     expect(screen.getByLabelText('删除资料 scan.pdf')).toBeDisabled();
-    expect(screen.getByText(/含无文本层页面，需要 OCR/)).toBeInTheDocument();
+    expect(screen.getByText(/含无文本层页面，等待授权多模态读取/)).toBeInTheDocument();
     expect(screen.getByText(/本地关键词检索（BM25）/)).toBeInTheDocument();
   });
 

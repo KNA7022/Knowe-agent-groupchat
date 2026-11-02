@@ -143,9 +143,10 @@ class Client:
         try:
             async with self._send_lock:
                 from .protected_events import REF
+                from .task_runtime.group_content import REF as CHAT_REF
                 def contains(value):
                     if isinstance(value, dict):
-                        return REF in value or any(contains(child) for child in value.values())
+                        return REF in value or CHAT_REF in value or any(contains(child) for child in value.values())
                     return isinstance(value, list) and any(contains(child) for child in value)
                 if contains(event):
                     protected_send = True
@@ -304,6 +305,7 @@ class Hub:
         # canonical Group identity.  The server installs this resolver after startup.
         self.group_id_resolver: Callable[[str], str | None] | None = None
         self.protected_events = None
+        self.group_content = None
         self.protected_enqueue_fault = None
 
     def bind_protected_events(self, authority):
@@ -481,6 +483,8 @@ class Hub:
         proj = self.projects.get(project_id)
         if proj is None:
             proj = Project(project_id, name or project_id, CONFIG.ring_capacity)
+            if self.group_content is not None:
+                proj.seq = max(proj.seq, self.group_content.head(project_id))
             if self.protected_events is not None:
                 proj.seq = max(self.protected_events.head(project_id),
                     self.store.load_seq_watermark(project_id) if self.store is not None else 0)
@@ -517,6 +521,10 @@ class Hub:
         for ev in events:
             proj.ring.append(ev)
         proj.seq = max(max((int(e["seq"]) for e in events), default=0), int(seq_watermark or 0))
+        if self.group_content is not None:
+            for reference in self.group_content.references(project_id):
+                proj.ring.append(reference)
+            proj.seq = max(proj.seq, self.group_content.head(project_id))
         if self.protected_events is not None:
             proj.seq = max(proj.seq, self.protected_events.head(project_id))
         # v1.0.35.3: 恢复已读水位（跨重启保留未读语义）。
@@ -610,6 +618,10 @@ class Hub:
         """快照的 conversation：磁盘全量结构历史 + ring 中尚未落盘的结构事件。"""
         proj = self.get_or_create(project_id)
         merged: dict[int, dict[str, Any]] = {}
+        if self.group_content is not None:
+            for reference in self.group_content.references(project_id):
+                if reference.get("type") in STRUCTURAL_EVENT_TYPES:
+                    merged[reference["seq"]] = reference
         if self.store is not None:
             for ev in self.store.load_all_events(project_id):
                 seq = ev.get("seq")
@@ -646,6 +658,11 @@ class Hub:
             seq = ev.get("seq")
             if isinstance(seq, int) and seq > after_seq:
                 merged[seq] = ev
+        if self.group_content is not None:
+            for ev in self.group_content.references(project_id):
+                seq = ev.get("seq")
+                if isinstance(seq, int) and seq > after_seq and ev.get("type") in STRUCTURAL_EVENT_TYPES:
+                    merged[seq] = ev
         return [self._filter_public_text(project_id, merged[k]) for k in sorted(merged)]
 
     # ── 发事件：引擎级（盖 seq、进 ring、广播） ──
@@ -689,6 +706,9 @@ class Hub:
             if isinstance(event_id, str) and event_id:
                 existing = self._find_idempotent_event(project_id, event_id, proj)
                 if existing is not None:
+                    from .task_runtime.group_content import REF as CHAT_REF
+                    if CHAT_REF in existing and self.group_content is not None:
+                        existing = self.group_content.hydrate(existing)
                     if self._idempotency_payload(existing) != self._idempotency_payload(event):
                         # Completion-triggered coordinator turns can be replayed after a
                         # process dies between user-message persistence and notification
@@ -703,6 +723,9 @@ class Hub:
                     return existing, False
             proj.seq += 1
             event["seq"] = proj.seq
+            transient_event = event
+            if self.group_content is not None:
+                event = self.group_content.seal_event(event)
             proj.ring.append(event)
             if self.store is not None:
                 # 结构事件落盘：[v1.0.24.4] 提交进持久化队列即返回，磁盘写入在后台
@@ -721,7 +744,7 @@ class Hub:
 
         if self.protected_events is None:
             await self.broadcast(event)
-        return event, True
+        return transient_event, True
 
     # ── 发事件：服务器级（无 seq，旁路） ──
     async def emit_no_seq(self, payload: dict[str, Any]) -> dict[str, Any]:

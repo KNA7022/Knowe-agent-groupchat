@@ -198,6 +198,16 @@ def _sensitive_feature(text: str) -> str | None:
     return None
 
 
+def effective_sensitivity(text: str, requested: MemorySensitivity) -> MemorySensitivity:
+    """A caller's public label cannot downgrade detected private evidence."""
+    feature = _sensitive_feature(text)
+    if feature in {'grade', 'contact', 'identifier'}:
+        return MemorySensitivity.SENSITIVE
+    if feature == 'weakness' and requested is MemorySensitivity.PUBLIC:
+        return MemorySensitivity.PERSONAL
+    return requested
+
+
 def _parse(moment: str | None) -> datetime | None:
     if not moment:
         return None

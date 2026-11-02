@@ -10,6 +10,8 @@ StudyCrew 用你最熟悉的聊天软件界面，把 Agent 变成一支学习伙
 
 StudyCrew 是由 Hezhou Jiang 的 [Knowe](https://github.com/HirezmingD/Knowe-agent-groupchat) 独立分叉而来，保留上游 MIT 许可证与署名。
 
+本分叉的学习流程与验证记录：[交付报告](docs/STUDYCREW-DELIVERY-20261011.md)、[架构和面试说明](docs/STUDYCREW-ARCHITECTURE.md)、[可重复演示](docs/STUDYCREW-DEMO.md)、[构建安装](docs/STUDYCREW-BUILD.md)、[评测说明](evals/README.md)。实际能力和未验证边界以交付报告为准。
+
 ---
 
 ## 组建你的 Agent 团队

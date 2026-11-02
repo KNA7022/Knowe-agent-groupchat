@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "steps": [
+    "upgraded_installed_app_restores_existing_course",
+    "installed_ui_schedules_synthetic_task",
+    "installed_ui_downloads_calendar_with_scheduled_event",
+    "installed_mem0_e5_usearch_semantic_recall_via_ui",
+    "installed_memory_delete_and_no_recall_via_ui",
+    "installed_restart_restores_new_task"
+  ],
+  "scope": "actual installed Electron and frozen backend; no model request"
+}

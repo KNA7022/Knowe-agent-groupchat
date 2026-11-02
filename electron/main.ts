@@ -11,7 +11,7 @@
  */
 
 import {
-  app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, session, safeStorage,
+  app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, nativeImage, session, safeStorage, Notification,
   type Session,
 } from 'electron';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -34,6 +34,7 @@ import { createConnection } from 'node:net'; // [1.2] 端口占用探测
 import { pathToFileURL } from 'node:url';
 
 import { buildRuntimeEnv, selectInheritedEnv } from './backendEnv';
+import { LearningNotificationScheduler } from './learningNotifications';
 
 import {
   isPreviewControlRequest,
@@ -1689,6 +1690,26 @@ async function openPreviewWindow(payload: PreviewOpenPayload): Promise<void> {
 // ═══════════════════════════════════════════════════════════════
 
 function registerIpc(): void {
+  ipcMain.handle(IPC.learningNotificationSupported, (evt) => Boolean(mainWindow && !mainWindow.isDestroyed() && evt.sender === mainWindow.webContents && Notification.isSupported()));
+  const learningScheduler = new LearningNotificationScheduler((path) => new Promise((resolveJson, reject) => {
+    const req = httpRequest(`${RUNTIME_ENDPOINTS.httpBase}${path}`, {
+      method: 'GET', headers: { 'X-Knowe-Runtime-Token': runtimeToken },
+    }, res => {
+      let body = '';
+      res.on('data', (chunk: Buffer) => {body += chunk.toString('utf8'); if (body.length > 2 * 1024 * 1024) req.destroy(new Error('learning_response_too_large'));});
+      res.on('end', () => {try {if (res.statusCode !== 200) {reject(new Error('learning_unavailable'));return;}resolveJson(JSON.parse(body));}catch {reject(new Error('invalid_learning_response'));}});
+      res.on('error', reject);
+    });
+    req.setTimeout(5000, () => req.destroy(new Error('learning_timeout')));
+    req.on('error', reject); req.end();
+  }), () => {
+    const notice = new Notification({title: 'StudyCrew 学习提醒', body: '有一项学习任务即将开始，请打开学习计划查看。'});
+    notice.on('click', () => {if (mainWindow && !mainWindow.isDestroyed()) {mainWindow.show();mainWindow.focus();}});
+    notice.show();
+  }, () => Boolean(runtimeToken && notifyPrefs.desktop && Notification.isSupported() && !isQuitting));
+  const learningTimer = setInterval(() => {void learningScheduler.poll();}, 30000);
+  learningTimer.unref();
+  app.once('will-quit', () => clearInterval(learningTimer));
   // ① 问一次当前状态
   ipcMain.handle(IPC.getStatus, () => snapshot());
 

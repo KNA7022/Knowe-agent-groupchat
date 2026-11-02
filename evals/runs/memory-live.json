@@ -1,0 +1,64 @@
+{
+  "scope": "memory-probe_real_provider_http_not_desktop",
+  "passed": true,
+  "result": {
+    "pass": true,
+    "scope": "synthetic real governed memory API, not desktop UI",
+    "maximum_model_requests": 1,
+    "output_cap": 2048,
+    "stages": [
+      {
+        "action": "extract",
+        "status": 200
+      },
+      {
+        "action": "extract",
+        "status": 200
+      },
+      {
+        "action": "approve",
+        "status": 200
+      },
+      {
+        "action": "search",
+        "status": 200
+      },
+      {
+        "action": "delete",
+        "status": 200
+      },
+      {
+        "action": "search",
+        "status": 200
+      }
+    ],
+    "data_root": "evals\\runs\\memory-live-data\\memory-probe-d79903b1ba2a4e7e9eeec61b715fbce9",
+    "sdk_required_version": "2.0.20",
+    "approval_before_egress": true,
+    "extraction_run_status": "partial",
+    "candidate_requires_confirmation": true,
+    "semantic_recall_verified": true,
+    "model_requests": 1,
+    "deletion_no_recall": true,
+    "actual_sdk": true,
+    "actual_local_embedding": true,
+    "actual_usearch": true,
+    "local_embedding_identity": "intfloat/multilingual-e5-small@614241f622f53c4eeff9890bdc4f31cfecc418b3:int8:mean-l2:384",
+    "remaining_sdk_arenas": 0
+  },
+  "calls": [
+    {
+      "ticket": "1791656595577983000",
+      "input_cap": 37667,
+      "output_cap": 2048,
+      "status": "accounted",
+      "usage": {
+        "input_tokens": 8277,
+        "output_tokens": 161
+      },
+      "cny": "0.105120"
+    }
+  ],
+  "rejections": [],
+  "task_total_cny_upper_bound": "0.673140"
+}

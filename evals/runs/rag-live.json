@@ -1,0 +1,41 @@
+{
+  "scope": "rag-probe_real_provider_http_not_desktop",
+  "passed": false,
+  "result": {
+    "pass": false,
+    "scope": "synthetic real LocalKnowledgeService/RagRuntime chain, not desktop UI",
+    "render_pixels": [
+      640,
+      440
+    ],
+    "maximum_model_requests": 2,
+    "output_cap": 2048,
+    "stages": [
+      {
+        "route": "import",
+        "status": 200
+      },
+      {
+        "route": "vision",
+        "status": 202
+      }
+    ],
+    "data_root": "evals\\runs\\rag-live-data\\rag-probe-06c56e82cb7b42a38379483da1311717",
+    "error": "DecodingError"
+  },
+  "calls": [
+    {
+      "ticket": "1791655424189675200",
+      "input_cap": 10745,
+      "output_cap": 2048,
+      "status": "uncertain_full_reservation_retained",
+      "usage": {
+        "input_tokens": 386,
+        "output_tokens": 354
+      },
+      "cny": "0.017376"
+    }
+  ],
+  "rejections": [],
+  "task_total_cny_upper_bound": "0.510600"
+}

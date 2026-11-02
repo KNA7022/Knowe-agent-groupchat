@@ -1998,9 +1998,80 @@ class ProviderCapability:
             _canonical_provider_endpoint(endpoint)
 
 
+# Verified 2026-10-11: https://help.aliyun.com/zh/model-studio/qwen3-8-max
+# Catalog metadata is not evidence of the user's active binding or billing authority.
+VERIFIED_MODEL_CAPABILITIES = {
+    ("alibaba", model): frozenset({"chat", "stream", "tools", "vision"})
+    for model in ("qwen3.8-max", "qwen3.8-max-0902", "qwen3.8-max-2026-09-02")
+}
+
+VERIFIED_MODEL_CAPABILITIES[("alibaba", "qwen-vl-max")] = frozenset({"chat", "stream", "vision"})
+# Source: https://help.aliyun.com/zh/model-studio/qwen-vl-max
+
+
+# Verified 2026-10-11: https://developers.openai.com/api/docs/models/gpt-4o-mini
+for model in ("gpt-4o-mini", "gpt-4o-mini-2024-07-18"):
+    VERIFIED_MODEL_CAPABILITIES[("openai-api", model)] = frozenset({"chat", "stream", "tools", "vision"})
+
+
+# Exact endpoint model declarations; an ID is never rewritten to another model.
+# Current source: https://api-docs.deepseek.com/zh-cn/quick_start/pricing/
+for model in ('deepseek-flash', 'deepseek-v4-flash', 'deepseek-v4-flash-vision-exp'):
+    VERIFIED_MODEL_CAPABILITIES[('deepseek', model)] = frozenset({'chat', 'stream', 'tools', 'vision'})
+VERIFIED_MODEL_CAPABILITIES[('deepseek', 'deepseek-v4-pro')] = frozenset({'chat', 'stream', 'tools'})
+# Deprecated historical ID: https://deepseek.com/news/api-upgrade/
+# This declares the documented tools contract, not current service availability.
+VERIFIED_MODEL_CAPABILITIES[('deepseek', 'deepseek-chat')] = frozenset({'chat', 'stream', 'tools'})
+# https://help.aliyun.com/zh/model-studio/text-embedding-v4
+VERIFIED_MODEL_CAPABILITIES[('alibaba', 'text-embedding-v4')] = frozenset({'embedding'})
+
+# Exact model limits, verified 2026-10-11. Unlisted IDs have no verified limits.
+# Input preflight is a conservative byte-based estimate, NOT a provider tokenizer.
+VERIFIED_MODEL_LIMITS = {
+    ("alibaba", model): {"context_tokens": 1_000_000, "max_input_tokens": 991_808,
+        "thinking_max_input_tokens": 983_616, "max_output_tokens": 131_072,
+        "source": "https://help.aliyun.com/zh/model-studio/qwen3-8-max"}
+    for model in ("qwen3.8-max", "qwen3.8-max-0902", "qwen3.8-max-2026-09-02")
+}
+VERIFIED_MODEL_LIMITS[("alibaba", "qwen-vl-max")] = {
+    "context_tokens": 131_072, "max_input_tokens": 129_024, "max_output_tokens": 8_192,
+    "source": "https://help.aliyun.com/en/model-studio/qwen-vl-max"}
+for _model in ("gpt-4o-mini", "gpt-4o-mini-2024-07-18"):
+    VERIFIED_MODEL_LIMITS[("openai-api", _model)] = {
+        "context_tokens": 128_000, "max_input_tokens": 128_000, "max_output_tokens": 16_384,
+        "source": "https://developers.openai.com/api/docs/models/gpt-4o-mini"}
+for _model in ("deepseek-flash", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-v4-pro"):
+    VERIFIED_MODEL_LIMITS[("deepseek", _model)] = {
+        # Official catalog states1M; use conservative decimal1M rather than infer1Mi.
+        "context_tokens": 1_000_000, "max_input_tokens": 1_000_000, "max_output_tokens": 393_216,
+        "source": "https://api-docs.deepseek.com/quick_start/pricing/",
+        "output_source": "https://api-docs.deepseek.com/api/create-chat-completion/"}
+
+
+def verified_model_limits(provider, model):
+    limits = VERIFIED_MODEL_LIMITS.get((str(provider), str(model)))
+    return {"verified": limits is not None, **(limits or {}),
+        "input_estimation": "serialized_utf8_bytes_plus_256_and_estimated_image_tokens; not exact tokenizer"}
+
+
+def _enforce_model_limits(provider, model, serialized, output_limit, extra_input_tokens=0):
+    """Bound actual wire output and reject estimated context overflow before effects."""
+    limits = VERIFIED_MODEL_LIMITS.get((str(provider), str(model)))
+    if limits is None:
+        return output_limit
+    output_limit = min(output_limit, limits["max_output_tokens"])
+    # UTF-8 byte count is deliberately conservative for text incl. CJK/tool schemas;
+    # image overhead remains an explicitly estimated value, not an exact guarantee.
+    estimate = len(serialized.encode("utf-8")) + 256 + extra_input_tokens
+    input_cap = min(limits["max_input_tokens"], limits.get("thinking_max_input_tokens", limits["max_input_tokens"]))
+    if estimate > input_cap or estimate + output_limit > limits["context_tokens"]:
+        raise GatewayDenied("conservative estimated input plus reserved output exceeds verified model context limits")
+    return output_limit
+
 class ModelCapabilityRegistry:
     def __init__(self) -> None:
         self._providers: dict[str, ProviderCapability] = {}
+        self.strict_model_operations = frozenset()
 
     def register(self, capability: ProviderCapability) -> None:
         if capability.provider_id in self._providers:
@@ -2036,6 +2107,12 @@ class ModelCapabilityRegistry:
             raise GatewayDenied("provider transport is not in the trusted capability registry")
         required = frozenset(str(item) for item in required_capabilities)
         if not required.issubset(capability.capabilities):
+            raise GatewayDenied("provider operation exceeds the trusted capability registry")
+        known_model = VERIFIED_MODEL_CAPABILITIES.get((str(provider_id), str(model)))
+        if "*" in capability.models and required & self.strict_model_operations and known_model is None:
+            raise GatewayDenied("model vision/tools capability is not verified")
+        model_capabilities = known_model if known_model is not None else capability.capabilities
+        if not required.issubset(model_capabilities):
             raise GatewayDenied("provider operation exceeds the trusted capability registry")
         candidate = _canonical_provider_endpoint(endpoint)
         if not capability.endpoint_authorities or not any(
@@ -2153,7 +2230,12 @@ _PRODUCTION_PROVIDER_ENDPOINTS: dict[str, tuple[tuple[str, ...], tuple[str, ...]
     "zai": (("https://api.z.ai", "https://open.bigmodel.cn"), ("openai_chat",)),
     "kimi-coding": (("https://api.moonshot.ai",), ("openai_chat",)),
     "kimi-coding-cn": (("https://api.moonshot.cn",), ("openai_chat",)),
-    "alibaba": (("https://dashscope.aliyuncs.com", "https://dashscope-intl.aliyuncs.com"), ("openai_chat",)),
+    "alibaba": (("https://dashscope.aliyuncs.com", "https://dashscope-intl.aliyuncs.com",
+        # Explicit user-confirmed workspace on 2026-10-11; no *.maas grant.
+        "https://ws-1y8ivqouamht78in.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        # Official Anthropic compatibility path, same explicitly approved workspace.
+        "https://ws-1y8ivqouamht78in.cn-beijing.maas.aliyuncs.com/apps/anthropic/v1"),
+        ("openai_chat", "anthropic_messages", "codex_responses")),
     "minimax": (("https://api.minimax.io",), ("anthropic_messages",)),
     "minimax-cn": (("https://api.minimaxi.com",), ("anthropic_messages",)),
     "stepfun": (("https://api.stepfun.com",), ("openai_chat",)),
@@ -2208,6 +2290,7 @@ def production_model_capability_registry() -> ModelCapabilityRegistry:
     }
 
     registry = ModelCapabilityRegistry()
+    registry.strict_model_operations = frozenset({"vision", "tools", "embedding", "rerank"})
     for provider_id, (endpoints, transports) in _PRODUCTION_PROVIDER_ENDPOINTS.items():
         embedding, vision, rerank = rag_capabilities.get(provider_id, (False, False, False))
         capabilities = {"chat", "stream", "tools"}
@@ -2334,7 +2417,7 @@ def _vision_shape(prompt: str, payloads: Sequence[bytes]) -> _EgressShape:
         payload={
             "prompt": str(prompt),
             "images": [
-                {"mime": _image_mime(payload), "bytes": len(payload)}
+                {"mime": _image_mime(payload), "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
                 for payload in payloads
             ],
         },
@@ -2368,6 +2451,8 @@ class _ProviderAuthorization:
     started_at: float = 0.0
     #: 授权时的 capability 摘要，终态事件要带上以便与 authorized 配对（I-R5）。
     capability_digest: str = ""
+    # Exact authorized output limit must also reach the provider wire body.
+    output_limit: int = 0
 
 
 #: `max_tokens` 未显式给出时施加的 backend 输出上限。
@@ -2492,6 +2577,7 @@ class ProviderGatewayClient:
             backoff_base=backoff_base,
             credential_provider=credential_provider,
             _gateway_managed=True,
+            transport=self.transport,
         )
 
     #: 允许从底层 transport 读取的**只读**属性。
@@ -2609,16 +2695,12 @@ class ProviderGatewayClient:
         capability_digest = _provider_capability_digest(
             capability, model=self.model, endpoint=self.base_url, transport=self.transport,
         )
-        operation_scope = {
-            "capability": capability_digest,
-            "request": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
-            "provider": hashlib.sha256(self.provider.encode("utf-8")).hexdigest(),
-            "model": hashlib.sha256(self.model.encode("utf-8")).hexdigest(),
-            "endpoint": hashlib.sha256(
-                _canonical_provider_endpoint(self.base_url).encode("utf-8")
-            ).hexdigest(),
-            "transport": hashlib.sha256(self.transport.encode("utf-8")).hexdigest(),
-        }
+        operation_scope = self._operation_scope(shape, capability)
+        output_limit = (
+            self._effective_output_limit(authority, run=run, requested=max_tokens)
+            if shape.reserves_output else 0)
+        output_limit = _enforce_model_limits(self.provider, self.model, serialized,
+            output_limit, shape.extra_input_tokens)
         invocation_id = ""
         # 审批要求来自两处：DLP 在文本里扫到了敏感内容，或者这次调用的出站内容里有 DLP 读
         # 不懂的东西（图片）。后者不由扫描决定——扫描看不见它，所以它无条件要审批。
@@ -2654,11 +2736,6 @@ class ProviderGatewayClient:
         #
         # embedding 不生成 token，所以它**不预留输出**：给一次向量化按 chat 的输出上限
         # 扣预算不会报错，只是每次调用都白扣一大笔，然后把额度悄悄用光。
-        output_limit = (
-            self._effective_output_limit(authority, run=run, requested=max_tokens)
-            if shape.reserves_output
-            else 0
-        )
         reserved_output_tokens = output_limit
         # I3：预留与 consume 必须用**同一份** BudgetUsage。旧实现声明
         # `model_turns = 1 + max_retries` 却只 consume 1 轮/1 份成本，于是 settle 的
@@ -2709,7 +2786,30 @@ class ProviderGatewayClient:
             estimated_input_tokens=estimated_input_tokens,
             started_at=time.monotonic(),
             capability_digest=capability_digest,
+            output_limit=output_limit,
         )
+
+    def _operation_scope(self, shape, capability):
+        serialized = self._serialized_request(shape.payload)
+        capability_digest = _provider_capability_digest(
+            capability, model=self.model, endpoint=self.base_url, transport=self.transport,
+        )
+        return {
+            "capability": capability_digest,
+            "request": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+            "provider": hashlib.sha256(self.provider.encode("utf-8")).hexdigest(),
+            "model": hashlib.sha256(self.model.encode("utf-8")).hexdigest(),
+            "endpoint": hashlib.sha256(_canonical_provider_endpoint(self.base_url).encode("utf-8")).hexdigest(),
+            "transport": hashlib.sha256(self.transport.encode("utf-8")).hexdigest(),
+        }
+
+    def preview_operation_scope(self, *, images=None, prompt="", messages=None):
+        """Pure approval preflight. No credentials, budget mutation or network I/O."""
+        shape = _vision_shape(prompt, images) if images is not None else _EgressShape(
+            required=frozenset({"chat"}), payload={"messages": messages, "tools": None, "extra_body": None}, reserves_output=True)
+        capability = self.registry.authorize(self.provider, model=self.model, endpoint=self.base_url,
+            transport=self.transport, required_capabilities=shape.required)
+        return self._operation_scope(shape, capability)
 
     def _reserved_usage(self, *, capability: Any, tokens: int) -> BudgetUsage:
         """本次调用的预留用量（consume 与 settle 共用同一份定义）。
@@ -2987,7 +3087,7 @@ class ProviderGatewayClient:
         )
         try:
             result = await object.__getattribute__(self, "_transport").chat(
-                messages, tools, temperature, max_tokens, extra_body,
+                messages, tools, temperature, authorization.output_limit, extra_body,
             )
         except (GeneratorExit, asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             # M-6：取消不是失败。终态记 `cancelled`，不写 error_type。
@@ -3093,7 +3193,7 @@ class ProviderGatewayClient:
         )
         messages = build_vision_messages(prompt, payloads)
         try:
-            result = await object.__getattribute__(self, "_transport").chat(messages)
+            result = await object.__getattribute__(self, "_transport").chat(messages, max_tokens=authorization.output_limit)
         except (GeneratorExit, asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             self._reconcile_provider_usage(authorization, None, failed=True)
             self._complete_authorized_effect(authorization, error=None, cancelled=True)
@@ -3127,7 +3227,7 @@ class ProviderGatewayClient:
         )
         try:
             async for event in object.__getattribute__(self, "_transport").chat_stream(
-                messages, tools, temperature, max_tokens, extra_body,
+                messages, tools, temperature, authorization.output_limit, extra_body,
             ):
                 yield event
         except (GeneratorExit, asyncio.CancelledError, KeyboardInterrupt, SystemExit):

@@ -471,8 +471,9 @@ def test_approving_a_candidate_makes_it_recallable(tmp_path: Path) -> None:
         approved = repository.approve(memory_id=candidate.memory_id, now=SOON)
 
         assert approved.scope.status is MemoryStatus.ACTIVE
-        assert approved.version == candidate.version
-        assert [record.text for record in _recall(repository)] == ["他不擅长因式分解"]
+        assert approved.version == candidate.version + 1
+        assert _recall(repository) == ()
+        assert [record.text for record in _recall(repository, sensitivity=MemorySensitivity.PERSONAL)] == ["他不擅长因式分解"]
 
 
 def test_a_rejected_candidate_is_not_asked_about_twice(tmp_path: Path) -> None:
@@ -506,7 +507,7 @@ def test_a_rejected_inference_yields_to_the_user_saying_it_directly(
     assert told.stored is not None
     assert told.stored.memory_id == candidate.memory_id
     assert told.stored.scope.status is MemoryStatus.ACTIVE
-    assert told.stored.version == candidate.version + 1
+    assert told.stored.version == candidate.version + 2
 
 
 def test_approve_and_reject_refuse_a_record_that_is_not_a_candidate(

@@ -28,6 +28,7 @@
 
 import os  # noqa: E402
 import sys  # noqa: E402
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_data_files, copy_metadata
 
 # ── 版本资源：让失败无法静默 ───────────────────────────────────────────────
 #
@@ -93,7 +94,7 @@ _ICON = os.path.join(SPECPATH, "..", "build", "icon.ico")
 a = Analysis(
     ["run_backend.py"],
     pathex=[SPECPATH],
-    binaries=[],
+    binaries=collect_dynamic_libs('onnxruntime') + collect_dynamic_libs('usearch'),
     datas=[
         # (源相对 spec 目录, 目标相对 _internal/) —— 与 __file__ 相对路径匹配
         # v1.0.24.7 归一后 souls/prompts/locales 已在 backend/ 下，源相对 spec 目录直接写名字
@@ -101,7 +102,9 @@ a = Analysis(
         ("prompts", "backend/prompts"),
         ("locales", "backend/locales"),
         ("worker_prompt.md", "backend"),
-    ],
+        ("model_assets/e5-small", "backend/model_assets/e5-small"),
+    ] + copy_metadata('mem0ai') + copy_metadata('numpy') + copy_metadata('onnxruntime')
+      + copy_metadata('tokenizers') + copy_metadata('usearch') + collect_data_files('tokenizers'),
     hiddenimports=[
         # 仅列**必须显式声明且真实存在**的延迟导入项。
         # playwright 由 browser_tools._import_playwright() 延迟导入，需要显式声明；
@@ -110,11 +113,17 @@ a = Analysis(
         "playwright.async_api",
         "playwright._impl._driver",
         "yaml",
+        "backend.knowe_memory.mem0_adapters", "backend.knowe_memory.local_embedding",
+        "mem0.memory.main", "mem0.configs.base", "mem0.utils.factory", "mem0.llms.base",
+        "mem0.embeddings.base", "mem0.vector_stores.base", "mem0.llms.configs",
+        "mem0.embeddings.configs", "mem0.vector_stores.configs", "mem0.memory.telemetry",
+        "mem0.configs.vector_stores", "mem0.configs.vector_stores.qdrant",
+        "onnxruntime", "tokenizers", "usearch.index",
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["pytest", "tests", "IPython", "numpy", "scipy", "mkl", "mkl_fft", "mkl_random", "mkl-service"],
+    excludes=["pytest", "tests", "IPython", "scipy", "mkl", "mkl_fft", "mkl_random", "mkl-service"],
     noarchive=False,
     optimize=0,
 )

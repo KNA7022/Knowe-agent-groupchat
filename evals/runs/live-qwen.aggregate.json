@@ -1,0 +1,1021 @@
+{
+  "dataset": "v1",
+  "case_count": 120,
+  "attempts": 121,
+  "code_identities": [
+    "2589f06d5c7c12185026bf737ddc6035a9a091fa52d6f3ef0ef147d5bb09445f",
+    "4f87fda4a3c628f076dd77d984d86390395312de399a3a78f120c654c47dfc35",
+    "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d"
+  ],
+  "counts": {
+    "passed": 88,
+    "failed": 32
+  },
+  "by_split": {
+    "development": {
+      "passed": 65,
+      "failed": 25
+    },
+    "holdout": {
+      "passed": 23,
+      "failed": 7
+    }
+  },
+  "by_category": {
+    "knowledge": {
+      "passed": 21,
+      "failed": 3
+    },
+    "learning": {
+      "passed": 4,
+      "failed": 20
+    },
+    "memory": {
+      "passed": 16
+    },
+    "multimodal": {
+      "passed": 24
+    },
+    "permissions": {
+      "passed": 16
+    },
+    "protocol": {
+      "failed": 9,
+      "passed": 7
+    }
+  },
+  "cost_cny_upper_bound": "0.461940",
+  "unknown_usage_charged_full_reservation": [
+    {
+      "ticket": "1791652897003309500",
+      "kind": "settle",
+      "cny": "0",
+      "basis": "full_reserved_upper_bound_no_refund",
+      "usage_known": false,
+      "reason": "JSONDecodeError after bounded request; exact usage not retained, charge full 12000 input + 768 output at verified uncached price"
+    }
+  ],
+  "live_product_e2e": false,
+  "failures": [
+    {
+      "id": "knowledge-003",
+      "category": "knowledge",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "2589f06d5c7c12185026bf737ddc6035a9a091fa52d6f3ef0ef147d5bb09445f",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791652745.6073267,
+      "usage": {
+        "input_tokens": 123,
+        "output_tokens": 22
+      },
+      "cny": "0.002268",
+      "model": "qwen3.8-max",
+      "checks": {
+        "answer": false,
+        "source_id": true,
+        "page": true
+      },
+      "evidence": {
+        "actual": {
+          "answer": "各自概率的乘积",
+          "source_id": "synthetic-03",
+          "page": 3
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "knowledge-006",
+      "category": "knowledge",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "2589f06d5c7c12185026bf737ddc6035a9a091fa52d6f3ef0ef147d5bb09445f",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791652763.995306,
+      "usage": {
+        "input_tokens": 116,
+        "output_tokens": 18
+      },
+      "cny": "0.00204",
+      "model": "qwen3.8-max",
+      "checks": {
+        "answer": false,
+        "source_id": true,
+        "page": true
+      },
+      "evidence": {
+        "actual": {
+          "answer": "两个",
+          "source_id": "synthetic-06",
+          "page": 6
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "knowledge-011",
+      "category": "knowledge",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "2589f06d5c7c12185026bf737ddc6035a9a091fa52d6f3ef0ef147d5bb09445f",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791652794.0479712,
+      "usage": {
+        "input_tokens": 124,
+        "output_tokens": 21
+      },
+      "cny": "0.002244",
+      "model": "qwen3.8-max",
+      "checks": {
+        "answer": false,
+        "source_id": true,
+        "page": true
+      },
+      "evidence": {
+        "actual": {
+          "answer": "朝向法线",
+          "source_id": "synthetic-11",
+          "page": 11
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-002",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653181.1131005,
+      "usage": {
+        "input_tokens": 112,
+        "output_tokens": 19
+      },
+      "cny": "0.002028",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": false,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 35,
+          "unallocated_minutes": 25,
+          "conflict": true
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-003",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653201.5049622,
+      "usage": {
+        "input_tokens": 111,
+        "output_tokens": 18
+      },
+      "cny": "0.00198",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 0,
+          "unallocated_minutes": 40,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-006",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653273.8983982,
+      "usage": {
+        "input_tokens": 113,
+        "output_tokens": 19
+      },
+      "cny": "0.00204",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": false,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 55,
+          "unallocated_minutes": 65,
+          "conflict": true
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-007",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653303.9412942,
+      "usage": {
+        "input_tokens": 112,
+        "output_tokens": 18
+      },
+      "cny": "0.001992",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 0,
+          "unallocated_minutes": 60,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-008",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653317.2573755,
+      "usage": {
+        "input_tokens": 111,
+        "output_tokens": 19
+      },
+      "cny": "0.002016",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 45,
+          "unallocated_minutes": 20,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-009",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653324.3123567,
+      "usage": {
+        "input_tokens": 111,
+        "output_tokens": 19
+      },
+      "cny": "0.002016",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 60,
+          "unallocated_minutes": 10,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-010",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653332.786723,
+      "usage": {
+        "input_tokens": 112,
+        "output_tokens": 18
+      },
+      "cny": "0.001992",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": false,
+        "unallocated_minutes": false,
+        "conflict": false
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 75,
+          "unallocated_minutes": 0,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-011",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653343.286201,
+      "usage": {
+        "input_tokens": 111,
+        "output_tokens": 18
+      },
+      "cny": "0.00198",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 0,
+          "unallocated_minutes": 80,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-012",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653355.6809647,
+      "usage": {
+        "input_tokens": 112,
+        "output_tokens": 18
+      },
+      "cny": "0.001992",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 85,
+          "unallocated_minutes": 0,
+          "conflict": true
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-013",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653364.3642359,
+      "usage": {
+        "input_tokens": 112,
+        "output_tokens": 18
+      },
+      "cny": "0.001992",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 90,
+          "unallocated_minutes": 0,
+          "conflict": true
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-014",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653371.651342,
+      "usage": {
+        "input_tokens": 113,
+        "output_tokens": 19
+      },
+      "cny": "0.00204",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": false,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 95,
+          "unallocated_minutes": 40,
+          "conflict": true
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-015",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653380.6471288,
+      "usage": {
+        "input_tokens": 112,
+        "output_tokens": 19
+      },
+      "cny": "0.002028",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 0,
+          "unallocated_minutes": 100,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-016",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653391.303536,
+      "usage": {
+        "input_tokens": 112,
+        "output_tokens": 19
+      },
+      "cny": "0.002028",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 60,
+          "unallocated_minutes": 45,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-017",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653401.5657747,
+      "usage": {
+        "input_tokens": 112,
+        "output_tokens": 19
+      },
+      "cny": "0.002028",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 75,
+          "unallocated_minutes": 35,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-018",
+      "category": "learning",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653408.8832781,
+      "usage": {
+        "input_tokens": 113,
+        "output_tokens": 19
+      },
+      "cny": "0.00204",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 90,
+          "unallocated_minutes": 25,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-001",
+      "category": "protocol",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653417.2215493,
+      "usage": {
+        "input_tokens": 118,
+        "output_tokens": 20
+      },
+      "cny": "0.002136",
+      "model": "qwen3.8-max",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "chat/completions",
+          "input_key": "messages",
+          "max_output_key": "max_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-002",
+      "category": "protocol",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653426.0190241,
+      "usage": {
+        "input_tokens": 119,
+        "output_tokens": 17
+      },
+      "cny": "0.00204",
+      "model": "qwen3.8-max",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "messages",
+          "input_key": "messages",
+          "max_output_key": "max_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-003",
+      "category": "protocol",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653434.1553679,
+      "usage": {
+        "input_tokens": 119,
+        "output_tokens": 18
+      },
+      "cny": "0.002076",
+      "model": "qwen3.8-max",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "responses",
+          "input_key": "input",
+          "max_output_key": "max_output_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-008",
+      "category": "protocol",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653465.688189,
+      "usage": {
+        "input_tokens": 119,
+        "output_tokens": 17
+      },
+      "cny": "0.00204",
+      "model": "qwen3.8-max",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "messages",
+          "input_key": "messages",
+          "max_output_key": "max_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-009",
+      "category": "protocol",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653472.070769,
+      "usage": {
+        "input_tokens": 119,
+        "output_tokens": 18
+      },
+      "cny": "0.002076",
+      "model": "qwen3.8-max",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "responses",
+          "input_key": "input",
+          "max_output_key": "max_output_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-010",
+      "category": "protocol",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653480.2311652,
+      "usage": {
+        "input_tokens": 118,
+        "output_tokens": 20
+      },
+      "cny": "0.002136",
+      "model": "qwen3.8-max",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "chat/completions",
+          "input_key": "messages",
+          "max_output_key": "max_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-012",
+      "category": "protocol",
+      "split": "development",
+      "mode": "live",
+      "run_identity": "bc2ba1a3a95f31917ae9caab3d803b46400d7f0284e5fa6cca5c8fb90e018b7d",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653491.7397904,
+      "usage": {
+        "input_tokens": 119,
+        "output_tokens": 18
+      },
+      "cny": "0.002076",
+      "model": "qwen3.8-max",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "responses",
+          "input_key": "input",
+          "max_output_key": "max_output_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-019",
+      "category": "learning",
+      "split": "holdout",
+      "mode": "live",
+      "run_identity": "4f87fda4a3c628f076dd77d984d86390395312de399a3a78f120c654c47dfc35",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653779.50633,
+      "usage": {
+        "input_tokens": 113,
+        "output_tokens": 19
+      },
+      "cny": "0.00204",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 0,
+          "unallocated_minutes": 120,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-020",
+      "category": "learning",
+      "split": "holdout",
+      "mode": "live",
+      "run_identity": "4f87fda4a3c628f076dd77d984d86390395312de399a3a78f120c654c47dfc35",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653783.992203,
+      "usage": {
+        "input_tokens": 113,
+        "output_tokens": 19
+      },
+      "cny": "0.00204",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 120,
+          "unallocated_minutes": 5,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-022",
+      "category": "learning",
+      "split": "holdout",
+      "mode": "live",
+      "run_identity": "4f87fda4a3c628f076dd77d984d86390395312de399a3a78f120c654c47dfc35",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653792.982488,
+      "usage": {
+        "input_tokens": 113,
+        "output_tokens": 19
+      },
+      "cny": "0.00204",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 45,
+          "unallocated_minutes": 90,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-023",
+      "category": "learning",
+      "split": "holdout",
+      "mode": "live",
+      "run_identity": "4f87fda4a3c628f076dd77d984d86390395312de399a3a78f120c654c47dfc35",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653797.4092844,
+      "usage": {
+        "input_tokens": 112,
+        "output_tokens": 19
+      },
+      "cny": "0.002028",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 0,
+          "unallocated_minutes": 140,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-024",
+      "category": "learning",
+      "split": "holdout",
+      "mode": "live",
+      "run_identity": "4f87fda4a3c628f076dd77d984d86390395312de399a3a78f120c654c47dfc35",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653802.0064323,
+      "usage": {
+        "input_tokens": 112,
+        "output_tokens": 19
+      },
+      "cny": "0.002028",
+      "model": "qwen3.8-max",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 75,
+          "unallocated_minutes": 70,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-013",
+      "category": "protocol",
+      "split": "holdout",
+      "mode": "live",
+      "run_identity": "4f87fda4a3c628f076dd77d984d86390395312de399a3a78f120c654c47dfc35",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653806.1873431,
+      "usage": {
+        "input_tokens": 118,
+        "output_tokens": 20
+      },
+      "cny": "0.002136",
+      "model": "qwen3.8-max",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "chat/completions",
+          "input_key": "messages",
+          "max_output_key": "max_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-016",
+      "category": "protocol",
+      "split": "holdout",
+      "mode": "live",
+      "run_identity": "4f87fda4a3c628f076dd77d984d86390395312de399a3a78f120c654c47dfc35",
+      "attempt": 0,
+      "status": "failed",
+      "time": 1791653820.9987524,
+      "usage": {
+        "input_tokens": 118,
+        "output_tokens": 20
+      },
+      "cny": "0.002136",
+      "model": "qwen3.8-max",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "chat/completions",
+          "input_key": "messages",
+          "max_output_key": "max_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    }
+  ]
+}

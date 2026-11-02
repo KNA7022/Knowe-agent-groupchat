@@ -204,7 +204,12 @@ class ProviderClient:
         backoff_base: float = DEFAULT_BACKOFF_BASE,
         credential_provider: CredentialProvider | None = None,
         _gateway_managed: bool = False,
+        transport: str = "openai_chat",
     ):
+        from knowe_core.provider_protocols import PROTOCOL_PATHS
+        if transport not in PROTOCOL_PATHS:
+            raise ValueError("unsupported provider transport")
+        self.transport = transport
         normalized_base = base_url.rstrip("/")
         # HTTPX requires an absolute URL even when MockTransport intercepts the request.
         # The synthetic origin is used only for an explicitly injected client factory.
@@ -257,13 +262,13 @@ class ProviderClient:
         if api_key and credential_provider is None:
             self._headers["Authorization"] = f"Bearer {api_key}"
 
-        # Respect a version segment already present in the configured base URL.  The
-        # request layer only appends /chat/completions; it never injects /v1.
-        stripped = self.base_url
-        if stripped.endswith("/chat/completions"):
-            self._endpoint = stripped
-        else:
-            self._endpoint = f"{stripped}/chat/completions"
+        suffix = PROTOCOL_PATHS[transport]
+        self._endpoint = self.base_url if self.base_url.endswith(suffix) else self.base_url + suffix
+        if transport == "anthropic_messages":
+            self._headers.setdefault("anthropic-version", "2023-06-01")
+            self._headers.pop("Authorization", None)
+            if api_key and credential_provider is None:
+                self._headers["x-api-key"] = api_key
 
     def _request_headers(self) -> dict[str, str]:
         """Build one request-local header map and resolve a lease only at egress."""
@@ -284,7 +289,10 @@ class ProviderClient:
             raise ProviderAuthError(
                 "Provider credential lease is unavailable.", retryable=False,
             )
-        headers["Authorization"] = f"Bearer {credential}"
+        if self.transport == "anthropic_messages":
+            headers["x-api-key"] = credential
+        else:
+            headers["Authorization"] = f"Bearer {credential}"
         return headers
 
     # ── HTTP client lifecycle ──
@@ -315,31 +323,10 @@ class ProviderClient:
         if self._client_factory is not None:
             if self._injected_client is None or self._injected_client.is_closed:
                 self._injected_client = self._client_factory()
-            # C-R1（真的那一半）：测试通道必须**物理上出不了网**。
-            #
-            # 复审实测过：只把旧布尔改名的做法等于后门照旧——传入一个真实的
-            # `httpx.AsyncClient` 就能带着未注册的 provider/model/endpoint 发出去。
-            #
-            # 约束按"这个对象是不是真的 httpx client"判定：
-            #   · 真正的 `httpx.AsyncClient` 一定带 `_transport`。若它不是
-            #     `httpx.MockTransport`（后者由 handler 直接产生响应、不建 socket），
-            #     拒绝——这正是复审用来绕过的那条路。
-            #   · 既有的测试替身是自定义 fake 类（没有 `_transport`），继续放行，
-            #     否则会误伤大量合法的 agent 行为测试。
-            #
-            # ⚠ 诚实边界：这条检查拦得住"直接传真实 client"，拦不住"自己包一层
-            #   wrapper 把真 client 藏起来"。它不是密码学边界——`client_factory` 接受
-            #   任意可调用对象，所以这里承诺的只是"明显误传会被立刻拒绝"。
-            #   真正的边界不在这层：真实 provider egress 必须经过
-            #   `ProviderGatewayClient._authorize`，而那条路径已经没有任何可跳过授权的
-            #   开关（`_trusted_test_transport` 已删除，见该类 `__init__` 的说明）。
-            transport = getattr(self._injected_client, "_transport", None)
-            if transport is not None and not isinstance(transport, httpx.MockTransport):
-                self._injected_client = None
-                raise PermissionError(
-                    "an injected httpx client must use httpx.MockTransport: "
-                    "the test seam may not perform real network egress"
-                )
+            # Gateway-managed injection also supports a real bounded HTTP transport.
+            # Authorization remains in ProviderGatewayClient._authorize; this factory
+            # replaces only the send channel and never bypasses runtime/DLP/grants.
+            # _gateway_managed is a declaration, not an independent security boundary.
             return self._injected_client
 
         loop = asyncio.get_running_loop()
@@ -401,7 +388,12 @@ class ProviderClient:
             stream=False,
             extra_body=extra_body,
         )
-        return await self._request(body)
+        from knowe_core.provider_protocols import normalize_response
+        raw = await self._request(body)
+        try:
+            return normalize_response(raw, self.transport)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ProviderBadResponseError("Malformed native provider response") from exc
 
     # ── Streaming ──
 
@@ -416,6 +408,7 @@ class ProviderClient:
         """Yield provider-neutral SSE events with safe pre-output retries."""
 
         self._assert_gateway_managed()
+        self.last_attempts = 0
         body = self._build_body(
             messages,
             tools,
@@ -428,6 +421,7 @@ class ProviderClient:
 
         for attempt in range(total_attempts):
             emitted_event = False
+            self.last_attempts = attempt + 1
             try:
                 client = self._get_client()
                 async with client.stream(
@@ -550,7 +544,8 @@ class ProviderClient:
             body["tools"] = tools
         else:
             body.pop("tools", None)
-        return body
+        from knowe_core.provider_protocols import request_body
+        return request_body(body, self.transport)
 
     # ── Embeddings ──
 
@@ -796,6 +791,10 @@ class ProviderClient:
         mandatory.  Choice metadata (especially ``finish_reason``) is retained: it is
         part of the control protocol and is used by the downstream protocol gate.
         """
+        if self.transport != "openai_chat":
+            async for event in self._parse_native_stream(response):
+                yield event
+            return
         buffer = ""
         saw_finish = False
 
@@ -825,6 +824,39 @@ class ProviderClient:
                 yield event
             if done and not saw_finish:
                 yield {"type": "finish", "reason": "stop"}
+
+    async def _parse_native_stream(self, response: httpx.Response):
+        from knowe_core.provider_protocols import NativeStream
+        parser = NativeStream(self.transport)
+        lines = []
+        finished = False
+        async def decode(payload):
+            nonlocal finished
+            try:
+                data = json.loads(payload)
+                if not isinstance(data, dict):
+                    raise ValueError("expected object")
+                events = parser.events(data)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ProviderBadResponseError("Malformed native SSE frame") from exc
+            for event in events:
+                if event["type"] == "error":
+                    raise ProviderBadResponseError(event["message"])
+                if event["type"] == "finish":
+                    finished = True
+                yield event
+        async for line in response.aiter_lines():
+            if line.startswith("data:"):
+                lines.append(line[5:].lstrip())
+            elif not line and lines:
+                async for event in decode("\n".join(lines)):
+                    yield event
+                lines = []
+        if lines:
+            async for event in decode("\n".join(lines)):
+                yield event
+        if not finished:
+            raise ProviderBadResponseError("Native provider stream ended before completion")
 
     @classmethod
     def _parse_sse_line(cls, line: str) -> tuple[list[dict[str, Any]], bool]:

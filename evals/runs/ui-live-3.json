@@ -1,0 +1,148 @@
+{
+  "scope": "ui-probe_real_provider_http_not_desktop",
+  "passed": true,
+  "result": {
+    "ok": true,
+    "scope": "production_react_component_real_server_http_and_worker",
+    "status": "succeeded",
+    "model_calls": 1,
+    "tool_calls": 0,
+    "steps": [
+      "production_react_panel_loaded",
+      "input_proposal_exact_version_no_provider_call",
+      "user_clicked_exact_version_approval",
+      "real_worker_verified_result_rendered",
+      "browser_reload_restores_result_without_reexecution"
+    ],
+    "screenshots": [
+      "D:\\agentwork\\StudyCrew-worktree\\evals\\runs\\ui-live-3-data\\ui-proposal.png",
+      "D:\\agentwork\\StudyCrew-worktree\\evals\\runs\\ui-live-3-data\\ui-result.png"
+    ],
+    "http": [
+      {
+        "path": "/task-runtime/protected-snapshot",
+        "status": 200
+      },
+      {
+        "path": "/task-runtime/protected-propose",
+        "status": 200
+      },
+      {
+        "path": "/task-runtime/protected-snapshot",
+        "status": 200
+      },
+      {
+        "path": "/task-runtime/protected-resolve",
+        "status": 200
+      },
+      {
+        "path": "/task-runtime/protected-snapshot",
+        "status": 200
+      },
+      {
+        "path": "/task-runtime/protected-snapshot",
+        "status": 200
+      },
+      {
+        "path": "/task-runtime/protected-snapshot",
+        "status": 200
+      },
+      {
+        "path": "/task-runtime/protected-snapshot",
+        "status": 200
+      },
+      {
+        "path": "/task-runtime/protected-snapshot",
+        "status": 200
+      },
+      {
+        "path": "/task-runtime/protected-snapshot",
+        "status": 200
+      }
+    ],
+    "snapshot": {
+      "cards": [],
+      "runs": [
+        {
+          "run_id": "run_ca81ffbfb48441bfa9c07ec8e676ce1c",
+          "task_id": "task_f77981630f1a4f36853d8ca7ea9b52ed",
+          "group_id": "grp_7fd284624c264b2da3d6001ed43c430f",
+          "kind": "primary",
+          "title": "Protected instruction task",
+          "status": "succeeded",
+          "queue_class": "foreground",
+          "route_label": "queue_new",
+          "read_only": false,
+          "risk": "high",
+          "parent_run_id": null,
+          "version": 15,
+          "last_seq": 15,
+          "budget_limits": {
+            "wall_clock_seconds": 900,
+            "model_turns": 20,
+            "tool_calls": 30,
+            "tokens": 100000,
+            "cost_usd": 5.0
+          },
+          "budget_usage": {
+            "wall_clock_seconds": 0.0,
+            "model_turns": 1,
+            "tool_calls": 0,
+            "tokens": 4379,
+            "cost_usd": 0.010000000000000002
+          },
+          "agent_runs": [
+            {
+              "agent_run_id": "arun_c70d3476a77940589db898a38baba6fa",
+              "run_id": "run_ca81ffbfb48441bfa9c07ec8e676ce1c",
+              "agent_id": "gag_ba9152a223484738a53469d9e2f1d8d8",
+              "role": "verifier",
+              "phase": "verifying",
+              "operation_summary": "Verifying executor evidence",
+              "blocking_reason": "",
+              "version": 1,
+              "updated_at": "2026-10-10T18:12:16.706903Z",
+              "schema_version": 1
+            }
+          ],
+          "evidence": [],
+          "failure_type": null,
+          "public_summary": "Protected task execution completed",
+          "blocking_reason": "",
+          "data_classification": [],
+          "created_at": "2026-10-10T18:12:12.412492Z",
+          "updated_at": "2026-10-10T18:12:16.711908Z",
+          "started_at": "2026-10-10T18:12:12.421858Z",
+          "finished_at": "2026-10-10T18:12:16.711908Z",
+          "schema_version": 1
+        }
+      ],
+      "messages": [
+        {
+          "event_id": "p2evt_46a7b8d158b8b040404853f499ebb9b0",
+          "agent_id": "gag_d9c5efdeca594e5b8a794bb9ace85df4",
+          "content": "Spaced review revisits learning material at increasing intervals.",
+          "status": "SUCCEEDED",
+          "task_id": "p1_task_db7e8f37c7b342c289914d69727afdc5"
+        }
+      ],
+      "scope": "version-bound Group instruction and read-only source tasks",
+      "model_execution": "requires provider credential"
+    }
+  },
+  "calls": [
+    {
+      "ticket": "1791655933432735400",
+      "input_cap": 3298,
+      "output_cap": 4096,
+      "status": "accounted",
+      "usage": {
+        "input_tokens": 541,
+        "output_tokens": 55
+      },
+      "cny": "0.008472"
+    }
+  ],
+  "rejections": [],
+  "task_total_cny_upper_bound": "0.568020"
+}

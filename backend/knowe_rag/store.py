@@ -317,6 +317,36 @@ class EncryptedKnowledgeStore:
                  self._seal(document_id, "original", original)),
             )
 
+    def update_source_metadata(self, document_id: str, metadata: dict) -> None:
+        with self._database.transaction() as connection:
+            cursor = connection.execute(
+                "UPDATE rag_sources SET metadata=? WHERE document_id=?",
+                (self._seal(document_id, "metadata", json.dumps(metadata, ensure_ascii=False).encode("utf-8")), document_id),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("source_no_longer_exists")
+
+    def operation(self, operation_id: str) -> dict | None:
+        with self._database.transaction() as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS rag_operations (operation_id TEXT PRIMARY KEY, payload BLOB NOT NULL)")
+            row = connection.execute("SELECT payload FROM rag_operations WHERE operation_id=?", (operation_id,)).fetchone()
+        return json.loads(self._open(operation_id, "rag_operation", row["payload"]).decode("utf-8")) if row else None
+
+    def operation_ids(self) -> tuple[str, ...]:
+        with self._database.transaction() as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS rag_operations (operation_id TEXT PRIMARY KEY, payload BLOB NOT NULL)")
+            return tuple(row["operation_id"] for row in connection.execute("SELECT operation_id FROM rag_operations"))
+
+    def delete_operation(self, operation_id: str):
+        with self._database.transaction() as connection:
+            connection.execute("DELETE FROM rag_operations WHERE operation_id=?", (operation_id,))
+
+    def write_operation(self, operation_id: str, payload: dict) -> None:
+        encrypted = self._seal(operation_id, "rag_operation", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        with self._database.transaction() as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS rag_operations (operation_id TEXT PRIMARY KEY, payload BLOB NOT NULL)")
+            connection.execute("INSERT INTO rag_operations(operation_id,payload) VALUES (?,?) ON CONFLICT(operation_id) DO UPDATE SET payload=excluded.payload", (operation_id, encrypted))
+
     def source_metadata(self, document_id: str) -> dict | None:
         with self._database.transaction(immediate=False) as connection:
             row = connection.execute("SELECT metadata FROM rag_sources WHERE document_id=?", (document_id,)).fetchone()
@@ -338,7 +368,7 @@ class EncryptedKnowledgeStore:
 
     # ── 写 ────────────────────────────────────────────────────────────
 
-    def write_document(self, document_id: str, chunks: tuple[Chunk, ...]) -> ReindexPlan:
+    def write_document(self, document_id: str, chunks: tuple[Chunk, ...], *, metadata: dict | None = None, expected_version: int | None = None) -> ReindexPlan:
         """写入一份文档的这一版，返回与上一版之间的差异。
 
         差异由 `diff_fingerprints` 判定——和 `plan_reindex` 用的是同一个函数，所以"哪些要
@@ -353,6 +383,15 @@ class EncryptedKnowledgeStore:
 
         now = _utc_now()
         with self._database.transaction() as connection:
+            if metadata is not None:
+                source = connection.execute("SELECT metadata FROM rag_sources WHERE document_id=?", (document_id,)).fetchone()
+                if source is None:
+                    raise StoreError("source_no_longer_exists")
+                current_metadata = json.loads(self._open(document_id, "metadata", source["metadata"]).decode("utf-8"))
+                if expected_version is not None and current_metadata.get("version", 1) != expected_version:
+                    raise StoreError("source_version_changed")
+                connection.execute("UPDATE rag_sources SET metadata=? WHERE document_id=?",
+                    (self._seal(document_id, "metadata", json.dumps(metadata, ensure_ascii=False).encode("utf-8")), document_id))
             # 文档行必须先落地：chunk 的外键指向它，顺序反了会在第一次写入时就撞上
             # FOREIGN KEY constraint failed。
             connection.execute(

@@ -1006,6 +1006,15 @@ async def test_session_admission_baseline_prevents_late_predebt_claim(
 async def test_stalled_client_is_fenced_before_dirty_log_exceeds_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, update_count: int,
 ) -> None:
+    from backend import server as server_module
+    from types import SimpleNamespace
+    real_time = server_module.time
+    logical_time = [1000.0]
+    # Only recovery lease accounting uses this clock; asyncio scheduling and the
+    # database/flush owners remain real. Packaging latency cannot expire the
+    # replacement while it consumes its durable disconnect fence.
+    monkeypatch.setattr(server_module, "time", SimpleNamespace(
+        monotonic=lambda: logical_time[0], time=real_time.time, time_ns=real_time.time_ns))
     server = KnoweServer(str(tmp_path))
     assert server.groups is not None and server.task_runtime is not None
     monkeypatch.setattr(server, "TASK_RUNTIME_RECOVERY_DIRTY_GLOBAL_MAX", 8)
@@ -1043,6 +1052,7 @@ async def test_stalled_client_is_fenced_before_dirty_log_exceeds_budget(
     latest_generation = 1
     backpressured = False
     for index in range(update_count):
+        logical_time[0] += 0.003
         latest_generation = index + 2
         with server._task_runtime_event_bridge_lock:  # noqa: SLF001
             server._record_task_runtime_recovery_locked(  # noqa: SLF001

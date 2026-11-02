@@ -100,7 +100,7 @@ def _encode_png(width: int, height: int, rgb: bytes) -> bytes:
 
 
 def render_page(
-    path: str | Path, page_number: int, *, scale: float = RENDER_SCALE,
+    path: str | Path | bytes, page_number: int, *, scale: float = RENDER_SCALE,
 ) -> RenderedPage:
     """把第 `page_number` 页（**1 基**，与 `page:N` 位置对齐）渲染成 PNG。
 
@@ -112,11 +112,11 @@ def render_page(
     if page_number < 1:
         raise RenderingError(f"页号从 1 开始，收到 {page_number}")
 
-    source = Path(path)
+    source = path if isinstance(path, bytes) else Path(path)
     try:
         document = pdfium.PdfDocument(source)
     except (pdfium.PdfiumError, OSError) as exc:
-        raise RenderingError(f"{source.suffix} 打不开：{exc}") from exc
+        raise RenderingError(f"{"PDF"} 打不开：{exc}") from exc
 
     try:
         total = len(document)

@@ -152,8 +152,8 @@ class ProtectedLineages:
     def register(self, group_id: str, approval_id: str, *, generation: int, digest: str):
         cards = self.runtime.cards
         with cards._admission(group_id, approval_id) as (group, revision):
-            if group.source_links or group.course_bindings:
-                raise ProtectedStorageError("protected storage requires a source-free group")
+            if (group.source_links or group.course_bindings) and cards._source_validator is None:
+                raise ProtectedStorageError("protected source revision authority unavailable")
             with self.db.transaction() as conn:
                 row, owner, approval, card = cards._current(conn, group, approval_id, revision)
                 cards._match(card, generation, digest)
@@ -176,6 +176,9 @@ class ProtectedLineages:
                     "goal_digest": self.crypto.digest("protected-goal", card.proposal.instruction),
                     "worker_run_id": "",
                 }
+                if group.source_links or group.course_bindings:
+                    with cards._source_validator.guard(group) as source_revision:
+                        payload["source_revision"] = source_revision.revision
                 meta = self.crypto.verify(conn)
                 blob = self.crypto._key.seal(bounded_json(payload), aad=self._aad(meta, task_id, group_id, "active"))
                 receipt = self.crypto.digest("lineage-receipt", [task_id, group_id, "active"])
@@ -273,8 +276,8 @@ class ProtectedAccess:
         registry = self.registry
         try:
             with registry.runtime.cards._admission(self.group_id) as (group, revision):
-                if group.source_links or group.course_bindings:
-                    raise ProtectedStorageError("protected storage requires a source-free group")
+                if (group.source_links or group.course_bindings) and registry.runtime.cards._source_validator is None:
+                    raise ProtectedStorageError("protected source revision authority unavailable")
                 with registry.db.transaction(immediate=False) as conn:
                     data = registry._read(conn, self.task_id, self.group_id)
                     owner = registry.runtime.cards._owner(conn, data["owner_run_id"], self.group_id)
@@ -336,14 +339,20 @@ class _ExistingRecordsRead(ProtectedAccess):
                 group = runtime.groups.get(self.group_id)
                 runtime._assert_group_mutable(self.group_id)
                 runtime._assert_not_deferred_quarantine(self.group_id)
-                with self.registry.db.transaction(immediate=False) as conn:
+                source_validator = runtime.cards._source_validator
+                source_context = (source_validator.guard(group) if source_validator is not None
+                                  else nullcontext(None))
+                with source_context as source_revision, self.registry.db.transaction(immediate=False) as conn:
                     data = self.registry._read(conn, self.task_id, self.group_id)
-                    if (set(data) != self._P1_FIELDS
+                    if (set(data) not in {self._P1_FIELDS, self._P1_FIELDS | {"source_revision"}}
                             or any(type(value) is not str for name, value in data.items() if name != "generation")
                             or type(data["generation"]) is not int or data["generation"] < 1
                             or data["worker_role"] not in {"knowledge", "planning", "coach"}
                             or not re.fullmatch(r"[0-9a-f]{32}", data["worker_run_id"])):
                         raise ProtectedStorageError("unknown original protected history contract")
+                    if "source_revision" in data and (
+                            source_revision is None or source_revision.revision != data["source_revision"]):
+                        raise ProtectedStorageError("protected source history revision revoked")
                     owner = runtime.cards._owner(conn, data["owner_run_id"], self.group_id)
                     if owner.task_id != data["owner_task_id"]:
                         raise ProtectedStorageError("protected history owner mismatch")
@@ -351,9 +360,11 @@ class _ExistingRecordsRead(ProtectedAccess):
                         if owner.status not in {TaskStatus.SUCCEEDED, TaskStatus.PARTIAL}:
                             raise ProtectedStorageError("completed protected owner required")
                     else:
-                        revision = self.registry.crypto.digest("scope", [group.to_dict(), "no-source-content"])
+                        revision = self.registry.crypto.digest("scope", [group.to_dict(),
+                            source_revision.revision if source_revision is not None else "no-source-content"])
                         if (owner.status is not TaskStatus.PAUSED or group.lifecycle is not GroupLifecycle.ACTIVE
-                                or group.source_links or group.course_bindings or revision != data["scope_revision"]):
+                                or ((group.source_links or group.course_bindings) and source_validator is None)
+                                or revision != data["scope_revision"]):
                             raise ProtectedStorageError("paused protected scope unavailable")
                         row = conn.execute("SELECT * FROM studycrew_approvals WHERE approval_id=?",
                                            (data["approval_id"],)).fetchone()

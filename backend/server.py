@@ -450,9 +450,20 @@ class KnoweServer:
         self.store: Store | None = Store(raw_dir) if raw_dir else None
         self.data_root = Path(raw_dir or "./data").expanduser().resolve()
         self.groups: GroupRepository | None = GroupRepository(self.data_root) if raw_dir else None
+        self._group_master_key = None
+        key_path = self.data_root / "local_knowledge" / "master-key.dpapi"
+        if self.groups is not None:
+            from .knowe_rag.crypto import MasterKey, MasterKeyError
+            try:
+                self._group_master_key = MasterKey.load_or_create(key_path)
+            except (MasterKeyError, OSError):
+                log.warning("OS-protected Group encryption is unavailable; private workflows remain blocked")
         self.task_runtime: TaskRuntimeService | None = (
-            TaskRuntimeService(self.data_root, self.groups) if self.groups is not None else None
+            TaskRuntimeService(self.data_root, self.groups, card_master_key=self._group_master_key)
+            if self.groups is not None else None
         )
+        self.learning = None
+        self.governed_memory = None
         # This second process credential is deliberately independent from the renderer-visible
         # runtime token.  An absent, malformed or accidentally reused value fails the private
         # lease route closed without affecting ordinary CLI/test server construction.
@@ -468,6 +479,8 @@ class KnoweServer:
         self.hub = Hub(store=self.store)
         self.hub.group_id_resolver = self._group_id_for_runtime_project
         if self.task_runtime is not None:
+            from .task_runtime.group_content import GroupContent
+            self.hub.group_content = GroupContent(self.task_runtime)
             from .protected_events import ProtectedEvents
             protected_events = ProtectedEvents.existing(self.task_runtime)
             if protected_events is not None:
@@ -4643,9 +4656,20 @@ class KnoweServer:
     def _protected_public_projection(self, value, *, history=False):
         """Transient projection shared by admitted socket and HTTP response boundaries."""
         from .protected_events import REF
+        from .task_runtime.group_content import REF as CHAT_REF
         from .protected_storage import ProtectedStorageError
         if isinstance(value, dict):
+            if CHAT_REF in value:
+                if self.hub.group_content is None:
+                    raise ProtectedStorageError("Group content authority unavailable")
+                return self.hub.group_content.hydrate(value)
             if REF in value:
+                if self.task_runtime.cards._source_validator is None and getattr(self, '_group_master_key', None) is not None:
+                    from .local_knowledge import LocalKnowledgeService, LocalKnowledgeCardSourceGuard
+                    if self.local_knowledge is None:
+                        self.local_knowledge = LocalKnowledgeService(
+                            self.data_root, self.groups, master_key=self._group_master_key)
+                    self.task_runtime.cards._source_validator = LocalKnowledgeCardSourceGuard(self.local_knowledge)
                 authority = self.hub.protected_events
                 if (authority is None or self._group_id_for_runtime_project(
                         value.get("project_id")) != value.get("group_id")):
@@ -4659,8 +4683,9 @@ class KnoweServer:
 
     def _protected_http_projection(self, writer, events, project_id):
         from .protected_events import REF
+        from .task_runtime.group_content import REF as CHAT_REF
         from .protected_storage import ProtectedStorageError
-        refs = [event for event in events if REF in event]
+        refs = [event for event in events if REF in event or CHAT_REF in event]
         if not refs:
             return events
         if (writer not in getattr(self, "_protected_authenticated_http", ())
@@ -5106,6 +5131,15 @@ class KnoweServer:
         project_id = self._canonical_project_id_from_request(project_id)
         self._assert_project_activatable(project_id)
 
+        # Verify encryption before the first echo/routing/continuation writer.
+        chat_group_id = self._group_id_for_runtime_project(project_id)
+        if chat_group_id is not None:
+            try:
+                self.hub.group_content.admit(chat_group_id)
+            except Exception:
+                await self._server_error(client, "群组加密密钥或存储不可用；消息未保存，模型未执行。")
+                return
+
         # ★ user_echo：带 seq、进 ring、广播给所有人（含发送者自己）——回声哨兵的信号源
         #   [v1.0.19.4] 捎上附件**元数据**（路径/名称/大小/签名，绝不带字节）——
         #   气泡据此渲染文件卡片，重进会话/重放历史也能复原（DESIGN 决策 #3 / 验收 #8）。
@@ -5122,7 +5156,7 @@ class KnoweServer:
             echo_event["forwarded"] = fwd
         if att_records:
             echo_event["attachments"] = [echo_meta(a) for a in att_records]
-        await self.hub.emit(project_id, echo_event)
+        committed_echo = await self.hub.emit(project_id, echo_event)
 
         # Group-chat work enters the authoritative Task Runtime before any legacy
         # engine/model execution.  Explicit DM channels above remain private Agent
@@ -5161,6 +5195,13 @@ class KnoweServer:
             if isinstance(run_payload, dict) and isinstance(run_payload.get("run_id"), str):
                 runtime_run_id = str(run_payload["run_id"])
                 runtime_task_id = str(run_payload.get("task_id") or "") or None
+                if self.hub.group_content is not None:
+                    # Hub returns the transient body, while its ring owns the reference.
+                    from .task_runtime.group_content import REF as CHAT_REF
+                    reference = next((event for event in self.hub.get_or_create(project_id).ring.events()
+                        if CHAT_REF in event and event.get("seq") == committed_echo.get("seq")), None)
+                    if reference is not None:
+                        self.hub.group_content.bind_owner(reference, runtime_run_id)
             # Ambiguous, write-capable, or sensitive requests stop at the durable
             # approval gate.  The public RunEvent is already broadcast by the same
             # listener used for HTTP mutations and is replayable after reconnect.
@@ -5368,6 +5409,13 @@ class KnoweServer:
             await self._server_error(client, msg("server.py.331", exc=exc))
             return
 
+        chat_group_id = self._group_id_for_runtime_project(group_id)
+        if chat_group_id is not None:
+            try:
+                self.hub.group_content.admit(chat_group_id)
+            except Exception:
+                await self._server_error(client, "群组加密密钥或存储不可用；私聊未保存，模型未执行。")
+                return
         self._ensure_dm_channel(dm_id, group_id)
 
         # user_echo 发到私聊频道 —— 出现在私聊窗口，群聊时间线看不到。
@@ -6650,6 +6698,9 @@ class KnoweServer:
                 cors_token = _HTTP_CORS_ORIGIN.set(origin)
 
             exact_route_methods: dict[str, set[str]] = {
+                "/api/learning/state": {"GET"},
+                "/api/learning/action": {"POST"},
+                "/api/learning/ics": {"GET"},
                 "/health": {"GET"},
                 "/shutdown": {"POST"},
                 "/settings": {"GET", "POST"},
@@ -6677,6 +6728,9 @@ class KnoweServer:
                 "/groups/roster-update": {"POST"},
                 "/groups/runtime-summary": {"POST"},
                 "/task-runtime/submit": {"POST"},
+                "/task-runtime/protected-propose": {"POST"},
+                "/task-runtime/protected-resolve": {"POST"},
+                "/task-runtime/protected-snapshot": {"POST"},
                 "/task-runtime/control": {"POST"},
                 "/task-runtime/snapshot": {"POST"},
                 "/task-runtime/replay": {"POST"},
@@ -6699,6 +6753,8 @@ class KnoweServer:
             allowed_methods = exact_route_methods.get(path)
             if allowed_methods is None and path.startswith("/preview/tree/"):
                 allowed_methods = {"GET"}
+            if allowed_methods is None and path.startswith("/api/memory/"):
+                allowed_methods = {"GET", "POST"}
             if allowed_methods is None and path.startswith("/api/knowledge"):
                 allowed_methods = {"GET", "POST"}
 
@@ -6801,6 +6857,49 @@ class KnoweServer:
                     await writer.drain()
                     return
 
+                if path.startswith("/api/memory/"):
+                    from .knowledge_api import KnowledgeHttpResponse
+                    try:
+                        if self.groups is None or self._group_master_key is None:
+                            response = KnowledgeHttpResponse(503, {"ok": False, "error": "encrypted_storage_unavailable"})
+                        else:
+                            if self.governed_memory is None:
+                                from .memory_api import MemoryService
+                                from .learning import LearningService
+                                from .knowe_memory.mem0_bridge import local_factory
+                                if self.learning is None:
+                                    self.learning = LearningService(self.data_root, self.groups, master_key=self._group_master_key)
+                                if self.local_knowledge is None:
+                                    self.local_knowledge = LocalKnowledgeService(self.data_root, self.groups, master_key=self._group_master_key)
+                                self.governed_memory = MemoryService(self.data_root, self.groups, self._group_master_key,
+                                    learning=self.learning, knowledge=self.local_knowledge, semantic_factory=local_factory(),runtime=self.task_runtime)
+                            response = await self.governed_memory.dispatch(method, path, split.query, body_bytes)
+                    except Exception:
+                        response = KnowledgeHttpResponse(503, {"ok": False, "error": "memory_service_unavailable"})
+                    self._write_http(writer, f"{response.status} Response".encode("ascii"),
+                        json.dumps(response.body, ensure_ascii=False).encode("utf-8"), b"application/json; charset=utf-8")
+                    await writer.drain()
+                    return
+
+                if path.startswith("/api/learning/"):
+                    from .knowledge_api import KnowledgeHttpResponse
+                    try:
+                        if self.groups is None:
+                            response = KnowledgeHttpResponse(503, {"ok": False, "error": "canonical_group_scope_unavailable"})
+                        else:
+                            if self.learning is None:
+                                from .learning import LearningService
+                                self.learning = LearningService(self.data_root, self.groups, master_key=self._group_master_key)
+                            response = await self.learning.dispatch(method, path, split.query, body_bytes)
+                            if method == 'POST' and response.status == 200 and self.governed_memory is not None:
+                                self.governed_memory.reconcile()
+                    except Exception:
+                        response = KnowledgeHttpResponse(503, {"ok": False, "error": "learning_service_unavailable"})
+                    self._write_http(writer, f"{response.status} Response".encode("ascii"),
+                        json.dumps(response.body, ensure_ascii=False).encode("utf-8"), b"application/json; charset=utf-8")
+                    await writer.drain()
+                    return
+
                 if path.startswith("/api/knowledge"):
                     if path.startswith("/api/knowledge/local/"):
                         if self.groups is None:
@@ -6810,7 +6909,16 @@ class KnoweServer:
                         try:
                             if self.local_knowledge is None:
                                 self.local_knowledge = LocalKnowledgeService(self.data_root, self.groups)
+                            # Memory/deletion routes may have initialized this service first.
+                            if not hasattr(self.local_knowledge, "rag_runtime"):
+                                from .rag_runtime import RagRuntime, configured_gateway
+                                rag = RagRuntime(self.local_knowledge, self.task_runtime, configured_gateway)
+                                self.local_knowledge.rag_runtime = rag
+                                self.local_knowledge.vision_reader = rag.vision
+                                self.local_knowledge.answer_reader = rag.answer
                             response = await self.local_knowledge.dispatch(method, path, split.query, body_bytes)
+                            if method == "POST" and response.status == 200 and self.governed_memory is not None:
+                                self.governed_memory.reconcile()
                         except Exception:
                             # A corrupt/wrong key must never be repaired by replacing encrypted data.
                             from .knowledge_api import KnowledgeHttpResponse
@@ -9525,6 +9633,10 @@ class KnoweServer:
                     if self.local_knowledge is None and (self.data_root / "local_knowledge" / "knowledge.sqlite").exists():
                         self.local_knowledge = LocalKnowledgeService(self.data_root, self.groups)
                     removed = self.groups.unlink_source(group_id, source_id)
+                    if self.learning is not None:
+                        self.learning.reconcile()
+                    if self.governed_memory is not None:
+                        self.governed_memory.reconcile()
                     if self.local_knowledge is not None:
                         self.local_knowledge.reconcile()
                     result = {
@@ -9582,7 +9694,26 @@ class KnoweServer:
         service = self.task_runtime
         request_key = payload.get("request_key")
 
-        if action == "submit":
+        if action.startswith("protected-"):
+            from .task_runtime.product import ProtectedProduct
+            group = self.groups.get(group_id)
+            if (group.source_links or group.course_bindings) and service.cards._source_validator is None:
+                from .local_knowledge import LocalKnowledgeService, LocalKnowledgeCardSourceGuard
+                if self._group_master_key is None:
+                    raise ValueError("Group encryption key unavailable")
+                if self.local_knowledge is None:
+                    self.local_knowledge = LocalKnowledgeService(self.data_root, self.groups, master_key=self._group_master_key)
+                service.cards._source_validator = LocalKnowledgeCardSourceGuard(self.local_knowledge)
+            product = ProtectedProduct(service, self.engine_for)
+            if action == "protected-propose":
+                result = product.propose(group_id, payload)
+            elif action == "protected-resolve":
+                result = product.resolve(group_id, payload)
+            elif action == "protected-snapshot":
+                result = product.snapshot(group_id)
+            else:
+                raise ValueError("Unknown protected task operation")
+        elif action == "submit":
             if not isinstance(request_key, str) or not request_key:
                 raise ValueError("request_key is required")
             title = payload.get("title")
@@ -9629,6 +9760,9 @@ class KnoweServer:
                 after_version=int(payload["after_version"]) if payload.get("after_version") is not None else None,
             )
         elif action == "route":
+            if self.hub.group_content is None:
+                raise ValueError("Encrypted Group content unavailable")
+            self.hub.group_content.admit(group_id)
             content = payload.get("content")
             if not isinstance(content, str) or not isinstance(request_key, str) or not request_key:
                 raise ValueError("content and request_key are required")
@@ -9739,10 +9873,13 @@ class KnoweServer:
     async def _serve_task_runtime_operation(
         self, writer: asyncio.StreamWriter, path: str, body_bytes: bytes,
     ) -> None:
+        from .task_runtime.card_state import CardStateError
+        from .protected_storage import ProtectedStorageError
         try:
             payload = self._decode_json_object(body_bytes)
             result = self._task_runtime_dispatch(path.rsplit("/", 1)[-1], payload)
-        except (ValueError, RuntimeConflictError, RuntimeNotFoundError, GroupDomainError) as exc:
+        except (ValueError, RuntimeConflictError, RuntimeNotFoundError, GroupDomainError,
+                CardStateError, ProtectedStorageError) as exc:
             self._preview_error(writer, b"400 Bad Request", str(exc))
             return
         except Exception:  # noqa: BLE001
@@ -10873,6 +11010,10 @@ class KnoweServer:
                 self.store.close(timeout=10.0)
             if self.task_runtime is not None:
                 self.task_runtime.close()
+            if self.governed_memory is not None:
+                self.governed_memory.close()
+            if self.learning is not None:
+                self.learning.close()
             if self.local_knowledge is not None:
                 self.local_knowledge.close()
             self.secret_leases.close()

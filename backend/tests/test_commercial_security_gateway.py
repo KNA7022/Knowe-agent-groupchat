@@ -504,3 +504,33 @@ def test_diagnostics_redaction_is_total_for_pii_secret_and_tool_bodies() -> None
     assert "13800138000" not in text
     assert "\u5f20\u4e09" not in text
     assert redacted["safe"] == "opaque_123"
+
+
+@pytest.mark.parametrize("identifier", [
+    "gag_abcdefab110101199001011234abcdef",
+    "p1_task_abcdefab13812345678abcdefabcdefa",
+])
+def test_dlp_does_not_whitelist_opaque_looking_user_text(identifier):
+    assert PiiDlpGateway().decide_outbound(identifier, approved=False).requires_approval
+
+
+@pytest.mark.parametrize("text,kind", [
+    ("身份证110101199001011234", "identity_pii"),
+    ("身份证：11010119900101123X", "identity_pii"),
+    ("identity number: 110101199001011234", "identity_pii"),
+    ("电话13812345678", "contact_pii"),
+    ("电话号码：13812345678", "contact_pii"),
+    ("phone: 13812345678", "contact_pii"),
+    ("110101199001011234", "identity_pii"),
+    ("13812345678", "contact_pii"),
+    ("phone13812345678", "contact_pii"),
+    ("ID110101199001011234", "identity_pii"),
+    ("a13812345678", "contact_pii"),
+    ("13812345678b", "contact_pii"),
+    ("gag_110101199001011234abcdef", "identity_pii"),
+    ("gag_abcdefab110101199001011234abcdef_suffix", "identity_pii"),
+])
+def test_dlp_real_numeric_personal_data_still_requires_approval(text, kind):
+    decision = PiiDlpGateway().decide_outbound(text, approved=False)
+    assert decision.requires_approval and not decision.allowed
+    assert any(finding.kind == kind for finding in decision.findings)

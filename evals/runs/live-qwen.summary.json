@@ -1,0 +1,184 @@
+{
+  "run_identity": "4f87fda4a3c628f076dd77d984d86390395312de399a3a78f120c654c47dfc35",
+  "cases": 30,
+  "counts": {
+    "passed": 23,
+    "failed": 7,
+    "error": 0,
+    "blocked": 0
+  },
+  "categories": {
+    "knowledge": {
+      "passed": 6,
+      "failed": 0,
+      "error": 0,
+      "blocked": 0
+    },
+    "learning": {
+      "passed": 1,
+      "failed": 5,
+      "error": 0,
+      "blocked": 0
+    },
+    "memory": {
+      "passed": 4,
+      "failed": 0,
+      "error": 0,
+      "blocked": 0
+    },
+    "multimodal": {
+      "passed": 6,
+      "failed": 0,
+      "error": 0,
+      "blocked": 0
+    },
+    "permissions": {
+      "passed": 4,
+      "failed": 0,
+      "error": 0,
+      "blocked": 0
+    },
+    "protocol": {
+      "passed": 2,
+      "failed": 2,
+      "error": 0,
+      "blocked": 0
+    }
+  },
+  "failures": [
+    {
+      "id": "learning-019",
+      "category": "learning",
+      "status": "failed",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 0,
+          "unallocated_minutes": 120,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-020",
+      "category": "learning",
+      "status": "failed",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 120,
+          "unallocated_minutes": 5,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-022",
+      "category": "learning",
+      "status": "failed",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 45,
+          "unallocated_minutes": 90,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-023",
+      "category": "learning",
+      "status": "failed",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 0,
+          "unallocated_minutes": 140,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "learning-024",
+      "category": "learning",
+      "status": "failed",
+      "checks": {
+        "allocated_minutes": true,
+        "unallocated_minutes": false,
+        "conflict": true
+      },
+      "evidence": {
+        "actual": {
+          "allocated_minutes": 75,
+          "unallocated_minutes": 70,
+          "conflict": false
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-013",
+      "category": "protocol",
+      "status": "failed",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "chat/completions",
+          "input_key": "messages",
+          "max_output_key": "max_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    },
+    {
+      "id": "protocol-016",
+      "category": "protocol",
+      "status": "failed",
+      "checks": {
+        "endpoint": false,
+        "input_key": true,
+        "max_output_key": true
+      },
+      "evidence": {
+        "actual": {
+          "endpoint": "chat/completions",
+          "input_key": "messages",
+          "max_output_key": "max_tokens"
+        },
+        "transport": "openai_chat",
+        "scope": "isolated_model_behavior_not_desktop_E2E"
+      }
+    }
+  ],
+  "live_product_e2e": false
+}

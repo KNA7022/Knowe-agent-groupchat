@@ -1,0 +1,13 @@
+{
+  "version": "1.0.36",
+  "installer": "release/StudyCrew-Setup-1.0.36.exe",
+  "bytes": 392584112,
+  "sha256": "A1E30B31DCA744714330ACB38B8BFE1D4C86AECDF7E1D128D7806B82DD3E7DFC",
+  "installed_backend_matches_build": true,
+  "installed_app_matches_build": true,
+  "backend_sha256": "30F943EEC1448004F24822618ADA98E7FC724F7E121755F0D0D40725D0D20479",
+  "app_asar_sha256": "87153AEDF562DFA71A686BF60ABC0D9D1907EB41745A68E5428A3BFB7B81AEBD",
+  "installed_self_check": "installed-self-check.json",
+  "installed_ui_check": "installed-final.json",
+  "published": false
+}

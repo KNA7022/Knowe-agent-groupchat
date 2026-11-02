@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "cases": 120,
+  "development": 90,
+  "holdout": 30,
+  "sha256": "54184a3f0b856f8647a86d050caf5e1d722e557566411b59e87ba258373631f8",
+  "synthetic_only": true,
+  "creation_date": "2026-10-11",
+  "categories": {
+    "knowledge": 24,
+    "learning": 24,
+    "memory": 16,
+    "multimodal": 24,
+    "permissions": 16,
+    "protocol": 16
+  }
+}

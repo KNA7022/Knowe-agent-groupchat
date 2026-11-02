@@ -1,0 +1,7 @@
+{
+  "scope": "protected_product_with_real_provider_http_not_desktop",
+  "passed": false,
+  "error_type": "AssertionError",
+  "calls": [],
+  "task_total_cny_upper_bound": "0.461940"
+}

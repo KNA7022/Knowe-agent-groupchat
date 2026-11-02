@@ -371,3 +371,111 @@ async def test_chunk_preparation_is_off_loop_and_scope_is_rechecked_before_publi
     release.set()
     assert (await pending)[0] == 403
     assert server.local_knowledge.store.document_ids() == ()
+
+
+async def test_local_answer_exact_source_version_quote_and_hallucination_abstention(app):
+    server, group, _, http = app
+    source = (await http("import", document()))[1]["source"]
+    status, result = await http("answer", {"query": "导数"})
+    assert status == 200 and result["verification"] == "exact_quotes_verified"
+    citation = result["citations"][0]
+    assert citation["source_id"] == source["source_id"] and citation["version"] == 1
+    assert citation["quote"] in result["answer"]
+    async def hallucinate(**kwargs):
+        return {"answer": "Invented", "citations": [{**citation, "quote": "not in document"}]}
+    server.local_knowledge.answer_reader = hallucinate
+    bad = (await http("answer", {"query": "导数", "use_model": True, "approved": True}))[1]
+    assert bad["verification"] == "abstain_unsupported_citation" and not bad["citations"]
+    assert (await http("answer", {"query": "导数", "use_model": True}))[0] == 403
+
+
+async def test_visual_reader_is_version_bound_checkpoints_and_resumes(app):
+    server, _, _, http = app
+    raw = b"\x89PNG\r\n\x1a\nfixture"
+    source = (await http("import", {"filename": "image.png", "data_base64": base64.b64encode(raw).decode("ascii")}))[1]["source"]
+    calls = []
+    async def reader(**kwargs):
+        calls.append(kwargs)
+        return "导数 visual evidence"
+    server.local_knowledge.vision_reader = reader
+    assert (await http("vision", {"source_id": source["source_id"], "approved": True, "source_version": 0}))[0] == 403
+    status, visual = await http("vision", {"source_id": source["source_id"], "approved": True, "source_version": 1})
+    assert status == 200 and visual["source"]["version"] == 2 and visual["remaining_pages"] == 0
+    assert calls[0]["authorization"]["source_version"] == 1
+    assert (await http("search", {"query": "导数"}))[1]["results"]
+    assert (await http("vision", {"source_id": source["source_id"], "approved": True, "source_version": 2}))[0] == 200
+    assert len(calls) == 1
+    detail = (await http("detail", extra={"source_id": source["source_id"]}))[1]
+    assert "vision_text" not in detail["source"]
+
+
+async def test_production_rag_composition_approval_mock_egress_and_exact_citations(app, monkeypatch):
+    from backend import runtime_settings, commercial_gateway
+    from backend.tests.test_rag_vision_egress import _client
+    import httpx
+    server, group, _, http = app
+    calls = []
+    def handler(request):
+        calls.append(request)
+        wire = json.loads(request.content)
+        evidence = json.loads(wire["messages"][-1]["content"])["evidence"][0]
+        citation = {k: evidence[k] for k in ("source_id", "chunk_id", "version", "location")}
+        citation["quote"] = evidence["text"]
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({"answer": evidence["text"], "citations": [citation]}, ensure_ascii=False)}}], "usage": {"prompt_tokens": 30, "completion_tokens": 10}})
+    class FixtureGateway(commercial_gateway.ProviderGatewayClient):
+        def __new__(cls, **kwargs):
+            client = _client(handler, model="qwen3.8")
+            client.authority_provider = kwargs["authority_provider"]
+            return client
+    monkeypatch.setattr(commercial_gateway, "ProviderGatewayClient", FixtureGateway)
+    monkeypatch.setattr(runtime_settings, "model_binding_for", lambda *_: {"provider": "alibaba", "model": "qwen3.8", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "transport": "openai_chat", "secret_ref": "fixture", "credential_purpose": "fixture"})
+    await http("import", document())
+    payload = {"query": "导数", "use_model": True, "approved": True}
+    status, pending = await http("answer", payload)
+    assert status == 202 and pending["approval_required"] and not calls
+    approved_status, approved = await http("/task-runtime/approval", {"group_id": group.group_id, "approval_id": pending["approval_id"], "approved": True, "capabilities": ["provider_egress"], "request_key": "rag-test-approve"})
+    assert approved_status == 200
+    pending_again = (await http("sources"))[1]["pending_operations"]
+    assert pending_again[0]["operation_id"] == pending["operation_id"]
+    result_status, result = await http("answer", {**payload, "authorization": {"operation_id": pending["operation_id"]}})
+    assert result_status == 200 and result["verification"] == "exact_quotes_verified" and len(calls) == 1
+    assert server.task_runtime.store.get_run(pending["run_id"]).status.value == "partial"
+    duplicate_status, duplicate = await http("answer", {**payload, "authorization": {"operation_id": pending["operation_id"]}})
+    assert duplicate_status == 200 and duplicate["answer"] == result["answer"] and len(calls) == 1
+
+
+async def test_card_source_guard_revision_tracks_atomic_source_version_and_scoped_tool(app):
+    from backend.local_knowledge import LocalKnowledgeCardSourceGuard
+    server, group, other, http = app
+    source = (await http("import", document()))[1]["source"]
+    guard = LocalKnowledgeCardSourceGuard(server.local_knowledge)
+    with guard.guard(server.groups.get(group.group_id)) as before:
+        evidence = guard.evidence(group.group_id, None, "导数")
+        assert evidence[0]["source_id"] == source["source_id"]
+        assert guard.evidence(other.group_id, None, "导数") == []
+    metadata = server.local_knowledge.store.source_metadata(source["source_id"])
+    metadata["version"] = 2
+    server.local_knowledge.store.write_document(source["source_id"], server.local_knowledge.store.read_chunks(source["source_id"]), metadata=metadata, expected_version=1)
+    with guard.guard(server.groups.get(group.group_id)) as after:
+        assert before.revision != after.revision
+        assert guard.evidence(group.group_id, None, "导数")[0]["version"] == 2
+
+
+async def test_office_visual_conversion_keeps_original_text_and_uses_pdf_page_vision(app, monkeypatch, tmp_path):
+    from backend.tests.test_rag_office_parsers import _docx, _p
+    raw = _docx(tmp_path / "synthetic.docx", _p("Original textual evidence")).read_bytes()
+    server, _, _, http = app
+    source = (await http("import", {"filename": "synthetic.docx", "data_base64": base64.b64encode(raw).decode("ascii")}))[1]["source"]
+    pdf = pdfium.PdfDocument.new(); pdf.new_page(100, 100)
+    buffer = BytesIO(); pdf.save(buffer); pdf.close()
+    monkeypatch.setattr(local_knowledge, "convert_office_to_pdf", lambda *_: buffer.getvalue())
+    calls = []
+    async def reader(**kwargs):
+        calls.append(kwargs)
+        return "Synthetic chart A=12 B=27"
+    server.local_knowledge.vision_reader = reader
+    status, result = await http("vision", {"source_id": source["source_id"], "source_version": 1, "approved": True, "page_limit": 1})
+    assert status == 200 and calls[0]["location"] == "page:1"
+    assert calls[0]["image"].startswith(b"\x89PNG")
+    assert (await http("search", {"query": "Original"}))[1]["results"]
+    assert (await http("search", {"query": "chart"}))[1]["results"]

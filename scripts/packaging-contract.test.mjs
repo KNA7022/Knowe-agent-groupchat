@@ -19,6 +19,9 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { parsePythonCommand } from './python-command.mjs';
+
+const python = parsePythonCommand(process.env.STUDYCREW_DEV_PYTHON || process.env.KNOWE_DEV_PYTHON || 'py -3.12');
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const builderPath = join(projectRoot, 'electron-builder.yml');
@@ -79,7 +82,8 @@ test('spec 的 hiddenimports 生效值必须非空且每个模块全名可解析
   assert.ok(declared.length > 0, 'hiddenimports 生效值不应为空');
   const probe = 'import importlib.util as u, sys; sys.exit(0 if u.find_spec(sys.argv[1]) else 1)';
   const missing = declared.filter(
-    (name) => spawnSync('py', ['-3.12', '-c', probe, name], { cwd: projectRoot }).status !== 0,
+    (name) => spawnSync(python.command, [...python.args, '-c', probe, name], { cwd: projectRoot,
+      env: {...process.env, MEM0_TELEMETRY:'False', MEM0_TELEMETRY_SAMPLE_RATE:'0'} }).status !== 0,
   );
   assert.deepEqual(missing, [], `hiddenimports 引用了不可解析的模块：${missing.join(', ')}`);
 });
@@ -257,7 +261,7 @@ test('spec 的版本对象必须字段齐全、数字版本正确、品牌不残
     'print(json.dumps({"fields": fields, "filevers": quad(ffi.fileVersionMS, ffi.fileVersionLS),',
     '                  "prodvers": quad(ffi.productVersionMS, ffi.productVersionLS)}, ensure_ascii=False))',
   ].join('\n');
-  const raw = execFileSync('py', ['-3.12', '-c', py], { cwd: projectRoot, encoding: 'latin1' });
+  const raw = execFileSync(python.command, [...python.args, '-c', py], { cwd: projectRoot, encoding: 'latin1' });
   const parsed = JSON.parse(Buffer.from(raw.trim(), 'latin1').toString('utf8'));
 
   for (const name of [

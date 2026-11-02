@@ -177,6 +177,7 @@ def test_sse_line_no_usage_no_event():
 def _bare_client() -> ProviderClient:
     client = object.__new__(ProviderClient)
     client.model = "test-model"
+    client.transport = "openai_chat"
     return client
 
 

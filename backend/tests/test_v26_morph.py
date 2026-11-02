@@ -381,7 +381,8 @@ def test_server_feedback_unowned_card_fails_closed_with_observable_receipt(
             pending = engine.gate.pending_of(card_id)
             assert pending is not None and pending.card["instruction"] == OLD
             assert not pending.future.done() and "feedback_history" not in pending.card
-            events = server.hub.projects[pid].ring.events()
+            # The ring intentionally stores encrypted authority references.
+            events = server._protected_public_projection(server.hub.projects[pid].ring.events())
             errors = [event for event in events if event["type"] == "error"]
             assert len(errors) == 1
             assert errors[0]["message"] == msg("server.py.337", reason=msg("engine.186") + "调用失败：GatewayDenied")

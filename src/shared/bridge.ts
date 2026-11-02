@@ -115,6 +115,7 @@ export type PreviewOpenPayload = {
 
 /** window.knowe —— 渲染进程能看到的全部东西 */
 export interface KnoweBridge {
+  learningNotificationSupported?(): Promise<boolean>;
   /** 这是不是跑在 Electron 里（浏览器里打开时为 undefined，前端要能容忍） */
   readonly isElectron: true;
   /**
@@ -310,6 +311,7 @@ declare global {
 
 /** IPC 频道名——主进程和 preload 各写一遍就会写歪，所以只写一遍 */
 export const IPC = {
+  learningNotificationSupported: 'knowe:learning:notification-supported',
   getStatus: 'knowe:backend:get-status',
   restart: 'knowe:backend:restart',
   statusChanged: 'knowe:backend:status-changed',

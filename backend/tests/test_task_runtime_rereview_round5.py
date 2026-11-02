@@ -4,6 +4,8 @@ import asyncio
 import json
 import sqlite3
 import time
+import threading
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -54,7 +56,25 @@ def _high_risk_ready(
     return approval_id, str(continuation["run_id"]), original
 
 
-def test_nearest_expiry_watcher_fires_while_idle_and_releases_capacity(tmp_path: Path) -> None:
+def test_nearest_expiry_watcher_fires_while_idle_and_releases_capacity(tmp_path: Path, monkeypatch) -> None:
+    from backend.task_runtime import service as service_module
+    now = datetime.now(timezone.utc)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now if tz is not None else now.replace(tzinfo=None)
+    class ScheduledTimer:
+        def __init__(self, delay, callback):
+            self.delay, self.callback = delay, callback
+            self.cancelled = False
+            self.started = False
+        def start(self):
+            self.started = True
+        def cancel(self):
+            self.cancelled = True
+    monkeypatch.setattr(service_module, "datetime", Clock)
+    monkeypatch.setattr(service_module, "threading", SimpleNamespace(
+        RLock=threading.RLock, Timer=ScheduledTimer, get_ident=threading.get_ident))
     groups = GroupRepository(tmp_path)
     service = TaskRuntimeService(tmp_path, groups)
     group = groups.create_group("Autonomous expiry")
@@ -64,7 +84,7 @@ def test_nearest_expiry_watcher_fires_while_idle_and_releases_capacity(tmp_path:
         group.group_id, run.run_id, kind="message_route", summary="Confirm route",
         risk=RiskLevel.HIGH, request_key="idle-expiry-approval",
         requested_capabilities=("route_message",), operation_scope={"route": "queue_new"},
-        purpose="confirm_route", expires_at=_future(0.05),
+        purpose="confirm_route", expires_at=(now + timedelta(seconds=0.05)).isoformat(),
         executor_private_request={"project_id": group.group_id, "content": "private"},
         executor_execution_key="idle-expiry-execution", route_request_key="idle-expiry-route",
     )
@@ -72,8 +92,17 @@ def test_nearest_expiry_watcher_fires_while_idle_and_releases_capacity(tmp_path:
     service.schedule()
     assert service.store.get_run(queued.run_id).status is TaskStatus.QUEUED  # type: ignore[union-attr]
 
-    # No snapshot, summary, resolution, or scheduler call occurs during this wait.
-    time.sleep(0.20)
+    timer = service._approval_expiry_timer
+    assert timer is not None and timer.started and not timer.cancelled
+    assert 0.005 <= timer.delay <= 0.06  # The actual nearest-deadline arm is retained.
+    # Setup/database latency cannot consume the deadline. Fire the owned timer
+    # callback on its own thread after advancing the service clock; no foreground
+    # snapshot, resolution or scheduling operation triggers expiry.
+    now += timedelta(seconds=0.20)
+    worker = threading.Thread(target=timer.callback)
+    worker.start()
+    worker.join(timeout=3)
+    assert not worker.is_alive()
     assert service.store.get_approval(approval.approval_id).status == "rejected"  # type: ignore[union-attr]
     assert service.store.get_run(run.run_id).status is TaskStatus.FAILED  # type: ignore[union-attr]
     continuation = service.store.executor_continuation(approval_id=approval.approval_id)
@@ -243,7 +272,7 @@ async def test_http_ws_reject_raw_expiry_without_recovery_mutation(
         project_id="project_transport_expiry", prefix="transport-expiry",
     )
     server.task_runtime.close()  # type: ignore[union-attr]
-    server.task_runtime = TaskRuntimeService(tmp_path, server.groups)  # type: ignore[arg-type]
+    server.task_runtime = TaskRuntimeService(tmp_path, server.groups, card_master_key=server._group_master_key)  # type: ignore[arg-type]
     blocked = server.task_runtime.store.executor_continuation(approval_id=approval_id)
     assert blocked is not None and blocked["status"] == "recovered_blocked"
     before = server.task_runtime.store.get_run(run_id).to_dict()  # type: ignore[union-attr]

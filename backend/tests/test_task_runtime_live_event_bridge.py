@@ -320,7 +320,12 @@ async def test_replay_fence_sends_all_group_snapshots_before_racing_live_delta(
     server._start_task_runtime_event_bridge()  # noqa: SLF001
 
     socket = BlockingReplaySocket()
+    from types import SimpleNamespace
+    from backend.config import CONFIG
+    assert await server._authenticate_ws(socket, SimpleNamespace(
+        headers={'X-Knowe-Runtime-Token': CONFIG.runtime_token}, path='/')) is None
     client = Client(socket)
+    server._admit_protected_client(client)
     server._admit_task_runtime_client(client)  # noqa: SLF001
     replay_task = asyncio.create_task(server._do_replay(client, {  # noqa: SLF001
         "project_id": first_pid, "since_seq": 0,

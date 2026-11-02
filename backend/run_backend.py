@@ -11,7 +11,10 @@
 - 注意：本启动器仅用于打包态入口；开发态 Electron 仍走 ``python -m backend``
   （cwd=项目根，经 PYTHONPATH 解析 knowe_*），不经过本文件。
 """
-from backend.server import main
-
 if __name__ == "__main__":
+    import sys
+    if sys.argv[1:2] == ['--self-check'] and len(sys.argv)<=3:
+        from backend.self_check import main
+        raise SystemExit(main(sys.argv[2] if len(sys.argv)==3 else None))
+    from backend.server import main
     main()

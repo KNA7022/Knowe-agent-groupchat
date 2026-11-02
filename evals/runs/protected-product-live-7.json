@@ -1,0 +1,242 @@
+{
+  "scope": "product-probe_real_provider_http_not_desktop",
+  "passed": true,
+  "result": {
+    "ok": true,
+    "status": "succeeded",
+    "approved_generation": 1,
+    "model_calls": 2,
+    "tool_calls": 1,
+    "citation_verified": true,
+    "reopen_verified": true,
+    "snapshots": {
+      "proposed": {
+        "cards": [
+          {
+            "approval_id": "apr_4dbee1ed32b44151844f4806efee07cf",
+            "generation": 1,
+            "digest": "f97fa70079244074c14d2905245a37f3a62965c63b12b7be42fd9b1f987e0230",
+            "expires_at": "2026-10-10T18:07:48.849847Z",
+            "proposal": {
+              "target_role": "knowledge",
+              "instruction": "Call protected_source_search with query 'Synthetic evidence' and limit 1. Then explain spaced review in one sentence, citing the returned exact chunk_id as [[chunk_id]]. Do not use any other tool or request more information.",
+              "title": "",
+              "description": "",
+              "target_agent_id": "gag_0a05189fcbcf44c684cdc1f1419a5d54"
+            },
+            "status": "pending"
+          }
+        ],
+        "runs": [
+          {
+            "run_id": "run_ea33c5083bfe4da99514e6a6e14f9c1c",
+            "task_id": "task_65c8c021ada14a1ebdb29507051a0d03",
+            "group_id": "grp_deca51aff2154a20bbcc12d30e506af7",
+            "kind": "primary",
+            "title": "Protected instruction task",
+            "status": "waiting_approval",
+            "queue_class": "foreground",
+            "route_label": "queue_new",
+            "read_only": false,
+            "risk": "high",
+            "parent_run_id": null,
+            "version": 4,
+            "last_seq": 4,
+            "budget_limits": {
+              "wall_clock_seconds": 900,
+              "model_turns": 20,
+              "tool_calls": 30,
+              "tokens": 100000,
+              "cost_usd": 5.0
+            },
+            "budget_usage": {
+              "wall_clock_seconds": 0.0,
+              "model_turns": 0,
+              "tool_calls": 0,
+              "tokens": 0,
+              "cost_usd": 0.0
+            },
+            "agent_runs": [],
+            "evidence": [],
+            "failure_type": null,
+            "public_summary": "Task running",
+            "blocking_reason": "User approval required",
+            "data_classification": [],
+            "created_at": "2026-10-10T17:57:48.840157Z",
+            "updated_at": "2026-10-10T17:57:48.850866Z",
+            "started_at": "2026-10-10T17:57:48.846317Z",
+            "finished_at": null,
+            "schema_version": 1
+          }
+        ],
+        "messages": [],
+        "scope": "version-bound Group instruction and read-only source tasks",
+        "model_execution": "requires provider credential"
+      },
+      "completed": {
+        "cards": [],
+        "runs": [
+          {
+            "run_id": "run_ea33c5083bfe4da99514e6a6e14f9c1c",
+            "task_id": "task_65c8c021ada14a1ebdb29507051a0d03",
+            "group_id": "grp_deca51aff2154a20bbcc12d30e506af7",
+            "kind": "primary",
+            "title": "Protected instruction task",
+            "status": "succeeded",
+            "queue_class": "foreground",
+            "route_label": "queue_new",
+            "read_only": false,
+            "risk": "high",
+            "parent_run_id": null,
+            "version": 22,
+            "last_seq": 22,
+            "budget_limits": {
+              "wall_clock_seconds": 900,
+              "model_turns": 20,
+              "tool_calls": 30,
+              "tokens": 100000,
+              "cost_usd": 5.0
+            },
+            "budget_usage": {
+              "wall_clock_seconds": 0.0,
+              "model_turns": 2,
+              "tool_calls": 1,
+              "tokens": 9237,
+              "cost_usd": 0.020000000000000004
+            },
+            "agent_runs": [
+              {
+                "agent_run_id": "arun_b9b33236a2554821b87053e00e250291",
+                "run_id": "run_ea33c5083bfe4da99514e6a6e14f9c1c",
+                "agent_id": "gag_4b27583b10174ef8945fcd0eb1aa8320",
+                "role": "verifier",
+                "phase": "verifying",
+                "operation_summary": "Verifying executor evidence",
+                "blocking_reason": "",
+                "version": 1,
+                "updated_at": "2026-10-10T17:57:54.515699Z",
+                "schema_version": 1
+              }
+            ],
+            "evidence": [],
+            "failure_type": null,
+            "public_summary": "Protected task execution completed",
+            "blocking_reason": "",
+            "data_classification": [],
+            "created_at": "2026-10-10T17:57:48.840157Z",
+            "updated_at": "2026-10-10T17:57:54.518712Z",
+            "started_at": "2026-10-10T17:57:48.846317Z",
+            "finished_at": "2026-10-10T17:57:54.518712Z",
+            "schema_version": 1
+          }
+        ],
+        "messages": [
+          {
+            "event_id": "p2evt_6e6f7fc1475c8b7722b909edc1f30aa5",
+            "agent_id": "gag_0a05189fcbcf44c684cdc1f1419a5d54",
+            "content": "Spaced review means revisiting material at progressively increasing intervals so it is reinforced just as it would otherwise begin to fade from memory [[ac96655fedda6ec86876607e969d1399]].",
+            "status": "SUCCEEDED",
+            "task_id": "p1_task_80d43ea28e3840a7a2bfa9338a004532"
+          }
+        ],
+        "scope": "version-bound Group instruction and read-only source tasks",
+        "model_execution": "requires provider credential"
+      },
+      "reopened": {
+        "cards": [],
+        "runs": [
+          {
+            "run_id": "run_ea33c5083bfe4da99514e6a6e14f9c1c",
+            "task_id": "task_65c8c021ada14a1ebdb29507051a0d03",
+            "group_id": "grp_deca51aff2154a20bbcc12d30e506af7",
+            "kind": "primary",
+            "title": "Protected instruction task",
+            "status": "succeeded",
+            "queue_class": "foreground",
+            "route_label": "queue_new",
+            "read_only": false,
+            "risk": "high",
+            "parent_run_id": null,
+            "version": 22,
+            "last_seq": 22,
+            "budget_limits": {
+              "wall_clock_seconds": 900,
+              "model_turns": 20,
+              "tool_calls": 30,
+              "tokens": 100000,
+              "cost_usd": 5.0
+            },
+            "budget_usage": {
+              "wall_clock_seconds": 0.0,
+              "model_turns": 2,
+              "tool_calls": 1,
+              "tokens": 9237,
+              "cost_usd": 0.020000000000000004
+            },
+            "agent_runs": [
+              {
+                "agent_run_id": "arun_b9b33236a2554821b87053e00e250291",
+                "run_id": "run_ea33c5083bfe4da99514e6a6e14f9c1c",
+                "agent_id": "gag_4b27583b10174ef8945fcd0eb1aa8320",
+                "role": "verifier",
+                "phase": "verifying",
+                "operation_summary": "Verifying executor evidence",
+                "blocking_reason": "",
+                "version": 1,
+                "updated_at": "2026-10-10T17:57:54.515699Z",
+                "schema_version": 1
+              }
+            ],
+            "evidence": [],
+            "failure_type": null,
+            "public_summary": "Protected task execution completed",
+            "blocking_reason": "",
+            "data_classification": [],
+            "created_at": "2026-10-10T17:57:48.840157Z",
+            "updated_at": "2026-10-10T17:57:54.518712Z",
+            "started_at": "2026-10-10T17:57:48.846317Z",
+            "finished_at": "2026-10-10T17:57:54.518712Z",
+            "schema_version": 1
+          }
+        ],
+        "messages": [
+          {
+            "event_id": "p2evt_6e6f7fc1475c8b7722b909edc1f30aa5",
+            "agent_id": "gag_0a05189fcbcf44c684cdc1f1419a5d54",
+            "content": "Spaced review means revisiting material at progressively increasing intervals so it is reinforced just as it would otherwise begin to fade from memory [[ac96655fedda6ec86876607e969d1399]].",
+            "status": "SUCCEEDED",
+            "task_id": "p1_task_80d43ea28e3840a7a2bfa9338a004532"
+          }
+        ],
+        "scope": "version-bound Group instruction and read-only source tasks",
+        "model_execution": "requires provider credential"
+      }
+    }
+  },
+  "calls": [
+    {
+      "ticket": "1791655069087801800",
+      "input_cap": 3780,
+      "output_cap": 4096,
+      "status": "accounted",
+      "usage": {
+        "input_tokens": 690,
+        "output_tokens": 86
+      },
+      "cny": "0.011376"
+    },
+    {
+      "ticket": "1791655071770888000",
+      "input_cap": 4650,
+      "output_cap": 4096,
+      "status": "accounted",
+      "usage": {
+        "input_tokens": 919,
+        "output_tokens": 67
+      },
+      "cny": "0.013440"
+    }
+  ],
+  "rejections": [],
+  "task_total_cny_upper_bound": "0.486756"
+}

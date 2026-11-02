@@ -6195,6 +6195,11 @@ class ProjectEngine:
 
     def _schedule_project_memory(self, result: dict[str, Any]) -> None:
         """把一次 Project Memory 更新排成后台任务（不阻塞）。memory 没配就直接跳过。"""
+        if self._task_runtime_service is not None:
+            group = next((g for g in self._task_runtime_service.groups.list_groups() if self.project_id in {g.group_id, g.legacy_project_id}), None)
+            if group is not None:
+                log.info("private Group turn omitted from legacy plaintext memory")
+                return
         if self._memory is None:
             return
         self._turn_count += 1
@@ -8731,6 +8736,9 @@ class ProjectEngine:
         因此 stream_delta 不立即广播，等 message 到来后对完整文本做一次硬过滤；若完整流与
         final 一致，先发一条已脱敏的整段 delta，再发 message 使前端正常落定气泡。
         """
+        if payload.get("type") == "reasoning_delta":
+            return {}
+        payload = {key: value for key, value in payload.items() if key not in {"reasoning", "reasoning_content"}}
         etype = payload.get("type")
         # [v0.37.1] 频道决策：显式 channel 参数最高；否则若正在私聊回合（ContextVar 设了）
         #   且不是「必须留在群里」的管理事件 → 发私聊频道；其余发本项目（群）。

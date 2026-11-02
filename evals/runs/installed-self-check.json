@@ -1,0 +1,1 @@
+{"ok": true, "scope": "offline_installed_runtime", "external_calls": 0, "dimensions": 384, "semantic_retrieval": true, "versions": {"mem0ai": "2.0.20", "numpy": "2.5.3", "onnxruntime": "1.30.0", "tokenizers": "0.23.2", "usearch": "2.26.2"}}

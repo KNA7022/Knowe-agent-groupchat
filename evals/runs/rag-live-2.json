@@ -1,0 +1,74 @@
+{
+  "scope": "rag-probe_real_provider_http_not_desktop",
+  "passed": true,
+  "result": {
+    "pass": true,
+    "scope": "synthetic real LocalKnowledgeService/RagRuntime chain, not desktop UI",
+    "render_pixels": [
+      640,
+      440
+    ],
+    "maximum_model_requests": 2,
+    "output_cap": 2048,
+    "stages": [
+      {
+        "route": "import",
+        "status": 200
+      },
+      {
+        "route": "vision",
+        "status": 202
+      },
+      {
+        "route": "vision",
+        "status": 200
+      },
+      {
+        "route": "search",
+        "status": 200
+      },
+      {
+        "route": "answer",
+        "status": 202
+      },
+      {
+        "route": "answer",
+        "status": 200
+      }
+    ],
+    "data_root": "evals\\runs\\rag-live-2-data\\rag-probe-f3c3ab97096741038a54f30ba0d01ca7",
+    "vision_run_status": "partial",
+    "vision_source_version": 2,
+    "vision_remaining_pages": 0,
+    "verification": "exact_quotes_verified",
+    "citation_count": 1,
+    "answer_run_status": "partial",
+    "semantic_entailment_verified": false
+  },
+  "calls": [
+    {
+      "ticket": "1791655494945982800",
+      "input_cap": 10745,
+      "output_cap": 2048,
+      "status": "accounted",
+      "usage": {
+        "input_tokens": 388,
+        "output_tokens": 369
+      },
+      "cny": "0.017940"
+    },
+    {
+      "ticket": "1791655502617427500",
+      "input_cap": 3686,
+      "output_cap": 2048,
+      "status": "accounted",
+      "usage": {
+        "input_tokens": 548,
+        "output_tokens": 270
+      },
+      "cny": "0.016296"
+    }
+  ],
+  "rejections": [],
+  "task_total_cny_upper_bound": "0.544836"
+}

@@ -1,0 +1,10 @@
+{
+  "passed": false,
+  "scope": "installed UI schedule and actual native notification event; no mocks or model calls",
+  "supported": true,
+  "native": {
+    "calls": 0,
+    "shown": 0,
+    "failed": 0
+  }
+}

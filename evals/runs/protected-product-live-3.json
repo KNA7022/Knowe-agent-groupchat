@@ -1,0 +1,141 @@
+{
+  "scope": "protected_product_with_real_provider_http_not_desktop",
+  "passed": false,
+  "result": {
+    "ok": false,
+    "stage": "worker",
+    "status": "failed",
+    "model_calls": 1,
+    "tool_calls": 0,
+    "diagnostics": [],
+    "snapshots": {
+      "proposed": {
+        "cards": [
+          {
+            "approval_id": "apr_d36e0b3055c84793b70bd6bf368b581b",
+            "generation": 1,
+            "digest": "b5fc11a19e43c0daf31d424e20dd7fc60af6c19c917c4a0711d02f4433533a7a",
+            "expires_at": "2026-10-10T18:00:26.483866Z",
+            "proposal": {
+              "target_role": "knowledge",
+              "instruction": "Call protected_source_search with query 'Synthetic evidence' and limit 1. Then explain spaced review in one sentence, citing the returned exact chunk_id as [[chunk_id]]. Do not use any other tool or request more information.",
+              "title": "",
+              "description": "",
+              "target_agent_id": "gag_fbc7b9b868d8497aafcc16db7ed8da60"
+            },
+            "status": "pending"
+          }
+        ],
+        "runs": [
+          {
+            "run_id": "run_270ff93641b2455bbfa9206ea54adad9",
+            "task_id": "task_0a29ff44bee1472a84d9da0eafa9d9db",
+            "group_id": "grp_5edc6b1fc3d84d07b87245b28e02ccd2",
+            "kind": "primary",
+            "title": "Protected instruction task",
+            "status": "waiting_approval",
+            "queue_class": "foreground",
+            "route_label": "queue_new",
+            "read_only": false,
+            "risk": "high",
+            "parent_run_id": null,
+            "version": 4,
+            "last_seq": 4,
+            "budget_limits": {
+              "wall_clock_seconds": 900,
+              "model_turns": 20,
+              "tool_calls": 30,
+              "tokens": 100000,
+              "cost_usd": 5.0
+            },
+            "budget_usage": {
+              "wall_clock_seconds": 0.0,
+              "model_turns": 0,
+              "tool_calls": 0,
+              "tokens": 0,
+              "cost_usd": 0.0
+            },
+            "agent_runs": [],
+            "evidence": [],
+            "failure_type": null,
+            "public_summary": "Task running",
+            "blocking_reason": "User approval required",
+            "data_classification": [],
+            "created_at": "2026-10-10T17:50:26.472194Z",
+            "updated_at": "2026-10-10T17:50:26.483866Z",
+            "started_at": "2026-10-10T17:50:26.480844Z",
+            "finished_at": null,
+            "schema_version": 1
+          }
+        ],
+        "messages": [],
+        "scope": "version-bound Group instruction and read-only source tasks",
+        "model_execution": "requires provider credential"
+      },
+      "completed": {
+        "cards": [],
+        "runs": [
+          {
+            "run_id": "run_270ff93641b2455bbfa9206ea54adad9",
+            "task_id": "task_0a29ff44bee1472a84d9da0eafa9d9db",
+            "group_id": "grp_5edc6b1fc3d84d07b87245b28e02ccd2",
+            "kind": "primary",
+            "title": "Protected instruction task",
+            "status": "failed",
+            "queue_class": "foreground",
+            "route_label": "queue_new",
+            "read_only": false,
+            "risk": "high",
+            "parent_run_id": null,
+            "version": 15,
+            "last_seq": 15,
+            "budget_limits": {
+              "wall_clock_seconds": 900,
+              "model_turns": 20,
+              "tool_calls": 30,
+              "tokens": 100000,
+              "cost_usd": 5.0
+            },
+            "budget_usage": {
+              "wall_clock_seconds": 0.0,
+              "model_turns": 1,
+              "tool_calls": 0,
+              "tokens": 4510,
+              "cost_usd": 0.010000000000000002
+            },
+            "agent_runs": [
+              {
+                "agent_run_id": "arun_569bcf0ac0a345a18d09050c8e545fe4",
+                "run_id": "run_270ff93641b2455bbfa9206ea54adad9",
+                "agent_id": "gag_aebcf798702740dca95315071385095c",
+                "role": "verifier",
+                "phase": "verifying",
+                "operation_summary": "Verifying executor evidence",
+                "blocking_reason": "",
+                "version": 1,
+                "updated_at": "2026-10-10T17:50:27.123184Z",
+                "schema_version": 1
+              }
+            ],
+            "evidence": [],
+            "failure_type": "executor_failure",
+            "public_summary": "Protected task execution failed",
+            "blocking_reason": "",
+            "data_classification": [],
+            "created_at": "2026-10-10T17:50:26.472194Z",
+            "updated_at": "2026-10-10T17:50:27.126209Z",
+            "started_at": "2026-10-10T17:50:26.480844Z",
+            "finished_at": "2026-10-10T17:50:27.126209Z",
+            "schema_version": 1
+          }
+        ],
+        "messages": [],
+        "scope": "version-bound Group instruction and read-only source tasks",
+        "model_execution": "requires provider credential"
+      }
+    }
+  },
+  "calls": [],
+  "rejections": [],
+  "task_total_cny_upper_bound": "0.461940"
+}

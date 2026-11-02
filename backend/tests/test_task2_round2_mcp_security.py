@@ -387,7 +387,8 @@ def test_injecting_a_transport_no_longer_bypasses_authorization() -> None:
 
     1. `ProviderGatewayClient` 没有 `_trusted_test_transport` 这个参数；
     2. 注入 `client_factory` 但拿不出 Task Runtime 授权 —— 请求在出网前被拒；
-    3. 传输层仍拒绝明显误传的真实 client（这是早期反馈，不是安全边界）。
+    3. 注入非 MockTransport 的预算发送通道同样不能跳过真实 Gateway authority；
+    4. 底层 client_factory 仍要求 gateway-managed 声明（声明不是权限边界）。
     """
 
     from backend.commercial_gateway import ProviderGatewayClient
@@ -420,20 +421,37 @@ def test_injecting_a_transport_no_longer_bypasses_authorization() -> None:
 
     asyncio.run(attempt())
 
-    # 3. 传输层对"明显误传真实 client"仍会立刻拒绝。
-    transport = ProviderClient(
-        base_url="https://x.example/v1",
-        api_key="k",
-        model="m",
-        client_factory=lambda: httpx.AsyncClient(),
-        _gateway_managed=True,
+    # 3. 非 MockTransport 注入用于预算 transport；无 authority 时甚至不能构造发送 client。
+    sends = []
+    constructions = []
+    class InertBudgetTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            sends.append(request.url.path)
+            raise AssertionError("unauthorized request reached transport")
+    def bounded_factory():
+        constructions.append(True)
+        return httpx.AsyncClient(transport=InertBudgetTransport())
+    bounded = ProviderGatewayClient(
+        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        api_key="fixture", model="qwen3.8-max", provider="alibaba",
+        authority_provider=lambda: None, client_factory=bounded_factory,
     )
+    async def unauthorized_bounded() -> None:
+        try:
+            with pytest.raises(GatewayDenied, match="authoritative Task Runtime"):
+                await bounded.chat([{"role": "user", "content": "synthetic"}])
+            with pytest.raises(GatewayDenied, match="authoritative Task Runtime"):
+                async for _ in bounded.chat_stream([{"role": "user", "content": "synthetic"}]):
+                    pass
+        finally:
+            await bounded.aclose()
+    asyncio.run(unauthorized_bounded())
+    assert not constructions and not sends
 
-    async def misuse() -> None:
-        with pytest.raises(PermissionError, match="MockTransport"):
-            await transport.chat([{"role": "user", "content": "hi"}])
-
-    asyncio.run(misuse())
+    # 4. 未声明 gateway-managed 的底层 factory 仍被构造期拒绝。
+    with pytest.raises(PermissionError, match="Provider Gateway"):
+        ProviderClient(base_url="https://x.example/v1", api_key="fixture", model="m",
+            client_factory=bounded_factory)
 
 
 # ── I7：密封核对对 stdio 也必须有效 ─────────────────────────────────────────

@@ -1,0 +1,74 @@
+{
+  "currency": "CNY",
+  "budget": "50",
+  "known_usage_tokens": {
+    "input_tokens": 32125,
+    "output_tokens": 3222
+  },
+  "known_usage_cost_at_verified_uncached_rates": "0.501492",
+  "unknown_usage_retained_upper_bound": "0.171648",
+  "task_cost_upper_bound": "0.673140",
+  "remaining_budget_lower_bound": "49.326860",
+  "dataset_attempts": 121,
+  "probe_paid_requests": 11,
+  "probes": {
+    "memory-live.json": {
+      "passed": true,
+      "calls": 1
+    },
+    "protected-product-live-2.json": {
+      "passed": false,
+      "calls": 0
+    },
+    "protected-product-live-3.json": {
+      "passed": false,
+      "calls": 0
+    },
+    "protected-product-live-4.json": {
+      "passed": false,
+      "calls": 0
+    },
+    "protected-product-live-5.json": {
+      "passed": false,
+      "calls": 0
+    },
+    "protected-product-live-6.json": {
+      "passed": false,
+      "calls": 0
+    },
+    "protected-product-live-7.json": {
+      "passed": true,
+      "calls": 2
+    },
+    "protected-product-live.json": {
+      "passed": false,
+      "calls": 0
+    },
+    "protocols-live.json": {
+      "passed": true,
+      "calls": 3
+    },
+    "rag-live-2.json": {
+      "passed": true,
+      "calls": 2
+    },
+    "rag-live.json": {
+      "passed": false,
+      "calls": 1
+    },
+    "ui-live-2.json": {
+      "passed": false,
+      "calls": 1
+    },
+    "ui-live-3.json": {
+      "passed": true,
+      "calls": 1
+    },
+    "ui-live.json": {
+      "passed": false,
+      "calls": 0
+    }
+  },
+  "basis": "Verified published rates and provider usage, not an account invoice. Unknown usage retains the full reservation.",
+  "historical_report_correction": "rag-live.json response delivery failed after usage settlement; its known cost is included once, despite the old uncertain status label."
+}

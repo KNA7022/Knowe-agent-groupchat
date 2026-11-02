@@ -78,7 +78,7 @@ async def server(tmp_path):
     # Seed one real canonical project so E2E tests exercise transport/replay rather than
     # relying on the retired "handshake materialises a project" side effect.
     await srv.create_project(DEMO_ID, "端到端测试项目", str(tmp_path))
-    async with serve(srv.handle, "127.0.0.1", 0) as ws_server:
+    async with serve(srv.handle, "127.0.0.1", 0, process_request=srv._authenticate_ws) as ws_server:
         port = ws_server.sockets[0].getsockname()[1]
         srv.test_port = port  # type: ignore[attr-defined]
         yield srv
@@ -87,7 +87,7 @@ async def server(tmp_path):
 
 
 async def connect(srv) -> Conn:
-    ws = await websockets.connect(f"ws://127.0.0.1:{srv.test_port}")
+    ws = await websockets.connect(f"ws://127.0.0.1:{srv.test_port}", additional_headers={"X-Knowe-Runtime-Token": CONFIG.runtime_token})
     return Conn(ws)
 
 

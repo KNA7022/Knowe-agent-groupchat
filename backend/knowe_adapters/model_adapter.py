@@ -38,6 +38,7 @@ class ProviderAdapterConfig:
     max_tokens: int | None = None
     extra_body: dict[str, Any] | None = None
     protected_wait_control: bool = False
+    protected_read_tools: tuple[str, ...] = ()
 
 
 class ProviderModelAdapter:
@@ -90,9 +91,9 @@ class ProviderModelAdapter:
         messages = [dict(item) for item in context.messages]
         tools = [dict(item) for item in context.tool_schemas]
         if self.config.protected_wait_control:
-            if tools:
+            if any(item.get("function", {}).get("name") not in self.config.protected_read_tools for item in tools):
                 raise ProviderProtocolError("protected effect tools denied")
-            tools = [{"type": "function", "function": {
+            tools = [*tools, {"type": "function", "function": {
                 "name": "protected_wait_for_user",
                 "description": "Pause and ask the user for information required to continue.",
                 "parameters": {"type": "object", "properties": {
@@ -116,8 +117,10 @@ class ProviderModelAdapter:
             outcome = self.normalize_response(response)
         if self.config.protected_wait_control and outcome.kind is OutcomeKind.ACTIONS:
             calls = outcome.tool_calls
-            if len(calls) != 1 or calls[0].name != "protected_wait_for_user":
+            if len(calls) != 1 or calls[0].name not in ("protected_wait_for_user", *self.config.protected_read_tools):
                 raise ProviderProtocolError("protected native control denied")
+            if calls[0].name in self.config.protected_read_tools:
+                return outcome
             args = calls[0].arguments
             question = args.get("question")
             if (set(args) != {"question"} or not isinstance(question, str)

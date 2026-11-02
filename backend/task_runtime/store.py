@@ -8,6 +8,7 @@ ring and therefore can prove whether a client cursor is contiguous.
 """
 
 import hashlib
+import base64
 import json
 import logging
 import threading
@@ -721,6 +722,37 @@ class TaskRuntimeStore:
                 "SELECT 1 FROM studycrew_group_deletions WHERE group_id=? LIMIT 1", (group_id,),
             ).fetchone() is not None
 
+    def _seal_private(self, domain: str, identity: list, value: dict) -> dict:
+        if not value or self.card_states._key is None:
+            return value
+        from .card_state import canonical
+        from backend.knowe_rag.crypto import field_aad
+        with self.db._lock:
+            meta = self.card_states.verify(self.db._connection, initialize=True)
+        aad = field_aad(canonical(["studycrew.private-runtime", 1, meta["store_id"], domain, identity]), "payload")
+        blob = self.card_states._key.seal(canonical(value).encode("utf-8"), aad=aad)
+        return {"private_runtime_version": 1, "ciphertext": base64.b64encode(blob).decode("ascii")}
+
+    def _open_private(self, domain: str, identity: list, value: dict) -> dict:
+        if "private_runtime_version" not in value:
+            return value  # Explicitly retain readable legacy rows; new keyed writes are sealed.
+        from .card_state import canonical
+        from backend.knowe_rag.crypto import field_aad
+        if value.get("private_runtime_version") != 1 or set(value) != {"private_runtime_version", "ciphertext"}:
+            raise RuntimeStoreError("unsupported private runtime envelope")
+        with self.db._lock:
+            meta = self.card_states.verify(self.db._connection)
+        aad = field_aad(canonical(["studycrew.private-runtime", 1, meta["store_id"], domain, identity]), "payload")
+        try:
+            return json.loads(self.card_states._key.open(base64.b64decode(value["ciphertext"], validate=True), aad=aad))
+        except Exception:
+            raise RuntimeStoreError("private runtime authentication failed") from None
+
+    def _hydrate_continuation(self, raw: dict) -> dict:
+        result = dict(raw)
+        result["private_request"] = self._open_private("continuation", [raw["group_id"], raw["run_id"], raw["continuation_id"]], raw.get("private_request") or {})
+        return result
+
     def close(self) -> None:
         self.db.close()
 
@@ -926,8 +958,7 @@ class TaskRuntimeStore:
             self._publish(event)
         return run, event, True
 
-    @staticmethod
-    def _insert_event(conn: Any, event: RunEvent, *, request_key: str) -> None:
+    def _insert_event(self, conn: Any, event: RunEvent, *, request_key: str) -> None:
         conn.execute(
             """INSERT INTO studycrew_run_events(
                    event_id, run_id, group_id, seq, version, event_type,
@@ -935,19 +966,18 @@ class TaskRuntimeStore:
                    idempotency_key, created_at
                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (event.event_id, event.run_id, event.group_id, event.seq, event.version,
-             event.event_type, _dumps(event.public_payload), _dumps(event.sensitive_payload),
+             event.event_type, _dumps(event.public_payload), _dumps(self._seal_private("event", [event.group_id, event.run_id, event.event_id], event.sensitive_payload)),
              event.sensitivity, request_key, event.created_at),
         )
 
-    @staticmethod
-    def _row_event(row: Any) -> RunEvent:
+    def _row_event(self, row: Any) -> RunEvent:
         if row is None:
             raise RuntimeStoreError("event not found")
         return RunEvent(
             event_id=str(row["event_id"]), run_id=str(row["run_id"]),
             group_id=str(row["group_id"]), seq=int(row["seq"]), version=int(row["version"]),
             event_type=str(row["event_type"]), public_payload=_loads(row["public_payload_json"]),
-            sensitive_payload=_loads(row["sensitive_payload_json"]),
+            sensitive_payload=self._open_private("event", [row["group_id"], row["run_id"], row["event_id"]], _loads(row["sensitive_payload_json"])),
             sensitivity=str(row["sensitivity"]), created_at=str(row["created_at"]),
         )
 
@@ -1484,9 +1514,8 @@ class TaskRuntimeStore:
              _dumps(decision.to_dict()), decision.created_at),
         )
 
-    @staticmethod
     def insert_executor_continuation_in_transaction(
-        conn: Any, *, continuation_id: str, run: TaskRun, approval_id: str | None,
+        self, conn: Any, *, continuation_id: str, run: TaskRun, approval_id: str | None,
         execution_key: str, route_request_key: str, risk: RiskLevel,
         status: str, private_request: Mapping[str, Any],
         recovery_of_continuation_id: str | None = None,
@@ -1500,7 +1529,7 @@ class TaskRuntimeStore:
             "approval_id": approval_id, "execution_key": execution_key,
             "route_request_key": route_request_key, "route_version": run.version,
             "risk": risk.value, "status": status,
-            "private_request": dict(private_request), "created_at": now, "updated_at": now,
+            "private_request": self._seal_private("continuation", [run.group_id, run.run_id, continuation_id], dict(private_request)), "created_at": now, "updated_at": now,
             "recovery_of_continuation_id": recovery_of_continuation_id,
             "private_request_digest": private_request_digest,
             "inherited_purpose": inherited_purpose,
@@ -1557,7 +1586,7 @@ class TaskRuntimeStore:
                 "SELECT payload_json FROM studycrew_executor_continuations WHERE "
                 + " AND ".join(clauses), tuple(args),
             ).fetchone()
-        return None if row is None else _loads(row["payload_json"])
+        return None if row is None else self._hydrate_continuation(_loads(row["payload_json"]))
 
     def executor_continuations_for_run(self, run_id: str) -> tuple[dict[str, Any], ...]:
         with self.db.transaction(immediate=False) as conn:
@@ -1566,7 +1595,7 @@ class TaskRuntimeStore:
                 "WHERE run_id=? ORDER BY created_at, continuation_id",
                 (run_id,),
             ).fetchall()
-        return tuple(_loads(row["payload_json"]) for row in rows)
+        return tuple(self._hydrate_continuation(_loads(row["payload_json"])) for row in rows)
 
     def claim_executor_continuation(self, continuation_id: str) -> tuple[dict[str, Any], bool]:
         with self.db.transaction() as conn:
@@ -1596,7 +1625,7 @@ class TaskRuntimeStore:
             ).fetchone()
         if winner is None:
             raise RuntimeStoreError(f"executor continuation not found: {continuation_id}")
-        return _loads(winner["payload_json"]), claimed
+        return self._hydrate_continuation(_loads(winner["payload_json"])), claimed
 
     def finish_executor_continuation(
         self, continuation_id: str, *, status: str, failure_type: str | None = None,
@@ -2682,6 +2711,8 @@ class TaskRuntimeStore:
                 "studycrew_run_events", "studycrew_task_runs",
             ):
                 conn.execute(f"DELETE FROM {table} WHERE group_id=?", (group_id,))
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='studycrew_group_content_v1'").fetchone():
+                conn.execute("DELETE FROM studycrew_group_content_v1 WHERE group_id=?", (group_id,))
         return counts
 
     def group_content_counts(self, group_id: str) -> dict[str, int]:

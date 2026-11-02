@@ -10,6 +10,8 @@ StudyCrew turns agents into a focused study crew — inside the chat interface y
 
 StudyCrew is an independent fork of [Knowe](https://github.com/HirezmingD/Knowe-agent-groupchat) by Hezhou Jiang. It retains the upstream MIT license and attribution.
 
+StudyCrew's current learning workflows and evidence are documented in the [delivery report](docs/STUDYCREW-DELIVERY-20261011.md), [architecture and upstream boundary](docs/STUDYCREW-ARCHITECTURE.md), [repeatable demo](docs/STUDYCREW-DEMO.md), [Windows build guide](docs/STUDYCREW-BUILD.md), and [versioned evaluation guide](evals/README.md). Model evaluations, desktop checks and simulated interface tests are reported separately.
+
 ---
 
 ## Build your Agent team

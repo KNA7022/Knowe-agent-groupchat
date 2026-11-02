@@ -57,6 +57,7 @@ from .contracts import (
     MemoryTombstone,
     can_recall,
     classify_write,
+    effective_sensitivity,
     is_expired,
     memory_fingerprint,
 )
@@ -501,6 +502,7 @@ class MemoryRepository:
         顺序是有意的：**墓碑先判**，"删过就别再学回来"压过其它一切；然后才轮到去重与分类。
         """
         moment = now or _utc_now()
+        sensitivity = effective_sensitivity(text, sensitivity)
         decision = classify_write(sensitivity=sensitivity, inferred=inferred, text=text)
 
         if self.is_blocked(text=text, group_id=group_id, course_id=course_id):
@@ -703,9 +705,11 @@ class MemoryRepository:
                 f"只有候选需要{'批准' if target is MemoryStatus.ACTIVE else '否决'}，"
                 f"而这条记忆的状态是 {stored.scope.status.value}"
             )
+        if is_expired(stored, now=now or _utc_now()):
+            raise MemoryRepositoryError("过期候选不能批准或否决")
         with self._database.transaction() as connection:
             connection.execute(
-                "UPDATE memory_records SET status=?, updated_at=? WHERE memory_id=?",
+                "UPDATE memory_records SET status=?, updated_at=?, version=version+1 WHERE memory_id=?",
                 (target.value, now or _utc_now(), memory_id),
             )
         return self._row_to_record(self._require(memory_id))
@@ -742,13 +746,18 @@ class MemoryRepository:
             )
 
         with self._database.transaction() as connection:
+            sensitivity = effective_sensitivity(text, stored.scope.sensitivity)
+            decision = classify_write(sensitivity=sensitivity, inferred=False, text=text)
+            status = MemoryStatus.CANDIDATE if decision.needs_approval else stored.scope.status
             connection.execute(
                 "UPDATE memory_records SET content_digest=?, text=?, version=version+1,"
-                " updated_at=? WHERE memory_id=?",
+                " updated_at=?, status=?, sensitivity=? WHERE memory_id=?",
                 (
                     content_digest,
                     self._seal(memory_id, "memory.record.text", text.encode("utf-8")),
                     now or _utc_now(),
+                    status.value,
+                    sensitivity.value,
                     memory_id,
                 ),
             )

@@ -1,5 +1,9 @@
 # Remaining roadmap — StudyCrew commercial continuation
 
+## Current implementation evidence — 2026-10-11, uncommitted work preserved
+
+The historical checkpoints below are not the current feature inventory. The continuation now connects protected proposal/approval/Worker UI, governed model protocols, approved page vision/RAG answers, learning schedules and governed Mem0/E5/USearch memory. Real-model results cover 120 fixed cases plus product probes; failures remain visible. The canonical current implementation/verification/limitations record is `docs/STUDYCREW-DELIVERY-20261011.md`, with `evals/runs/cost-final.json` for aggregate paid usage. Do not infer commercial readiness or all-content encryption from these additions. Remaining checks include native notification delivery, external calendar interoperability, clean-machine behavior, semantic citation quality, Office crash cleanup and the explicit boundaries in that report.
+
 ## Accepted checkpoint — 2026-10-08, `9159a8c`
 
 Restricted real Worker composition passed independent review after one fix round: 0 Critical / 0 Important, with inherited output-hygiene Minor. Real Engine/factory/Gateway/Worker, encrypted completion and pending review, durable publication/ACK, lifecycle cancellation, capacity release and restart exclusion are exercised. Frozen backend: 1,993 passed / 5 existing skips / 10 subtests; relevant 160 passed / 10 subtests. The actual-chain fixture uses planning; the generic role factory is shared, but knowledge/coach are not separately product-validated here.

@@ -422,7 +422,7 @@ async def test_recovered_high_risk_requires_fresh_linked_attempt_and_executes_on
     assert third is not None and third["status"] == "completed"
     _close_server(server)
 
-    final_restart = TaskRuntimeService(tmp_path, groups)
+    final_restart = TaskRuntimeService(tmp_path, groups, card_master_key=server._group_master_key)
     try:
         assert final_restart.store.get_run(run_id).status is TaskStatus.SUCCEEDED  # type: ignore[union-attr]
         assert final_restart.store.executor_continuation(approval_id=third_approval_id)["status"] == "completed"  # type: ignore[index]

@@ -18,6 +18,8 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.venv-build/
+.installation-check/
 venv/
 
 # 运行时数据 & 日志
@@ -63,3 +65,6 @@ assets/videos/compressed/
 # 出现在 `git status` 里，会干扰"工作树必须干净"这类检查。
 # 只忽略这一个文件，不忽略整个 skills/ —— 将来若在那下面放源码，不该被吞掉。
 skills/third_party/.registry.json
+
+# Public hash-verified E5 assets are acquired explicitly for packaging.
+backend/model_assets/

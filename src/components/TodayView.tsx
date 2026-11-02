@@ -1,4 +1,5 @@
 import React from 'react';
+import { LearningPanel } from './LearningPanel';
 
 import type { Group, GroupRuntimeSummary } from '../contract/group';
 import { useGroupStore } from '../store/groups';
@@ -83,21 +84,22 @@ export const TodayView: React.FC<TodayViewProps> = ({ groups, summaries, onOpenG
         <button type="button" disabled={!row.legacyProjectId} aria-label={`打开群组 ${row.groupName}`}
           onClick={() => onOpenGroup(row.groupId, row.legacyProjectId)}>进入群组 <IconChevR /></button>
       </article>) : <div className="today-zero"><IconTask /><h2>还没有群组</h2><p>从聊天页创建课程学习组或考试冲刺组。</p></div>}
-    </section>
+    </section><LearningPanel />
   </div>;
 };
 
 export const TodayShell: React.FC = () => {
+  const error = useGroupStore((state) => state.error);
   const groups = useGroupStore((state) => state.order.map((id) => state.groups[id]).filter(
     (group): group is Group => group !== undefined,
   ));
   const summaries = useTaskRuntimeStore((state) => state.groupSummaries);
-  return <TodayView groups={groups} summaries={summaries} onOpenGroup={(_groupId, legacyProjectId) => {
+  return <>{error && <p role="alert">群组加载失败：{error} <button onClick={() => {void useGroupStore.getState().load().catch(() => undefined);}}>重试加载群组</button></p>}<TodayView groups={groups} summaries={summaries} onOpenGroup={(_groupId, legacyProjectId) => {
     if (!legacyProjectId) return;
     const store = useKnoweStore.getState();
     store.switchProject(legacyProjectId);
     store.setView('chats');
-  }} />;
+  }} /></>;
 };
 
 export default TodayShell;

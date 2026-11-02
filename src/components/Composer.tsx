@@ -39,6 +39,7 @@ import { kindOf } from '../preview/fileKinds';
 import { PLATFORM_PROJECT_ID } from '../store/avatar';
 import type { Member } from '../store/state';
 import { useGroupStore } from '../store/groups';
+import { ProtectedTaskPanel } from './ProtectedTaskPanel';
 
 /** 输入区最小高度（设计稿的原状） */
 export const COMPOSER_MIN = 96;
@@ -101,6 +102,9 @@ export const Composer: React.FC = () => {
   const conn = useKnoweStore(selectConn);
   const members = useKnoweStore(selectActiveMembers);
   const canonicalGroup = useGroupStore((state) => state.order.some(
+    (groupId) => state.groups[groupId]?.legacy_project_id === projectId,
+  ));
+  const protectedGroupId = useGroupStore((state) => state.order.find(
     (groupId) => state.groups[groupId]?.legacy_project_id === projectId,
   ));
 
@@ -582,6 +586,8 @@ export const Composer: React.FC = () => {
       style={selecting ? { opacity: 0.4, pointerEvents: 'none' } : undefined}
       aria-disabled={selecting || undefined}
     >
+      {protectedGroupId && <details><summary>受保护任务：提案、审批与执行结果</summary>
+        <ProtectedTaskPanel key={protectedGroupId} groupId={protectedGroupId} /></details>}
       {/* [v0.5 #15] 聊天区与输入框之间的分隔线，上下可拖 */}
       <div
         className="composer-grip"

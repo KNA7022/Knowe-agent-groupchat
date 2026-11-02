@@ -53,6 +53,7 @@ const runtimeEndpoints: RuntimeEndpoints = Object.freeze({
 });
 
 const api: KnoweBridge = {
+  learningNotificationSupported: () => ipcRenderer.invoke(IPC.learningNotificationSupported),
   isElectron: true,
   /**
    * [阶段一 1.5] 正式版（打包安装版）判定，值来自主进程侧信息（见 detectPackaged）。

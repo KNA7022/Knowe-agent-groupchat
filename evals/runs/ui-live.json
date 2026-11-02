@@ -1,0 +1,55 @@
+{
+  "scope": "ui-probe_real_provider_http_not_desktop",
+  "passed": false,
+  "error_type": "JSONDecodeError",
+  "error_frames": [
+    {
+      "file": "budget_product_probe.py",
+      "line": 157,
+      "function": "main"
+    },
+    {
+      "file": "runners.py",
+      "line": 195,
+      "function": "run"
+    },
+    {
+      "file": "runners.py",
+      "line": 118,
+      "function": "run"
+    },
+    {
+      "file": "base_events.py",
+      "line": 691,
+      "function": "run_until_complete"
+    },
+    {
+      "file": "budget_product_probe.py",
+      "line": 151,
+      "function": "run"
+    },
+    {
+      "file": "live_ui_probe.py",
+      "line": 101,
+      "function": "run_ui_probe"
+    },
+    {
+      "file": "__init__.py",
+      "line": 346,
+      "function": "loads"
+    },
+    {
+      "file": "decoder.py",
+      "line": 338,
+      "function": "decode"
+    },
+    {
+      "file": "decoder.py",
+      "line": 356,
+      "function": "raw_decode"
+    }
+  ],
+  "calls": [],
+  "rejections": [],
+  "task_total_cny_upper_bound": "0.544836"
+}

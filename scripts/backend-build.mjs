@@ -108,7 +108,7 @@ function selectPython() {
   process.exit(1);
 }
 
-const WATCHED_EXTENSIONS = /\.(py|spec|md|json|txt|ini|cfg|toml)$/;
+const WATCHED_EXTENSIONS = /\.(py|spec|md|json|txt|ini|cfg|toml|onnx)$/;
 
 /** backend/ 下所有打包输入的"路径@mtime@size"清单。 */
 function backendInputs() {
@@ -155,7 +155,7 @@ function buildFingerprint(python) {
       ...python.args,
       '-c',
       'import importlib.metadata as m\n' +
-        'for n in ("pyinstaller", "playwright", "PyYAML", "ddgs", "duckduckgo-search"):\n' +
+        'for n in ("pyinstaller", "playwright", "PyYAML", "ddgs", "duckduckgo-search", "mem0ai", "onnxruntime", "tokenizers", "usearch", "numpy"):\n' +
         '    try: print(n + "=" + m.version(n))\n' +
         '    except Exception: print(n + "=absent")\n',
     ],

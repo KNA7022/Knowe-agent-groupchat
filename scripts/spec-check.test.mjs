@@ -20,7 +20,9 @@ import { spawnSync } from 'node:child_process';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const REAL_SPEC = join(ROOT, 'backend', 'StudyCrewBackend.spec');
 const CHECKER = join(ROOT, 'scripts', 'spec-check.mjs');
-const real = readFileSync(REAL_SPEC, 'utf8');
+// Mutation patterns operate on logical Python lines; Windows Git checkouts use CRLF.
+// Normalize only this in-memory fixture, preserving the source file's encoding/EOL.
+const real = readFileSync(REAL_SPEC, 'utf8').replace(/\r\n/g, '\n');
 
 /** 调用真实检查器，返回 { ok, problems, findings, exitCode }。 */
 function runChecker(specSource) {

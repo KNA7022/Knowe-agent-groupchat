@@ -1,0 +1,77 @@
+{
+  "scope": "ui-probe_real_provider_http_not_desktop",
+  "passed": false,
+  "error_type": "TimeoutError",
+  "error_frames": [
+    {
+      "file": "budget_product_probe.py",
+      "line": 157,
+      "function": "main"
+    },
+    {
+      "file": "runners.py",
+      "line": 195,
+      "function": "run"
+    },
+    {
+      "file": "runners.py",
+      "line": 118,
+      "function": "run"
+    },
+    {
+      "file": "base_events.py",
+      "line": 691,
+      "function": "run_until_complete"
+    },
+    {
+      "file": "budget_product_probe.py",
+      "line": 151,
+      "function": "run"
+    },
+    {
+      "file": "live_ui_probe.py",
+      "line": 149,
+      "function": "run_ui_probe"
+    },
+    {
+      "file": "_generated.py",
+      "line": 20025,
+      "function": "wait_for"
+    },
+    {
+      "file": "_locator.py",
+      "line": 741,
+      "function": "wait_for"
+    },
+    {
+      "file": "_frame.py",
+      "line": 372,
+      "function": "wait_for_selector"
+    },
+    {
+      "file": "_connection.py",
+      "line": 69,
+      "function": "send"
+    },
+    {
+      "file": "_connection.py",
+      "line": 559,
+      "function": "wrap_api_call"
+    }
+  ],
+  "calls": [
+    {
+      "ticket": "1791655676309035100",
+      "input_cap": 3298,
+      "output_cap": 4096,
+      "status": "accounted",
+      "usage": {
+        "input_tokens": 548,
+        "output_tokens": 226
+      },
+      "cny": "0.014712"
+    }
+  ],
+  "rejections": [],
+  "task_total_cny_upper_bound": "0.559548"
+}

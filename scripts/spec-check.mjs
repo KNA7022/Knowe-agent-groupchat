@@ -271,7 +271,9 @@ else:
 print(json.dumps({"findings": findings, "problems": problems}, ensure_ascii=False))
 `;
 
-const r = spawnSync('py', ['-3.12', '-c', PY, specPath], {
+const pythonCommand = process.env.STUDYCREW_DEV_PYTHON || process.env.KNOWE_DEV_PYTHON || 'py -3.12';
+const python = pythonCommand === 'py -3.12' ? {command:'py',args:['-3.12']} : {command:pythonCommand,args:[]};
+const r = spawnSync(python.command, [...python.args, '-c', PY, specPath], {
   cwd: ROOT,
   encoding: 'utf8',
   env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
